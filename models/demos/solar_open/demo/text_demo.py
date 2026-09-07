@@ -1,0 +1,1280 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Solar-Open-100B text demo on the tt_transformers generation pipeline.
+
+Integrates the Solar-Open TT model with the tt_transformers infrastructure for:
+- Paged attention (always on)
+- The generation loop with on-device sampling (greedy or top-k/top-p, top_k <= 32)
+- Performance profiling and benchmarking
+- Multi-user batch generation (up to 32 users on a single-row 1x8 mesh)
+
+Solar specifics handled here:
+- Chat template kwargs: ``SOLAR_OPEN_REASONING_EFFORT`` (demo default "low": greedy 200-token cases answer
+  immediately; "high" emits a ``<|think|>`` block first and needs ~2K generated tokens, see the reasoning_high case)
+  and ``SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT`` (default on; the template stamps today's date into the system prompt).
+- Stop set {2 <|endoftext|>, 24 <|flush|>, 25 <|calls|>} from generation_config.json (``ModelArgs.stop_token_ids``);
+  ``<|end|>`` (21) closes a message but is NOT a stop token.
+- Output split into reasoning / answer on ``<|content|>`` (``split_solar_output``).
+
+Uses the refactored TestFactory and MeshConfig patterns:
+- parametrize_mesh_with_fabric() for consistent mesh setup (trace region from models/model_trace_region_sizes.yaml)
+- TestFactory.setup_test() for unified configuration
+- mesh_config passed to create_tt_model for proper sharding
+
+    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_128 and 1x8"
+    pytest models/demos/solar_open/demo/text_demo.py -k "batch32 and 1x8"
+"""
+
+import os
+
+import pytest
+import torch
+from loguru import logger
+
+import ttnn
+from models.common.sampling import SamplingParams
+from models.common.utility_functions import is_blackhole
+from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
+from models.demos.solar_open.tt.common import create_tt_model
+from models.demos.utils.device_sku import get_current_device_sku_name
+from models.demos.utils.llm_demo_utils import create_benchmark_data, verify_perf
+from models.demos.utils.model_targets import resolve_perf_targets
+from models.perf.benchmarking_utils import BenchmarkProfiler
+from models.tt_transformers.demo.simple_text_demo import create_tt_page_table, load_inputs
+from models.tt_transformers.tt.common import PagedAttentionConfig, get_padded_prefill_len, preprocess_inputs_prefill
+
+# Import specific utilities from tt_transformers
+from models.tt_transformers.tt.generator import Generator, create_submeshes
+from models.tt_transformers.tt.model_config import determine_device_name
+
+# Demo default: answer without a <|think|> block so the greedy 200-token cases reach <|content|>. Quality/accuracy
+# runs export SOLAR_OPEN_REASONING_EFFORT=high (and need max_generated_tokens >= 2048, see the reasoning_high case).
+os.environ.setdefault("SOLAR_OPEN_REASONING_EFFORT", "low")
+
+# TTSampling gathers at most 32 candidates per device (max_top_k); Solar's README suggests top_k=50, which is clamped.
+MAX_TOP_K = 32
+
+# Special tokens of the Solar chat template (tokenizer_config.json added_tokens_decoder).
+THINK_TOKEN = "<|think|>"
+CONTENT_TOKEN = "<|content|>"
+END_TOKEN = "<|end|>"
+
+
+def split_solar_output(generated_text):
+    """Split a generated assistant turn into ``(reasoning, answer)``.
+
+    Solar renders ``<|think|>{reasoning}<|end|><|begin|>assistant<|content|>{answer}<|end|>``; with
+    ``reasoning_effort`` "low"/"minimal" the think block is empty and generation starts at ``<|content|>``. Everything
+    before the first ``<|content|>`` is reasoning (``<|think|>`` marker dropped, cut at its ``<|end|>``), the answer is
+    cut at its ``<|end|>``. When no ``<|content|>`` was generated (the token budget ran out inside the think block)
+    the answer is empty and the reasoning holds the whole text.
+    """
+    reasoning, separator, answer = generated_text.partition(CONTENT_TOKEN)
+    reasoning = reasoning.replace(THINK_TOKEN, "").split(END_TOKEN)[0].strip()
+    answer = answer.split(END_TOKEN)[0].strip() if separator else ""
+    return reasoning, answer
+
+
+def log_device_memory(mesh_device, label):
+    """Log the per-device DRAM (and trace region) allocation of the mesh: allocated / free / largest free block.
+
+    The mesh allocator runs in lock-step on every device, so one view describes all of them. Used to record the DRAM
+    headroom left for a larger KV pool (README "Recorded baselines"; the KV budget guard in tt/common.py).
+    """
+    gib = 2**30
+    for buffer_type in ("DRAM", "TRACE"):
+        try:
+            view = ttnn.get_memory_view(mesh_device, getattr(ttnn.BufferType, buffer_type))
+            banks = int(view.num_banks)
+            logger.info(
+                f"[{label}] {buffer_type} per device: allocated {int(view.total_bytes_allocated_per_bank) * banks / gib:.3f} GiB, "
+                f"free {int(view.total_bytes_free_per_bank) * banks / gib:.3f} GiB of "
+                f"{int(view.total_bytes_per_bank) * banks / gib:.3f} GiB ({banks} banks; largest contiguous free block "
+                f"{int(view.largest_contiguous_bytes_free_per_bank) * banks / gib:.3f} GiB)"
+            )
+        except Exception as e:  # BufferType.TRACE view may be unavailable without a trace region
+            logger.info(f"[{label}] {buffer_type} memory view unavailable ({type(e).__name__}: {e})")
+
+
+def create_long_context_page_table(
+    global_batch_size: int,
+    mesh_rows: int,
+    paged_attention_config: PagedAttentionConfig,
+    long_context_user_per_row: int = 0,
+) -> torch.Tensor:
+    """Create page table where one user per row gets all blocks.
+
+    For long-context scenarios (e.g., 128k tokens), we want a single user per row
+    to have access to the entire page table for that row, while other users
+    (padding for decode batch size) have empty page tables.
+
+    Args:
+        global_batch_size: Total batch size across all rows (e.g., 128)
+        mesh_rows: Number of rows in the mesh (e.g., 4 for 4x8)
+        paged_attention_config: Paged attention configuration with block info
+        long_context_user_per_row: Which user index (0-31) gets full allocation
+
+    Returns:
+        Page table tensor [global_batch_size, blocks_per_row]
+    """
+    users_per_row = global_batch_size // mesh_rows
+    blocks_per_row = paged_attention_config.max_num_blocks
+
+    # Initialize with -1 (invalid) for all users
+    page_table = torch.full((global_batch_size, blocks_per_row), -1, dtype=torch.int32)
+
+    for row in range(mesh_rows):
+        # User index that gets the full page table for this row
+        long_user_idx = row * users_per_row + long_context_user_per_row
+        # Assign all blocks sequentially to this user
+        page_table[long_user_idx, :] = torch.arange(blocks_per_row, dtype=torch.int32)
+
+    return page_table
+
+
+def prepare_solar_open_generator_args(
+    num_devices,
+    data_parallel,
+    mesh_device,
+    global_batch_size,
+    optimizations,
+    max_seq_len,
+    page_params,
+    paged_attention,
+    mesh_config=None,
+    state_dict=None,
+    users_row_sharded=False,
+    long_context_mode=False,
+):
+    """Build the Solar-Open model(s), KV cache and page table through create_tt_model (one model per submesh).
+
+    Args:
+        long_context_mode: If True, allocate all page blocks to user 0 of each row
+                          for single-user long-context (e.g., 128k) scenarios.
+
+    Returns ``(model_args, models, page_table, tt_kv_cache, tokenizer, processor, paged_attention_config)``; the
+    stop set for generation is ``model_args[0].stop_token_ids``.
+    """
+    submesh_devices = create_submeshes(mesh_device, data_parallel)
+
+    # Hybrid requires a model per submesh
+    model_args = []
+    model = []
+    tt_kv_cache = []
+
+    paged_attention_config = (
+        PagedAttentionConfig(
+            block_size=page_params["page_block_size"],
+            max_num_blocks=page_params["page_max_num_blocks_per_dp"],
+        )
+        if paged_attention
+        else None
+    )
+
+    for submesh in submesh_devices:
+        logger.info(f"Creating Solar-Open model for submesh {submesh}")
+        model_args_i, model_i, tt_kv_cache_i, state_dict = create_tt_model(
+            submesh,
+            max_batch_size=global_batch_size // data_parallel,
+            optimizations=optimizations,
+            max_seq_len=max_seq_len,
+            paged_attention_config=paged_attention_config,
+            dtype=ttnn.bfloat8_b,
+            state_dict=state_dict,
+            mesh_config=mesh_config,  # Pass mesh config for proper sharding
+            users_row_sharded=users_row_sharded,
+        )
+        model_args.append(model_args_i)
+        model.append(model_i)
+        tt_kv_cache.append(tt_kv_cache_i)
+
+    # Page table will be created using tt-transformers infrastructure after input preprocessing
+    if paged_attention:
+        if long_context_mode and users_row_sharded:
+            # Long-context mode: one user per row gets all blocks
+            page_table = create_long_context_page_table(
+                global_batch_size,
+                mesh_device.shape[0],
+                paged_attention_config,
+                long_context_user_per_row=0,
+            )
+        elif users_row_sharded:
+            # If users are sharded on rows of mesh, we need a separate page table for each row
+            page_tables = [
+                create_tt_page_table(
+                    global_batch_size // mesh_device.shape[0],
+                    data_parallel,
+                    paged_attention_config,
+                )
+                for _ in range(mesh_device.shape[0])
+            ]
+            # Concat the separate page tables into a single page table
+            page_table = torch.concat(page_tables, dim=0) if page_tables else None
+        else:
+            page_table = create_tt_page_table(
+                global_batch_size,
+                data_parallel,
+                paged_attention_config,
+            )
+    else:
+        page_table = None
+
+    # Host code, safe to reuse tokenizer from the 1st model
+    tokenizer = model_args[0].tokenizer
+    processor = model_args[0].processor
+    return model_args, model, page_table, tt_kv_cache, tokenizer, processor, paged_attention_config
+
+
+# run_in_ci=True selects the variants that fire under CI=true; everything else
+# is skipped in setup. Long-sequence prefill variants (prefill_1k / 64k / 128k)
+# are kept out of CI because runner availability is limited and we only want
+# the canonical prefill_128 sanity to run on every push. Local / release
+# invocations can still target them explicitly with -k.
+@pytest.mark.timeout(7200)
+@pytest.mark.parametrize(
+    "input_prompts, data_parallel, batch_size, repeat_batches, max_seq_len, max_generated_tokens, page_params, sampling_params, enable_decode_trace, enable_prefill_trace, warmup_prefill, users_row_sharded, long_context_mode, stop_at_eos, run_in_ci, reasoning_effort",
+    [
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding),
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            True,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Same as prefill_128 with the first ENGLISH prompt (prefill_128 runs the first, Korean, prompt of the KO/EN file)
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort
+        ),
+        # Non-greedy on-device sampling with Solar's recommended temperature / top_p; top_k is capped at 32 (MAX_TOP_K)
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0.8, "top_p": 0.95, "top_k": 32},  # sampling_params (generation_config.json values)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort
+        ),
+        # reasoning_effort=high: the model thinks in a <|think|> block before <|content|>, so it needs a 2K token budget
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            2048,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            "high",  # reasoning_effort
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_1k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_4k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            4 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 4 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_8k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            8 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 8 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_16k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            16 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 16 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_32k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            32 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 32 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_64k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            64 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 64 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding),
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_128k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            128 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 128 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding),
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Batch 128
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            128,  # batch_size
+            1,  # repeat_batches
+            128 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 128 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            True,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            True,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Batch 128 with logprobs (top-5)
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            128,  # batch_size
+            1,  # repeat_batches
+            128 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 128 * 1024 // 64},  # page_params
+            {
+                "temperature": 0,
+                "top_p": 0.08,
+                "enable_log_probs": True,
+                "num_logprobs": 5,
+            },  # sampling_params with logprobs
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            True,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Long-context mode: 1 user per row with 128k tokens, batch=128 for decode throughput
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_128k.json",  # input_prompts (128k prompt)
+            1,  # data_parallel
+            128,  # batch_size (32 per row, but only 1 real user per row)
+            1,  # repeat_batches
+            128 * 1024,  # max_seq_len (128k tokens)
+            50,  # max_generated_tokens (reduced for long context)
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 128 * 1024 // 64},  # 2048 blocks for 128k
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace
+            False,  # warmup_prefill
+            True,  # users_row_sharded
+            True,  # long_context_mode - single user per row gets all page blocks
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Long-context mode: short prefill, long decode
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_prefill_128.json",  # input_prompts (128 token prompt)
+            1,  # data_parallel
+            128,  # batch_size (32 per row, but only 1 real user per row)
+            1,  # repeat_batches
+            128 * 1024,  # max_seq_len (128k tokens)
+            130000,  # max_generated_tokens (reduced for long context)
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 128 * 1024 // 64},  # 2048 blocks for 128k
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace
+            False,  # warmup_prefill
+            True,  # users_row_sharded
+            True,  # long_context_mode - single user per row gets all page blocks
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Batch 32 on a single-row mesh (8x Blackhole P150): TP=8, EP=1, users are NOT row-sharded and the MoE runs the
+        # union-of-experts decode on the whole 32-user tile (see experts/decode.py). 16 Korean + 16 English prompts.
+        # Page table: 32 users x (8K / 64) blocks = 4096 blocks (~3.2 GiB of paged bfp8 KV per device: 48 layers, hd128).
+        # 512-token budget: even with reasoning_effort=low the model opens a <|think|> block for most of these prompts
+        # (23/32 on 2026-09-07) and a 200-token budget truncated them before <|content|>.
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            32,  # batch_size
+            1,  # repeat_batches
+            8 * 1024,  # max_seq_len
+            512,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 32 * (8 * 1024 // 64)},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            True,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Seqlen sweep: 1k-128k context lengths, one step per seqlen (on single-row meshes, >64k steps are skipped)
+        (
+            [
+                "models/tt_transformers/demo/sample_prompts/input_data_long_1k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_2k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_4k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_8k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_16k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_32k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_64k.json",
+                "models/tt_transformers/demo/sample_prompts/input_data_long_128k.json",
+            ],  # input_prompts: list of 8 files, one per sweep step
+            1,  # data_parallel
+            1,  # batch_size
+            8,  # repeat_batches (one per seqlen step)
+            128 * 1024,  # max_seq_len (single-row meshes cap at 64k via is_seqlen_sweep guard)
+            32,  # max_generated_tokens (minimal decode to verify prefill works)
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 2048},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace (avoid trace memory issues at 128k)
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            # run_in_ci=False: an e2e pipeline running this demo file without a -k filter would collect a
+            # CI-enabled seqlen-sweep case and fail (see #48533); the sweep pipeline selects it explicitly
+            # via -k "seqlen-sweep".
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+    ],
+    ids=[
+        "prefill_128",
+        "prefill_128_en",
+        "sampling_b1",
+        "reasoning_high",
+        "prefill_1k",
+        "prefill_4k",
+        "prefill_8k",
+        "prefill_16k",
+        "prefill_32k",
+        "prefill_64k",
+        "prefill_128k",
+        "batch128",
+        "batch128_logprobs",
+        "long_context_128k",
+        "long_context_short_prefill_long_decode",
+        "batch32",
+        "seqlen-sweep",
+    ],
+)
+@parametrize_mesh_with_fabric()
+def test_solar_open_demo(
+    mesh_device,
+    device_params,
+    input_prompts,
+    data_parallel,
+    batch_size,
+    repeat_batches,
+    max_seq_len,
+    max_generated_tokens,
+    page_params,
+    sampling_params,
+    enable_decode_trace,
+    enable_prefill_trace,
+    warmup_prefill,
+    users_row_sharded,
+    long_context_mode,
+    stop_at_eos,
+    run_in_ci,
+    reasoning_effort,
+    is_ci_env,
+    request,
+    state_dict,
+    monkeypatch,
+):
+    """Solar-Open-100B demo on the full tt_transformers generation pipeline (prefill + traced decode + sampling)."""
+    mesh_shape = tuple(mesh_device.shape)
+    test_id = request.node.callspec.id if hasattr(request.node, "callspec") else request.node.name
+    is_seqlen_sweep = "seqlen-sweep" in test_id
+    # On single-row meshes (T3K, LoudBox), cap max_seq_len at 64k for seqlen-sweep so steps >64k are skipped
+    actual_max_seq_len = min(max_seq_len, 64 * 1024) if (is_seqlen_sweep and mesh_shape[0] == 1) else max_seq_len
+    if mesh_shape[0] == 1:
+        if users_row_sharded or batch_size > 32:
+            pytest.skip(
+                f"Batch size {batch_size} (users_row_sharded={users_row_sharded}) skipped for mesh shape {mesh_shape}: "
+                "row-sharded / >32-user demos need a multi-row mesh; single-row meshes decode up to 32 users "
+                "on one row via the union-of-experts decode (see the batch32 case)."
+            )
+        elif batch_size > 1 and mesh_shape[1] < 8:
+            pytest.skip(
+                f"Batch size {batch_size} skipped for mesh shape {mesh_shape}: multi-user single-row decode is "
+                "validated for TP=8 (1x8) only."
+            )
+        elif max_seq_len > 64 * 1024 and not is_seqlen_sweep:
+            # Seqlen sweep uses actual_max_seq_len (capped at 64k) for execution; skip only non-sweep tests
+            pytest.skip(f"Long context demo with >64k tokens skipped for mesh shape {mesh_shape} due to OOM.")
+    elif batch_size > 1 and not users_row_sharded:
+        pytest.skip(
+            f"Batch size {batch_size} without row sharding skipped for multi-row mesh {mesh_shape}: "
+            "multi-row meshes batch users across rows (users_row_sharded=True, e.g. the batch128 case)."
+        )
+    if is_blackhole() and users_row_sharded:
+        pytest.skip(
+            f"Row-sharded batch size {batch_size} demo skipped on Blackhole: the multi-row expert-parallel path "
+            "is not part of this tree. Single-row batch<=32 runs the union-of-experts decode instead."
+        )
+    if long_context_mode:
+        assert batch_size >= mesh_shape[0], "Long-context mode requires batch_size >= number of mesh rows"
+    if os.environ.get("CI", None) and not run_in_ci:
+        config_id = request.node.callspec.id if hasattr(request.node, "callspec") else request.node.name
+        pytest.skip(f"This test configuration is skipped in CI: {config_id}")
+
+    if reasoning_effort is not None:
+        monkeypatch.setenv("SOLAR_OPEN_REASONING_EFFORT", reasoning_effort)
+    logger.info(
+        f"Chat template: reasoning_effort={os.environ['SOLAR_OPEN_REASONING_EFFORT']}, "
+        f"default_system_prompt={os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}"
+    )
+
+    # Use our refactored TestFactory for consistent setup
+    setup = TestFactory.setup_test(mesh_device, use_real_weights=False)
+    config = setup["config"]
+    mesh_config = setup["mesh_config"]
+
+    logger.debug(f"Using mesh config: {mesh_config}, model config: {config}")
+
+    # Configuration matching tt_transformers defaults
+    num_devices = mesh_device.get_num_devices()
+    paged_attention = True  # Always use paged attention
+    global_batch_size = batch_size * data_parallel  # Total batch across all devices
+
+    # Validate data parallel configuration (like tt-transformers)
+    if data_parallel > num_devices or num_devices % data_parallel != 0:
+        raise ValueError(f"Invalid number of DP groups: {data_parallel}, for {num_devices} devices")
+
+    logger.info("Running the Solar-Open-100B demo with the tt_transformers generation pipeline")
+
+    # Setup profiler like tt_transformers
+    profiler = BenchmarkProfiler()
+    profiler.start("run")
+    batch_idx = 0
+
+    # No performance-optimization presets for this model
+    optimizations = None
+
+    # For long_context_mode, we only have 1 real user per row
+    # The rest are padding users with empty prompts
+    num_real_users = mesh_device.shape[0] if long_context_mode else global_batch_size
+    users_per_row = global_batch_size // mesh_device.shape[0]
+
+    seqlen_sweep_files = None
+    if is_seqlen_sweep:  # seqlen-sweep: list of file paths, loaded per step during repeat_batch_prompts construction
+        seqlen_sweep_files = input_prompts
+        real_prompts = None  # not used; each step loads its own prompts
+    elif isinstance(input_prompts, list) and len(input_prompts) == 1:  # Manual input
+        real_prompts = input_prompts * num_real_users
+    elif isinstance(input_prompts, str):  # Inputs from file
+        real_prompts, _ = load_inputs(input_prompts, num_real_users, instruct=False)
+    else:
+        raise ValueError(
+            f"Invalid input prompts: {input_prompts}. Expected a list of prompts, a single-item list, or a string path to a json file."
+        )
+
+    # Build the model(s) with the tt_transformers infrastructure
+    profiler.start(f"generator_setup", iteration=batch_idx)
+    (
+        model_args,
+        model,
+        page_table,
+        tt_kv_cache,
+        tokenizer,
+        processor,
+        paged_attention_config,
+    ) = prepare_solar_open_generator_args(
+        num_devices=num_devices,
+        data_parallel=data_parallel,
+        mesh_device=mesh_device,
+        global_batch_size=global_batch_size,
+        optimizations=optimizations,
+        max_seq_len=actual_max_seq_len,
+        page_params=page_params,
+        paged_attention=paged_attention,
+        mesh_config=mesh_config,  # Pass our refactored mesh config
+        state_dict=state_dict,
+        users_row_sharded=users_row_sharded,
+        long_context_mode=long_context_mode,
+    )
+
+    # Create generator (match tt-transformers pattern)
+    generator = Generator(model, model_args, mesh_device, processor=processor, tokenizer=tokenizer)
+
+    # Generation stop set {2, 24, 25} from generation_config.json; tokenizer.eos_token_id alone (2) would run past the
+    # end of the answer because <|end|> (21) closes a message without ending the turn.
+    stop_ids = set(model_args[0].stop_token_ids) or {tokenizer.eos_token_id}
+    logger.info(f"Stop token ids: {sorted(stop_ids)}")
+
+    profiler.end(f"generator_setup", iteration=batch_idx)
+    logger.info(
+        f"Model + KV cache ready in {profiler.get_duration('generator_setup', iteration=batch_idx):.1f} s "
+        f"(cold run: HF host load + ttnn cache build; warm run: cache-only)"
+    )
+    log_device_memory(mesh_device, "after model load")
+
+    # Create on-device sampling params
+    SAMPLING_BATCH_SIZE = 32
+    greedy = sampling_params["temperature"] == 0
+    enable_log_probs = sampling_params.get("enable_log_probs", False)
+    num_logprobs = sampling_params.get("num_logprobs", 0)
+    requested_top_k = sampling_params.get("top_k", MAX_TOP_K)
+    top_k = min(requested_top_k, MAX_TOP_K)
+    if not greedy and top_k != requested_top_k:
+        logger.info(f"Clamping top_k {requested_top_k} -> {top_k} (TTSampling max_top_k)")
+    device_sampling_params = SamplingParams(
+        temperature=[sampling_params["temperature"]] * SAMPLING_BATCH_SIZE,
+        top_k=[1] * SAMPLING_BATCH_SIZE if greedy else [top_k] * SAMPLING_BATCH_SIZE,
+        top_p=[1.0] * SAMPLING_BATCH_SIZE if greedy else [sampling_params["top_p"]] * SAMPLING_BATCH_SIZE,
+        enable_log_probs=[enable_log_probs] * SAMPLING_BATCH_SIZE,
+        num_logprobs=[num_logprobs] * SAMPLING_BATCH_SIZE,
+    )
+
+    # On-device sampling is disabled when per-device padded vocab exceeds the 64K
+    # cap (e.g. tp=1 on a single Blackhole card → 262K-padded vocab). In that case
+    # fall back to host-side sampling. Only greedy is supported for the fallback.
+    on_device_sampling_supported = all(getattr(m, "sampling", None) is not None for m in model)
+    if not on_device_sampling_supported:
+        assert greedy, (
+            "On-device sampling is unavailable on this mesh (per-device vocab > 64K) "
+            "and the host-side fallback only supports greedy decoding. "
+            f"Got temperature={sampling_params['temperature']}."
+        )
+        assert not enable_log_probs, "Host-side sampling fallback does not support logprobs."
+        logger.info("On-device sampling unavailable; using host-side greedy argmax for decode.")
+
+    # Prepare input prompts
+    logger.info(f"Reading inputs...")
+    profiler.start("loading_inputs")
+
+    if long_context_mode:
+        # Expand to full batch: 1 real user + (users_per_row - 1) padding users per row
+        # Padding users get minimal prompts (single token)
+        padding_prompt = "."  # Minimal prompt for padding users
+        input_prompts = []
+        for row in range(mesh_device.shape[0]):
+            input_prompts.append(real_prompts[row])  # User 0 of each row gets real prompt
+            input_prompts.extend([padding_prompt] * (users_per_row - 1))  # Padding users
+        logger.info(
+            f"Long-context mode: {num_real_users} real users with 128k context, {global_batch_size - num_real_users} padding users"
+        )
+    elif users_row_sharded and len(real_prompts) < global_batch_size:
+        # Randomize prompt order per row to help debug bad output patterns
+        # This ensures each row gets the same prompts but in different order
+        import random
+
+        random.seed(42)  # Fixed seed for reproducibility
+        input_prompts = []
+        num_prompts = len(real_prompts)
+        for row in range(mesh_device.shape[0]):
+            # Create a shuffled copy of prompts for this row
+            row_prompts = real_prompts.copy()
+            random.shuffle(row_prompts)
+            # Repeat if needed to fill users_per_row slots
+            row_prompts_extended = (row_prompts * ((users_per_row // num_prompts) + 1))[:users_per_row]
+            input_prompts.extend(row_prompts_extended)
+        logger.info(f"Row-sharded mode: randomized {num_prompts} prompts per row (seed=42)")
+    else:
+        input_prompts = real_prompts
+
+    profiler.end("loading_inputs")
+
+    # Create repeat batches (like tt-transformers)
+    repeat_batch_prompts = []
+    if is_seqlen_sweep:
+        # Load each seqlen step from its own file; skip steps exceeding the mesh's seqlen cap.
+        # Extract target seqlen from filename (e.g. "input_data_long_16k.json" -> "16k" -> 16384).
+        from pathlib import Path
+
+        for sweep_file in seqlen_sweep_files:
+            label = Path(sweep_file).stem.split("_")[-1]  # e.g. "16k"
+            if not (label.endswith("k") and label[:-1].isdigit()):
+                continue
+            step_len = int(label[:-1]) * 1024
+            if step_len > actual_max_seq_len:
+                logger.info(
+                    f"Seqlen sweep step ({step_len // 1024}k) skipped: exceeds mesh cap of {actual_max_seq_len // 1024}k"
+                )
+                continue
+            step_prompts, _ = load_inputs(sweep_file, num_real_users, instruct=False)
+            repeat_batch_prompts.append(step_prompts)
+    else:
+        for i in range(repeat_batches):
+            repeat_batch_prompts.append(
+                [input_prompts[(j + i) % len(input_prompts)] for j in range(len(input_prompts))]
+            )
+
+    num_tokens_generated_decode = []
+
+    logger.info("Starting inference...")
+    logger.debug(f"Page table: {page_table}")
+
+    # Main inference loop for repeat batches (like tt-transformers)
+    for batch_idx, input_prompts_batch in enumerate(repeat_batch_prompts):
+        logger.info(f"Processing batch {batch_idx}")
+
+        # Preprocess inputs (reusing tt_transformers function)
+        profiler.start(f"preprocess_prefill_inputs", iteration=batch_idx)
+        (
+            input_tokens_prefill_pt,
+            encoded_prompts,
+            decoding_pos,
+            prefill_lens,
+        ) = preprocess_inputs_prefill(
+            input_prompts_batch,
+            tokenizer,
+            model_args,
+            instruct=False,
+            max_generated_tokens=max_generated_tokens,
+            # The models were built with actual_max_seq_len (seqlen-sweep caps it at 64K on a single-row mesh);
+            # preprocess_inputs_prefill asserts max_prefill_len <= model_args.max_context_len.
+            max_prefill_len=actual_max_seq_len,
+        )
+
+        input_tokens_prefill_pt = torch.stack(input_tokens_prefill_pt).view(global_batch_size, -1)
+        profiler.end(f"preprocess_prefill_inputs", iteration=batch_idx)
+
+        logger.info(f"Input prompt: {input_prompts_batch[0]}")
+        logger.info(f"Encoded length: {prefill_lens[0]} tokens")
+
+        # Clear KV caches for repeat batches (like tt-transformers)
+        if batch_idx != 0:
+            # Fix for ND hangs with multiple repeat batches
+            generator.prev_page_table = None
+
+            for i in range(len(model)):
+                for layer in model[i].layers:
+                    k_cache, v_cache = layer.self_attn.layer_past
+                    k_cache = ttnn.mul(k_cache, 0, output_tensor=k_cache)
+                    v_cache = ttnn.mul(v_cache, 0, output_tensor=v_cache)
+
+        # Prefill phase
+        if long_context_mode:
+            # Long-context mode: prefill only the real users (user 0 of each row)
+            # Other users are padding and don't need prefill
+            logger.info(f"Long-context prefill: processing {num_real_users} real users...")
+            profiler.start(f"compile_prefill", iteration=batch_idx)
+
+            prefilled_token = torch.zeros(global_batch_size, dtype=torch.long)
+            real_user_indices = [row * users_per_row for row in range(mesh_device.shape[0])]
+
+            model_id = 0  # data_parallel=1, single model
+
+            for i, user_id in enumerate(real_user_indices):
+                user_prefill_len = prefill_lens[user_id]
+                padded_len = get_padded_prefill_len(user_prefill_len)
+
+                # Pad tokens to required length (multiple of 32 / power of 2)
+                user_tokens_raw = input_tokens_prefill_pt[user_id : user_id + 1, :user_prefill_len]
+                user_tokens = torch.cat(
+                    [user_tokens_raw, torch.zeros(1, padded_len - user_prefill_len, dtype=torch.long)], dim=-1
+                )
+                user_page_table = page_table[user_id : user_id + 1]
+
+                logger.info(
+                    f"Prefilling user {user_id} (row {i}) with {user_prefill_len} tokens (padded to {padded_len})..."
+                )
+
+                # Use single-user prefill
+                # Note: user_id=0 because page_table is already sliced for this user
+                # (batch_idx for fill_cache should be 0 since page_table has shape [1, blocks]).
+                # global_user_id tells the model which mesh row to target for KV cache filling.
+                logits = generator.prefill_forward_single_user_text(
+                    user_tokens,
+                    page_table=user_page_table,
+                    user_id=0,
+                    last_token_idx=user_prefill_len - 1,
+                    kv_cache=tt_kv_cache[model_id],
+                    model_id=model_id,
+                    global_user_id=user_id,  # Pass actual global user_id for mesh row targeting
+                )
+                # Convert ttnn.Tensor to torch.Tensor for argmax
+                # For multi-device tensors, extract from device 0 first
+                if not isinstance(logits, torch.Tensor):
+                    tt_output_tensor = ttnn.get_device_tensors(logits)[0]
+                    logits = ttnn.to_torch(tt_output_tensor)
+                # Logits shape may be [batch_per_row, vocab_size], select user 0 of the row
+                if logits.dim() > 1 and logits.shape[0] > 1:
+                    logits = logits[0]  # Select first user's logits
+                prefilled_token[user_id] = torch.argmax(logits.view(-1)).item()
+
+            profiler.end(f"compile_prefill", iteration=batch_idx)
+
+            # Skip second timing pass for long-context mode - it's too expensive
+            # Just copy compile time as inference time for metrics
+            profiler.start(f"inference_prefill", iteration=batch_idx)
+            profiler.end(f"inference_prefill", iteration=batch_idx)
+
+            # For padding users, generate a dummy token (they won't be used meaningfully)
+            for user_id in range(global_batch_size):
+                if user_id not in real_user_indices:
+                    prefilled_token[user_id] = tokenizer.eos_token_id
+
+            logger.info(f"Prefill finished for {num_real_users} real users")
+        elif users_row_sharded:
+            # Row-parallel batched prefill through generator infrastructure
+            logger.info("Starting row-parallel batched prefill through generator...")
+            profiler.start(f"compile_prefill", iteration=batch_idx)
+            generator.prefill_forward_text(
+                input_tokens_prefill_pt,
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=warmup_prefill,
+                sampling_params=device_sampling_params,
+            )
+            profiler.end(f"compile_prefill", iteration=batch_idx)
+            logger.info("Row-parallel prefill compilation done")
+
+            # Clear KV caches before timed run
+            for i in range(len(model)):
+                for layer_obj in model[i].layers:
+                    k_cache, v_cache = layer_obj.self_attn.layer_past
+                    ttnn.mul(k_cache, 0, output_tensor=k_cache)
+                    ttnn.mul(v_cache, 0, output_tensor=v_cache)
+
+            profiler.start(f"inference_prefill", iteration=batch_idx)
+            prefill_result = generator.prefill_forward_text(
+                input_tokens_prefill_pt,
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=False,
+                sampling_params=device_sampling_params,
+            )
+            if isinstance(prefill_result, tuple):
+                prefilled_token = prefill_result[0].squeeze(-1)
+            else:
+                prefilled_token = torch.argmax(prefill_result, dim=-1)
+            profiler.end(f"inference_prefill", iteration=batch_idx)
+            logger.info("Row-parallel batched prefill finished")
+
+        else:
+            # Standard sequential prefill (batch_size < num_rows)
+            logger.info("Starting prefill warmup...")
+            profiler.start(f"compile_prefill", iteration=batch_idx)
+            generator.prefill_forward_text(
+                input_tokens_prefill_pt[:1],
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=warmup_prefill,
+            )
+            profiler.end(f"compile_prefill", iteration=batch_idx)
+            logger.info("Finished prefill warmup")
+
+            logger.info(f"Starting prefill...")
+            profiler.start(f"inference_prefill", iteration=batch_idx)
+            logits = generator.prefill_forward_text(
+                input_tokens_prefill_pt,
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=warmup_prefill,
+            )
+            prefilled_token = torch.argmax(logits, dim=-1)
+            profiler.end(f"inference_prefill", iteration=batch_idx)
+            logger.info(f"Prefill finished")
+
+        logger.info(f"First generated token: '{tokenizer.decode(prefilled_token[0])}'")
+        log_device_memory(mesh_device, f"after prefill (batch {batch_idx})")
+
+        # Initialize generation state like tt_transformers
+        all_outputs = [encoded_prompts[b][: prefill_lens[b]] for b in range(global_batch_size)]
+        for user in range(global_batch_size):
+            user_tok = int(prefilled_token[user].item())
+            all_outputs[user].append(user_tok)
+
+        user_done = [False] * global_batch_size
+        current_pos = torch.tensor([decoding_pos[b] for b in range(global_batch_size)])
+        out_tok = prefilled_token
+
+        # Define real_user_indices for long_context_mode (user 0 of each row)
+        real_user_indices = set(row * users_per_row for row in range(mesh_device.shape[0]))
+
+        # In long_context_mode, mark padding users as done immediately
+        if long_context_mode:
+            for user in range(global_batch_size):
+                if user not in real_user_indices:
+                    user_done[user] = True
+
+        # Generation loop (matching tt_transformers structure)
+        logger.info(f"Starting decode loop...")
+        iteration = 0
+        users_decoding = True
+
+        profiler.start(f"inference_decode", iteration=batch_idx)
+        while users_decoding and iteration < max_generated_tokens:
+            if iteration == 0:
+                profiler.start(f"compile_decode", iteration=batch_idx)
+            else:
+                profiler.start(f"inference_decode_time_{iteration}", iteration=batch_idx)
+
+            # Decode forward — on-device sampling when available, host-side
+            # greedy argmax otherwise (1×1 Blackhole, etc.)
+            if on_device_sampling_supported:
+                out_tok, _ = generator.decode_forward(
+                    out_tok,
+                    current_pos,
+                    enable_trace=enable_decode_trace,
+                    page_table=page_table,
+                    kv_cache=tt_kv_cache,
+                    sampling_params=device_sampling_params,
+                )
+            else:
+                # decode_forward returns (logits, log_probs) when sampling_params=None.
+                logits, _ = generator.decode_forward(
+                    out_tok,
+                    current_pos,
+                    enable_trace=enable_decode_trace,
+                    page_table=page_table,
+                    kv_cache=tt_kv_cache,
+                    sampling_params=None,
+                )
+                out_tok = torch.argmax(logits, dim=-1).view(-1)
+
+            if iteration == 0:
+                profiler.end(f"compile_decode", iteration=batch_idx)
+                decode_iteration_time = profiler.get_duration("compile_decode", iteration=batch_idx)
+            else:
+                profiler.end(f"inference_decode_time_{iteration}", iteration=batch_idx)
+                decode_iteration_time = profiler.get_duration(f"inference_decode_time_{iteration}", iteration=batch_idx)
+
+            # Print perf after every iteration
+            tokens_per_second_per_user = 1 / decode_iteration_time
+            logger.debug(
+                f"Iteration {iteration}: {1000*decode_iteration_time:.0f}ms @ {tokens_per_second_per_user:.1f} tok/s/user ({global_batch_size*tokens_per_second_per_user:.1f} tok/s throughput)"
+            )
+
+            current_pos += 1
+
+            # Save output token; a stop token ends the user's turn (and is not appended)
+            for user in range(global_batch_size):
+                user_tok = out_tok[user].item()
+                if user_tok not in stop_ids and not user_done[user]:
+                    all_outputs[user].append(user_tok)
+                elif stop_at_eos:
+                    user_done[user] = True
+                    logger.debug(f"User {user} finished decoding at iteration {iteration}")
+                    if all(user_done):
+                        users_decoding = False
+                else:
+                    all_outputs[user].append(user_tok)
+
+            iteration += 1
+
+        profiler.end(f"inference_decode", iteration=batch_idx)
+        log_device_memory(mesh_device, f"after decode (batch {batch_idx}, {iteration} steps)")
+
+        # Final output for this batch (like tt_transformers)
+        logger.info("Finished decoding, printing the final outputs...\n")
+        for i, (output, prompt) in enumerate(zip(all_outputs, input_prompts_batch)):
+            # In long_context_mode, skip printing padding users
+            if long_context_mode and i not in real_user_indices:
+                continue
+
+            # Keep the special tokens: the reasoning / answer split needs <|think|>, <|content|> and <|end|>.
+            text = tokenizer.decode(output, skip_special_tokens=False)
+            prompt_with_template = tokenizer.decode(model_args[0].encode_prompt(prompt), skip_special_tokens=False)
+            generated = (
+                text[len(prompt_with_template) :]
+                if text.startswith(prompt_with_template)
+                else text.replace(prompt_with_template, "", 1)
+            )
+            reasoning, answer = split_solar_output(generated)
+            short_prompt = (
+                (prompt[:100] + "\n<long prompt not printed in full>\n" + prompt[-100:])
+                if len(prompt) > 200
+                else prompt
+            )
+            user_label = f"USER {i} (row {i // max(users_per_row,1)})" if long_context_mode else f"USER {i}"
+            # decoding_pos[i] is the user's real prompt length; prefill_lens[i] is the batch-wide padded length.
+            n_generated = len(output) - decoding_pos[i]
+            stop_note = "stopped on a stop token" if user_done[i] else f"hit the {max_generated_tokens}-token budget"
+            logger.info(
+                f"\n==REPEAT BATCH {batch_idx}\n=={user_label} - PROMPT\n{short_prompt}\n"
+                f"=={user_label} - ANSWER\n{answer or '<no <|content|> block within the token budget>'}\n"
+                f"=={user_label} - REASONING\n{reasoning or '<none>'}\n"
+                f"=={user_label} - TOKENS\nprompt {decoding_pos[i]}, generated {n_generated} ({stop_note})\n"
+            )
+
+        num_tokens_generated_decode.append(iteration)  # Save the number of tokens generated for each repeat batch
+
+    # Performance metrics calculation (like tt-transformers)
+    profiler.end("run")
+
+    # Calculate performance metrics for the first batch only
+    compile_prefill_time = profiler.get_duration("compile_prefill")
+    compile_decode_time = profiler.get_duration("compile_decode")
+
+    total_inference_prefill_time = profiler.get_duration("inference_prefill")
+    total_inference_decode_time = 0
+    for i in range(1, num_tokens_generated_decode[0]):  # Iteration 0 is the compile time
+        total_inference_decode_time += profiler.get_duration(f"inference_decode_time_{i}")
+
+    # Calculate TTFT and t/s/u metrics (like tt-transformers)
+    # For long_context_mode, only count real users for metrics
+    effective_batch_size = num_real_users if long_context_mode else global_batch_size
+    avg_time_to_first_token = total_inference_prefill_time / effective_batch_size  # TTFT per user
+    avg_decode_iteration_time = total_inference_decode_time / (num_tokens_generated_decode[0] - 1)
+
+    prefill_tok_s = prefill_lens[0] / total_inference_prefill_time * effective_batch_size
+    decode_tok_s_user = (num_tokens_generated_decode[0] - 1) / total_inference_decode_time  # t/s/u
+    decode_tok_s = (
+        (num_tokens_generated_decode[0] - 1) / total_inference_decode_time * effective_batch_size
+    )  # total t/s
+
+    measurements = {
+        # Required measurements
+        "compile_prefill": compile_prefill_time,
+        "compile_decode": compile_decode_time,
+        "inference_prefill": total_inference_prefill_time,
+        "inference_decode": total_inference_decode_time,
+        "prefill_time_to_token": avg_time_to_first_token,
+        "prefill_t/s": prefill_tok_s,  # tokens/s
+        "decode_t/s/u": decode_tok_s_user,  # tokens/s/u
+        "decode_t/s": decode_tok_s,  # tokens/s
+        # Optional measurements
+        "Total compile time": compile_prefill_time + compile_decode_time,
+        "Full demo runtime": profiler.get_duration("run"),
+    }
+
+    # Performance logging (like tt-transformers)
+    logger.info("")
+    logger.info(f"=== Performance metrics ===")
+    logger.info(f"Prefill compile time: {round(compile_prefill_time, 2)}s")
+    logger.info(f"Decode compile time: {round(compile_decode_time, 2)}s")
+    logger.info("")
+    logger.info(f"Average Time to First Token (TTFT): {round(avg_time_to_first_token * 1000, 2)}ms")
+    logger.info(
+        f"Average decode speed: {round(avg_decode_iteration_time * 1000, 2)}ms @ {round(decode_tok_s_user, 2)} tok/s/user ({round(decode_tok_s, 2)} tok/s throughput)"
+    )
+    logger.info(f"Data parallel: {data_parallel}, Global batch size: {global_batch_size}")
+
+    logger.info("Solar-Open-100B demo completed successfully!")
+
+    if is_ci_env:
+        tt_device_name = determine_device_name(mesh_device)  # submesh device should not decide performance target
+        tt_device_name = "GLX" if tt_device_name == "TG" else tt_device_name  # TG is old nomenclature of 4U galaxy.
+        model_name = model_args[0].model_name
+        model_device_key = f"{tt_device_name}_{model_name}"
+        sku = get_current_device_sku_name()
+        targets = {}
+        resolved_perf_targets = resolve_perf_targets(
+            model_name=model_name,
+            sku=sku,
+            batch_size=global_batch_size,
+            seq_len=max(prefill_lens),
+        )
+        if resolved_perf_targets:
+            if resolved_perf_targets.get("prefill_t/s") is not None:
+                targets["prefill_t/s"] = float(resolved_perf_targets["prefill_t/s"])
+            if resolved_perf_targets.get("decode_t/s") is not None:
+                targets["decode_t/s"] = float(resolved_perf_targets["decode_t/s"])
+            if resolved_perf_targets.get("decode_t/s/u") is not None:
+                targets["decode_t/s/u"] = float(resolved_perf_targets["decode_t/s/u"])
+            if not targets:
+                logger.warning(
+                    f"No centralized perf targets found for {model_device_key} "
+                    f"(batch={global_batch_size}, seq_len={max(prefill_lens)})"
+                )
+        else:
+            logger.warning(
+                f"No centralized perf targets found for {model_device_key} "
+                f"(batch={global_batch_size}, seq_len={max(prefill_lens)})"
+            )
+        # Instead of running warmup iterations, the demo profiles the initial compile iteration
+        bench_n_warmup_iter = {"inference_prefill": 0, "inference_decode": 1}
+        benchmark_data = create_benchmark_data(profiler, measurements, bench_n_warmup_iter, targets)
+
+        # Save the decode performance of every iteration for plotting in superset
+        for i in range(1, num_tokens_generated_decode[0]):
+            benchmark_data.add_measurement(
+                profiler,
+                0,
+                "inference_decode",
+                f"time_to_token_{i}",
+                profiler.get_duration(f"inference_decode_time_{i}") * 1000,
+                step_warm_up_num_iterations=None,
+                target=None,
+            )
+
+        # Also save the avg decode performance for the 128 iterations (excluding the compile time)
+        num_iterations_for_avg = min(128, num_tokens_generated_decode[0])
+        inference_decode_time_first_128 = sum(
+            profiler.get_duration(f"inference_decode_time_{i}") for i in range(1, num_iterations_for_avg)
+        )
+        benchmark_data.add_measurement(
+            profiler,
+            0,
+            "inference_decode",
+            "avg_decode_time_first_128",
+            inference_decode_time_first_128 * 1000 / max(1, num_iterations_for_avg - 1),
+            step_warm_up_num_iterations=None,
+            target=None,
+        )
+        benchmark_data.save_partial_run_json(
+            profiler,
+            run_type="demo_perf",
+            ml_model_name=model_args[0].base_model_name,
+            ml_model_type="llm",
+            device_name=tt_device_name,
+            num_layers=model_args[0].n_layers,
+            batch_size=global_batch_size,
+            config_params={"data_parallel": data_parallel, "tensor_parallel": num_devices // data_parallel},
+            input_sequence_length=max(prefill_lens),
+            output_sequence_length=num_tokens_generated_decode[0],
+        )
+
+        if targets:
+            verify_perf(
+                measurements,
+                expected_measurements={k: True for k in ("prefill_t/s", "decode_t/s", "decode_t/s/u") if k in targets},
+                model_name=model_name,
+                sku=sku,
+                batch_size=global_batch_size,
+                seq_len=max(prefill_lens),
+            )
+        else:
+            logger.info(
+                "Skipping in-demo verify_perf checks for Solar-Open-100B: no centralized SKU/targets entry yet "
+                "(models/model_targets.yaml). Performance validation remains enforced by centralized target validation in CI."
+            )

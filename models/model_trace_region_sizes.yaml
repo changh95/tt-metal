@@ -148,6 +148,15 @@ sizes:
       p300x2:
         trace_region_size: 100000000
 
+  solar-open-100b:
+    aliases: ["Solar-Open-100B", "solar-open-100b", "upstage/Solar-Open-100B", "models/demos/solar_open/configs/Solar-Open-100B"]
+    skus:
+      bh_loudbox:
+        # Inherited from gpt-oss-120b bh_loudbox; re-measure (decode B=32 trace + prefill@128 trace).
+        trace_region_size: 100000000
+      bh_p150:
+        trace_region_size: 100000000
+
   informer:
     aliases: ["informer"]
     skus:

@@ -1,0 +1,22 @@
+{
+    "Solar-Open-100B": {
+        "decode": {
+            "attention": 0.95,
+            "rms_norm": 0.99,
+            "router": 0.99,
+            "experts": 0.97,
+            "shared_expert": 0.98,
+            "mlp": 0.97,
+            "decoder": 0.97
+        },
+        "prefill": {
+            "attention": 0.95,
+            "rms_norm": 0.99,
+            "router": 0.99,
+            "experts": 0.97,
+            "shared_expert": 0.98,
+            "mlp": 0.97,
+            "decoder": 0.97
+        }
+    }
+}
