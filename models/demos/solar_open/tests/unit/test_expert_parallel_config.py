@@ -73,7 +73,8 @@ def test_decode_forward_forwards_configured_ep_and_axis(mesh_config_factory, exp
             decode_forward(
                 hidden_states=SimpleNamespace(shape=[1, 1, 1, config.hidden_size]),
                 routing_weights=MagicMock(),
-                weights=MagicMock(),
+                # a bare MagicMock attribute is truthy: pin the always-on slot count so the EP path is taken
+                weights=MagicMock(num_always_on_experts=0),
                 config=config,
                 mesh_config=mesh_config,
                 mesh_device=MagicMock(),
@@ -133,11 +134,11 @@ def _grid(cfg):
     "call, expected",
     [
         # (grid, per_core_N, in0_block_w, out_subblock_w); every grid is an exact fill of ceil(Nt / per_core_N) blocks
-        (lambda pc: pc.get_decode_gate_up_config(32, _GATE_UP_N, k=_H), ((5, 2), 1, 32, 1)),
-        (lambda pc: pc.get_decode_down_config(1, _DOWN_N, k=_IP), ((8, 4), 4, 5, 1)),
-        (lambda pc: pc.get_decode_down_config(8, _DOWN_N, k=_IP), ((8, 4), 4, 5, 1)),
-        (lambda pc: pc.get_decode_down_config(16, _DOWN_N, k=_IP), ((8, 8), 2, 5, 1)),
-        (lambda pc: pc.get_decode_down_config(32, _DOWN_N, k=_IP), ((8, 8), 2, 5, 1)),
+        (lambda pc: pc.get_decode_gate_up_config(32, _GATE_UP_N, k=_H), ((5, 2), 1, 128, 1)),
+        (lambda pc: pc.get_decode_down_config(1, _DOWN_N, k=_IP), ((8, 4), 4, 5, 4)),
+        (lambda pc: pc.get_decode_down_config(8, _DOWN_N, k=_IP), ((8, 4), 4, 5, 4)),
+        (lambda pc: pc.get_decode_down_config(16, _DOWN_N, k=_IP), ((8, 8), 2, 5, 2)),
+        (lambda pc: pc.get_decode_down_config(32, _DOWN_N, k=_IP), ((8, 8), 2, 5, 2)),
         (lambda pc: pc.get_prefill_gate_up_config(1024, _GATE_UP_N, k=_H), ((5, 2), 1, 32, 1)),
         (lambda pc: pc.get_prefill_down_config(1024, _DOWN_N, k=_IP), ((8, 8), 2, 5, 1)),
     ],
@@ -154,7 +155,8 @@ def _grid(cfg):
 def test_solar_open_program_config_grids_resolve_exactly(call, expected):
     """The shipped SolarOpenProgramConfig values must be the identity under ProgramConfig._build_matmul_config
     (no silent grid shrink, no in0_block_w snap): Nt=10 on 5x2 x 1 tile, Nt=128 on 8x4 x 4 tiles or 8x8 x 2 tiles,
-    in0_block_w 32 | Kt=128 and 5 | Kt=5."""
+    in0_block_w 128 == Kt (decode gate/up), 32 | Kt=128 (prefill sparse gate/up) and 5 == Kt (down); the decode down
+    out_subblock_w equals per_core_N on both grids (4 on 8x4, 2 on 8x8), the sparse prefill configs keep 1."""
     assert _grid(call(SolarOpenProgramConfig())) == expected
 
 

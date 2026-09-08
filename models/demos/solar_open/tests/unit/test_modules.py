@@ -24,6 +24,7 @@ variants can be A/B tested with the same suite.
 
 import collections
 import contextlib
+import dataclasses
 from unittest import mock
 
 import pytest
@@ -472,6 +473,30 @@ def uniform_random_routing(num_tokens, num_experts, top_k):
     return router_indices, routing_dense, routing_topk
 
 
+def indexed_routing_from_torch(mesh_device, router_indices, routing_topk):
+    """``IndexedRouting`` of ONE token from the controlled routing (``[1, k]`` ids / weights), replicated: the
+    layout ``TopKRouter.route_indexed`` produces (uint16 ROW_MAJOR ids, bf16 TILE weights, both ``[1, 1, 1, k]``)."""
+    from models.demos.solar_open.tt.experts import IndexedRouting
+
+    k = router_indices.shape[-1]
+    replicate = ttnn.ShardTensor2dMesh(dims=(None, None), mesh_shape=mesh_device.shape, mesh_device=mesh_device)
+    indices = ttnn.from_torch(
+        router_indices.reshape(1, 1, 1, k).to(torch.int32),
+        device=mesh_device,
+        dtype=ttnn.uint16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=replicate,
+    )
+    weights = ttnn.from_torch(
+        routing_topk.reshape(1, 1, 1, k),
+        device=mesh_device,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=replicate,
+    )
+    return IndexedRouting(indices=indices, weights=weights, top_k=k)
+
+
 def dram_allocated_bytes(mesh_device):
     """Bytes currently allocated in DRAM per device (the mesh allocator is in lock-step across the devices)."""
     view = ttnn.get_memory_view(mesh_device, ttnn.BufferType.DRAM)
@@ -487,6 +512,11 @@ def run_experts_component(mesh_device, hidden_shape, config, reference_layer, de
     pre-call level (plus the sorted path's small cached identity) once the output is freed: no per-expert weight
     slice may outlive the call (design X5).
     """
+    if decoder_layer.mlp.experts.weights.num_always_on_experts:
+        pytest.skip(
+            "shared expert fused into the routed experts (SOLAR_OPEN_FUSE_SHARED_EXPERT=1): the [T, 128] "
+            "controlled-routing contract does not apply, see test_fused_shared_expert.py"
+        )
     batch_size, seq_len, hidden_size = hidden_shape
     num_tokens = batch_size * seq_len
     hidden_states = torch.randn(hidden_shape)
@@ -503,6 +533,9 @@ def run_experts_component(mesh_device, hidden_shape, config, reference_layer, de
         )
 
     experts = decoder_layer.mlp.experts
+    # Single-user decode with MoEOptions.indexed_decode: feed the token's top-k as the router would
+    # (``MLP.route`` -> ``route_indexed``) so the indexed/gather expert path is what gets compared.
+    use_indexed = is_decode and num_tokens == 1 and decoder_layer.mlp.indexed_decode
     program_config = experts.program_config
     split_len = min(seq_len, program_config.get_down_split_size(seq_len))
     expect_sorted = (
@@ -523,22 +556,27 @@ def run_experts_component(mesh_device, hidden_shape, config, reference_layer, de
             dtype=ttnn.bfloat16,
             mesh_mapper=replicate,
         )
-        tt_routing_weights = ttnn.from_torch(
-            routing_weights,
-            device=mesh_device,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            mesh_mapper=replicate,
-        )
-        tt_output = experts(
-            hidden_states=tt_hidden_states,
-            topk_expert_weights=tt_routing_weights,
-            is_decode=is_decode,
-        )
+        if use_indexed:
+            indexed = indexed_routing_from_torch(mesh_device, router_indices, routing_weights_topk)
+            tt_output = experts(hidden_states=tt_hidden_states, is_decode=True, indexed_routing=indexed)
+            indexed.deallocate()
+        else:
+            tt_routing_weights = ttnn.from_torch(
+                routing_weights,
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=replicate,
+            )
+            tt_output = experts(
+                hidden_states=tt_hidden_states,
+                topk_expert_weights=tt_routing_weights,
+                is_decode=is_decode,
+            )
         out = ttnn.to_torch(tt_output, mesh_composer=mesh_composer)[..., :num_tokens, :hidden_size]
         tt_output.deallocate(True)
         assert not tt_hidden_states.is_allocated(), "the experts must consume their input"
-        if tt_routing_weights.is_allocated():
+        if not use_indexed and tt_routing_weights.is_allocated():
             tt_routing_weights.deallocate(True)  # decode leaves the caller's routing tensor alone; prefill consumes it
         return out
 
@@ -551,7 +589,8 @@ def run_experts_component(mesh_device, hidden_shape, config, reference_layer, de
     call_experts()
     dram_second = dram_allocated_bytes(mesh_device) - dram_before - dram_first
     logger.info(
-        f"Experts ({'decode' if is_decode else 'prefill'} {num_tokens} tokens): sorted-MoE plan {plan or None}; "
+        f"Experts ({'decode' if is_decode else 'prefill'} {num_tokens} tokens, "
+        f"{'INDEXED/gather' if use_indexed else 'dense routing'} path): sorted-MoE plan {plan or None}; "
         f"per-device DRAM growth {dram_first / 2**20:.2f} MiB on the first call (kernel binaries of the newly cached "
         f"programs + the sorted path's identity), {dram_second / 2**20:.2f} MiB on the second"
     )
@@ -588,6 +627,8 @@ def run_shared_expert_component(mesh_device, hidden_shape, reference_layer, deco
         reference_output = reference_layer.mlp.shared_experts(hidden_states).reshape(num_tokens, hidden_size)
 
     shared_expert = decoder_layer.mlp.shared_expert
+    if shared_expert is None and decoder_layer.mlp.experts.weights.num_always_on_experts:
+        pytest.skip("shared expert fused into the routed experts; covered by test_fused_shared_expert.py")
     assert shared_expert is not None, "n_shared_experts > 0 in the config but the TT MLP has no shared expert"
 
     tt_hidden_states = ttnn.from_torch(
@@ -697,8 +738,12 @@ def setup_reference_layer(setup, layer_idx=0):
     return reference_layer.eval()
 
 
-def setup_decoder_layer(setup, reference_layer, local_batch_size, seq_len, layer_idx=0, paged_attention_config=None):
-    """TT ``DecoderLayer`` fed with the reference layer's state dict (Meta-permuted q/k), production RoPE setup."""
+def setup_decoder_layer(
+    setup, reference_layer, local_batch_size, seq_len, layer_idx=0, paged_attention_config=None, moe_options=None
+):
+    """TT ``DecoderLayer`` fed with the reference layer's state dict (Meta-permuted q/k), production RoPE setup.
+
+    ``moe_options`` defaults to ``MoEOptions.from_env()`` (the SOLAR_OPEN_* flags of the run)."""
     logger.info("Setting up TT decoder layer...")
     config = setup["config"]
     reference_state_swizzled = convert_hf_qkv_to_meta_format(reference_layer.state_dict(), config.head_dim)
@@ -729,7 +774,7 @@ def setup_decoder_layer(setup, reference_layer, local_batch_size, seq_len, layer
         max_local_batch_size=local_batch_size,
         paged_attention_config=paged_attention_config,
         tokens_per_device=local_batch_size,
-        moe_options=MoEOptions.from_env(),
+        moe_options=moe_options or MoEOptions.from_env(),
     )
     return decoder_layer
 
@@ -1176,11 +1221,22 @@ def test_experts_shared_expert_hook(mesh_device, device_params, batch_size, seq_
     config = setup["config"]
     hidden_size = config.hidden_size
     reference_layer = setup_reference_layer(setup)
-    decoder_layer = setup_decoder_layer(setup, reference_layer, batch_size, seq_len)
+    # The hook contract belongs to the unfused layout: pin it regardless of SOLAR_OPEN_FUSE_SHARED_EXPERT.
+    decoder_layer = setup_decoder_layer(
+        setup,
+        reference_layer,
+        batch_size,
+        seq_len,
+        moe_options=dataclasses.replace(MoEOptions.from_env(), fuse_shared_expert=False),
+    )
     experts = decoder_layer.mlp.experts
+    # The single-user case runs the indexed/gather path when MoEOptions.indexed_decode is on (as MLP.route would).
+    use_indexed = is_decode and num_tokens == 1 and decoder_layer.mlp.indexed_decode
 
     hidden_states = torch.randn(1, 1, num_tokens, hidden_size)
-    _, routing_dense, _ = uniform_random_routing(num_tokens, config.num_local_experts, config.num_experts_per_tok)
+    router_indices, routing_dense, routing_topk = uniform_random_routing(
+        num_tokens, config.num_local_experts, config.num_experts_per_tok
+    )
     replicate = ttnn.ShardTensor2dMesh(dims=(None, None), mesh_shape=mesh_device.shape, mesh_device=mesh_device)
     mesh_composer = ttnn.ConcatMesh2dToTensor(mesh_device, dims=(-2, -1), mesh_shape=mesh_shape)
 
@@ -1189,15 +1245,25 @@ def test_experts_shared_expert_hook(mesh_device, device_params, batch_size, seq_
         tt_hidden = ttnn.from_torch(
             hidden_states, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=replicate
         )
-        tt_routing = ttnn.from_torch(
-            routing_dense, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=replicate
-        )
-        tt_out = experts(
-            hidden_states=tt_hidden, topk_expert_weights=tt_routing, is_decode=is_decode, shared_expert=shared_expert
-        )
+        if use_indexed:
+            indexed = indexed_routing_from_torch(mesh_device, router_indices, routing_topk)
+            tt_out = experts(
+                hidden_states=tt_hidden, is_decode=True, shared_expert=shared_expert, indexed_routing=indexed
+            )
+            indexed.deallocate()
+        else:
+            tt_routing = ttnn.from_torch(
+                routing_dense, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=replicate
+            )
+            tt_out = experts(
+                hidden_states=tt_hidden,
+                topk_expert_weights=tt_routing,
+                is_decode=is_decode,
+                shared_expert=shared_expert,
+            )
+            tt_routing.deallocate(True)
         out = ttnn.to_torch(tt_out, mesh_composer=mesh_composer)[..., :num_tokens, :hidden_size]
         tt_out.deallocate(True)
-        tt_routing.deallocate(True)
         return out.reshape(num_tokens, hidden_size).float()
 
     baseline = run(None)
@@ -1210,7 +1276,8 @@ def test_experts_shared_expert_hook(mesh_device, device_params, batch_size, seq_
     shift = with_constant - baseline
     shift_err = (shift - expected_shift).abs()
     logger.info(
-        f"shared-expert hook (batch {batch_size} x seq {seq_len}, TP={tp}): zeros hook {zero_output} "
+        f"shared-expert hook (batch {batch_size} x seq {seq_len}, TP={tp}, "
+        f"{'indexed' if use_indexed else 'dense'} routing): zeros hook {zero_output} "
         f"(max |diff| {zero_max_diff:.4f}); constant hook shift mean {shift.mean():.4f} / expected {expected_shift:.1f}, "
         f"max |err| {shift_err.max():.4f}"
     )
@@ -1346,11 +1413,13 @@ def run_model_forward_test(
         (1, 128, "prefill"),
         (128, 1, "decode"),
         (32, 1, "decode"),
+        (1, 1, "decode"),  # single user: the indexed/gather expert path (MoEOptions.indexed_decode) end to end
     ],
     ids=[
         "prefill_b1_s128",
         "decode_b128_s1",
         "decode_b32_s1",
+        "decode_b1_s1",
     ],
 )
 @pytest.mark.parametrize("num_layers", [1], ids=["1_layer"])

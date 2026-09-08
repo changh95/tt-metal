@@ -251,12 +251,29 @@ class MoEOptions:
         router_fp32_logits: ``SOLAR_OPEN_ROUTER_FP32_LOGITS`` 1 (default) | 0. With 0 the router matmul emits
             bf16 logits (fp32-accumulated) and the fused op takes a bf16 bias; the selection math still runs in
             fp32 in both implementations.
+        fuse_shared_expert: ``SOLAR_OPEN_FUSE_SHARED_EXPERT`` 0 (default) | 1. With 1 the shared expert runs as the
+            always-on slot ``num_local_experts`` (the "129th expert") of the routed expert tensors with the constant
+            routing weight 1.0 instead of as a separate ``SharedExpert`` module (phase 2, design D2 follow-up: -5
+            launches per layer). The fused tensors are built ON DEVICE from the cached routed + shared shards, so the
+            flag changes no cache file and is deliberately NOT part of ``marker_fields()``. Off until validated
+            (fused-vs-unfused PCC, teacher-forced accuracy and the decode step time), then on.
+        indexed_decode: ``SOLAR_OPEN_INDEXED_DECODE`` 1 (default) | 0. With 1 a single-user decode step (one token
+            on the mesh row) runs the routed experts in the sparse_matmul INDEXED/GATHER mode (phase 2, profile lever
+            1): the router hands the experts its top-k expert ids (uint16) and weights directly
+            (``TopKRouter.route_indexed`` -> ``experts.IndexedRouting``) instead of the dense ``[1, E]`` routing
+            tensor, both sparse_matmuls visit only the k selected experts and emit compact ``[1, k, 1, *]`` outputs
+            (no 128-slot sparsity scan, no zero-filled full-E outputs, no bfp8 transpose glue). Batched steps (2..32
+            users) always take the union-of-experts path. Requires the fused router (uint16 ids), EP=1 and the
+            unfused shared expert; otherwise the flag is ignored (logged once per MLP). Cache-neutral (not in
+            ``marker_fields()``). 0 restores the phase-1 single-user scan path for A/B runs.
     """
 
     expert_dtype: ttnn.DataType = ttnn.bfloat8_b
     shared_expert_dtype: ttnn.DataType = ttnn.bfloat8_b
     router_impl: str = "fused"
     router_fp32_logits: bool = True
+    fuse_shared_expert: bool = False
+    indexed_decode: bool = True
 
     ROUTER_IMPLS: ClassVar[tuple] = ("fused", "ops")
     EXPERT_DTYPES: ClassVar[tuple] = ("bfp8", "bfp4")
@@ -291,6 +308,8 @@ class MoEOptions:
             shared_expert_dtype=cls._dtype_from_env("SOLAR_OPEN_SHARED_EXPERT_DTYPE", "bfp8", cls.SHARED_EXPERT_DTYPES),
             router_impl=impl,
             router_fp32_logits=os.getenv("SOLAR_OPEN_ROUTER_FP32_LOGITS", "1") == "1",
+            fuse_shared_expert=os.getenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "0") == "1",
+            indexed_decode=os.getenv("SOLAR_OPEN_INDEXED_DECODE", "1") == "1",
         )
 
     @classmethod
@@ -305,7 +324,12 @@ class MoEOptions:
 
     def marker_fields(self) -> dict:
         """JSON-serialisable record written into the weight cache's .weights_complete marker; a cache built with
-        different options is rejected by ModelArgs.weight_cache_is_complete."""
+        different options is rejected by ModelArgs.weight_cache_is_complete.
+
+        ``fuse_shared_expert`` is deliberately absent: both modes read the SAME cache files (the fused expert tensors
+        are concatenated on device from the cached routed and shared shards), so flipping it must not invalidate the
+        marker or force a cold load. ``indexed_decode`` is absent for the same reason (a pure runtime path choice
+        over the same weight tensors)."""
         return {
             "expert_dtype": self.expert_dtype_str,
             "shared_expert_dtype": self.dtype_str(self.shared_expert_dtype),

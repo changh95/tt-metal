@@ -25,9 +25,16 @@ Uses the refactored TestFactory and MeshConfig patterns:
 - mesh_config passed to create_tt_model for proper sharding
 
     pytest models/demos/solar_open/demo/text_demo.py -k "prefill_128 and 1x8"
-    pytest models/demos/solar_open/demo/text_demo.py -k "batch32 and 1x8"
+    pytest models/demos/solar_open/demo/text_demo.py -k "batch32 and 1x8 and not 16k and not 32k"
+    pytest models/demos/solar_open/demo/text_demo.py -k "batch32_16k and 1x8"      # 32 users x 2-15K-token contexts
+    SOLAR_OPEN_KV_BUDGET_GIB=13 pytest models/demos/solar_open/demo/text_demo.py -k "batch32_32k and 1x8"
+    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_64k and 1x8"      # single user, 64K prefill
+
+A paged KV pool above the per-device budget (tt/common.py: 8 GiB with bfp8 experts, 14 GiB with bfp4, env
+SOLAR_OPEN_KV_BUDGET_GIB clamped to 14.5 / 20 GiB) skips the case before anything is loaded.
 """
 
+import json
 import os
 
 import pytest
@@ -37,8 +44,9 @@ from loguru import logger
 import ttnn
 from models.common.sampling import SamplingParams
 from models.common.utility_functions import is_blackhole
+from models.demos.solar_open.config import MoEOptions
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
-from models.demos.solar_open.tt.common import create_tt_model
+from models.demos.solar_open.tt.common import check_kv_budget, create_tt_model
 from models.demos.utils.device_sku import get_current_device_sku_name
 from models.demos.utils.llm_demo_utils import create_benchmark_data, verify_perf
 from models.demos.utils.model_targets import resolve_perf_targets
@@ -76,6 +84,23 @@ def split_solar_output(generated_text):
     reasoning = reasoning.replace(THINK_TOKEN, "").split(END_TOKEN)[0].strip()
     answer = answer.split(END_TOKEN)[0].strip() if separator else ""
     return reasoning, answer
+
+
+def load_demo_prompts(input_file, num_users):
+    """``load_inputs`` with the context formatting the prompt file asks for.
+
+    The tt_transformers loader turns a ``{"prompt", "context", "max_length"}`` entry into the clipped Gutenberg
+    context ALONE unless its ``instruct`` flag is set, in which case the question follows the context as
+    ``\`\`\`context\`\`\`\n\nquestion``. Solar always applies its chat template afterwards (``encode_prompt`` rejects
+    ``instruct=True``), so the flag is purely a formatting choice here: entries opt in with ``"context_question": true``
+    (the KO/EN long-context files, whose 32 distinct questions keep the answers judgeable); the phase-1 files keep their
+    context-only prompts and recorded baselines.
+    """
+    with open(input_file) as f:
+        entries = json.load(f)
+    context_question = bool(entries) and all(e.get("context_question", False) for e in entries)
+    prompts, _ = load_inputs(entries, num_users, instruct=context_question)
+    return prompts
 
 
 def log_device_memory(mesh_device, label):
@@ -542,6 +567,54 @@ def prepare_solar_open_generator_args(
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
         ),
+        # Batch 32 x 16K context (phase 2, design_misc.md (b)): 32 users each read a DIFFERENT clip (2K..15K tokens)
+        # of the cached Frankenstein text followed by a KO/EN question about it (distinct contexts keep the union of
+        # experts realistic; identical prompts would collapse the decode to 8 experts). Page table 32 x 256 blocks =
+        # 8192 blocks = 6.38 GiB of KV per device, inside the 8 GiB bfp8 default budget. Eager sorted-MoE prefill
+        # (prompts far above the 128-token trace length), a fixed 256 decode steps (stop_at_eos False) so the step time
+        # at a 2-15K context per user is measured on a full batch. Thermal: check `tt-smi -s` first (every ASIC < 80 C).
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_ko_en_long_ctx_16k.json",  # input_prompts
+            1,  # data_parallel
+            32,  # batch_size
+            1,  # repeat_batches
+            16 * 1024,  # max_seq_len
+            256,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 32 * (16 * 1024 // 64)},  # page_params (8192)
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace (2K-15K-token prompts: eager prefill)
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos (measure a fixed 256 steps)
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
+        # Batch 32 x 32K context: clips of 4K..31K tokens, page table 32 x 512 blocks = 16384 blocks = 12.75 GiB of KV
+        # per device. Above the 8 GiB bfp8 default budget on purpose: the case SKIPS unless SOLAR_OPEN_KV_BUDGET_GIB=13
+        # (4.5 GiB of DRAM left for activations) or SOLAR_OPEN_EXPERT_DTYPE=bfp4 (14 GiB default budget) is set, so the
+        # guard is exercised and the pool is never allocated by accident. At a full 32K context the decode step reads
+        # the whole pool once per step (design estimate ~140-160 ms/step). Same thermal rule as batch32_16k, plus a
+        # `tt-smi -s` check between the compile pass and the timed prefill (32 sequential 4-32K prefills, 5-8 min).
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_ko_en_long_ctx_32k.json",  # input_prompts
+            1,  # data_parallel
+            32,  # batch_size
+            1,  # repeat_batches
+            32 * 1024,  # max_seq_len
+            256,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 32 * (32 * 1024 // 64)},  # page_params (16384)
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace (4K-31K-token prompts: eager prefill)
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos (measure a fixed 256 steps)
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+        ),
         # Seqlen sweep: 1k-128k context lengths, one step per seqlen (on single-row meshes, >64k steps are skipped)
         (
             [
@@ -591,6 +664,8 @@ def prepare_solar_open_generator_args(
         "long_context_128k",
         "long_context_short_prefill_long_decode",
         "batch32",
+        "batch32_16k",
+        "batch32_32k",
         "seqlen-sweep",
     ],
 )
@@ -670,9 +745,34 @@ def test_solar_open_demo(
 
     logger.debug(f"Using mesh config: {mesh_config}, model config: {config}")
 
+    paged_attention = True  # Always use paged attention
+    # KV budget pre-check (phase 2): a paged pool above SOLAR_OPEN_KV_BUDGET_GIB (default 8 GiB with bfp8 experts,
+    # 14 GiB with bfp4; see tt/common.py) SKIPS the case instead of failing inside create_tt_model. Only the config is
+    # needed, so nothing is loaded first. The batch32_32k case (12.75 GiB) relies on this: it runs only with
+    # SOLAR_OPEN_KV_BUDGET_GIB=13 or SOLAR_OPEN_EXPERT_DTYPE=bfp4.
+    if paged_attention:
+        try:
+            check_kv_budget(
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
+                n_layers=config.num_hidden_layers,
+                paged_attention_config=PagedAttentionConfig(
+                    block_size=page_params["page_block_size"], max_num_blocks=page_params["page_max_num_blocks_per_dp"]
+                ),
+                tensor_parallel=mesh_shape[1] // data_parallel if mesh_shape[0] == 1 else mesh_shape[1],
+                moe_options=MoEOptions.from_env(),
+            )
+        except ValueError as e:
+            pytest.skip(f"KV pool over the per-device budget for case {test_id}: {e}")
+    if actual_max_seq_len >= 32 * 1024 or (batch_size > 1 and actual_max_seq_len >= 16 * 1024):
+        logger.warning(
+            f"Long-context case {test_id} ({batch_size} x {actual_max_seq_len // 1024}K): the devices run at full "
+            "compute for minutes. Check `tt-smi -s` before starting (every ASIC < 80 C, board 1 is the hottest) and "
+            "again between the compile pass and the timed prefill; never start right after a cold cache build."
+        )
+
     # Configuration matching tt_transformers defaults
     num_devices = mesh_device.get_num_devices()
-    paged_attention = True  # Always use paged attention
     global_batch_size = batch_size * data_parallel  # Total batch across all devices
 
     # Validate data parallel configuration (like tt-transformers)
@@ -701,7 +801,7 @@ def test_solar_open_demo(
     elif isinstance(input_prompts, list) and len(input_prompts) == 1:  # Manual input
         real_prompts = input_prompts * num_real_users
     elif isinstance(input_prompts, str):  # Inputs from file
-        real_prompts, _ = load_inputs(input_prompts, num_real_users, instruct=False)
+        real_prompts = load_demo_prompts(input_prompts, num_real_users)
     else:
         raise ValueError(
             f"Invalid input prompts: {input_prompts}. Expected a list of prompts, a single-item list, or a string path to a json file."

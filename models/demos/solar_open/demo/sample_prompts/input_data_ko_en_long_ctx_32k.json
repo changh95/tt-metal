@@ -1,0 +1,194 @@
+[
+    {
+        "prompt": "위 글의 편지들을 쓴 사람은 누구이며, 누구에게 보내는 편지인가요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 17500,
+        "context_question": true
+    },
+    {
+        "prompt": "Who writes the letters at the beginning of this text, and to whom are they addressed?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 21300,
+        "context_question": true
+    },
+    {
+        "prompt": "편지를 쓴 사람이 떠나려는 곳은 어디이며, 그곳에서 무엇을 찾기를 바라나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 25000,
+        "context_question": true
+    },
+    {
+        "prompt": "Where is the letter writer planning to travel, and what does he hope to find there?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 28700,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글의 첫 편지는 어느 도시에서, 몇 월에 쓰였나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 32500,
+        "context_question": true
+    },
+    {
+        "prompt": "From which city and in which month is the first letter dated?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 36400,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글에 등장하는 지명을 세 개 이상 골라 나열해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 40300,
+        "context_question": true
+    },
+    {
+        "prompt": "List at least three place names mentioned in the text.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 44200,
+        "context_question": true
+    },
+    {
+        "prompt": "편지를 쓴 사람은 자신의 교육과 항해 준비 과정을 어떻게 설명하나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 48000,
+        "context_question": true
+    },
+    {
+        "prompt": "How does the writer describe his education and his preparation for the voyage?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 51900,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글을 세 문장으로 요약해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 55900,
+        "context_question": true
+    },
+    {
+        "prompt": "Summarize the text above in three sentences.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 59700,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글에서 북극을 묘사한 문장 하나를 인용하고, 그 문장이 글쓴이에 대해 무엇을 드러내는지 설명해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 63500,
+        "context_question": true
+    },
+    {
+        "prompt": "Quote one sentence from the text about the North Pole and explain what it reveals about the writer.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 67400,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글의 분위기(어조)를 두 단어로 표현하고, 인용문 하나로 그 이유를 설명해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 71300,
+        "context_question": true
+    },
+    {
+        "prompt": "Describe the mood of the letters in two words and justify your choice with one quotation.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 75200,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글의 첫 편지의 첫 문장을 한국어로 번역해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 79000,
+        "context_question": true
+    },
+    {
+        "prompt": "Translate the first sentence of the first letter into Korean.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 82900,
+        "context_question": true
+    },
+    {
+        "prompt": "편지를 쓴 사람의 여동생 이름은 무엇인가요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 86700,
+        "context_question": true
+    },
+    {
+        "prompt": "What is the name of the writer's sister?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 90300,
+        "context_question": true
+    },
+    {
+        "prompt": "편지를 쓴 사람이 탐험을 준비하며 보낸 여섯 해에 대해 무엇이라고 말하나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 94000,
+        "context_question": true
+    },
+    {
+        "prompt": "What does the writer say about the six years he spent preparing for the expedition?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 97600,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글의 마지막 부분에서는 어떤 일이 일어나고 있나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 101400,
+        "context_question": true
+    },
+    {
+        "prompt": "Which events take place in the final part of the excerpt?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 105100,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글에서 이름이 언급되는 인물들을 모두 적어 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 108700,
+        "context_question": true
+    },
+    {
+        "prompt": "Name every character who is mentioned by name in the text.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 112500,
+        "context_question": true
+    },
+    {
+        "prompt": "편지를 쓴 사람은 자신의 계획에 대해 어떤 감정을 드러내며, 어떤 문장에서 그것이 드러나나요?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 116200,
+        "context_question": true
+    },
+    {
+        "prompt": "What feelings does the writer express about his undertaking, and which sentences show them?",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 119800,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글에서 은유(비유) 하나를 골라 그 의미를 설명해 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 123400,
+        "context_question": true
+    },
+    {
+        "prompt": "Pick one metaphor from the text and explain its meaning.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 127100,
+        "context_question": true
+    },
+    {
+        "prompt": "위 글에서 직접 인용한 문장 세 개를 큰따옴표 안에 적고, 각 문장에 한 줄씩 해설을 달아 주세요.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 130700,
+        "context_question": true
+    },
+    {
+        "prompt": "Explicitly state three quotes taken directly from the text, each inside double quotes, with a one-line comment on each.",
+        "context": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
+        "max_length": 134300,
+        "context_question": true
+    }
+]

@@ -29,6 +29,47 @@ class ExpertConfig:
     activation: str = "silu"
 
 
+@dataclass(frozen=True)
+class IndexedRouting:
+    """Top-k routing of ONE token in the layout the sparse_matmul indexed/gather mode consumes (decode.py
+    ``_decode_forward_indexed``; produced by the model's router, e.g. ``TopKRouter.route_indexed``).
+
+    Attributes:
+        indices: ``[1, 1, 1, k]`` **uint16 ROW_MAJOR** device tensor of the selected expert ids (unsorted, distinct,
+            all < num_experts; a single row-major stick as ``ttnn.sparse_matmul(indices=...)`` requires).
+        weights: ``[1, 1, 1, k]`` **bf16 TILE** device tensor of the routing weights in the same order as ``indices``
+            (normalised by the router; the experts multiply them into the k compact GLU rows before the down projection
+            and sum the k down outputs).
+        top_k: k (static per model; the compact shapes ``[1, k, 1, *]`` make the path trace-safe).
+    """
+
+    indices: ttnn.Tensor
+    weights: ttnn.Tensor
+    top_k: int
+
+    def __post_init__(self):
+        if self.top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {self.top_k}")
+        shape = (1, 1, 1, self.top_k)
+        if tuple(self.indices.shape) != shape or tuple(self.weights.shape) != shape:
+            raise ValueError(
+                f"IndexedRouting tensors must be {shape}: indices {tuple(self.indices.shape)}, "
+                f"weights {tuple(self.weights.shape)}"
+            )
+        if self.indices.dtype != ttnn.uint16 or self.indices.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise ValueError(
+                f"IndexedRouting.indices must be uint16 ROW_MAJOR, got {self.indices.dtype} {self.indices.layout}"
+            )
+        if self.weights.dtype != ttnn.bfloat16 or self.weights.layout != ttnn.TILE_LAYOUT:
+            raise ValueError(
+                f"IndexedRouting.weights must be bfloat16 TILE, got {self.weights.dtype} {self.weights.layout}"
+            )
+
+    def deallocate(self):
+        self.indices.deallocate(True)
+        self.weights.deallocate(True)
+
+
 @dataclass
 class ProgramConfig:
     """
@@ -67,9 +108,12 @@ class ProgramConfig:
     prefill_gate_up_cores: tuple[int, int] = (3, 4)
     prefill_down_cores: tuple[int, int] = (5, 6)
 
-    # Sparse matmul subblock widths
+    # Sparse matmul subblock widths (out_subblock_w == out_block_w; 1 = one output tile per compute pass). The
+    # batched down grid has its own value: with per_core_N 2 (8x8) the widest legal subblock is 2, with per_core_N 4
+    # (8x4) it is 4.
     decode_gate_up_subblock_w: int = 1
     decode_down_subblock_w: int = 1
+    decode_down_batched_subblock_w: int = 1
     prefill_gate_up_subblock_w: int = 1
     prefill_down_subblock_w: int = 1
 
@@ -89,6 +133,10 @@ class ProgramConfig:
     # longer splits take the expert-sorted hot/cold path or the per-expert loop.
     dense_grid_max_width: int = 12
     dense_bmm_max_tokens: int = 256
+    # Dense prefill down projection [1, E, S, Ip] x [1, E, Ip, H] as a 1D-multicast matmul on this grid (one K block
+    # of Kt tiles, per_core_N = Nt / cores) instead of ttnn's ``core_grid=`` auto choice (which picks in0_block_w 1
+    # for Kt = 5 and runs 2.7x slower at S = 128). None keeps the auto config. See get_dense_down_config.
+    dense_down_cores: tuple[int, int] | None = None
 
     def __post_init__(self):
         """Validate configuration on creation"""
@@ -96,6 +144,8 @@ class ProgramConfig:
         self._validate_cores("decode_down_cores", self.decode_down_cores)
         if self.decode_down_cores_batched is not None:
             self._validate_cores("decode_down_cores_batched", self.decode_down_cores_batched)
+        if self.dense_down_cores is not None:
+            self._validate_cores("dense_down_cores", self.dense_down_cores)
         self._validate_cores("prefill_gate_up_cores", self.prefill_gate_up_cores)
         self._validate_cores("prefill_down_cores", self.prefill_down_cores)
 
@@ -171,12 +221,22 @@ class ProgramConfig:
         for w in range(core_x, 0, -1):
             for h in range(core_y, 0, -1):
                 num_cores = w * h
+                if num_cores == 1:
+                    # A single-core mcast_in0 sparse_matmul has no multicast receivers and deadlocks the device
+                    # (measured 2026-09-07 on P150: 1x1 grid, per_core_N 10 -> hang, board reset needed).
+                    continue
                 pcn = (Nt + num_cores - 1) // num_cores
                 if (Nt + pcn - 1) // pcn != num_cores:
                     continue
                 if best is None or num_cores > best[0] or (num_cores == best[0] and w > best[1]):
                     best = (num_cores, w, h, pcn)
-        _, core_x, core_y, per_core_N = best  # num_cores == 1 always qualifies, so best is never None
+        if best is None:
+            raise ValueError(
+                f"sparse matmul with N = {n} ({Nt} tiles) on a {core_x}x{core_y} grid: no multi-core rectangle is an "
+                "exact fill and a single-core mcast_in0 grid hangs the device; use a grid with >= 2 cores that "
+                f"divides ceil({Nt} / per_core_N)"
+            )
+        _, core_x, core_y, per_core_N = best
         # The sparse matmul kernel asserts `Kt % in0_block_w == 0`. Different
         # tp factors produce different Kt (e.g. down's K = intermediate/tp:
         # tp=8 → Kt=5, tp=1 → Kt=40), and the configured in0_block_w may not
@@ -255,16 +315,51 @@ class ProgramConfig:
         self, m: int, n: int, k: int = None
     ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
         """Get program config for decode down projection (m = tokens in the step)"""
-        cores = self.decode_down_cores
+        cores, subblock_w = self.decode_down_cores, self.decode_down_subblock_w
         if self.decode_down_cores_batched is not None and m >= self.decode_down_batched_min_tokens:
-            cores = self.decode_down_cores_batched
+            cores, subblock_w = self.decode_down_cores_batched, self.decode_down_batched_subblock_w
         return self._build_matmul_config(
             cores,
             m,
             n,
             in0_block_w=self.decode_down_in0_block_w,
-            out_subblock_w=self.decode_down_subblock_w,
+            out_subblock_w=subblock_w,
             k=k,
+        )
+
+    def get_dense_down_config(self, m: int, n: int, k: int) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig | None:
+        """Program config for the DENSE prefill down projection ``[1, E, m, k] x [1, E, k, n]`` (all experts, one
+        batched matmul), or None when ``dense_down_cores`` is unset (caller uses ``core_grid=`` auto).
+
+        1D multicast of in0 over ``dense_down_cores``, the whole K (``Kt`` tiles) as one block, ``per_core_N = Nt /
+        cores`` and one ``[per_core_M x per_core_N]`` output block per core (``out_subblock_w`` = the widest divisor
+        of per_core_N <= 4 with out_subblock_h 1). Measured on P150 for Solar-Open (Kt = 5, Nt = 128, 8x8 cores):
+        311 / 642 / 1096 us at m = 32 / 128 / 256 vs 396 / 1148 / 1716 us for the auto config (in0_block_w 1).
+        Requires ``Nt % cores == 0`` and ``m % 32 == 0``; raises otherwise (no silent fallback)."""
+        if self.dense_down_cores is None:
+            return None
+        core_x, core_y = self.dense_down_cores
+        num_cores = core_x * core_y
+        Mt, Kt, Nt = m // 32, int(math.ceil(k / 32)), int(math.ceil(n / 32))
+        if m % 32 != 0 or Nt % num_cores != 0:
+            raise ValueError(
+                f"dense down config: m={m} must be a tile multiple and Nt={Nt} must be divisible by the "
+                f"{core_x}x{core_y} = {num_cores} cores of dense_down_cores"
+            )
+        per_core_N = Nt // num_cores
+        out_subblock_w = max(d for d in (4, 2, 1) if per_core_N % d == 0)
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(core_x, core_y),
+            in0_block_w=Kt,
+            out_subblock_h=1,
+            out_subblock_w=out_subblock_w,
+            out_block_h=Mt,
+            out_block_w=per_core_N,
+            per_core_M=Mt,
+            per_core_N=per_core_N,
+            fuse_batch=False,
+            fused_activation=None,
+            mcast_in0=True,
         )
 
     def get_prefill_gate_up_config(

@@ -59,6 +59,7 @@ class ProgramConfig:
     decode_qkv_in0_block_w: int = 1
     decode_qkv_out_subblock_h: int = 1
     decode_qkv_out_subblock_w: int = 1
+    decode_qkv_fp32_dest_acc: bool = False  # fp32 destination accumulation for the explicit qkv config
 
     # Decode output projection
     decode_out_cores: tuple[int, int] | None = None
@@ -180,6 +181,21 @@ class ProgramConfig:
             packer_l1_acc=self.packer_l1_acc,
         )
 
+    def get_decode_qkv_compute_config(self, arch):
+        """Compute kernel config to pass WITH ``get_decode_qkv_config``'s program config.
+
+        ttnn raises a bf16 x bfp8 matmul to HiFi2 (no approx, L1 packer accumulation) only for the AUTO config
+        (``matmul_device_operation.cpp::create_matmul_attributes``: a program config or a core grid drops it to
+        LoFi), so an explicit program config must restate those defaults to keep the auto numerics;
+        ``decode_qkv_fp32_dest_acc`` adds fp32 destination accumulation on top."""
+        return ttnn.init_device_compute_kernel_config(
+            arch,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=self.decode_qkv_fp32_dest_acc,
+            packer_l1_acc=True,
+        )
+
     def _build_matmul_config(
         self,
         cores: tuple[int, int],
@@ -190,18 +206,44 @@ class ProgramConfig:
         out_subblock_h: int,
         out_subblock_w: int,
     ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
-        """Build matmul program config for attention projections"""
+        """Build a 1D in0-multicast matmul program config for an attention projection ``[1, 1, m, k] x [k, n]``.
+
+        The N tiles are split evenly over the ``cores`` grid (``n // 32`` must be divisible by the core count) and
+        every core computes one ``[per_core_M x per_core_N]`` output block, so ``out_block_h/w`` equal the per-core
+        block (the matmul validation requires ``per_core_M % out_block_h == 0``, ``per_core_N % out_block_w == 0``
+        and the subblocks to divide the blocks; ``out_subblock_h * out_subblock_w <= 8`` dst registers). Requested
+        subblock widths that do not divide the per-core block snap down to the largest divisor; ``in0_block_w``
+        snaps to a divisor of ``Kt`` (a WIDTH-sharded in0 such as ``nlp_concat_heads_decode``'s output additionally
+        needs ``in0_block_w`` to divide its shard width in tiles -- 4 for head_dim 128). ``fuse_batch=True`` so a
+        sharded in0 is accepted (the inputs are ``[1, 1, m, k]``, so M is ``m // 32`` either way).
+        """
         core_x, core_y = cores
+        num_cores = core_x * core_y
+        Mt, Kt, Nt = max(32, m) // 32, max(32, k) // 32, n // 32
+        if n % 32 != 0 or Nt % num_cores != 0:
+            raise ValueError(
+                f"attention matmul config: N = {n} ({Nt} tiles) must be a tile multiple divisible by the "
+                f"{core_x}x{core_y} = {num_cores} cores"
+            )
+        per_core_N = Nt // num_cores
+        if Kt % in0_block_w != 0:
+            in0_block_w = max(d for d in range(1, in0_block_w + 1) if Kt % d == 0)
+        if per_core_N % out_subblock_w != 0:
+            out_subblock_w = max(d for d in range(1, out_subblock_w + 1) if per_core_N % d == 0)
+        if Mt % out_subblock_h != 0:
+            out_subblock_h = max(d for d in range(1, out_subblock_h + 1) if Mt % d == 0)
+        while out_subblock_h * out_subblock_w > 8:
+            out_subblock_h = max(d for d in range(1, out_subblock_h) if Mt % d == 0)
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(core_x, core_y),
             in0_block_w=in0_block_w,
             out_subblock_h=out_subblock_h,
             out_subblock_w=out_subblock_w,
-            out_block_h=1,
-            out_block_w=1,
-            per_core_M=m // 32,
-            per_core_N=n // 32 // (core_x * core_y),
-            fuse_batch=False,
+            out_block_h=Mt,
+            out_block_w=per_core_N,
+            per_core_M=Mt,
+            per_core_N=per_core_N,
+            fuse_batch=True,
             fused_activation=None,
             mcast_in0=True,
         )

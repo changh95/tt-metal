@@ -2,10 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 
 import ttnn
 
 from .weights import AttentionWeights
+
+# Phase 2 (design_misc.md (a)): keep the attention branch output in bf16 through o_proj and the TP all_reduce instead
+# of rounding it to bfp8 first. Default off = the phase-1 numerics recorded in README "Numerics". Weights are untouched,
+# so the option needs no cache rebuild and is deliberately NOT part of MoEOptions / the weight-cache marker.
+ATTENTION_BF16_OUTPUT_ENV = "SOLAR_OPEN_ATTENTION_BF16_OUTPUT"
+
+
+def attention_bf16_output(program_config=None) -> bool:
+    """True when the attention output stays bf16 through o_proj and the all_reduce (off by default).
+
+    Enabled by ``SOLAR_OPEN_ATTENTION_BF16_OUTPUT=1`` or by a ``bf16_output=True`` attribute on the attention program
+    config (either source suffices; the base ProgramConfig carries no such field). Prefill: the o_proj input is not cast
+    to bfp8, so the bf16 x bfp8 matmul runs HiFi2 instead of the LoFi ttnn picks for two bfp8 operands
+    (matmul_device_operation.cpp: HiFi2 unless both inputs are bfp8/bfp4) and the ``[S, 1024]`` bfp8 copy disappears.
+    Decode: the per-device o_proj partial enters the 8-way all_reduce as bf16 (``[1, 1, 32, 4096]``: 256 KiB instead of
+    136 KiB per layer per device) and 48 typecast launches per step disappear. Numerics/perf are measured only through
+    the teacher-forced test and the demo step times (device lane); the default stays off until that says otherwise.
+    """
+    if getattr(program_config, "bf16_output", False):
+        return True
+    return os.getenv(ATTENTION_BF16_OUTPUT_ENV, "0") == "1"
 
 
 def apply_qkv_projection(hidden_states, weights: AttentionWeights):
@@ -78,18 +100,24 @@ def concat_heads(tensor, is_decode_mode: bool):
     return ttnn.experimental.nlp_concat_heads(tensor, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-def apply_output_projection(tensor, weights: AttentionWeights, activation_dtype):
+def apply_output_projection(tensor, weights: AttentionWeights, activation_dtype, keep_bf16=False):
     """
     Apply the bias-free output projection (per-device partial sum; the TP all-reduce follows).
 
     Args:
-        tensor: Attention output tensor
+        tensor: Attention output tensor (bf16 after concat_heads); the caller frees it
         weights: Attention weights container
         activation_dtype: Target dtype for output
+        keep_bf16: Skip the bfp8 typecast of the input when ``activation_dtype`` is bf16 (see
+            ``attention_bf16_output``: the bf16 x bfp8 matmul then runs HiFi2). With a bfp8 activation dtype (prefill
+            above 32K, prefill.py) the cast stays: the output is block-quantised anyway and a bf16 ``[S, 1024]`` input
+            would only cost DRAM at that length.
 
     Returns:
         Output tensor after projection
     """
+    if keep_bf16 and activation_dtype == ttnn.bfloat16:
+        return ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype)
     tensor = ttnn.typecast(tensor, ttnn.bfloat8_b)
     out = ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype)
     tensor.deallocate(True)

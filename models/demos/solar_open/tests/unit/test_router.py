@@ -521,3 +521,104 @@ def test_router_trace_replay(mesh_device, tokens):
         assert torch.equal(dense_b_again, dense_b), "two replays on the same input differ"
     finally:
         ttnn.release_trace(mesh_device, trace_id)
+
+
+@parametrize_mesh_with_fabric(MESH_SHAPES)
+@pytest.mark.parametrize("fp32_logits", [True, False], ids=["fp32", "bf16"])
+def test_router_route_indexed(mesh_device, fp32_logits, expect_error):
+    """``TopKRouter.route_indexed`` (phase 2, ``MoEOptions.indexed_decode``): one token's top-k as an ``IndexedRouting``.
+
+    Same ids and bit-identical weights as the dense form of the same router on the same input, in the layout the
+    sparse_matmul indexed mode consumes (``[1, 1, 1, k]`` uint16 ROW_MAJOR ids, ``[1, 1, 1, k]`` bf16 TILE weights),
+    replicated on every device, HF-rule agreement through ``_check_routing``; the input is not consumed; T != 1 and the
+    ops router (uint32 ids) are rejected.
+    """
+    setup = TestFactory.setup_test(mesh_device, use_real_weights=False)
+    config = setup["config"]
+    top_k, num_experts = config.num_experts_per_tok, config.num_local_experts
+    generator = torch.Generator().manual_seed(777)
+
+    bias = _load_layer0_bias(setup["model_args"].model_path, num_experts)
+    if bias is None:
+        bias = _synthetic_bias(num_experts, generator)
+    state_dict = _make_router_state(config, bias, generator)
+    reference = HFRouterReference(config, state_dict)
+    options = MoEOptions(router_impl="fused", router_fp32_logits=fp32_logits)
+    router = TopKRouter(
+        mesh_device, config, state_dict, tensor_cache_path=None, tokens_per_device=32, moe_options=options
+    )
+    assert router.supports_indexed
+
+    hidden = _rms_normed_hidden(1, config.hidden_size, generator)
+    logits, ref_indices, ref_weights = reference.route(hidden)
+    margins = reference.selection_margins(logits)
+    tt_hidden = _to_device(hidden, mesh_device)
+    tt_indices, tt_dense = router(tt_hidden, is_decode=True)
+    routing = router.route_indexed(tt_hidden)
+    assert tt_hidden.is_allocated(), "route_indexed must not consume the hidden states"
+
+    shape = (1, 1, 1, top_k)
+    assert tuple(routing.indices.shape) == shape and routing.indices.dtype == ttnn.uint16, routing.indices
+    assert routing.indices.layout == ttnn.ROW_MAJOR_LAYOUT, routing.indices.layout
+    assert tuple(routing.weights.shape) == shape and routing.weights.dtype == ttnn.bfloat16, routing.weights
+    assert routing.weights.layout == ttnn.TILE_LAYOUT, routing.weights.layout
+    assert routing.top_k == top_k
+
+    label = f"route_indexed[fp32_logits={fp32_logits}]"
+    per_device = zip(
+        _per_device_torch(routing.indices),
+        _per_device_torch(routing.weights),
+        _per_device_torch(tt_dense),
+        _per_device_torch(tt_indices),
+    )
+    for d, (idx_d, w_d, dense_d, call_idx_d) in enumerate(per_device):
+        idx = idx_d.reshape(-1).long()
+        w = w_d.reshape(-1).float()
+        dense = dense_d.float().reshape(-1)
+        assert len(set(idx.tolist())) == top_k and int(idx.max()) < num_experts, f"{label} dev {d}: ids {idx.tolist()}"
+        assert (
+            sorted(idx.tolist()) == torch.nonzero(dense).reshape(-1).tolist()
+        ), f"{label} dev {d}: ids != dense columns"
+        assert sorted(idx.tolist()) == sorted(
+            call_idx_d.reshape(-1).long().tolist()
+        ), f"{label} dev {d}: ids != __call__"
+        assert torch.equal(
+            dense[idx], w
+        ), f"{label} dev {d}: weights {w.tolist()} != dense values {dense[idx].tolist()}"
+    idx0 = _per_device_torch(routing.indices)[0].reshape(1, -1).long()
+    w0 = _per_device_torch(routing.weights)[0].reshape(1, -1).float()
+    _check_routing(
+        _dense_from_sparse(idx0, w0, num_experts),
+        idx0,
+        reference,
+        ref_indices,
+        ref_weights,
+        margins,
+        fp32_logits,
+        label,
+    )
+    logger.info(f"{label}: ids {sorted(idx0.reshape(-1).tolist())}, weights sum {w0.sum().item():.4f}")
+
+    # the ops chain's uint32 ids are not accepted by the sparse_matmul indexed mode
+    ops_router = TopKRouter(
+        mesh_device,
+        config,
+        state_dict,
+        tensor_cache_path=None,
+        tokens_per_device=32,
+        moe_options=MoEOptions(router_impl="ops", router_fp32_logits=fp32_logits),
+    )
+    assert not ops_router.supports_indexed
+    with expect_error(ValueError, "fused router"):
+        ops_router.route_indexed(tt_hidden)
+
+    # exactly one token
+    tt_hidden32 = _to_device(_rms_normed_hidden(32, config.hidden_size, generator), mesh_device)
+    with expect_error(ValueError, "exactly one token"):
+        router.route_indexed(tt_hidden32)
+
+    routing.deallocate()
+    tt_dense.deallocate(True)
+    tt_indices.deallocate(True)
+    tt_hidden.deallocate(True)
+    tt_hidden32.deallocate(True)

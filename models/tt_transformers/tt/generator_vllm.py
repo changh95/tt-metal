@@ -1155,3 +1155,166 @@ class GptOssForCausalLM(HybridAttentionForCausalLM):
     # from HybridAttentionForCausalLM.
     def allocate_kv_cache(self, *args, **kwargs):
         return allocate_vllm_kv_cache(*args, **kwargs, dp_model=self.model, tt_cache_path=self.cache_path)
+
+
+class SolarOpenForCausalLM(HybridAttentionForCausalLM):
+    """upstage/Solar-Open-100B on the 1x8 Blackhole mesh (TP=8) for the vLLM TT plugin.
+
+    UNTESTED against a live vLLM: vLLM is not installed on the Solar bring-up box, so this class has only been
+    exercised by the host-only smoke test ``models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py``.
+    Registry key = ``hf_config.architectures[0]`` = ``"SolarOpenForCausalLM"`` (the TT plugin's model_registry
+    entry points at this module / class).
+
+    Solar's 48 layers are all full attention and ``SolarOpenConfig`` has no ``layer_types``, so
+    ``get_kv_cache_spec`` emits the 48 ``FullAttentionSpec`` entries itself (one KV group) instead of the base
+    class' ``layer_types`` lookup. With a single group the plugin's per-layer page tables are copies of the one
+    ``page_table``, so ``prefill_forward`` / ``decode_forward`` take the legacy single-table path through
+    :class:`Generator` (``page_tables_per_layer`` is accepted and ignored). The Solar-specific pieces - request
+    validation, the token capacity derived from the KV budget, the paged pool allocator (zeros written to the
+    device with ``ttnn.from_torch``, no tensorbins), the stop set and the chat-template kwargs - live in
+    ``models/demos/solar_open/tt/vllm_support.py`` (importable without vllm) and are imported lazily here so this
+    module's import does not depend on the Solar tree, as ``GptOssForCausalLM`` does for gpt_oss.
+    """
+
+    # Class-level capabilities (kept literally in sync with vllm_support.MODEL_CAPABILITIES by the smoke test).
+    model_capabilities = {
+        "supports_prefix_caching": False,  # a nonzero start_pos (chunked-SDPA resume) is not validated for Solar
+        "supports_async_decode": True,  # Generator.decode_forward(read_from_device=False) + read_decode_output
+        "supports_sample_on_device": True,  # TTSampling at TP=8 over the pow2-padded per-device vocab (32768)
+        "max_device_top_k": 32,  # TTSampling.max_top_k default; the demo clamps larger top_k requests
+    }
+
+    @classmethod
+    def get_max_tokens_all_users(
+        cls,
+        model_name: str = "",
+        num_devices: int = 1,
+        tt_data_parallel: int = 1,
+        **kwargs,
+    ) -> int:
+        """All-user KV capacity from the Solar KV budget (``SOLAR_OPEN_KV_BUDGET_GIB`` or its per-expert-dtype
+        default in ``models/demos/solar_open/tt/common.py``), in whole 64-token blocks - the same figure
+        ``allocate_kv_cache`` enforces (8 GiB -> 657,920 tokens with bfp8 experts)."""
+        from models.demos.solar_open.config import MoEOptions
+        from models.demos.solar_open.tt.vllm_support import max_tokens_all_users
+
+        return max_tokens_all_users(MoEOptions.from_env())
+
+    @classmethod
+    def get_kv_cache_spec(cls, vllm_config):
+        """48 ``FullAttentionSpec`` entries keyed ``model.layers.<i>.self_attn`` (SolarOpenConfig has no
+        ``layer_types``, which the base implementation requires)."""
+        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        from models.demos.solar_open.tt.vllm_support import (
+            build_full_attention_kv_cache_spec,
+            full_attention_layer_types,
+        )
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        layer_types = full_attention_layer_types(model_config.hf_config)
+        dtype = (
+            model_config.dtype
+            if cache_config.cache_dtype == "auto"
+            else STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+        )
+        return build_full_attention_kv_cache_spec(
+            len(layer_types),
+            FullAttentionSpec,
+            block_size=cache_config.block_size,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_size=model_config.get_head_size(),
+            dtype=dtype,
+        )
+
+    @classmethod
+    def initialize_vllm_model(
+        cls,
+        hf_config,
+        mesh_device,
+        max_batch_size,
+        max_seq_len,
+        n_layers=None,
+        tt_data_parallel=1,
+        optimizations: str = None,
+    ):
+        from models.demos.solar_open.config import MoEOptions
+        from models.demos.solar_open.tt.common import create_tt_model
+        from models.demos.solar_open.tt.vllm_support import validate_vllm_model_request
+
+        # 1x8 / TP=8 / DP=1 / batch <= 32 / <= 131072 positions / the same checkpoint as HF_MODEL; raises before the
+        # 393 GB host load of a cold cache starts.
+        validate_vllm_model_request(
+            mesh_shape=tuple(mesh_device.shape),
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            tt_data_parallel=tt_data_parallel,
+            hf_name_or_path=getattr(hf_config, "_name_or_path", ""),
+            optimizations=optimizations,
+        )
+        # ModelArgs resolves the checkpoint from HF_MODEL and the ttnn weight cache from TT_CACHE_PATH; a complete
+        # cache skips the HF load. vLLM owns the paged KV pool (allocate_kv_cache), so no cache is created here.
+        model_args, model, _, _ = create_tt_model(
+            mesh_device,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            paged_attention_config=None,
+            dtype=ttnn.bfloat8_b,
+            state_dict=None,
+            num_layers=n_layers,
+            mesh_config=None,
+            create_kv_cache=False,
+            users_row_sharded=False,
+            moe_options=MoEOptions.from_env(),  # SOLAR_OPEN_EXPERT_DTYPE / router flags apply to vLLM too
+        )
+        return cls([model], [model_args], mesh_device)
+
+    @property
+    def cache_path(self):
+        return self.model_args[0].weight_cache_path(ttnn.bfloat8_b)
+
+    @property
+    def stop_token_ids(self):
+        """Generation stop set {2, 24, 25} from ``ModelArgs.stop_token_ids`` (generation_config.json), for the plugin /
+        parity checks; vLLM applies ``eos_token_id`` itself with ``--generation-config auto``."""
+        from models.demos.solar_open.tt.vllm_support import stop_token_ids_for_vllm
+
+        return stop_token_ids_for_vllm(self.model_args[0])
+
+    def prefill_forward(self, *args, page_tables_per_layer=None, **kwargs):
+        # One full-attention KV group: every per-layer table equals the single page_table, so the legacy path applies.
+        return super().prefill_forward_text(*args, **kwargs)
+
+    def decode_forward(self, *args, page_tables_per_layer=None, **kwargs):
+        # Skip HybridAttentionForCausalLM.decode_forward (a NotImplementedError placeholder); Generator's decode.
+        return super(HybridAttentionForCausalLM, self).decode_forward(*args, **kwargs)
+
+    def allocate_kv_cache(self, kv_cache_shape, dtype, num_layers):
+        """``list[submesh][layer][k, v]`` of replicated bfp8 pools, budget-checked; see vllm_support for why this is
+        ``ttnn.from_torch`` and not ``allocate_vllm_kv_cache`` (no ~27 GB of zero tensorbins per pool shape)."""
+        from models.demos.solar_open.tt.vllm_support import allocate_paged_kv_cache
+
+        return allocate_paged_kv_cache(
+            self.model,
+            kv_cache_shape,
+            num_layers,
+            moe_options=self.model_args[0].moe_options,
+            vllm_dtype=dtype,
+        )
+
+    def allocate_kv_cache_per_layer(self, per_layer_specs):
+        """Per-layer entry point of the hybrid plugin path: with one group every spec has the same shape, so one pool
+        per distinct ``tensor_idx`` is allocated through ``allocate_kv_cache`` and shared where the indices repeat."""
+        shapes = {tuple(int(s) for s in shape) for shape, _, _ in per_layer_specs}
+        if len(shapes) != 1:
+            raise ValueError(f"Solar-Open has one full-attention KV group; got mixed KV cache shapes {sorted(shapes)}")
+        (shape,) = shapes
+        dtype = per_layer_specs[0][1]
+        tensor_indices = list(dict.fromkeys(tensor_idx for _, _, tensor_idx in per_layer_specs))
+        pools = self.allocate_kv_cache(shape, dtype, len(tensor_indices))
+        return [
+            [pools_per_submesh[tensor_indices.index(tensor_idx)] for _, _, tensor_idx in per_layer_specs]
+            for pools_per_submesh in pools
+        ]

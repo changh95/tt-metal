@@ -188,7 +188,20 @@ def layer0_weights():
 
     snapshot = _snapshot_dir()
     config = AutoConfig.from_pretrained(str(snapshot), trust_remote_code=True)
-    state_dict, embed = load_layer_state_dict(snapshot, LAYER_IDX, config.num_local_experts)
+    if os.getenv("SOLAR_OPEN_STREAMING_LOAD") == "1":
+        # Phase-2 streaming loader as the source of the layer (raw HF q/k order: the reference layer loads this dict
+        # too, the TT side permutes it in setup_decoder_layer). Same keys / tensors as load_layer_state_dict.
+        from models.demos.solar_open.utils.streaming_loader import LazyStateDict
+
+        lazy = LazyStateDict(
+            snapshot, head_dim=config.head_dim, num_experts=config.num_local_experts, convert_to_meta=False
+        )
+        state_dict = lazy.layer_state_dict(LAYER_IDX)
+        embed = lazy[EMBED_KEY]
+        logger.info(f"layer {LAYER_IDX} + embedding read through the streaming loader: {lazy.stats}")
+        lazy.close()
+    else:
+        state_dict, embed = load_layer_state_dict(snapshot, LAYER_IDX, config.num_local_experts)
     _check_contract_c1(state_dict, config)
     return state_dict, embed
 

@@ -30,12 +30,12 @@ import ttnn
 
 from models.demos.solar_open.config import MeshConfig, ModeConfig
 
-from .config import ExpertConfig, ProgramConfig
+from .config import ExpertConfig, IndexedRouting, ProgramConfig
 from .decode import decode_forward
 from .prefill import prefill_forward
 from .weights import load_expert_weights
 
-__all__ = ["Experts", "ExpertConfig", "ProgramConfig"]
+__all__ = ["Experts", "ExpertConfig", "IndexedRouting", "ProgramConfig"]
 
 
 class Experts:
@@ -46,6 +46,10 @@ class Experts:
     weight for the selected experts, 0 elsewhere) and returns the all-reduced MoE output. An optional
     ``shared_expert`` callable is evaluated on the experts' input and its per-device partial is summed into the
     routed partial BEFORE the single TP all_reduce, so routed + shared cost one CCL per layer.
+
+    Single-user decode may instead receive the token's top-k ids and weights as an ``IndexedRouting``
+    (``indexed_routing=``, no dense tensor): the experts then run the sparse_matmul indexed/gather mode, visiting
+    only the k selected experts with compact ``[1, k, 1, *]`` intermediates (phase 2, ``MoEOptions.indexed_decode``).
     """
 
     def __init__(
@@ -125,10 +129,11 @@ class Experts:
     def __call__(
         self,
         hidden_states,
-        topk_expert_weights: ttnn.Tensor,
+        topk_expert_weights: ttnn.Tensor = None,
         is_decode: bool = True,
         topk_expert_indices: ttnn.Tensor = None,
         shared_expert=None,
+        indexed_routing: IndexedRouting = None,
     ):
         """
         Forward pass - automatically dispatches to decode or prefill.
@@ -137,19 +142,37 @@ class Experts:
             hidden_states: Input tensor [1, 1, tokens, hidden_size] (decode: one token per user,
                 1 <= users <= 32; prefill: tokens = seq_len, a multiple of 32). Consumed.
             topk_expert_weights: Dense router scores [tokens, num_experts] bf16 TILE (0 for unselected experts,
-                > 0 for the selected ones; rows normalised by the router)
+                > 0 for the selected ones; rows normalised by the router). ``num_experts`` INCLUDES the always-on
+                slots of a fused shared expert (``self.weights.num_always_on_experts``, routing weight 1.0). May be
+                None only together with ``indexed_routing``.
             is_decode: Decode mode
             topk_expert_indices: Top-k expert indices per token (informational; the dense weights carry the routing)
+            indexed_routing: decode with exactly one token only: the token's top-k ids / weights as an
+                ``IndexedRouting`` (see decode.py ``_decode_forward_indexed``). Not consumed. Mutually exclusive with
+                ``topk_expert_weights``; requires EP=1 and no always-on slots (ValueError otherwise -- the caller
+                decides the path, see ``tt/mlp.py::MLP.route``).
             shared_expert: Optional ``Callable[[ttnn.Tensor], ttnn.Tensor]``. Called exactly once per decode call on
                 the (32-row padded) input ``[1, 1, 32, H]`` (``[1, 1, 1, H]`` for a single user) and once per
                 <= ``sequence_chunk_size``-token chunk in prefill on ``[1, 1, chunk, H]``, before that input is
                 deallocated. It must return this device's PARTIAL ``[1, 1, rows, H]`` bf16 TILE interleaved tensor
                 with the same logical/padded shape; the experts add it in place to their routed partial and
-                deallocate it. The shared partial is never all-reduced separately.
+                deallocate it. The shared partial is never all-reduced separately. For the unfused layout only:
+                a ValueError is raised when the weights carry always-on slots.
 
         Returns:
             Expert output tensor [1, 1, tokens, hidden_size] bfloat8_b, replicated (all-reduced over TP)
         """
+        if shared_expert is not None and self.weights.num_always_on_experts:
+            raise ValueError(
+                "the shared expert is fused as an always-on slot of these experts; do not pass shared_expert"
+            )
+        if indexed_routing is not None:
+            if not is_decode:
+                raise ValueError("indexed_routing is a decode-only input (prefill routes through the dense tensor)")
+            if topk_expert_weights is not None:
+                raise ValueError("pass either the dense topk_expert_weights or indexed_routing, not both")
+        elif topk_expert_weights is None:
+            raise ValueError("topk_expert_weights is required without indexed_routing")
         # Determine mode based on sequence length
         if is_decode:
             return decode_forward(
@@ -162,6 +185,10 @@ class Experts:
                 ccl_manager=self.ccl_manager,
                 program_config=self.program_config,
                 shared_expert=shared_expert,
+                indexed_routing=indexed_routing,
+                # the sparse_matmul indexed mode still takes a `sparsity` operand it never reads: the cached
+                # [1, 1, 1, E] ones of the EP=1 prefill mask serve (ROW_MAJOR bf16, the validated shape)
+                sparsity_placeholder=self.prefill_sparsity,
             )
         else:
             return prefill_forward(

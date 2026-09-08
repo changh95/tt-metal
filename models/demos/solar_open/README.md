@@ -9,18 +9,44 @@ traced prefill at 128 tokens and the Blackhole user-grid placement are kept; the
 (attention-sink logits and biases, clamped SwiGLU, sliding windows, channel-token shortcuts) is gone and Solar's
 sigmoid router with selection bias plus the shared expert are added.
 
-Status: phase-1 bring-up (correctness first). See "Recorded baselines" at the end for the measured PCC values.
+Status: phase 2 complete (2026-09-07): perf levers, streaming loader, KV budgets / long-context cases, vLLM wrapper
+(untested), all default-on changes re-validated on the final tree. See "Recorded baselines" at the end: the phase-1 vs
+phase-2 summary table first, then the per-test rows with the measured PCC / step-time values.
 
 Numerics (relative to the bf16 HF model): weights are bfp8 (experts, attention, lm_head, KV cache) / bf16 (embeddings,
 norms, router gate, fp32 router bias); the residual stream is bf16 (`DecoderLayer._residual_add` writes each residual
 sum into a new bf16 tensor instead of the branch's bfp8 output, so the stream is never block-quantised), the norm
 outputs and hence the attention / router / expert inputs are bf16, the attention and MoE branch outputs are bfp8
-(o_proj input and the pre-all_reduce partials are bfp8, inherited from the source demo), the router linear runs in
+(o_proj input and the pre-all_reduce partials are bfp8, inherited from the source demo; the phase-2 option
+`SOLAR_OPEN_ATTENTION_BF16_OUTPUT=1` keeps the attention branch bf16 through o_proj and its all-reduce -- measured
+WORSE on the teacher-forced test (top-1 0.9336 -> 0.8828, KL 0.0355 -> 0.0654, root cause open), so it stays off, see
+"Environment variables" and "Recorded baselines"), the router linear runs in
 fp32 (HiFi4, fp32 accumulation; a bfp8 input would be widened to bf16 first), the selection math in fp32, and the
-lm_head emits bf16 logits (TTSampling consumes bf16 natively). Every TP all-reduce (attention prefill and decode, MoE)
+lm_head emits bf16 logits (TTSampling consumes bf16 natively). The shared expert runs bf16 activations with HiFi4
+in its own module; with `SOLAR_OPEN_FUSE_SHARED_EXPERT=1` it runs as slot 128 of the routed sparse_matmuls, i.e. with
+bfp8 activations and the routed compute config (one bfp8 re-quantisation of its partial disappears, its GLU
+intermediate becomes bfp8), so the fused output is PCC- but not bit-equivalent to the unfused one. With the default
+`SOLAR_OPEN_INDEXED_DECODE=1` a single-user decode step runs the routed experts in the sparse_matmul indexed/gather mode
+(only the 8 selected experts, compact outputs; the routing weights multiply the bfp8 GLU rows before the down projection
+instead of the bfp8 down outputs after it, `tt/experts/decode.py::INDEXED_WEIGHTS_ON_DOWN_INPUT`), which is PCC- but not
+bit-equivalent to the phase-1 scan path (one bfp8 ulp on the expert output; even with the scan path's mul order the 8-slot
+`fast_reduce_nc` differs from the 128-slot `ttnn.sum` by half an ulp on ~18 % of the elements, so no bit-neutral indexed
+variant exists). Component PCCs are unchanged; the teacher-forced b1 metrics move inside the bfp8 rounding-noise band
+(top-1 0.9453 -> 0.9336, decisive 0.9779 -> 0.9558, KL 0.0316 -> 0.0355; the output-side mul lands at 0.9258 / 0.9646 /
+0.0346 -- see the perf-p2 row). Every TP all-reduce (attention prefill and decode, MoE)
 is `ttnn.all_reduce`: `MeshConfig.allreduce` (reduce_scatter_minimal_async + all_gather_async on the CCLManager's
 ping-pong semaphores) is NOT used on the 1x8 path because its all-gather leaves a stale block on the last ring devices
-on every other call on P150x8 (see `tt/attention/operations.py::apply_allreduce` and "Recorded baselines").
+on every other call on P150x8 (see `tt/attention/operations.py::apply_allreduce` and "Recorded baselines"). The
+phase-2 program configs (perf-p0) keep or improve the operand precision: `ttnn.matmul` / `ttnn.linear` run a bf16 x
+bfp8 product at HiFi2 when they pick the config themselves but fall back to LoFi as soon as a `program_config` or
+`core_grid` is passed without a `compute_kernel_config`, so every wired config in this tree passes an explicit compute
+config (HiFi2, no approximations, packer L1 accumulation, bf16 destination; HiFi4 / fp32 accumulation for the
+router). Measured against a torch fp32 reference of the device-rounded operands (`tests/perf/test_config_candidates.py`,
+auto -> wired): router bit-identical, decode qkv 0.999936 -> 0.999862 (the fp32-destination variant reaches 0.999994 on
+the op but measured slightly worse on the whole model, see the gate-p0 row; `decode_qkv_fp32_dest_acc=True` is its A/B
+switch), shared
+expert gate 0.99927 -> 0.99973, width-sharded decode norm 0.999963 -> 0.999994 (T = 32), dense prefill down 0.999959 ->
+0.999953 (the bfp8 floor); the component and teacher-forced values of the merged tree are in "Recorded baselines".
 
 ## Layout
 
@@ -32,7 +58,8 @@ on every other call on P150x8 (see `tt/attention/operations.py::apply_allreduce`
 | `tt/experts/` | routed experts: fused `[gate_d|up_d]` per device, SiLU GLU, union-of-experts decode, dense/sorted prefill; `SolarOpenProgramConfig` |
 | `tt/shared_expert.py`, `tt/mlp.py` | shared expert (TP-sharded partial, summed into the routed partial before the single all-reduce) and the MoE block |
 | `tt/model_config.py`, `tt/common.py`, `config.py` | `ModelArgs` (HF config/tokenizer, stop set, weight cache), `create_tt_model`, `MeshConfig`, `MoEOptions` |
-| `demo/text_demo.py`, `demo/sample_prompts/` | generation demo; `input_data_questions_ko_en_prefill_128.json` = 16 Korean + 16 English prompts |
+| `demo/text_demo.py`, `demo/sample_prompts/` | generation demo; `input_data_questions_ko_en_prefill_128.json` = 16 Korean + 16 English prompts; `input_data_ko_en_long_ctx_{16k,32k}.json` = 32 distinct clips (2-15K / 4-31K tokens) of the cached Frankenstein text, each followed by a KO/EN question about it (`"context_question": true`) |
+| `tt/vllm_support.py`, `vllm_plugins/solar_open_parsers.py` | vllm-free helpers of the vLLM wrapper `SolarOpenForCausalLM` (`models/tt_transformers/tt/generator_vllm.py`): request validation, 48-layer KV spec, token capacity from the KV budget, `from_torch` pool allocator, stop ids, template kwargs, parser registration; the plugin file registers Upstage's reasoning / tool parsers (see "Serving with vLLM") |
 | `tests/` | unit tests (`tests/unit/`), real-weight layer-0 test, multi-user consistency test, `tests/accuracy/` (host-side HF bf16 reference generator + teacher-forced whole-model accuracy test) |
 | `unit_test_thresholds.json` | PCC thresholds per component (key `Solar-Open-100B`) |
 
@@ -83,16 +110,32 @@ without any checkpoint.
 | `SOLAR_OPEN_SHARED_EXPERT_DTYPE` | `bfp8` | shared expert weight dtype (`bfp8` or `bf16`); the shared output is always bf16 |
 | `SOLAR_OPEN_ROUTER_IMPL` | `fused` | `fused` = `moe_grouped_topk` (3 launches); `ops` = exact pure-ttnn chain (~10 launches, fidelity fallback) |
 | `SOLAR_OPEN_ROUTER_FP32_LOGITS` | `1` | `0` = bf16 router logits (fp32-accumulated; the variant Blackhole CI covers); both router impls still select in fp32 |
+| `SOLAR_OPEN_FUSE_SHARED_EXPERT` | `0` | `1` runs the shared expert as always-on slot 128 of the routed expert tensors (built on device at load time from the cached routed + shared shards; cache-neutral, not in the marker) instead of the separate `SharedExpert` module: 5 launches per layer fewer (3 linears, the GLU mul and the partial add). See "Recorded baselines" (phase-2 fusion row) for the measured equivalence / speed before flipping it |
+| `SOLAR_OPEN_INDEXED_DECODE` | `1` | `0` disables the phase-2 indexed/gather single-user expert path (profile lever 1): with `1` a decode step with ONE user routes through `TopKRouter.route_indexed` (top-8 ids + weights, no dense `[1, 128]` scatter) and `experts/decode.py::_decode_forward_indexed` (`ttnn.sparse_matmul(indices=...)` for gate\|up and down: only the 8 selected experts are visited, compact `[1, 8, 1, *]` outputs, no 16 MB zero-filled down output, no bfp8 transpose glue; routing weights on the compact GLU rows). Batched steps (2..32 users) and prefill are unaffected. Needs the fused router, EP=1 and the unfused shared expert (otherwise the scan path runs, logged at debug level). Cache-neutral (not in the marker). Measured: b1 decode 52.8 -> 35.8 ms/step (see "Recorded baselines", perf-p2 row) |
 | `SOLAR_OPEN_REASONING_EFFORT` | `high` (demo sets `low`) | chat-template `reasoning_effort`: `low`/`minimal` prepend an empty `<\|think\|>` block so the answer starts immediately |
 | `SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT` | `1` | `0` disables the template's dated provider system prompt |
-| `SOLAR_OPEN_KV_BUDGET_GIB` | `16` (bfp8 experts) / `22` (bfp4) | `create_tt_model` raises when the paged KV pool would exceed this per device |
+| `SOLAR_OPEN_KV_BUDGET_GIB` | `8` (bfp8 experts) / `14` (bfp4) | per-device KV budget: `create_tt_model` raises (the demo skips the case) when the KV pool would exceed it. The defaults admit 32 x 16K with bfp8 experts and 32 x 32K with bfp4; `13` admits the bfp8 32 x 32K pool (12.75 GiB, 4.5 GiB left for activations). Values above the hard cap `14.5` / `20` (DRAM - weights - 2.8 GiB activation reserve) are clamped with a warning |
+| `SOLAR_OPEN_ATTENTION_BF16_OUTPUT` | `0` | `1` keeps the attention branch output bf16 through o_proj and the TP all-reduce (skips the two bfp8 typecasts: the o_proj input in prefill, the pre-all_reduce partial in decode; the o_proj matmul then runs HiFi2 instead of LoFi). Weights and cache unchanged. MEASURED WORSE (2026-09-07, see "Recorded baselines"): teacher-forced b1 top-1 0.9336 -> 0.8828, KL 0.0355 -> 0.0654, b32 0.9375 -> 0.8906 / 0.0630 -- both FAIL the floors -- and slower (47.4 / 74.1 vs 45.3 / 69.8 ms/step). A/B and diagnosis switch only; keep 0 |
 | `SOLAR_OPEN_TRACE_REGION_SIZE` | from `models/model_trace_region_sizes.yaml` (`solar-open-100b`: 100 MB) | overrides the trace region in bytes; `0` = dynamic allocation |
 | `SOLAR_OPEN_FORCE_MODEL_LOAD` | unset | `1` forces the HF weight load even when the ttnn cache marker says the cache is complete |
 | `SOLAR_OPEN_SORTED_MOE_DEBUG` | `0` | `1` logs the expert-sorted prefill MoE plan |
-| `SOLAR_OPEN_STREAMING_LOAD` | unset | phase 2: `1` selects the per-layer streaming loader (not part of phase 1) |
+| `SOLAR_OPEN_STREAMING_LOAD` | unset | `1` selects the phase-2 streaming loader (`utils/streaming_loader.py::LazyStateDict`) for cold cache builds: tensors are read per access from the safetensors shards (peak host RSS ~ one layer's transients instead of 393 GB), same contract-C1 keys, bit-identical tensors (see "Streaming loader" below); unset = phase-1 whole-model `from_pretrained` |
+| `SOLAR_OPEN_STREAMING_THREADS` | `4` | streaming loader: `preadv` threads assembling the fused expert tensors (7.5 GB/s from the page cache with 4, 2.1 GB/s with 1) |
+| `SOLAR_OPEN_STREAMING_DONTNEED` | `0` | streaming loader: `1` = `posix_fadvise(DONTNEED)` on every finished layer's byte ranges so the page cache never holds the whole 205 GB checkpoint (off: a following whole-model load / test run reuses the cached pages) |
 | `SOLAR_OPEN_TF_REFERENCE` | `$TT_CACHE_PATH/teacher_forced_reference.pt` | reference file written by `tests/accuracy/gen_reference.py` and read by `tests/accuracy/test_teacher_forced.py` |
 | `SOLAR_OPEN_TF_REPORT_DIR` | unset | `test_teacher_forced.py` writes a markdown report (`teacher_forced_<case>.md`: per-prompt metrics, HF vs TT greedy continuations) into this directory |
 | `SOLAR_OPEN_NUM_DEVICES` | unset | test collection only: replaces `ttnn.get_num_devices()` in the mesh parametrizations so `pytest --collect-only` / `python -c "import ..."` never touch the devices (e.g. `SOLAR_OPEN_NUM_DEVICES=8`) |
+
+The phase-2 program-config levers (perf-p0, all default ON and cache-neutral) have no environment variable; each one is
+an A/B switch in its module: `tt/rms_norm.py::DECODE_NORM_GRID = None` (or `RMSNorm(sharded_decode=False)`) restores the
+single-core decode norm, `tt/shared_expert.py::SHARED_EXPERT_CONFIG_MAX_ROWS = 0` (or `SharedExpert(program_configs=False)`)
+the auto shared-expert linears, `tt/topk.py::_LINEAR_CONFIG_MAX_TOKENS = 0` the auto router linear,
+`SolarOpenAttentionProgramConfig(decode_qkv_cores=None)` the auto decode qkv matmul (`decode_qkv_fp32_dest_acc=True`
+adds fp32 destination accumulation to the (8,5) config: closer to fp32 on the op, measured slightly worse on the whole
+model), `SolarOpenProgramConfig(dense_down_cores=None)` the auto dense prefill
+down; the expert-path levers of perf-p1 are module constants in `tt/experts/decode.py` / `prefill.py`
+(`ROUTING_WEIGHTS_ON_DOWN_INPUT`, `HOT_EXPERTS_PER_EXPERT_LINEAR`, `ELIDE_ROUTING_COPIES`) and the indexed path has
+`SOLAR_OPEN_INDEXED_DECODE`. Measured effect of every switch: "Recorded baselines" (perf rows).
 
 The MoE flags are recorded in the cache marker (`.weights_complete`); a run with different flags rebuilds its own
 cache directory (expert dtype) or invalidates the marker (router flags). Only weights are cached (embeddings, norms,
@@ -103,7 +146,8 @@ context length and the paged block count, and a warm start reads only the weight
 dtype-suffixed tensorbins of both variants coexist on disk, but the marker records one set of flags and is rewritten
 by the cold run, so flipping back reloads again); only `SOLAR_OPEN_EXPERT_DTYPE` has its own directory. A complete
 48-layer cache does satisfy a `num_layers`-limited debug build (the marker's `n_layers` only has to be >= the
-requested layer count).
+requested layer count). `SOLAR_OPEN_FUSE_SHARED_EXPERT` is the exception: it changes no cache file and is not recorded
+in the marker (the fused tensors are assembled on device from the cached routed and shared shards at every start).
 
 ## Test ladder (bring-up order)
 
@@ -114,6 +158,7 @@ python -c "import models.demos.solar_open.tt.model"
 pytest models/demos/solar_open/tests/unit/test_model_config.py \
        models/demos/solar_open/tests/unit/test_expert_weights.py \
        models/demos/solar_open/tests/unit/test_expert_parallel_config.py
+pytest models/demos/solar_open/tests/unit/test_streaming_loader.py     # phase-2 loader; Part B needs the real shards of layer 0 (~30 s, < 4 GB RSS)
 grep -rIin "gpt[_-]oss\|gptoss" models/demos/solar_open   # source-demo identifiers: expect only tt-metal issue references
 ```
 
@@ -122,16 +167,39 @@ Random weights on the 1x8 mesh (`HF_MODEL` may be the config directory). Compone
 
 ```bash
 T=models/demos/solar_open/tests
-pytest $T/unit/test_router.py -k 1x8                                     # router: T in {1,8,32,128,4096}, 4 impl/dtype combos, trace smoke
+pytest $T/unit/test_router.py -k 1x8                                     # router: T in {1,8,32,128,4096}, 4 impl/dtype combos, trace smoke, route_indexed (top-k form)
 pytest $T/unit/test_shared_expert.py -k 1x8                              # shared expert partial sums
 pytest $T/unit/test_modules.py -k "test_decoder and 1x8" --test-modules=rms_norm,attention   # decode cases attend over a 64-token context per user
 pytest $T/unit/test_rope.py -k 1x8                                       # YaRN tables vs HF (positions > 65536), 1.0693 kernel case
 pytest $T/unit/test_modules.py -k "test_decoder and 1x8 and unpaged and pos0" --test-modules=experts   # decode b1/16/32, prefill 128/1024/4096
 pytest $T/unit/test_modules.py -k "test_experts_shared_expert_hook and 1x8"   # shared partial added before the single all_reduce (shift == 8c)
-pytest $T/test_experts_skewed_routing.py -k 1x8                          # hot/cold expert-sorted prefill path
+pytest $T/test_experts_skewed_routing.py -k 1x8                          # hot/cold expert-sorted prefill path (per-expert hot linears)
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_p1_layout.py                 # host: sorted-MoE cost model, hot-group configs, layout switch defaults
+pytest $T/perf/test_layout_candidates.py -k 1x1                          # one device: layout levers (routing mul on the down input, hot group forms, copy elision) vs torch fp32
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_p2_indexed.py                # host: indexed single-user path (MoEOptions.indexed_decode rule, IndexedRouting contract, decode_forward guards, source contracts)
+pytest $T/perf/test_indexed_candidates.py -k 1x1                         # one device: production decode_forward scan vs indexed vs torch fp32 (numerics, traced timing, weight-layout variants, routing-weight placement)
 pytest $T/unit/test_modules.py -k "test_decoder and 1x8 and unpaged and pos0" --test-modules=router,shared_expert,mlp
+SOLAR_OPEN_INDEXED_DECODE=0 pytest $T/unit/test_modules.py -k "test_decoder and 1x8 and pos0 and decode_b1" --test-modules=experts,mlp,decoder   # phase-1 scan path (A/B reference)
 pytest $T/unit/test_modules.py -k "test_decoder and 1x8" --test-modules=decoder                # unpaged + paged, pos0 + pos70000 (decode: context at 70000..70064)
-pytest $T/unit/test_modules.py -k "test_model and 1x8"                   # 1-layer SolarOpenForCausalLM: prefill_b1_s128, decode_b32_s1
+pytest $T/unit/test_modules.py -k "test_decoder and 1x8 and pos70000" --test-modules=attention,rms_norm,experts,router,shared_expert,mlp,decoder   # every component at RoPE 70000..70064 (YaRN beyond 65536)
+pytest $T/unit/test_modules.py -k "test_model and 1x8"                   # 1-layer SolarOpenForCausalLM: prefill_b1_s128, decode_b32_s1, decode_b1_s1 (indexed expert path)
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_fused_shared_expert.py -k host   # host: fusion concat sequence, guards, router seed, torch emulation
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_p0_program_configs.py             # host: perf-p0 program-config builders + their ON defaults (shared expert, router, sharded decode norm gate, qkv HiFi2/fp32-dst, dense down)
+pytest $T/unit/test_fused_shared_expert.py -k 1x8                        # fused (129-slot) vs unfused MLP: weights bit-identical, PCC >= 0.998, linears 4 -> 1 (decode / prefill_128) and unfused - 3 + one always-on linear per sorted split (1K / 4K)
+SOLAR_OPEN_FUSE_SHARED_EXPERT=1 pytest $T/unit/test_modules.py -k "test_decoder and 1x8 and unpaged and pos0" --test-modules=router,mlp,decoder
+```
+
+Perf tests (phase 2; not correctness tests, `tests/perf/`). The first two are the fast A/B tools of every perf change
+(`scratchpad/phase2/perf_log.md` holds the lever-by-lever history), the last two are profiling helpers that SKIP unless
+`SOLAR_OPEN_PERF_PROFILE=1` and are meant to run under the tracy device profiler:
+
+```bash
+pytest $T/perf/test_layer0_device_perf.py -k 1x8         # real layer 0 (needs the layer-0 shards): traced replay ms per layer for decode b1 / b32, eager prefill 128 / 1024; x48 = the demo step within ~2 %; SOLAR_OPEN_PERF_OUT=<json> records it. Final phase-2 tree: b1 0.376-0.379 / b32 1.30-1.33 ms traced (phase 1 1.152 / 1.911), prefill_128 eager 3.94-3.97 (4.5)
+pytest $T/perf/test_config_candidates.py -k 1x1          # one device, random weights at the TP=8 shapes: candidate matmul configs vs the auto config and a torch fp32 reference (PCC, max abs diff, wall)
+pytest $T/perf/test_layout_candidates.py -k 1x1          # one device: perf-p1 layout levers (routing mul placement, hot-group forms, copy elision) vs torch fp32
+pytest $T/perf/test_indexed_candidates.py -k 1x1         # one device: perf-p2 scan vs indexed expert block vs torch fp32, traced timing
+SOLAR_OPEN_PERF_PROFILE=1 SOLAR_OPEN_PERF_OUT=/tmp/mb.json python -m tracy -r -p -v -m pytest $T/perf/test_expert_microbench.py -k 1x1   # kernel micro-benchmarks of the expert / attention / norm / router shapes per program config (signposted; never emits a 1-core sparse grid)
+SOLAR_OPEN_PERF_PROFILE=1 SOLAR_OPEN_PERF_OUT=/tmp/fm.json python -m tracy -r -p -v --op-support-count 40000 -m pytest $T/perf/test_full_model_device_perf.py -k b1   # whole-model decode steps with a signpost per step: per-op device time vs dispatch gaps (also -k b32)
 ```
 
 Real weights, layer 0 only (needs shards 1 and 2, or whatever `model.safetensors.index.json` lists for layer 0;
@@ -139,6 +207,9 @@ input = real embeddings of the KO/EN prompts):
 
 ```bash
 pytest models/demos/solar_open/tests/test_layer0_real_weights.py -k 1x8
+SOLAR_OPEN_STREAMING_LOAD=1 pytest models/demos/solar_open/tests/test_layer0_real_weights.py -k 1x8   # same, layer 0 read through the streaming loader
+SOLAR_OPEN_FUSE_SHARED_EXPERT=1 pytest models/demos/solar_open/tests/test_layer0_real_weights.py -k 1x8   # same, shared expert fused as slot 128
+timeout 1800 pytest models/demos/solar_open/tests/test_streaming_loader_device.py -k 1x8   # 2-layer streamed build into a temp cache: tensorbins byte-identical to the phase-1 cache, RSS < 40 GB
 ```
 
 Full model (all 42 shards; the first cold run per cache variant loads 205 GB on host and writes the ttnn cache):
@@ -149,7 +220,10 @@ pytest $D -k "prefill_128 and 1x8 and not prefill_128_en and not prefill_128k"  
    # -k is a substring match over the whole node id: plain "prefill_128" also selects prefill_128_en and prefill_128k,
    # and "not en" deselects EVERYTHING because the function name test_solar_op*en*_demo contains "en".
 pytest $D -k "prefill_128_en and 1x8"     # batch 1, first English prompt
-pytest $D -k "batch32 and 1x8"            # 32 users x 8K context: 16 Korean + 16 English prompts, traced decode + prefill@128
+pytest $D -k "batch32 and 1x8 and not 16k and not 32k"   # 32 users x 8K context: 16 Korean + 16 English prompts, traced decode + prefill@128
+pytest $D -k "batch32_16k and 1x8"        # 32 users x 2-15K-token Frankenstein clips + KO/EN questions, 16K pool (6.38 GiB, default budget), 256 fixed decode steps
+SOLAR_OPEN_KV_BUDGET_GIB=13 pytest $D -k "batch32_32k and 1x8"   # 32 x 4-31K tokens, 32K pool (12.75 GiB): SKIPS without the env or SOLAR_OPEN_EXPERT_DTYPE=bfp4
+pytest $D -k "prefill_64k and 1x8"        # single user, 64K prefill (1024 blocks); records the 64K TTFT and the transient DRAM peak
 pytest $D -k "sampling_b1 and 1x8"        # temperature 0.8 / top_p 0.95 / top_k 32 on-device sampling
 pytest $D -k "reasoning_high and 1x8"     # reasoning_effort=high with a 2048-token budget (think block + answer)
 pytest $D -k "prefill_1k and 1x8"         # ... prefill_4k, prefill_8k, prefill_16k, prefill_32k, prefill_64k, seqlen-sweep
@@ -170,6 +244,18 @@ pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "b32 and
 longer continuation; the date is pinned (the chat template stamps `strftime_now` into the system prompt) so the token
 ids are reproducible, and the test asserts that `ModelArgs.encode_prompt` with the same template kwargs yields the
 reference's ids before it runs.
+
+Thermal gate for the long cases (`batch32_16k`, `batch32_32k`, `prefill_64k`, `seqlen-sweep`): the devices run at full
+compute for 3-8 minutes (32 sequential 2-31K-token prefills, or one 64K prefill). Read `tt-smi -s` before starting and
+wait until every ASIC is below 60 C for a perf measurement (80 C is the bare functional gate; board 1 is the hottest:
+65-76 C after earlier long runs), read it again between the compile pass and the timed prefill, and never start one
+right after a cold cache build (75.8 C measured). Measured 2026-09-07 on the final tree: `batch32_16k` started at
+66-75 C plateaued at 123.8 ms/step with the step oscillating 94-131 ms once board 1 passed ~80 C (throttling); the same
+binary started below 58 C ran 79.7 ms/step for ~200 iterations (TTFT 4562 vs 6263 ms/user) and only its last 50 steps
+rose to 98-110 ms as the board reached 84 C. The 8K `batch32` case is not thermally limited (cool / warm runs identical). The demo
+logs a reminder for these cases. Record per case: the KV guard line, DRAM after load / prefill / decode (largest free
+block), TTFT per user, decode ms/step at iterations 2-22 and at the plateau, tok/s, temperatures before/after and the
+32 answers (they must be about the excerpt the user read, in the question's language).
 
 Every demo output is logged as `ANSWER` (text after `<|content|>`, cut at `<|end|>`), `REASONING` (the `<|think|>`
 block) and `TOKENS` (prompt length, generated count, stop token vs budget); per-device DRAM / trace-region usage is
@@ -196,15 +282,98 @@ vs 25 of 32 with bfp8; it puts `<|content|>` above `<|think|>` at the first toke
 | item | bfp8 experts | bfp4 experts |
 |---|---|---|
 | routed experts (48 x 255 MiB) | 11.95 GiB | 6.33 GiB |
-| shared experts, attention, router, lm_head, RoPE tables | 0.09 + 0.45 + 0.05 + 0.13 + 0.125 GiB | same |
+| shared experts, attention, router, lm_head, RoPE tables | 0.09 + 0.45 + 0.05 + 0.13 + 0.125 GiB (with `SOLAR_OPEN_FUSE_SHARED_EXPERT=1` the 0.09 GiB shared row folds into the routed row as slot 128: 12.04 GiB, total unchanged; init transient <= 180 MiB per layer for the fused copy) | same |
 | embedding (bf16, replicated) | 1.5 GiB | 1.5 GiB |
 | fixed total | 14.3 GiB | 8.7 GiB |
-| paged KV (bfp8, 13,056 B/token) | 32 x 8K = 3.19 GiB, 32 x 16K = 6.38 GiB, 32 x 32K = 12.75 GiB, 1 x 128K = 1.59 GiB | |
+| paged KV (bfp8, 13,056 B/token) | 32 x 8K = 3.19 GiB, 32 x 16K = 6.38 GiB, 32 x 32K = 12.75 GiB, 1 x 64K = 0.80 GiB, 1 x 128K = 1.59 GiB | same |
+| measured 2026-09-07: DRAM after load / free after the 32 x 8K pool + 512 decode steps | 14.44 GiB / 14.15 GiB free, i.e. 17.34 GiB for KV + activations | 8.81 GiB / 19.77 GiB free (22.96 GiB) |
+| KV budget default / hard cap (`SOLAR_OPEN_KV_BUDGET_GIB`, `tt/common.py`) | 8 GiB (657,920 tokens = 32 x 20.5K) / 14.5 GiB (1,192,448 tokens) | 14 GiB (1,151,360 = 32 x 36K) / 20 GiB (1,644,800) |
+| DRAM left for activations with a 32 x 16K / 32 x 32K pool | 10.9 GiB / 4.55 GiB (32 x 32K needs `SOLAR_OPEN_KV_BUDGET_GIB=13`) | 16.6 GiB / 10.2 GiB |
 
-Phase-1 defaults: batch 32 x 8K context; the KV budget guard (`SOLAR_OPEN_KV_BUDGET_GIB`) refuses larger pools
-until the DRAM headroom has been measured.
+Phase-2 defaults (design_misc.md (b)): the KV budget guard admits 32 x 16K with bfp8 experts and 32 x 32K with bfp4
+by default; the bfp8 32 x 32K pool needs `SOLAR_OPEN_KV_BUDGET_GIB=13`. The hard cap = DRAM (31.74 GiB) - weights -
+2.8 GiB reserve for long-prefill activations, program binaries and the trace region; the env override is clamped to
+it. The reserve is an estimate (a 64K single-user prefill holds ~1.5-2.5 GiB of transients: a bf16 `[64K, 4096]`
+activation is 512 MiB, the `ttnn.all_reduce` composite ~0.6 GiB, RoPE slices and binaries ~0.25 GiB) until the
+`prefill_64k` case has recorded the peak. `tt/common.py::kv_budget_tokens` turns the budget into whole 64-token blocks
+(the max-tokens-all-users figure a serving layer needs). Batch-32 decode at a full 32K context reads the whole 12.75 GiB
+pool every step: expect ~140-160 ms/step (~115-125 at 16K) against the 92 ms plateau at 8K.
 
-## Known limitations (phase 1)
+## Serving with vLLM (untested here)
+
+vLLM is NOT installed in the bring-up venv (`python -c "import vllm"` -> `ModuleNotFoundError`), so everything in
+this section is code plus a host-only smoke test; nothing has run against a live vLLM server or the TT plugin.
+Treat every statement about the vLLM side as a hypothesis to verify on a machine with the
+[TT vLLM plugin](https://github.com/tenstorrent/vllm/tree/dev/plugins/vllm-tt-plugin).
+
+- Wrapper: `SolarOpenForCausalLM` in `models/tt_transformers/tt/generator_vllm.py` (additive, next to the other
+  text-model wrappers, subclass of `HybridAttentionForCausalLM`). Registry key = `hf_config.architectures[0]` =
+  `SolarOpenForCausalLM` (`configs/Solar-Open-100B/config.json`); the plugin's `model_registry.py` line (out of
+  tree) is `"SolarOpenForCausalLM": ("models.tt_transformers.tt.generator_vllm", "SolarOpenForCausalLM")`. The
+  Solar-specific logic is in `tt/vllm_support.py`, importable and unit-tested without vllm.
+- `initialize_vllm_model(hf_config, mesh_device, max_batch_size, max_seq_len, n_layers, tt_data_parallel,
+  optimizations)` refuses anything but the 1x8 mesh, `tt_data_parallel=1`, `max_batch_size <= 32`
+  (`--max-num-seqs`), `max_seq_len <= 131072` (`--max-model-len`), `optimizations=None` and a model name other
+  than `Solar-Open-100B` BEFORE the host load, then calls `create_tt_model(create_kv_cache=False, dtype=bfp8,
+  moe_options=MoEOptions.from_env())`: `HF_MODEL`, `TT_CACHE_PATH`, `MESH_DEVICE=P150x8` and the `SOLAR_OPEN_*`
+  flags must be exported for the server process (`source env.sh`); a cold cache does the 393 GB host load.
+- KV cache: `get_kv_cache_spec` emits 48 `FullAttentionSpec` entries (`model.layers.<i>.self_attn`; SolarOpenConfig
+  has no `layer_types`, so the base class' lookup cannot be used), i.e. one KV group. `allocate_kv_cache((max_num_blocks,
+  kv_heads, block_size, 128), dtype, num_layers)` re-runs `check_kv_budget` (`create_tt_model` skipped it) and
+  zero-fills replicated bfp8 pools with `ttnn.from_torch` like `attention/kv_cache.py` - deliberately not
+  `allocate_vllm_kv_cache`, whose `as_tensor(cache_file_name=...)` would write ~27 GB of zero tensorbins per pool
+  shape. `kv_heads` is the per-device 1 (the TT worker divides the 8 KV heads by TP); an undivided 8 is accepted.
+  Use `--block-size 64` (the demo's page block; any multiple of 32 passes the guard).
+- `get_max_tokens_all_users()` = `kv_budget_tokens(MoEOptions.from_env())` from `tt/common.py`: the KV budget
+  (`SOLAR_OPEN_KV_BUDGET_GIB` or its per-expert-dtype default) divided by 13,056 B per token per device in whole
+  64-token blocks - 8 GiB -> 657,920 tokens (32 users x 20.5K), 13 GiB -> 1,069,120, 14 GiB -> 1,151,360. The pool
+  vLLM allocates from this figure is what `allocate_kv_cache` then checks against the same budget.
+- `model_capabilities`: `supports_prefix_caching False` (a nonzero `start_pos` is unvalidated), `supports_async_decode
+  True`, `supports_sample_on_device True`, `max_device_top_k 32` (`TTSampling.max_top_k`). `prefill_forward` /
+  `decode_forward` take `Generator`'s legacy single-`page_table` path (with one KV group the plugin's per-layer
+  tables are copies of it; `page_tables_per_layer` is accepted and ignored).
+- Stop ids: vLLM stops on `generation_config.json`'s `eos_token_id` `[2, 24, 25]` itself (`--generation-config auto`,
+  the default); the wrapper exposes `stop_token_ids` (= `ModelArgs.stop_token_ids`) for parity checks only and never
+  truncates generations. `<|end|>` (21) closes a message without ending the turn and is not a stop id.
+- Chat template (`chat_template.jinja`): kwargs `reasoning_effort` (default `high`; `low` / `minimal` prepend an
+  empty `<|think|><|end|>` block), `default_system_prompt` (default true, dated through the `strftime_now` Jinja
+  global) and `think_render_option` (`lastthink`). Per request: `"chat_template_kwargs": {"reasoning_effort": "low"}`
+  in the OpenAI request body (or the server-wide default-chat-template-kwargs option where the installed vLLM has
+  it); `vllm_support.chat_template_kwargs()` returns the demo's effective values (env `SOLAR_OPEN_REASONING_EFFORT`
+  / `SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT` applied). The demo's `low` is a demo choice, not a wrapper default.
+- Reasoning / tool parsers: the HF repo ships `solar_open_reasoning_parser.py` (`SolarOpenReasoningParser`:
+  reasoning between `<|think|>` and `<|end|>`, content after `<|content|>` / `<|tool_calls|>`, `is_reasoning_end`
+  recognises the empty think block of `low`) and `solar_open_tool_parser.py` (`SolarOpenToolParser`, needs
+  `pyjson5`) WITHOUT register decorators - Upstage's fork `UpstageAI/vllm@v0.12.0-solar-open` registers them
+  internally (`--reasoning-parser solar_open --tool-call-parser solar_open`). On a stock vLLM + TT plugin build use
+  the in-tree plugin file, which registers both under `solar_open`
+  (`vllm_support.register_vllm_parsers()`; `HF_MODEL` must be the snapshot directory):
+
+  ```bash
+  P=models/demos/solar_open/vllm_plugins/solar_open_parsers.py
+  vllm serve upstage/Solar-Open-100B --max-num-seqs 32 --max-model-len 8192 --block-size 64 \
+      --reasoning-parser-plugin $P --reasoning-parser solar_open \
+      --tool-parser-plugin $P --tool-call-parser solar_open --enable-auto-tool-choice   # UNTESTED
+  ```
+
+  The two request logits processors of the HF README (`SolarOpenTemplateLogitsProcessor`,
+  `ParallelToolCallLogitsProcessor`, token ids 20-25 / 30-34) run on host logits and are incompatible with on-device
+  sampling; requests that need them must take the host-sampling path (plugin behaviour, unverified).
+- Open items to verify on the vLLM side, in this order: (1) decode batches arrive padded to `max_num_seqs` with
+  position -1 in the unused slots (`Model.ttnn_decode_forward` raises unless the batch equals
+  `max_local_batch_size`); (2) `prefill_forward` returns pre-sampled argmax tokens when `sampling_params` is given
+  (`tt/model.py::process_output_prefill`) - correct for greedy, sampled first tokens must come from host sampling;
+  (3) the `kv_cache_shape` head count and `block_size` the plugin passes; (4) warmup (`warmup_model_prefill`, traced
+  prefill at 128 only on P150x8) and trace-region use (100 MB, `models/model_trace_region_sizes.yaml`); (5) the
+  effective `--max-model-len` x `--max-num-seqs` against the 8 GiB default budget (32 x 16K fits;
+  `SOLAR_OPEN_KV_BUDGET_GIB=13` or `SOLAR_OPEN_EXPERT_DTYPE=bfp4` for 32 x 32K).
+- Host smoke test (no device, vllm optional): `pytest models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py`
+  checks `vllm_support` with mocks (token capacity vs the budget, the 48-entry KV spec, request validation, the
+  `from_torch` allocator and its budget refusal, stop ids, template kwargs, the plugin file) and parses
+  `generator_vllm.py` to keep the wrapper's capabilities / method set / signature in sync; the cases that import the
+  wrapper class run only where vllm is importable (skipped here).
+
+## Known limitations
 
 - Batch <= 32 users (single mesh row); row-sharded multi-row meshes are not part of this tree.
 - Single-user prefill is capped at 64K tokens on the 1x8 mesh (the 128K cases skip); `max_position_embeddings`
@@ -214,23 +383,113 @@ until the DRAM headroom has been measured.
 - The trace region size (100 MB, `models/model_trace_region_sizes.yaml`) is inherited from the source demo's
   bh_loudbox entry; measured usage is 23.6 MiB (prefill@128 trace + batch-1 decode trace) / 25.6 MiB (batch-32 decode)
   of the 93.1 MiB region, so it suffices with ~3.6x headroom.
-- Whole-model host load on every cold cache build (streaming loader is phase 2).
+- Cold cache builds default to the whole-model host load (393 GB peak RSS). The phase-2 streaming loader
+  (`SOLAR_OPEN_STREAMING_LOAD=1`, section "Streaming loader") is host-validated bit-exact on layer 0 / embed / norm /
+  lm_head and its 2-layer device smoke build is byte-identical to the phase-1 cache (8.8 GB peak RSS), but the full
+  48-layer cold cache build has not been run through it yet, so it is opt-in until that run is byte-identical.
 - The router prebuilds its per-token-count helper tensors (the `[T, 128]` bias copy the fused top-k op needs and
   the bf16 zeros the scatter starts from) for `T` in {decode batch, 32, 128} and keeps them for every `T <= 128`
   it meets; longer prefill lengths rebuild them per call (two device ops, freed after the scatter) and must not be
   traced (only 128 is a traced prefill length on P150x8).
-- `create_tt_model` refuses KV pools above `SOLAR_OPEN_KV_BUDGET_GIB` (paged and unpaged alike). Measured on the
-  full model (2026-09-07): 14.44 GiB of weights per device, 17.57 GiB with the batch-32 x 8K pool (3.19 GiB), 14.15 GiB
-  still free after a 512-step batch-32 decode, i.e. room for 32 x 32K (12.75 GiB) with ~1.4 GiB spare; the default
-  16 GiB budget stays until the activation peak of a 64K prefill has been measured.
+- `create_tt_model` refuses KV pools above `SOLAR_OPEN_KV_BUDGET_GIB` (paged and unpaged alike; the demo skips such
+  cases before loading anything). Measured on the full model (2026-09-07): 14.44 GiB of weights per device, 17.57 GiB
+  with the batch-32 x 8K pool (3.19 GiB), 14.15 GiB still free after a 512-step batch-32 decode, i.e. 17.34 GiB for
+  KV + activations: 32 x 16K leaves 10.9 GiB, 32 x 32K leaves 4.55 GiB (an earlier note said ~1.4 GiB; it
+  double-counted the 8K pool that was still allocated when the 14.15 GiB were measured). Defaults 8 / 14 GiB, hard
+  caps 14.5 / 20 GiB (bfp8 / bfp4 experts); the 2.8 GiB activation reserve behind the caps is unmeasured until the
+  `prefill_64k` case has run.
+- lm_head padding: `compute_per_device_vocab(196608, 8)` rounds the 24,576-column per-device shard up to the next
+  power of two (32,768; padded vocab 262,144) because `ttnn.topk`'s multi-core path needs a power-of-two width, so
+  devices 6 and 7 hold only zero columns (6 x 32,768 = 196,608) and every device runs the same `[32, 4096] x
+  [4096, 32768]` decode matmul (~0.1 ms/step; 0.133 GiB of bfp8 weight instead of 0.100). A 6-way split is not
+  possible (one shape per mesh tensor, the 8-device sampling gather and TTSampling's `padded // 8` offset stride); an
+  exact 8 x 24,576 split is representable and this tree's `ttnn.topk` would route the non-power-of-two width to the
+  Blackhole-only `topk_large_indices` kernel, but it needs a new cache stem, changes the sampler's tie order and buys
+  ~33 MiB per device and < 0.1 ms per step, so it stays documented only (design_misc.md (c)); revisit if a profile
+  shows lm_head + sampling above ~1 ms/step.
 - The expert-sorted prefill MoE path passes TILE tables to `ttnn.embedding` (two untilize copies per 1024-token
   split) and caches a `[split, split]` bf16 identity per layer (2 MiB at 1024; ~120 MiB per device over 48 layers
   after a long prefill); a module-level ROW_MAJOR identity is a phase-2 cleanup.
 - Decode batch sizes must map onto one core per user on a single rectangle of at most 8x8 cores for
   `nlp_concat_heads_decode` (any batch <= 8, multiples of 8, powers of two up to 32); `Model.__init__` raises for
   others (11, 13, 17, 19, 22, 23, 26, 29, 31) before any weight is loaded.
+- The shared-expert fusion (`SOLAR_OPEN_FUSE_SHARED_EXPERT=1`) needs EP=1 (129 slots do not split over EP groups),
+  `n_shared_experts == 1` and a tile-aligned per-device shared intermediate (160 at TP=8); a single-user decode step
+  then runs the batched union-of-experts path, NOT the indexed path of `SOLAR_OPEN_INDEXED_DECODE` (the indexed and
+  single-user scan paths have no contract for always-on slots), so fused batch-1 decode is slower than the unfused
+  default (see the fusion row of "Recorded baselines"). With `SOLAR_OPEN_SHARED_EXPERT_DTYPE=bf16` the fused slot is
+  quantised to the routed expert dtype on device (the bf16 option is ineffective in fused mode; logged once).
+
+## Streaming loader (phase 2, `SOLAR_OPEN_STREAMING_LOAD=1`)
+
+`utils/streaming_loader.py::LazyStateDict` (DESIGN 4.16) replaces the whole-model `from_pretrained` on cold cache
+builds. It is a `Mapping` over the 42 safetensors shards that presents exactly the 627 contract-C1 keys (3 + 48 x 13):
+the 384 per-expert tensors of a layer are collapsed into the virtual `mlp.experts.gate_up_proj [128, 2560, 4096]`
+(gate rows first) and `mlp.experts.down_proj [128, 4096, 1280]`, assembled straight into one preallocated buffer with
+`os.preadv` reads sorted by file offset on 4 threads (no mmap: `safe_open.get_tensor` leaves file-backed pages mapped);
+`q_proj` / `k_proj` are Meta-permuted on access (`load_checkpoints.reverse_permute`, the rule of
+`convert_hf_qkv_to_meta_format`); the router bias stays fp32; fp32 stragglers get the phase-1 safety-net cast.
+`substate()` returns lazy prefix views (two `hasattr` hooks in `utils/substate.py`), so `Model`, `DecoderLayer` and every
+weight consumer walk it unchanged, reading each tensor exactly once and freeing it when their constructor returns.
+The loader keeps no tensor: its "one-layer LRU" is a window of <= 2 open shard fds plus an asynchronous
+`posix_fadvise(WILLNEED)` prefetch of the next layer's byte ranges (embed -> layers -> norm/lm_head);
+`close()` releases the fds (idempotent, a later access reopens). `ModelArgs.load_state_dict` validates the C1 layout
+from the shard headers only (`meta()`) and returns the loader without the dict rebuild. `==` is identity, `pickle` /
+`deepcopy` raise, and `items()` / `values()` / `nn.Module.load_state_dict(lazy)` would materialise the whole checkpoint
+(the HF reference generators keep the phase-1 path).
+
+```bash
+# opt-in cold build (the warm-cache decision is unchanged: with a complete marker no loader is constructed)
+SOLAR_OPEN_STREAMING_LOAD=1 pytest models/demos/solar_open/demo/text_demo.py -k "prefill_128 and 1x8 and not prefill_128_en and not prefill_128k"
+pytest models/demos/solar_open/tests/unit/test_streaming_loader.py   # host only: synthetic checkpoint + real layer 0 vs phase 1
+```
+
+Host validation (2026-09-07, `tests/unit/test_streaming_loader.py`): the synthetic 3-shard checkpoint (Part A, 11
+tests) is bit-exact against `torch.stack` / `torch.cat` fusion + `convert_hf_qkv_to_meta_format` + the safety-net cast,
+including the consumer walk through `prepare_expert_weights_torch` and `load_attention_weights`; on the real checkpoint
+(Part B) the 16 tensors of layer 0 + embedding + final norm + lm_head are sha256-identical to
+`AutoModelForCausalLM.from_pretrained(dtype=bf16, num_hidden_layers=1)` + Meta permute run in a subprocess (8.3 s,
+10.5 GB peak; hashes cached in `$TT_CACHE_PATH/streaming_loader_reference_layer0.json`,
+`SOLAR_OPEN_REGEN_LOADER_REFERENCE=1` regenerates) and to the raw per-expert shards (`gate_up_proj[e, :1280]` == disk
+gate of expert e, bias sample / min / max / 10 distinct values, `permute(reverse_permute(q)) == q`); the lazy path read
+7.43 GB in 398 preads (13.2 s from a cold page cache, 0.36 s / 0.19 s for the two fused tensors from a warm one) with a
+peak RSS of 3.1 GB. Device smoke (2026-09-07, `tests/test_streaming_loader_device.py -k 1x8`, PASSED): a streamed
+2-layer build into a temporary cache took 31.6 s (11.6 GB in 793 preads, 4 fused builds, 0 repeat reads), `ru_maxrss`
+0.68 -> 8.80 GB, its 25 tensorbins (6.73 GiB) byte-identical to the phase-1 cache (0 differ, 0 missing) and a decode step
+through the 2-layer model ran; `tests/test_layer0_real_weights.py` with `SOLAR_OPEN_STREAMING_LOAD=1` passes with the same
+PCCs as the phase-1 load. Still pending: the full 48-layer cold build (expected ~610-630 s vs 662 s: the ~12 s/layer bfp8
+pack dominates, the disk read hides under the prefetch). The default stays the whole-model load until that cache is
+byte-identical; `tt/common.py` does not yet call `state_dict.close()` after the build (the fds close when the loader is
+garbage-collected).
 
 ## Recorded baselines (fill in during bring-up, design D13)
+
+Phase 1 (commit df800791d50) vs the final phase-2 tree (perf levers A-C, perf-p1 layout levers, perf-p2 indexed
+decode, perf-p0 program configs a-e; same box, warm cache, bfp8 experts, `reasoning_effort=low`, greedy). Phase-2
+numbers are the gate-p0 stage's runs of 2026-09-07 16:15-17:33 (`scratchpad/gate_p0/`), the phase-1 numbers the rows
+below. Demo `b1` = `prefill_128` (78-token KO prompt, 4K paged context, traced prefill@128 + traced decode), `b32` =
+`batch32` (32 KO/EN prompts, 8K paged context, 512-token budget; plateau = iterations 25-60).
+
+| metric | phase 1 | phase 2 final | note |
+|---|---:|---:|---|
+| b1 decode ms/step (tok/s/user) | 54.4 (18.4) | **17.97-18.15 (55.1-55.4)** | two runs (fp32-dst / final bf16-dst qkv), plateau 18.0 both, iterations 2-22 17.6-18.0; = 48 x the traced layer (0.377-0.379 ms) within 1 % |
+| b1 TTFT@128 ms | 186 | **153.6-155.0** | traced prefill@128 (dense-down, shared, router and qkv configs all inside the trace) |
+| b32 decode ms/step avg / plateau (tok/s aggregate) | 92.1 / 93.8 (347) | **62.1-62.7 / 63.1 (508)** | iterations 2-22 74.0 -> 53.8; last-50 80.1 -> 61.5-61.8; three runs 62.14 / 62.45 / 62.67 (cool and warm box identical) |
+| b32 TTFT ms/user | 184 | **149.6** | 32 sequential traced prefills |
+| prefill_1k TTFT ms | 520 | **413** (runs 609 / 413 / 619) | eager, host-load sensitive; pre-p0 same-day runs 488 / 614 |
+| prefill_8k TTFT ms | 4047 | **3190** (runs 3190 / 3903 / 3199) | eager 1024-token sorted-MoE splits; decode at 7.5K context 56.1 -> 19.3-19.4 ms/step |
+| batch32_16k (32 x 2-15K tokens, 16K pool) | not run | TTFT **4562** ms/user, decode **81.1** ms/step avg, plateau 79.7 (402 tok/s), last-50 86.4 | from a cool box (< 58 C); started at 66-75 C the same binary measured 6263 / 123.6 (plateau 123.8) and the pre-p0 tree 7561 / 110.95 -- board 1 reaches 84 C during the run and throttles, see the long-context row |
+| batch32_32k / prefill_64k | not run | 163.84 ms/step, TTFT 17662 ms/user / TTFT 51950 ms, decode 43.98 ms/step | measured on the pre-p0 phase-2 tree (2026-09-07 15:37-15:48, `SOLAR_OPEN_KV_BUDGET_GIB=13` for 32K); not re-run after the p0 merge |
+| per-layer traced replay ms (real layer 0) decode b1 / b32 | 1.152 / 1.911 | **0.376-0.379 / 1.30-1.33** | `tests/perf/test_layer0_device_perf.py`, 5 runs; b1 on the indexed path; -67 % / -31 % |
+| per-layer eager ms prefill 128 / 1024 | ~4.5 / - | 3.94-3.97 / 8.8-9.6 | host-load sensitive |
+| DRAM per device after load / with the b32 8K pool / 16K pool | 14.436 / 17.572 / - GiB | 14.436 / 17.572 / 20.760 GiB | unchanged weights; 14.147 GiB free after 512 b32 steps, 10.838 GiB free after 256 16K steps |
+| teacher-forced b1 top-1 / decisive / top-5 / top-64 PCC / full PCC / KL | 0.9297 / 0.9779 / 0.9281 / 0.98177 / 0.99215 / 0.0347 | 0.9258 / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.0300 | floors 0.90 (0.85 per prompt) / 0.94 / 0.90 / 0.96 / 0.97 / 0.06; per prompt 0.9375 / 0.9219 / 0.9375 / 0.9062; TF decode 59.8-63.1 -> 26.5 ms/step (final default: bf16-dst qkv; with the fp32-dst variant 0.9219 / 0.9558 / 0.9086 / 0.97922 / 0.99056 / 0.0333) |
+| teacher-forced b32 (same metrics) | 0.9180 / 0.9602 / 0.9227 / 0.98222 / 0.99219 / 0.0324 | 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.0312 | per prompt 0.9062 / 0.8906 / 0.9844 / 0.9375; TF decode 74.0 -> 49.0 ms/step (fp32-dst variant 0.9258 / 0.9646 / 0.9164 / 0.98038 / 0.99123 / 0.0311) |
+| decoder component PCC decode b1 / b32 / b16, prefill 128 / 1024 / 4096 (random weights, pos0) | 0.99325 / 0.99637 / 0.99644, 0.99618 / 0.99561 / 0.99658 | 0.99349 / 0.99729 / 0.99713, 0.99603 / 0.99561 / 0.99658 | paged == unpaged; with the fp32-dst qkv variant 0.99341 / 0.99680 / 0.99704 (pos70000 0.99332 / 0.99701 / 0.99684, 0.99611 / 0.99568 / 0.99657) |
+| real-weight layer 0 decoder PCC b1 / b32 / 128 / 1024 | 0.99844 / 0.99876 / 0.99997 / 0.99982 (after lever A) | 0.99871 / 0.99886 / 0.99997 / 0.99996 | mlp 0.99980 / 0.99966 / 0.99985 / 0.99988; router flips 0/1, 1/32, 2/128, 6/1024 (0 decisive) in both; fp32-dst qkv variant 0.99855 / 0.99891 |
+
+Numerics of the phase-2 tree are PCC- but not bit-equivalent to phase 1 (single-K-block expert gate|up, indexed
+single-user path, 1D configs); every component, real-weight and teacher-forced floor holds, see the rows below.
 
 2026-09-07, review fixes (all rows below were re-measured afterwards): (1) the residual stream, the embeddings and the
 lm_head logits are bf16 (they were bfp8 -- the source demo's in-place residual add into the bfp8 branch output and
@@ -350,3 +609,14 @@ dtype (`THRESHOLDS["bfp4"]`: 0.87 / 0.84 / 0.92 / 0.87 / 0.95 / 0.96 / KL <= 0.1
 | test_teacher_forced | b32 (8K context, prompt p in slots p, p+4, ...) | PASSED (52 s pytest warm): top-1 0.9180 (235/256; per prompt 0.906 / 0.922 / 0.938 / 0.906), decisive-step top-1 0.9602 (217/226), top-5 0.9227, top-64 PCC 0.98222, full-vocab PCC 0.99219, KL 0.0324 / max 0.435; 21 flips = reference rank 1-2, margins 0-0.875; slot copies vs first slot: logit PCC min 0.99995, 1792/1792 identical top-1 and greedy tokens; teacher-forced decode 74.0 ms/step; temps 47-55 -> 56-65 C | 2026-09-07 |
 | test_teacher_forced with `SOLAR_OPEN_EXPERT_DTYPE=bfp4` (same reference) | b1 / b32 | FAIL against the bfp8 floors, PASS against `THRESHOLDS["bfp4"]`: top-1 0.9062 (232/256; per prompt 0.859 / 0.906 / 0.922 / 0.938) / 0.8945 (229/256), decisive-step top-1 0.9425 / 0.9425, top-5 0.8977 / 0.8906, top-64 PCC 0.97061 / 0.97154 (per-step min 0.60 / 0.64), full-vocab PCC 0.98747 / 0.98755, KL 0.0694 / 0.0681 (max 2.87 at step 0 of the desert prompt: bfp4 `<\|content\|>` 37.25 vs `<\|think\|>` 34.25 where bf16 has 34.5 vs 38.25); all 4 first tokens flip to `<\|content\|>`, the later steps agree 90-94 %; bfp8-vs-bfp4 device logits PCC 0.990, top-1 0.934, KL 0.04-0.06; slot copies 0.99994 / 1792/1792; decode 60.3 / 74.3 ms/step (no gain) | 2026-09-07 |
 | text_demo with `SOLAR_OPEN_EXPERT_DTYPE=bfp4`: cold `prefill_128`, warm `batch32` | cache build, perf, behaviour | cold: HF load 28 s + ttnn cache build ~515 s (model + KV ready 549 s, 559 s pytest), peak process RSS 362 GB, cache 58 GB / 531 tensorbins; DRAM 8.811 GiB after load (bfp8 14.436; -5.63 GiB = the routed experts), 11.947 GiB with the 32 x 8K KV pool (19.79 GiB free); b1: TTFT 175 ms, decode 54.11 ms/step (bfp8 186 / 54.4), 33-token direct answer "대한민국의 수도는 **서울특별시**입니다. ..."; b32: TTFT 172 ms, decode 90.64 ms/step = 353 tok/s (bfp8 92.1 / 347), 3 of 32 think blocks (bfp8 25), 32/32 reach `<\|content\|>`, 30/32 stop within 512 tokens (bfp8 19), mean 155 generated tokens, all answers coherent and correct incl. the desert prompt ("Antarctic Desert ... 14.2 million square kilometers"); temps up to 75.8 C (board 1) after the cold build | 2026-09-07 |
+| phase-2 expert program configs (profile-driven, `tt/expert_configs.py`: gate\|up sparse_matmul `decode_gate_up_in0_block_w` 32 -> 128 (one K block), down sparse_matmul `decode_down_subblock_w` 1 -> 4 on the 8x4 single-user grid and new `decode_down_batched_subblock_w` = 2 on the 8x8 batched grid; `tt/experts/prefill.py` sorted-MoE cost-model constants re-measured for H=4096 / Ip=160: `_SORTED_FIXED_MS, _SORTED_PER_KROW_MS, _HOT_FIXED_MS, _HOT_PER_EXPERT_MS` 2.5, 0.27, 1.0, 0.25 -> 0.5, 0.23, 0.3, 0.25 and `_DENSE_PER_EXPERT_MS` 0.125 -> 0.15). Measured lever by lever in an isolated worktree at HEAD (the other phase-2 implementers were editing the shared checkout); details, per-iteration series and logs in `scratchpad/phase2/perf_log.md` | b1 / b32 demos, prefill_1k / prefill_8k, component tests, real-weight layer 0, teacher-forced accuracy | **before -> after** (same box, same day): b1 decode 54.27 -> 52.82 ms/step (18.4 -> 18.9 tok/s; gate\|up K-block neutral -0.03, down subblock -1.4), TTFT@128 unchanged (186-192 ms, traced dense path); b32 decode avg 92.66 -> 83.17 ms/step, plateau (iterations 25-60) 93.8 -> 83.6 ms, iterations 2-22 83.3 -> 76.5, 345 -> 385 tok/s aggregate (gate\|up K-block -5.8 ms plateau, down subblock -4.4), TTFT 183 ms/user unchanged; prefill_1k TTFT 524.8 -> 506.8 ms (constants: more layers plan cap 160/192 with fewer hot experts); prefill_8k TTFT old-constant runs 4360 / 4326 / 4339 ms vs new-constant runs 4305 / 3801 / 4267 / 4086 ms (faster in every alternating pair, -55 to -253 ms; the eager 8K path varies by up to 500 ms run to run under the concurrent host load, the morning's quiet-box value was 4047). Per-layer traced replay (tests/perf/test_layer0_device_perf.py, real layer 0): decode b1 1.152 -> 1.110 ms, b32 (union 71) 1.911 -> 1.721 ms. Numerics: the single K block accumulates the whole K = 4096 in the destination registers instead of spilling three partials, so it is NOT bit-identical to phase 1 -- experts component PCC decode b1/b32/b16 0.99887/0.99892/0.99890 -> 0.99800/0.99821/0.99812 (prefill unchanged 0.99938/0.99937/0.99937; the subblock width is bit-identical), MLP 0.99828/0.99811/0.99808, decoder 0.99313/0.99628/0.99636 (from 0.99325/0.99637/0.99644; prefill 0.99618/0.99561/0.99658 identical; paged bit-identical to unpaged; 12 passed), real layer 0 mlp 0.99975/0.99970/0.99987/0.99987 and decoder 0.99844/0.99876/0.99997/0.99982 (8 passed); teacher-forced b1 top-1 0.9453 (was 0.9297), decisive 0.9779 (same), top-5 0.9148 (0.9281), top-64 PCC 0.98180, full-vocab PCC 0.99174 (0.99215), KL 0.0316 (0.0347); b32 top-1 0.9180 (same), decisive 0.9513 (0.9602; floor 0.94), top-5 0.9227, top-64 PCC 0.98119, full-vocab PCC 0.99150 (0.99219), KL 0.0338 (0.0324); slot copies 1792/1792; teacher-forced decode 57.4 / 69.2 ms/step (was 59.8-63.1 / 74.0) -- every floor holds, nothing re-baselined. Not adopted: `dense_grid_max_width` (10 vs 11 wide identical), `dense_bmm_max_tokens` 512 (dense costs 2x the sorted per-token cost). Validated but NOT wired (their call sites are outside the perf-tuning files): `ProgramConfig.get_dense_down_config` (8x8, in0_block_w = Kt) for the dense prefill down bmm, -0.5 ms per layer per 128-token split (auto 0.43/1.18/1.75 -> 0.34/0.70/1.15 ms wall at S 32/128/256, PCC vs fp32 at the bfp8 floor) -> ~-24 ms TTFT@128 once `experts/prefill.py::_dense_tail` and the sorted cold down pass it; attention decode qkv (8,5) in0_block_w 16 (60 -> 20 us kernel; PCC vs fp32 0.99994 -> 0.99983, prefer in0_block_w 8 or fp32 dst accumulation); the o_proj candidate (8,8) pcn2 shows no gain on the width-sharded concat_heads input (56 -> 64 us wall) and is dropped. `attention/config.py::_build_matmul_config` fixed to emit legal 1D configs (out_block = per-core block, fuse_batch=True, divisibility checks); `experts/config.py::_build_matmul_config` refuses single-core sparse grids (a 1x1 mcast_in0 grid hangs the device) | 2026-09-07 |
+| perf-p1 layout levers of the expert paths (PCC-equivalent; `tt/experts/decode.py` `ROUTING_WEIGHTS_ON_DOWN_INPUT`: the batched decode multiplies the routing weights into the down INPUT `[1, E, 32, 160]` instead of the down OUTPUT `[1, E, 32, 4096]`; `tt/experts/prefill.py` `HOT_EXPERTS_PER_EXPERT_LINEAR`: the sorted-MoE hot group runs one `ttnn.linear` per hot expert over the whole split instead of `ttnn.repeat` x n_hot + a batched matmul (the K-concatenated down `HOT_DOWN_KCONCAT` was implemented, measured slower than bmm + fast_reduce_nc -- 2.75 vs 2.42 ms per 15-hot 1K split -- and stays off); `ELIDE_ROUTING_COPIES`: the expert-major `[E, S, 1]` routing copy is built per split on demand for the dense-bmm / per-expert-loop splits only (sorted splits never read it), the cold index reaches `ttnn.embedding` as a `[E, cap]` view instead of a `[1, E*cap]` row-major copy and the hot routing rows are tile-transposed instead of reshape-copied; hot cost-model constants re-derived `_HOT_FIXED_MS, _HOT_PER_EXPERT_MS` 0.3, 0.25 -> 0.4, 0.135 from the measured 0.39 + 0.136 x n_hot ms fit). Each lever is a module constant (A/B by sed); one-device numerics + timing vs torch fp32 in `tests/perf/test_layout_candidates.py`, host checks in `tests/unit/test_p1_layout.py`; details and logs in `scratchpad/phase2/perf_log.md` (section perf-p1) | component tests (experts / mlp / decoder decode b1/b32/b16 and prefill 128/1024/4096), skewed routing, real-weight layer 0, teacher-forced b1 + b32, demos b32 / prefill_1k / prefill_8k, per-layer traced perf | **before -> after** (main tree, same box, 2026-09-07 13:00-13:47): per-layer traced replay (real layer 0) decode b32 (union 71) 1.737 -> 1.671 ms blocking / 1.684 -> 1.637 non-blocking, b1 unchanged 1.107; prefill_1024 eager 10.7-11.3 -> 10.1-10.6 ms per layer; b32 demo avg 83.17 -> **81.23 ms/step**, plateau (iterations 25-60) 83.6 -> **81.7**, last-50 83.2 -> 80.1, TTFT 182.6 ms/user unchanged; prefill_1k TTFT (eager, host-load sensitive) same-session OFF 596.3 -> ON 521.9 / 440.1 ms (perf-lane quiet-box OFF value 506.8 -> best-of 440.1, -13 %); prefill_8k TTFT OFF 4344.8 / 4374.3 -> ON 3320.1 / 3997.7 ms (alternating pairs, -1025 / -377 ms; best-of -24 %). Numerics: experts / MLP / decoder component PCCs IDENTICAL to the row above (decode 0.99800 / 0.99818 / 0.99809 experts, 0.99828 / 0.99811 / 0.99808 MLP, 0.99313 / 0.99628 / 0.99636 decoder; prefill 0.99938 / 0.99937 / 0.99937, 0.99899 / 0.99903 / 0.99916, 0.99618 / 0.99561 / 0.99658), skewed routing 0.99932 / 0.99945 -> 0.99937 / 0.99946, real layer 0 mlp 0.99975 / 0.99969 / 0.99987 / 0.99988 and decoder identical (8 passed); one-device candidates vs fp32: routing-on-input PCC 0.999807 -> 0.999815, hot group (4 / 8 / 15 hot) 0.99944 -> 0.99954, index / routing-row layouts bit-identical; teacher-forced b1 BIT-IDENTICAL to the row above (top-1 0.9453, decisive 0.9779, full PCC 0.99174, KL 0.0316), b32 top-1 0.9180 -> **0.9375** (240/256), decisive 0.9513 -> **0.9602** (floor 0.94), top-5 0.9227 -> 0.9148, top-64 PCC 0.98119 -> 0.98082, full-vocab PCC 0.99150 -> 0.99165, KL 0.0338 -> 0.0355 (floor 0.06), per-prompt 0.922 / 0.953 / 0.953 / 0.922, slot copies 1792/1792 -- every floor holds. Also fixed on the way: `demo/text_demo.py` read `paged_attention` before its assignment (the phase-2 KV-budget pre-check), which made EVERY demo case fail at collection-time setup in the shared tree (the assignment now precedes the check) | 2026-09-07 |
+| perf-p2 indexed/gather single-user expert path (profile lever 1; `MoEOptions.indexed_decode`, env `SOLAR_OPEN_INDEXED_DECODE` default 1, cache-neutral): `tt/topk.py::TopKRouter.route_indexed` returns the fused op's top-8 uint16 ids (one untilize) and bf16 weights (a view) as an `experts.IndexedRouting` without the dense scatter; `tt/experts/decode.py::_decode_forward_indexed` runs gate\|up and down as `ttnn.sparse_matmul(indices=...)` (compact `[1, 8, 1, *]` outputs, `is_input_a_sparse` down on the compact A, `fast_reduce_nc` over the 8 slots, shared partial + single all_reduce unchanged; `nnz` never passed; the cached `[1, 1, 1, E]` prefill ones serve as the required-but-unread `sparsity`); `tt/mlp.py::MLP.route` is the single dispatch point (indexed only for ONE token with the fused router, EP=1 and the unfused shared expert). Routing weights multiply the compact bfp8 GLU rows (`INDEXED_WEIGHTS_ON_DOWN_INPUT = True`; False = the scan path's order on the compact down output, retained as the A/B variant). New tests: `tests/unit/test_p2_indexed.py` (host, 24), `tests/perf/test_indexed_candidates.py` (1x1), `test_router.py::test_router_route_indexed`, `test_model[decode_b1_s1]`; details and logs in `scratchpad/phase2/perf_log.md` (section perf-p2) | router, experts / mlp / decoder decode_b1 unpaged + paged, shared-expert hook, real-weight layer 0, test_model, teacher-forced b1, b1 demo (traced), per-layer traced perf, one-device candidates vs torch fp32 | **before -> after** (main tree, same box, 2026-09-07 14:15-14:38): b1 demo **52.83 -> 35.77 ms/step** (plateau 53.0 -> 36.0, TTFT@128 187-192 ms unchanged; 18.9 -> 28.0 tok/s), per-layer traced replay (real layer 0) decode b1 **1.109 -> 0.760 ms** blocking / 1.080 -> 0.731 non-blocking (-31 %), eager 2.96 -> 2.58 ms; traced expert block alone (1x1, random bfp8 weights) 0.477 -> 0.133 ms. Numerics: PCC vs torch fp32 of the expert block 0.998220 (scan) vs 0.998177 (indexed; output-side mul 0.998213); indexed vs scan PCC 0.99980, max diff one bfp8 ulp (no bit-equivalent indexed form exists: the 8-slot reduction alone moves ~18 % of the elements by half an ulp); component PCCs experts / MLP / decoder decode_b1 0.99800 / 0.99828 / 0.99314 (scan 0.99800 / 0.99828 / 0.99313), paged == unpaged; real layer 0 mlp 0.99974 / decoder 0.99843 (scan 0.99975 / 0.99844); test_model decode_b1_s1 0.99921; hook b1 zeros stub exact, shift 8.1028 / 8.0; teacher-forced b1 top-1 0.9453 -> **0.9336** (239/256), decisive 0.9779 -> **0.9558** (floor 0.94), top-5 0.9148 -> 0.9180, top-64 PCC 0.98180 -> 0.97945, full-vocab PCC 0.99174 -> 0.99071, KL 0.0316 -> 0.0355 (floor 0.06), per prompt 0.9375 / 0.9375 / 0.9531 / 0.9062 -- every floor holds; the output-side mul variant lands at 0.9258 / 0.9646 / 0.99142 / 0.0346 with the same component PCCs, +3-5 us per layer and 36.7 ms/step. Batched (b32) decode and prefill are untouched (dense routing). router test 26 passed | 2026-09-07 |
+| perf-p0 program-config levers (profile section 6, levers 2-5 + the dense prefill down config), implemented and gated in an isolated git worktree of the same HEAD (removed after the merge) while perf-p1 / perf-p2 changed the main tree's expert paths: (a) shared expert `ttnn.linear` configs ((5,1) grid, in0_block_w 32 for gate/up; (8,8) pcn2 for the down; auto above 128 rows), (b) width-sharded 8x4 decode `rms_norm`, (c) router linear (4,1) config with fp32 accumulation, (d) decode qkv (8,5) in0_block_w 16 with HiFi2 restated (ttnn drops a bf16 x bfp8 matmul to LoFi as soon as a program config is passed without a compute config -- `matmul_device_operation.cpp::create_matmul_attributes`), (e) dense prefill down 1D 8x8 in0_block_w 5 (`ProgramConfig.dense_down_cores`; the main tree's `experts/prefill.py` already carries the inert call-site helpers) | per-lever unit tests + `tests/perf/test_layer0_device_perf.py` on the worktree (scan path, no perf-p1/p2 levers), one-device numerics vs torch fp32 (`tests/perf/test_config_candidates.py`) | Worktree measurements (MERGED into the main tree by the merge-p0 stage and re-gated there by the gate-p0 stage, see the next rows; the worktree was removed afterwards). Worktree ladder, traced replay ms per layer (real layer 0): all off 1.111 (b1) / 1.721 (b32 union 71) -> a 0.946 / 1.638 -> a+c 0.862 / 1.480 -> a+c+d 0.833 / 1.457 -> a+c+d+e 0.820 / 1.438; prefill_128 eager 4.43 -> 3.88 ms per layer with e (~-26 ms TTFT@128); lever b FAILED its unit test (`test_decoder --test-modules=rms_norm decode_b32`: `TT_FATAL tensor_spec.cpp !shard_grid_fit_error`, the [32, 128] width shards do not fit the 8x4 grid spec) and was switched off. Numerics (PCC vs torch fp32, auto -> candidate): dense down 0.999959 -> 0.999953 (wall 0.44 / 1.19 / 1.89 -> 0.35 / 0.69 / 1.13 ms at S 32 / 128 / 256), qkv bw16 without a compute config (LoFi) 0.999936 -> 0.999828, bw16 HiFi2 0.999862, bw8 HiFi2 0.999927, bw16 HiFi2 + fp32 dst 0.999994 (all 0.081-0.088 vs 0.125 ms), shared gate at M=1 0.999272 -> 0.999734 (0.127 -> 0.049 ms), o_proj identical and slower (dropped). Expected on the main tree once merged: b1 ~36 -> ~28-30 ms/step, b32 ~82 -> ~69-71, TTFT@128 -26 ms. Details: `scratchpad/phase2/perf_log.md` (sections perf-p0 / final) | 2026-09-07 |
+| merge-p0: perf-p0 levers a, b, c, d, e ported hunk-by-hunk into the main tree on top of perf-p1 / perf-p2 (`tt/linear_configs.py` new; `tt/shared_expert.py` `shared_expert_program_configs` + `program_configs=` switch; `tt/topk.py` `router_linear_program_config` wired into `_select` (both `__call__` and `route_indexed` take it); `tt/attention/config.py` `decode_qkv_fp32_dest_acc` + `get_decode_qkv_compute_config`; `tt/attention_configs.py` `decode_qkv_cores=(8, 5)`, `in0_block_w=16`, `decode_qkv_fp32_dest_acc=True` (switched back to False by the gate-p0 stage after the whole-model A/B); `tt/attention/decode.py` qkv matmul with the explicit program AND compute config; `tt/expert_configs.py` `dense_down_cores=(8, 8)` (the call sites already carried the helpers); `tt/rms_norm.py` width-sharded 8x4 decode norm, `DECODE_NORM_GRID=(8, 4)`, `sharded_decode=` switch). Every wired matmul config passes an explicit compute config (HiFi2, no approx, packer_l1_acc; fp32 dst for qkv; the router's HiFi4 / fp32-acc config unchanged) because ttnn drops a program-config matmul to LoFi otherwise. Lever b root cause: the worktree gated the sharded path on `x.shape[-2] <= 32`; the rms_norm component test feeds the HF-shaped `[32, 1, 4096]` decode input whose 32 one-row batches pad to 32 tile rows (physical height 1024), so the `[32, 128]` width shard could not cover it (`TT_FATAL tensor_spec.cpp !shard_grid_fit_error`). Fixed with `decode_norm_applies`: the sharded kernel runs only for interleaved bf16 tensors whose TILE-PADDED shape is exactly one tile row of `hidden` columns (the model's decode inputs `[1, 1, T <= 32, 4096]`); everything else keeps the default kernel. Host tests `tests/unit/test_p0_program_configs.py` (39), `tests/perf/test_config_candidates.py` extended with the `RMSNorm` module gate check | py_compile + import gate; host: test_p0_program_configs, test_model_config, test_expert_parallel_config, test_p1_layout, test_p2_indexed, test_attention_precision_option (151 passed), test_fused_shared_expert -k host (7 passed); one device (1x1): `tests/perf/test_config_candidates.py -k 1x1` PASSED (PCC vs torch fp32, auto -> wired) | dense down 0.999959 -> 0.999953 (S 32 / 128 / 256 wall 0.43 / 1.18 / 1.76 -> 0.34 / 0.68 / 1.16 ms); qkv (8,5) bw16 HiFi2 + fp32 dst 0.999936 -> **0.999994** (wall 0.105 -> 0.070 ms; bw16 LoFi 0.999828 / 0.061, bw16 HiFi2 0.999862 / 0.068, bw8 HiFi2 0.999927 / 0.087); shared gate M = 1 / 32 / 128 0.99927 / 0.99919 / 0.99917 -> 0.99973 / 0.99969 / 0.99968 (0.119 / 0.117 / 0.115 -> 0.038 / 0.037 / 0.061 ms), shared down 0.999984 -> 0.999979 (0.042 -> 0.034 ms); router M = 1 / 32 / 128 BIT-IDENTICAL to auto (0.117 / 0.117 / 0.121 -> 0.038 / 0.040 / 0.064 ms); rms_norm config M = 1 0.9999963 -> 0.9999948, M = 32 0.9999626 -> 0.9999935 (eager wall 0.078 -> 0.078 / 0.086 -> 0.123 ms: three launches instead of one, the 57 -> 7 us kernel gain shows in the traced decode only); `RMSNorm` module on `[1,1,1,H]` / `[1,1,32,H]` / `[1,1,16,H]` sharded (PCC vs fp32 0.9999953 / 0.9999936 / 0.9999933 vs default 0.9999945 / 0.9999578 / 0.9999822, max abs err 0.023 / 0.053 / 0.034 vs 0.105 / 0.197 / 0.141), `[32,1,H]` / `[1,32,1,H]` / `[1,1,128,H]` on the default kernel (bit-identical to `sharded_decode=False`), no TT_FATAL. Gated on the main tree by the gate-p0 stage (next row) | 2026-09-07 |
+| gate-p0: full 1x8 gate of the merged tree (levers a-e ON; `scratchpad/gate_p0/`, `perf_log.md` section gate-p0) | per-layer traced perf + A/B of the two perf-decided levers; test_router, test_shared_expert, test_decoder all 7 components pos0 + pos70000 paged + unpaged, hook, skewed routing, real-weight layer 0, test_model, teacher-forced b1 + b32, demos b1 / b32 / prefill_1k x3 / prefill_8k x3 / batch32_16k (hot and cool box), fused test | **All levers KEPT.** Per-layer traced replay (real layer 0, blocking mean): decode b1 0.758 -> **0.376-0.379** ms (lever b OFF 0.471; qkv fp32 dst OFF 0.378), b32 1.676 -> **1.30-1.33** (b OFF 1.389; fp32 dst OFF 1.318), prefill_128 eager 4.4-4.5 -> 3.94-3.97, prefill_1024 9.3-10.1 -> 8.8-9.6 -> lever b kept (-0.09 ms/layer traced despite 2 reshard launches per norm); the qkv fp32 destination (equal time) was measured on the whole model afterwards and switched OFF (below). Components (pre-merge in brackets): shared decode 0.99931 / 0.99920 / 0.99921 [0.99843 / 0.99820 / 0.99819], prefill_128 0.99917 [0.99965] (the 1D config at exactly 128 rows lands at the 1-32-row level; vs torch fp32 it is the closer one, gate M=128 0.99917 -> 0.99968), attention decode 0.99930 / 0.99919 / 0.99920 [0.99923 / 0.99907 / 0.99909], mlp decode 0.99894 / 0.99812 / 0.99896 [0.99814 / 0.99732 / 0.99812], decoder decode 0.99341 / 0.99680 / 0.99704 [0.99314 / 0.99628 / 0.99636], prefill 0.99603 / 0.99561 / 0.99658 [0.99618 / = / =]; router, experts, rms_norm unchanged; test_shared_expert bfp8 T=1/32/128 0.99915 / 0.99913 / 0.99915 [0.99794 / 0.99802 / 0.99966]; real layer 0 mlp 0.99980 / 0.99966 / 0.99985 / 0.99988, decoder 0.99855 / 0.99891 / 0.99997 / 0.99996 (all >= before); test_model prefill_b1_s128 0.99052 [0.99189] (lever a at 128 rows), decode_b32_s1 0.99920 [0.99903], decode_b1_s1 0.99769 [0.99921] -- the latter is an interaction of the sharded decode norm with the fp32-DESTINATION qkv accumulation in the 0.02-std random 1-layer model (lever b OFF 0.99950, lever d OFF 0.99939, fp32 dst OFF with b and d ON 0.99935). Teacher-forced with fp32 dst ON (floors hold): b1 top-1 0.9336 -> 0.9219, decisive 0.9558 (=), top-5 0.9180 -> 0.9086, top-64 PCC 0.97945 -> 0.97922, full 0.99071 -> 0.99056, KL 0.0355 -> 0.0333, TF decode 45.3 -> **26.2** ms/step; b32 0.9375 -> 0.9258, decisive 0.9602 -> 0.9646, top-5 0.9148 -> 0.9164, 0.98082 -> 0.98038, 0.99165 -> 0.99123, KL 0.0355 -> 0.0311, 69.8 -> **48.7** ms/step. Teacher-forced A/B with the bf16 destination (`scratchpad/gate_p0/tf/b1_fp32off`, `b32_fp32off`): b1 **0.9258 / 0.9558 / 0.9234 / 0.98089 / 0.99162 / KL 0.0300** (26.5 ms/step), b32 **0.9297 / 0.9690 / 0.9211** / 0.97969 / 0.99064 / 0.0312 (49.0) -- better-or-equal on 10 of 12 metrics at identical traced time and without the test_model interaction -> `decode_qkv_fp32_dest_acc = False` is the final default (True = A/B switch); re-gated with the flipped default (all rc=0, `scratchpad/gate_p0/h_*.log`): attention component decode 0.99893 / 0.99890 / 0.99887 (the one gate that prefers the fp32 destination: 0.99930 / 0.99919 / 0.99920; auto 0.99923 / 0.99907 / 0.99909), prefill =; decoder component decode **0.99349 / 0.99729 / 0.99713**, prefill =; test_model 0.99052 / 0.99902 / **0.99935**; per-layer traced 0.379 / 1.319 ms; demos b1 18.15 ms/step (TTFT 155), b32 62.67 (plateau 63.1, TTFT 150); real layer 0 decoder **0.99871** / 0.99886 / 0.99997 / 0.99996, mlp 0.99980 / 0.99966 / 0.99985 / 0.99988 -- everything downstream of the attention op is better-or-equal with the bf16 destination. Demos: b1 36.45 -> **17.97 ms/step** (TTFT 193 -> 154), b32 81.21 -> **62.14** (plateau 81.9 -> 63.1, 391 -> 508 tok/s; TTFT 184 -> 150), prefill_1k best-of-3 488 -> 413 ms, prefill_8k 3273 -> 3190 ms, batch32_16k from a cool box TTFT 7561 -> 4562 ms/user and 110.95 -> 81.06 ms/step (hot-box run 123.6: throttling). `test_fused_shared_expert` re-baselined: `FUSED_VS_UNFUSED_PCC` 0.999 -> 0.998 (the unfused MLP moved closer to HF, 0.99822 -> 0.99896 at decode b1; the fused slot is unchanged at 0.99827) and the launch count is checked against the unfused block per sorted split (a 4096-token prefill's 4 splits have different hot counts) | 2026-09-07 |
+| text_demo `batch32_16k` / `batch32_32k` / `prefill_64k` (phase 2, design_misc.md (b): 32 distinct 2-15K / 4-31K-token clips + KO/EN questions; 8192 / 16384 / 1024 page blocks) | KV pool allocation under the new budgets, TTFT per user, decode ms/step (iterations 2-22 and plateau) at long contexts, DRAM after load / prefill / decode, 64K transient peak, answer sanity | MEASURED (2026-09-07, warm cache, `scratchpad/phase2/final/d_b32_16k.log`, `d_p64k.log`, `d_b32_32k.log` on the pre-p0 phase-2 tree; `scratchpad/gate_p0/d_b32_16k*.log` on the final tree). `batch32_16k` (pre-p0 tree, started at 67-77 C): TTFT 7561 ms/user, decode 110.95 ms/step avg (iterations 2-22 98.2, plateau 101.0, last-50 121.0), DRAM 20.760 GiB after load (16K pool 6.32 GiB), 20.879 after the prefills, 20.882 after 256 steps, largest free block 10.838 GiB; final tree from a cool box (every ASIC < 58 C): TTFT **4562** ms/user, **81.06** ms/step avg (iterations 2-22 76.9, plateau 79.7 = 402 tok/s, last-50 86.4 as board 1 climbs to 84 C), started hot (66-75 C) the same tree measured 6263 / 123.6 (plateau 123.8, steps oscillating 94-131 ms = throttling of the hottest board) -- always cool the box before this case. `prefill_64k` (pre-p0 tree): TTFT 51950 ms, decode 43.98 ms/step at a 64K context, DRAM 15.183 GiB after load (1024-block pool), 15.317 after the prefill, 15.321 after decode, largest free block 16.009 GiB (transient peak inside the 2.8 GiB reserve). `batch32_32k` with `SOLAR_OPEN_KV_BUDGET_GIB=13` (pre-p0 tree): TTFT 17662 ms/user, decode 163.84 ms/step (256 steps), DRAM 27.135 GiB after load (32K pool 12.7 GiB), 27.268 after the prefills, 27.271 after decode, largest free block 4.426 GiB. The bfp4 variants and the 64K / 32K cases on the final tree are not measured | 2026-09-07 |
+| `SOLAR_OPEN_ATTENTION_BF16_OUTPUT=1` (phase 2, design_misc.md (a); skips the o_proj-input and pre-all_reduce bfp8 typecasts) | test_teacher_forced b1/b32 vs the bit-identical phase-1 baselines (b1 top-1 0.9297 / full-vocab PCC 0.99215 / KL 0.0347; b32 0.9180 / 0.99219 / 0.0324), demo `prefill_128` + `batch32` step times (54.4 / 92.1 ms) | **MEASURED WORSE, root cause open, default stays OFF** (final chain1 2026-09-07 15:19-15:22, `scratchpad/phase2/final/tf/b1_bf16out`, `b32_bf16out`; same reference, same final-tree defaults as the passing rows): b1 top-1 0.9336 -> **0.8828** (per prompt 0.859 / 0.859 / 0.938 / 0.875 vs 0.938 / 0.938 / 0.953 / 0.906), decisive 0.9558 -> 0.9248 (floor 0.94), top-5 0.9180 -> 0.9008, top-64 PCC 0.97945 -> 0.97526, full PCC 0.99071 -> 0.98985, KL 0.0355 -> **0.0654** (floor 0.06; max 0.83), teacher-forced decode 45.3 -> 47.4 ms/step; b32 top-1 0.9375 -> 0.8906, decisive 0.9602 -> 0.9248, KL 0.0355 -> 0.0630, 69.8 -> 74.1 ms/step; demos b1 36.45 -> 37.22, b32 81.21 -> 80.34 ms/step, TTFT unchanged. Both teacher-forced cases FAIL the floors. Host review of the option (merge-p0 stage): in decode the ONLY change is the dtype on the all_reduce wire (o_proj already ran bf16 x bfp8 at HiFi2 with a bf16 output; the bfp8 typecast before the reshape / `ttnn.all_reduce` is skipped), in prefill the o_proj input stays bf16 (HiFi2 instead of the LoFi of two bfp8 operands) and the all_reduce moves to bf16 too; the residual add (`ttnn.add(residual, branch, dtype=bf16)`), the norms, the router and the experts never see the option, and `ttnn.all_reduce` -> `all_reduce_async` picks the reduce_scatter_minimal_async + all_gather_async path independently of the dtype -- so on paper every changed operand is at least as precise and the accuracy loss cannot be explained from the host side. Device component check (merge-p0 stage, `scratchpad/merge_p0/attn_bf16out.log`: `test_decoder --test-modules=attention -k "1x8 and pos0 and unpaged"` with the option ON, random layer-0 weights, same seeds as the default run `final/u_decoder_pos0.log`): 6 passed, every all-reduced output replica-consistent on the 8 devices; attention PCC vs HF ON / default: decode b1 0.99915 / 0.99923, b32 0.99926 / 0.99907, b16 0.99927 / 0.99909, prefill 128 0.99930 / 0.99920, 1024 0.99880 / 0.99871, 4096 0.99856 / 0.99845 -- neutral-or-better in isolation, so the whole-model loss is NOT reproducible at the component level with random weights and needs a real-weight A/B (`tests/test_layer0_real_weights.py` with the env, then a per-layer teacher-forced probe) in the device lane. Candidates left for the device lane: the reduce_scatter / all_gather kernels with bf16 pages of 2 KiB (validated exact on P150x8 only with bfp8 pages), the bf16 dst accumulation order of the 8 partials, and the auto program config the bf16 prefill o_proj gets | 2026-09-07 |
+| `SOLAR_OPEN_FUSE_SHARED_EXPERT=1` (phase-2 fusion row: shared expert as always-on slot 128; `tests/unit/test_fused_shared_expert.py -k 1x8`, random layer-0 weights, final tree) | fused vs unfused MLP, both vs `SolarOpenMoE`, weights / router columns bit-identical, one all_reduce, `ttnn.linear` launch count | PASSED 8/8 on the final tree (2026-09-07 16:52-17:14, `scratchpad/gate_p0/u_fused2.log` + `u_fused3.log`): fused vs unfused PCC decode b1 / b8 / b32 0.99890 / 0.99887 / 0.99889, prefill 128 / 1024 / 4096 0.99903 / 0.99928 / 0.99940 (floor `FUSED_VS_UNFUSED_PCC` 0.998: the phase-1 shared expert measured 0.9993-0.9994 against the fused slot, the perf-p0 1D configs moved the UNFUSED output closer to HF -- decode b1 vs HF 0.99822 -> 0.99896 -- while the fused slot (bfp8 activations, routed compute config) stays at 0.99827, so the two forms now agree at the bfp8-activation floor); vs HF unfused 0.99896 / 0.99898 / 0.99857 / 0.99863 / 0.99915 / 0.99931, fused 0.99827 / 0.99825 / 0.99780 / 0.99894 / 0.99919 / 0.99924 (the fused block is the less accurate one on decode, equal on prefill); fused weights and routed router columns bit-identical, `{'all_reduce': 1}` on both; linears 4 -> 1 (decode, prefill 128), 4 -> 2 (1K: one sorted split, always-on hot linear), 5 -> 6 (4K: 4 sorted splits, one of which also has a routed hot expert -- the expectation is `unfused - 3 x chunks + one always-on linear per sorted split`). Perf / teacher-forced ladder in fused mode NOT measured (single-user decode falls back to the batched union path, so fused b1 is slower than the unfused default): the default stays 0 | 2026-09-07 |
+| test_vllm_wrapper_import (host only, no device, vllm absent) | vllm_support plumbing with mocked ttnn / mesh + AST checks of `SolarOpenForCausalLM` | PASSED: 35 cases, the 4 cases that import the wrapper class skipped (vllm not installed); token capacities 657,920 (8 GiB bfp8 default) / 1,151,360 (14 GiB bfp4) / 1,069,120 (13 GiB); 48 FullAttentionSpec keys; 96 `from_torch` calls for 48 layers; 25.5 GiB pool refused before any allocation. UNTESTED against a live vLLM | 2026-09-07 |
+| test_streaming_loader (host only, no device; `SOLAR_OPEN_STREAMING_LOAD=1` loader) | Part A synthetic 3-shard checkpoint (11 tests) + Part B real layer 0 / embed / norm / lm_head vs `from_pretrained(num_hidden_layers=1)` | PASSED 13/13 (27 s with a cold page cache): 16 real tensors sha256-identical to the phase-1 path; lazy loader 7.43 GB in 398 preads, 2 fused builds, 0 repeat reads, peak RSS 3.1 GB (reference subprocess 10.5 GB peak, 8.3 s); layout validation on the lazy dict reads 0 tensor bytes; before: phase-1 cold build 393 GB peak RSS (device smoke / full cold build pending) | 2026-09-07 |

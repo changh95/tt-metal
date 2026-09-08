@@ -40,6 +40,7 @@ SOLAR_ENV_VARS = (
     "SOLAR_OPEN_SHARED_EXPERT_DTYPE",
     "SOLAR_OPEN_ROUTER_IMPL",
     "SOLAR_OPEN_ROUTER_FP32_LOGITS",
+    "SOLAR_OPEN_FUSE_SHARED_EXPERT",
     "SOLAR_OPEN_REASONING_EFFORT",
     "SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT",
     "SOLAR_OPEN_FORCE_MODEL_LOAD",
@@ -121,6 +122,8 @@ class TestMoEOptions:
         assert opts.shared_expert_dtype == ttnn.bfloat8_b
         assert opts.router_impl == "fused"
         assert opts.router_fp32_logits is True
+        assert opts.fuse_shared_expert is False  # phase 2: off until the fused path is validated
+        assert opts.indexed_decode is True  # phase 2 (perf-p2): indexed single-user expert path, validated
         assert opts.expert_dtype_str == "bfp8"
         assert opts.marker_fields() == DEFAULT_MARKER_MOE
         assert MoEOptions.from_env() == opts
@@ -130,11 +133,15 @@ class TestMoEOptions:
         monkeypatch.setenv("SOLAR_OPEN_SHARED_EXPERT_DTYPE", "bf16")
         monkeypatch.setenv("SOLAR_OPEN_ROUTER_IMPL", "ops")
         monkeypatch.setenv("SOLAR_OPEN_ROUTER_FP32_LOGITS", "0")
+        monkeypatch.setenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "1")
+        monkeypatch.setenv("SOLAR_OPEN_INDEXED_DECODE", "0")
         opts = MoEOptions.from_env()
         assert opts.expert_dtype == ttnn.bfloat4_b
         assert opts.shared_expert_dtype == ttnn.bfloat16
         assert opts.router_impl == "ops"
         assert opts.router_fp32_logits is False
+        assert opts.fuse_shared_expert is True
+        assert opts.indexed_decode is False
         assert opts.expert_dtype_str == "bfp4"
         fields = opts.marker_fields()
         assert fields == {
@@ -144,6 +151,18 @@ class TestMoEOptions:
             "router_fp32_logits": False,
         }
         assert json.loads(json.dumps(fields)) == fields  # survives the .weights_complete JSON round trip
+
+    def test_fuse_shared_expert_is_cache_neutral(self, monkeypatch):
+        """The fused expert tensors are concatenated on device from the cached routed + shared shards, so the flag
+        must change neither the marker fields nor the cache directory (flipping it costs no 393 GB cold load)."""
+        fused, unfused = MoEOptions(fuse_shared_expert=True), MoEOptions()
+        assert fused != unfused and fused.marker_fields() == unfused.marker_fields() == DEFAULT_MARKER_MOE
+        assert "fuse_shared_expert" not in fused.marker_fields()
+        assert fused.expert_dtype_str == unfused.expert_dtype_str  # the only option folded into the directory name
+        monkeypatch.setenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "0")
+        assert MoEOptions.from_env() == unfused
+        monkeypatch.setenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "yes")  # anything but "1" keeps the flag off
+        assert MoEOptions.from_env() == unfused
 
     @pytest.mark.parametrize(
         "var, value",
@@ -399,6 +418,12 @@ class TestWeightCacheMarker:
         self._write_marker(cache, meta)
         assert args.weight_cache_is_complete(dtype)
 
+        # The shared-expert fusion flag is cache-neutral: same directory, and the unfused marker is accepted
+        # (the fused expert tensors are built on device from the cached routed + shared shards).
+        args.moe_options = MoEOptions(fuse_shared_expert=True)
+        assert args.weight_cache_path(dtype) == cache
+        assert args.weight_cache_is_complete(dtype)
+
         # Different expert dtype -> different directory -> cold load
         args.moe_options = MoEOptions(expert_dtype=ttnn.bfloat4_b)
         assert args.weight_cache_path(dtype).name == "tensor_cache_bfp8_expbfp4_(1, 8)"
@@ -503,10 +528,8 @@ class TestLoadStateDict:
         with expect_error(ValueError, "fp32"):
             mc._validate_state_dict_layout(sd)
 
-    def test_streaming_loader_is_phase_2(self, monkeypatch, expect_error):
-        monkeypatch.setenv("SOLAR_OPEN_STREAMING_LOAD", "1")
-        with expect_error(NotImplementedError, r"DESIGN\.md"):
-            ModelArgs.load_state_dict("/ckpt/Solar-Open-100B")
+    # The SOLAR_OPEN_STREAMING_LOAD=1 branch of load_state_dict is covered by
+    # tests/unit/test_streaming_loader.py::TestSyntheticCheckpoint::test_load_state_dict_streaming_branch_returns_the_loader
 
 
 class TestKVBudget:
@@ -517,8 +540,9 @@ class TestKVBudget:
         [
             (4096, 3.1875),  # demo batch32: 32 users x 8K / 64
             (2048, 1.59375),  # demo single user 128K / 64
-            (8192, 6.375),  # 32 x 16K
-            (16384, 12.75),  # 32 x 32K
+            (1024, 0.796875),  # demo prefill_64k: 1 user x 64K / 64
+            (8192, 6.375),  # 32 x 16K (demo batch32_16k)
+            (16384, 12.75),  # 32 x 32K (demo batch32_32k)
         ],
     )
     def test_solar_footprint(self, blocks, expected_gib):
@@ -530,28 +554,82 @@ class TestKVBudget:
         )
 
     def test_budget_defaults_and_override(self, monkeypatch):
-        assert kv_budget_gib(MoEOptions()) == 16.0
-        assert kv_budget_gib(MoEOptions(expert_dtype=ttnn.bfloat4_b)) == 22.0
+        from models.demos.solar_open.tt import common as solar_common
+
+        bfp8, bfp4 = MoEOptions(), MoEOptions(expert_dtype=ttnn.bfloat4_b)
+        # Phase-2 defaults from the measured headroom (design_misc.md (b)): 32 x 16K fits bfp8, 32 x 32K fits bfp4.
+        assert kv_budget_gib(bfp8) == 8.0 == solar_common.KV_BUDGET_GIB_BFP8_EXPERTS
+        assert kv_budget_gib(bfp4) == 14.0 == solar_common.KV_BUDGET_GIB_BFP4_EXPERTS
+        assert solar_common.kv_hard_cap_gib(bfp8) == 14.5 == solar_common.KV_HARD_CAP_GIB_BFP8_EXPERTS
+        assert solar_common.kv_hard_cap_gib(bfp4) == 20.0 == solar_common.KV_HARD_CAP_GIB_BFP4_EXPERTS
+        # The caps leave the 2.8 GiB activation / trace reserve: 31.74 GiB DRAM - 14.44 / 8.81 GiB weights - 2.8.
+        assert 31.74 - 14.44 - 2.8 >= solar_common.kv_hard_cap_gib(bfp8) - 0.05
+        assert 31.74 - 8.81 - 2.8 >= solar_common.kv_hard_cap_gib(bfp4) - 0.05
         monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "9.5")
-        assert kv_budget_gib(MoEOptions()) == 9.5
+        assert kv_budget_gib(bfp8) == 9.5
+        assert kv_budget_gib(bfp4) == 9.5
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "13")  # the documented bfp8 32 x 32K override
+        assert kv_budget_gib(bfp8) == 13.0
+        # The env cannot exceed the hard cap: clamped, not honoured
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "30")
+        assert kv_budget_gib(bfp8) == 14.5
+        assert kv_budget_gib(bfp4) == 20.0
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "14.5")
+        assert kv_budget_gib(bfp8) == 14.5
+
+    def test_budget_tokens(self, monkeypatch):
+        """Token capacity per device in whole 64-token blocks (the serving layer's max-tokens-all-users figure)."""
+        from models.demos.solar_open.tt.common import kv_budget_tokens
+
+        bfp8, bfp4 = MoEOptions(), MoEOptions(expert_dtype=ttnn.bfloat4_b)
+        assert kv_budget_tokens(bfp8) == 657920 == int(8 * 2**30 // 13056) // 64 * 64  # 32 users x 20.5K
+        assert kv_budget_tokens(bfp4) == 1151360  # 32 users x 36K
+        assert kv_budget_tokens(bfp8) % 64 == 0 and kv_budget_tokens(bfp4) % 64 == 0
+        # The default admits 32 x 16K (524,288 positions) with bfp8 and 32 x 32K (1,048,576) with bfp4, but not more
+        assert 32 * 16 * 1024 <= kv_budget_tokens(bfp8) < 32 * 32 * 1024
+        assert 32 * 32 * 1024 <= kv_budget_tokens(bfp4) < 32 * 64 * 1024
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "13")
+        assert kv_budget_tokens(bfp8) == 1069120
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "30")  # clamped to the caps
+        assert kv_budget_tokens(bfp8) == 1192448
+        assert kv_budget_tokens(bfp4) == 1644800
+        # TP=1 keeps all 8 KV heads on the one device: 8x the bytes per token
+        monkeypatch.delenv("SOLAR_OPEN_KV_BUDGET_GIB")
+        assert kv_budget_tokens(bfp8, tensor_parallel=1) == int(8 * 2**30 // (8 * 13056)) // 64 * 64
 
     def test_guard(self, monkeypatch, expect_error):
         bfp8, bfp4 = MoEOptions(), MoEOptions(expert_dtype=ttnn.bfloat4_b)
         ok = PagedAttentionConfig(block_size=64, max_num_blocks=4096)
         assert check_kv_budget(paged_attention_config=ok, moe_options=bfp8, **self.SOLAR) == pytest.approx(3.1875)
-        assert check_kv_budget(
-            paged_attention_config=PagedAttentionConfig(64, 16384), moe_options=bfp8, **self.SOLAR
-        ) == pytest.approx(12.75)
-        borderline = PagedAttentionConfig(block_size=64, max_num_blocks=20480)  # 15.94 GiB: under 22, over 16
+        # 32 x 16K (demo batch32_16k) fits the bfp8 default; 32 x 32K (batch32_32k) needs bfp4 or the env
+        pool_16k = PagedAttentionConfig(block_size=64, max_num_blocks=32 * (16 * 1024 // 64))
+        pool_32k = PagedAttentionConfig(block_size=64, max_num_blocks=32 * (32 * 1024 // 64))
+        assert check_kv_budget(paged_attention_config=pool_16k, moe_options=bfp8, **self.SOLAR) == pytest.approx(6.375)
+        assert check_kv_budget(paged_attention_config=pool_32k, moe_options=bfp4, **self.SOLAR) == pytest.approx(12.75)
+        with expect_error(ValueError, r"needs 12\.75 GiB per device, above the 8\.0 GiB budget for bfp8 experts"):
+            check_kv_budget(paged_attention_config=pool_32k, moe_options=bfp8, **self.SOLAR)
+        with expect_error(ValueError, r"SOLAR_OPEN_KV_BUDGET_GIB \(<= 14\.5\)"):
+            check_kv_budget(paged_attention_config=pool_32k, moe_options=bfp8, **self.SOLAR)
+        # single user 64K (prefill_64k) and 128K fit both defaults
+        check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 1024), moe_options=bfp8, **self.SOLAR)
+        check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 2048), moe_options=bfp8, **self.SOLAR)
+        borderline = PagedAttentionConfig(block_size=64, max_num_blocks=17920)  # 13.94 GiB: under 14 (bfp4), over 8
         check_kv_budget(paged_attention_config=borderline, moe_options=bfp4, **self.SOLAR)
         with expect_error(ValueError, "SOLAR_OPEN_KV_BUDGET_GIB"):
-            check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 32768), moe_options=bfp8, **self.SOLAR)
-        with expect_error(ValueError, "above the 22.0 GiB budget"):
+            check_kv_budget(paged_attention_config=borderline, moe_options=bfp8, **self.SOLAR)
+        with expect_error(ValueError, r"above the 14\.0 GiB budget for bfp4 experts \(hard cap 20\.0 GiB"):
             check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 32768), moe_options=bfp4, **self.SOLAR)
+        # The documented override admits the bfp8 32 x 32K pool ...
+        monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "13")
+        assert check_kv_budget(paged_attention_config=pool_32k, moe_options=bfp8, **self.SOLAR) == pytest.approx(12.75)
+        # ... and an env above the hard cap is clamped to it: 25.5 GiB (64 x 32K) is refused even with 30
         monkeypatch.setenv("SOLAR_OPEN_KV_BUDGET_GIB", "30")
-        assert check_kv_budget(
-            paged_attention_config=PagedAttentionConfig(64, 32768), moe_options=bfp8, **self.SOLAR
-        ) == pytest.approx(25.5)
+        with expect_error(ValueError, r"above the 14\.5 GiB budget for bfp8 experts"):
+            check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 32768), moe_options=bfp8, **self.SOLAR)
+        with expect_error(ValueError, r"above the 20\.0 GiB budget for bfp4 experts \(hard cap 20\.0 GiB"):
+            check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 32768), moe_options=bfp4, **self.SOLAR)
+        # ... while the largest pool the cap admits passes: 14.5 GiB bfp8 = 18,624 blocks (14.48 GiB)
+        check_kv_budget(paged_attention_config=PagedAttentionConfig(64, 18624), moe_options=bfp8, **self.SOLAR)
         # TP=1 keeps all 8 KV heads on the one device
         assert paged_kv_cache_gib(8, 128, 48, ok, tensor_parallel=1) == pytest.approx(8 * 3.1875)
 

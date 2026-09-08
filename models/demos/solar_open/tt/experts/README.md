@@ -42,6 +42,8 @@ experts = Experts(
 
 # Forward: dense [tokens, E] routing weights (0 for unselected experts), optional shared-expert callable
 output = experts(hidden_states, routing_weights, is_decode=True, shared_expert=shared_expert)
+# Single-user decode, indexed/gather form (no dense tensor): the token's top-k ids / weights as an IndexedRouting
+output = experts(hidden_states, is_decode=True, indexed_routing=routing, shared_expert=shared_expert)
 ```
 
 ## Contract
@@ -50,9 +52,20 @@ output = experts(hidden_states, routing_weights, is_decode=True, shared_expert=s
   tile internally). Prefill: `tokens` = seq_len, a multiple of 32, processed in `sequence_chunk_size` chunks.
 * `routing_weights` is the DENSE `[tokens, num_experts]` bf16 TILE tensor from the router: the normalised routing
   weight for the selected experts, 0 elsewhere (the union-of-experts decode mask relies on weights `>= 0`).
-* `shared_expert(x)` (optional) is called once per decode call on the padded input and once per prefill chunk,
-  before the input is deallocated. It must return this device's PARTIAL `[1, 1, rows, hidden]` bf16 tensor; the
-  experts add it in place to their routed partial so the single TP `all_reduce` completes routed + shared.
+  `num_experts` == `config.num_experts` INCLUDING any always-on slots (`weights.num_always_on_experts`, the fused
+  shared expert built by `weights.fuse_always_on_expert`): those trailing columns carry 1.0 for every token.
+* `indexed_routing` (decode with exactly ONE token, mutually exclusive with `routing_weights`) is an `IndexedRouting`:
+  `indices` `[1, 1, 1, k]` uint16 ROW_MAJOR (the selected expert ids on one stick) and `weights` `[1, 1, 1, k]` bf16
+  TILE (their routing weights, same order). The experts then run `ttnn.sparse_matmul(indices=...)` for both
+  projections (only the k experts are visited, compact `[1, k, 1, *]` intermediates, the weights multiply the compact
+  GLU rows before the down projection -- or the compact down outputs after it with
+  `decode.INDEXED_WEIGHTS_ON_DOWN_INPUT = False`, the scan path's order; both differ from the scan path by bfp8 rounding
+  only) -- `decode.py::_decode_forward_indexed`. Not consumed. Requires EP=1 and no always-on slots (`ValueError`). The
+  batched (2..32 users) and prefill paths always take the dense tensor.
+* `shared_expert(x)` (optional, unfused layout only; `ValueError` when the weights carry always-on slots) is called
+  once per decode call on the padded input and once per prefill chunk, before the input is deallocated. It must
+  return this device's PARTIAL `[1, 1, rows, hidden]` bf16 tensor; the experts add it in place to their routed
+  partial so the single TP `all_reduce` completes routed + shared.
 * Output: `[1, 1, tokens, hidden]` bfloat8_b, all-reduced over TP.
 
 ## Weight layout

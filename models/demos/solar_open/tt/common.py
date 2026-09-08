@@ -7,6 +7,8 @@ Solar-Open implementation of create_tt_model, compatible with the tt_transformer
 
 Besides building ModelArgs + Model it owns two bring-up guards: the warm-cache skip of the 205 GB host load and
 the per-device KV DRAM budget check (design D6; paged pool or unpaged caches), which runs before any weight is read.
+The budget constants (defaults and hard caps per expert dtype) and ``kv_budget_tokens`` are the single source of
+truth for how much context the box admits (README "Memory per device").
 """
 
 import os
@@ -20,10 +22,18 @@ from models.tt_transformers.tt.common import PagedAttentionConfig
 
 # The paged KV cache is bfloat8_b (attention/kv_cache.py): 1 mantissa byte + 1/16 byte of shared exponent per element.
 KV_BYTES_PER_ELEMENT = 1.0625
-# Default per-device KV budget (GiB) next to the fixed weights: ~14.3 GiB with bfp8 experts, ~8.7 GiB with bfp4
-# (32 GiB per Blackhole device). Override with SOLAR_OPEN_KV_BUDGET_GIB.
-KV_BUDGET_GIB_BFP8_EXPERTS = 16.0
-KV_BUDGET_GIB_BFP4_EXPERTS = 22.0
+# Per-device KV budget (GiB) next to the fixed weights (31.74 GiB DRAM per Blackhole P150; measured 2026-09-07 on the
+# full model: 14.436 GiB of weights with bfp8 experts / 8.811 GiB with bfp4, the 32 x 8K pool + 512 decode steps left
+# 14.149 / 19.77 GiB free, i.e. 17.34 / 22.96 GiB for KV + activations).
+# - default: admits 32 users x 16K (6.38 GiB) with bfp8 experts and 32 x 32K (12.75 GiB) with bfp4; the bfp8 32 x 32K
+#   pool (4.5 GiB left for activations) needs SOLAR_OPEN_KV_BUDGET_GIB >= 13 (phase 2, design_misc.md (b)).
+# - hard cap: DRAM - weights - 2.8 GiB reserve for long-prefill activations, program binaries and the trace region;
+#   SOLAR_OPEN_KV_BUDGET_GIB is clamped to it (a pool above the cap would OOM on the device after the host load).
+KV_BUDGET_GIB_BFP8_EXPERTS = 8.0
+KV_BUDGET_GIB_BFP4_EXPERTS = 14.0
+KV_HARD_CAP_GIB_BFP8_EXPERTS = 14.5
+KV_HARD_CAP_GIB_BFP4_EXPERTS = 20.0
+KV_BUDGET_ENV = "SOLAR_OPEN_KV_BUDGET_GIB"
 
 
 def paged_kv_cache_gib(num_kv_heads, head_dim, n_layers, paged_attention_config: PagedAttentionConfig, tensor_parallel):
@@ -51,10 +61,59 @@ def unpaged_kv_cache_gib(num_kv_heads, head_dim, n_layers, max_local_batch_size,
     return tokens * 2 * kv_heads_per_device * head_dim * KV_BYTES_PER_ELEMENT * n_layers / 2**30
 
 
+def _experts_are_bfp8(moe_options: MoEOptions) -> bool:
+    return moe_options.expert_dtype == ttnn.bfloat8_b
+
+
+def kv_budget_default_gib(moe_options: MoEOptions) -> float:
+    """Default KV budget per device: 8 GiB with bfp8 experts (32 x 16K fits), 14 GiB with bfp4 (32 x 32K fits)."""
+    return KV_BUDGET_GIB_BFP8_EXPERTS if _experts_are_bfp8(moe_options) else KV_BUDGET_GIB_BFP4_EXPERTS
+
+
+def kv_hard_cap_gib(moe_options: MoEOptions) -> float:
+    """Largest KV pool the env override may ask for: DRAM - weights - 2.8 GiB activation / trace reserve."""
+    return KV_HARD_CAP_GIB_BFP8_EXPERTS if _experts_are_bfp8(moe_options) else KV_HARD_CAP_GIB_BFP4_EXPERTS
+
+
 def kv_budget_gib(moe_options: MoEOptions) -> float:
-    """KV budget in GiB per device: SOLAR_OPEN_KV_BUDGET_GIB if set, else 16 (bfp8 experts) / 22 (bfp4 experts)."""
-    default = KV_BUDGET_GIB_BFP8_EXPERTS if moe_options.expert_dtype == ttnn.bfloat8_b else KV_BUDGET_GIB_BFP4_EXPERTS
-    return float(os.getenv("SOLAR_OPEN_KV_BUDGET_GIB", str(default)))
+    """KV budget in GiB per device: SOLAR_OPEN_KV_BUDGET_GIB (clamped to the hard cap) if set, else the default.
+
+    Defaults 8 (bfp8 experts) / 14 (bfp4 experts) GiB; hard caps 14.5 / 20 GiB. An env value above the cap is
+    clamped with a warning rather than honoured: the cap is what the measured DRAM headroom supports.
+    """
+    default = kv_budget_default_gib(moe_options)
+    cap = kv_hard_cap_gib(moe_options)
+    raw = os.getenv(KV_BUDGET_ENV)
+    if raw is None:
+        return default
+    requested = float(raw)
+    if requested > cap:
+        logger.warning(
+            f"{KV_BUDGET_ENV}={requested:g} GiB exceeds the {cap:g} GiB hard cap for {moe_options.expert_dtype_str} "
+            f"experts (DRAM - weights - 2.8 GiB activation reserve); using {cap:g} GiB."
+        )
+        return cap
+    return requested
+
+
+def kv_budget_tokens(
+    moe_options: MoEOptions,
+    num_kv_heads=8,
+    head_dim=128,
+    n_layers=48,
+    tensor_parallel=8,
+    block_size=64,
+) -> int:
+    """Number of KV positions (over all users) the budget admits per device, rounded down to whole page blocks.
+
+    The single source of truth for a serving layer's max-tokens-all-users figure (design_misc.md (e)): with the
+    Solar-Open-100B shapes at TP=8 (13,056 B per token per device) the 8 GiB bfp8 default is 657,920 tokens
+    (32 users x 20.5K), the 14 GiB bfp4 default 1,151,360, the 14.5 GiB bfp8 cap 1,192,448.
+    """
+    kv_heads_per_device = max(1, num_kv_heads // tensor_parallel)
+    bytes_per_token = 2 * kv_heads_per_device * head_dim * KV_BYTES_PER_ELEMENT * n_layers
+    tokens = int(kv_budget_gib(moe_options) * 2**30 // bytes_per_token)
+    return tokens // block_size * block_size
 
 
 def check_kv_budget(
@@ -94,10 +153,11 @@ def check_kv_budget(
         f"experts {moe_options.expert_dtype_str})"
     )
     if kv_gib > budget:
+        cap = kv_hard_cap_gib(moe_options)
         raise ValueError(
             f"{shape} needs {kv_gib:.2f} GiB per device, above the {budget:.1f} GiB budget for "
-            f"{moe_options.expert_dtype_str} experts. {remedy}, use SOLAR_OPEN_EXPERT_DTYPE=bfp4, or raise "
-            f"SOLAR_OPEN_KV_BUDGET_GIB once DRAM headroom is measured."
+            f"{moe_options.expert_dtype_str} experts (hard cap {cap:.1f} GiB = DRAM - weights - activation reserve). "
+            f"{remedy}, use SOLAR_OPEN_EXPERT_DTYPE=bfp4, or raise {KV_BUDGET_ENV} (<= {cap:.1f})."
         )
     return kv_gib
 

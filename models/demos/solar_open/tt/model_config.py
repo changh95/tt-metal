@@ -8,7 +8,8 @@ Solar-Open-100B ModelArgs, compatible with the tt_transformers Generator / creat
 ModelArgs resolves the checkpoint (HF_MODEL), loads the HuggingFace SolarOpenConfig and tokenizer, owns the MoE flag
 bundle (MoEOptions), the generation stop set ({2, 24, 25} from generation_config.json), the chat-template
 encoding, and the on-disk ttnn weight cache (directory naming + completion marker). load_state_dict is the single
-host weight path (contract C1): whole-model bf16 from_pretrained -> Meta-permuted q/k -> fp32 router bias kept.
+host weight path (contract C1): whole-model bf16 from_pretrained -> Meta-permuted q/k -> fp32 router bias kept, or,
+with SOLAR_OPEN_STREAMING_LOAD=1, the per-layer streaming LazyStateDict that presents the same keys lazily.
 """
 
 import gc
@@ -302,6 +303,12 @@ class ModelArgs:
         keys, so one weight path serves tests and demo. ``mlp.gate.e_score_correction_bias`` is fp32 on disk and
         MUST stay fp32 (the router adds it to fp32 sigmoid scores; |bias| <= 0.01 is below the bf16 ulp near 0.5).
 
+        ``SOLAR_OPEN_STREAMING_LOAD=1`` (phase 2, DESIGN.md 4.16) returns a ``utils.streaming_loader.LazyStateDict``
+        instead: the same contract-C1 keys (fused expert tensors, Meta-permuted q/k, fp32 bias) over the safetensors
+        shards, each tensor read on access and never retained, so a cold cache build peaks at one layer's transients
+        instead of 393 GB. The returned object is a ``Mapping``, ``substate()``-aware, and bit-identical to the
+        phase-1 tensors (tests/unit/test_streaming_loader.py); it must never go through the dict rebuild below.
+
         Args:
             weights_path (str or Path): checkpoint directory, symlink or HF repo id.
             dummy_weights (bool): If True, returns ``{}`` (every module then builds random / cached tensors).
@@ -311,11 +318,24 @@ class ModelArgs:
         if dummy_weights:
             return {}
         if os.getenv("SOLAR_OPEN_STREAMING_LOAD") == "1":
-            # Phase 2: per-layer streaming over the safetensors shards (DESIGN.md 4.16). Raises NotImplementedError
-            # until it lands, so a run never silently changes loaders.
+            # Phase 2: per-layer streaming over the safetensors shards (DESIGN.md 4.16). head_dim / num_experts come
+            # from the HF config (head_dim is an explicit field: hidden_size // num_attention_heads would give 64).
             from models.demos.solar_open.utils.streaming_loader import LazyStateDict
 
-            return LazyStateDict(weights_path, convert_to_meta=convert_to_meta_format)
+            hf_config = AutoConfig.from_pretrained(weights_path, trust_remote_code=True)
+            head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
+            state_dict = LazyStateDict(
+                weights_path,
+                head_dim=head_dim,
+                num_experts=hf_config.num_local_experts,
+                convert_to_meta=convert_to_meta_format,
+            )
+            _validate_state_dict_layout(state_dict)  # metadata only on a LazyStateDict (meta()); no tensor is read
+            logger.info(
+                f"Streaming loader: {len(state_dict)} tensors over {state_dict.num_shards} shards from "
+                f"{state_dict.snapshot_dir}; tensors are read per access (peak host RSS ~ one layer)"
+            )
+            return state_dict
 
         # bf16 straight from disk (the checkpoint is bf16): no fp32 intermediate, and the safety-net cast below is a
         # no-op that rebinds references instead of copying 205 GB. `dtype=` is the transformers 5.x spelling
@@ -460,11 +480,22 @@ class ModelArgs:
         return ttnn.CoreGrid(y=8, x=8)  # Standard grid size
 
 
+def _shape_dtype(state_dict, key):
+    """``(shape, dtype)`` of ``state_dict[key]``: from the headers on a ``LazyStateDict`` (``meta()``, no tensor bytes
+    read - a layer-0 expert tensor is 2.7 GB), from the tensor on a plain dict."""
+    if hasattr(state_dict, "meta"):
+        shape, dtype = state_dict.meta(key)
+        return tuple(shape), dtype
+    tensor = state_dict[key]
+    return tuple(tensor.shape), tensor.dtype
+
+
 def _validate_state_dict_layout(state_dict):
     """Fail loudly, before any device work, if the checkpoint did not arrive in the contract-C1 layout.
 
     The most likely misconfiguration is an older transformers that leaves the 128 per-expert
     ``mlp.experts.{e}.*`` tensors unfused; the TT expert loader would only notice after the mesh is open.
+    Works on a plain dict and on the streaming ``LazyStateDict`` (metadata only, see ``_shape_dtype``).
     """
     layer0 = "model.layers.0."
     required = (
@@ -482,22 +513,22 @@ def _validate_state_dict_layout(state_dict):
             "mlp.experts.{e}.gate_proj/up_proj/down_proj keys need transformers >= 5.12 (solar_open -> qwen2_moe "
             "conversion mapping fuses them to gate_up_proj [E, 2I, H] / down_proj [E, H, I])."
         )
-    gate_up = state_dict[layer0 + "mlp.experts.gate_up_proj"]
-    down = state_dict[layer0 + "mlp.experts.down_proj"]
+    gate_up_shape, _ = _shape_dtype(state_dict, layer0 + "mlp.experts.gate_up_proj")
+    down_shape, _ = _shape_dtype(state_dict, layer0 + "mlp.experts.down_proj")
     if (
-        gate_up.ndim != 3
-        or down.ndim != 3
-        or gate_up.shape[0] != down.shape[0]  # E
-        or gate_up.shape[1] != 2 * down.shape[2]  # 2I vs I
-        or gate_up.shape[2] != down.shape[1]  # H
+        len(gate_up_shape) != 3
+        or len(down_shape) != 3
+        or gate_up_shape[0] != down_shape[0]  # E
+        or gate_up_shape[1] != 2 * down_shape[2]  # 2I vs I
+        or gate_up_shape[2] != down_shape[1]  # H
     ):
         raise ValueError(
-            f"Expected mlp.experts.gate_up_proj [E, 2I, H] and down_proj [E, H, I]; got {tuple(gate_up.shape)} and "
-            f"{tuple(down.shape)}"
+            f"Expected mlp.experts.gate_up_proj [E, 2I, H] and down_proj [E, H, I]; got {gate_up_shape} and "
+            f"{down_shape}"
         )
-    bias = state_dict[layer0 + f"mlp.gate.{ROUTER_BIAS_SUFFIX}"]
-    if bias.dtype != torch.float32:
-        raise ValueError(f"mlp.gate.{ROUTER_BIAS_SUFFIX} must stay fp32 (contract C1), got {bias.dtype}")
+    _, bias_dtype = _shape_dtype(state_dict, layer0 + f"mlp.gate.{ROUTER_BIAS_SUFFIX}")
+    if bias_dtype != torch.float32:
+        raise ValueError(f"mlp.gate.{ROUTER_BIAS_SUFFIX} must stay fp32 (contract C1), got {bias_dtype}")
 
 
 def determine_device_name(mesh_device):

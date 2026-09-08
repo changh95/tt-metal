@@ -11,6 +11,7 @@ from .operations import (
     apply_output_projection_fused_rs,
     apply_qkv_projection,
     apply_rope,
+    attention_bf16_output,
     concat_heads,
     is_shape_fused_mm_rs_supported,
     split_qkv_heads_prefill,
@@ -55,7 +56,9 @@ def prefill_forward(
         ccl_manager: Communication manager
 
     Returns:
-        Attention output [1, 1, batch * seq_len, hidden_size], all-reduced over the TP axis
+        Attention output [1, 1, batch * seq_len, hidden_size], all-reduced over the TP axis (bf16 up to 32K tokens per
+        user, bfloat8_b above). Phase 1 rounds the o_proj input to bfloat8_b; the SOLAR_OPEN_ATTENTION_BF16_OUTPUT
+        option keeps it bf16 (operations.attention_bf16_output).
     """
     activation_dtype = ttnn.bfloat16
     total_seq_len = hidden_states.shape[-2]
@@ -178,7 +181,9 @@ def prefill_forward(
         tt_sdpa_out.deallocate(True)
         tt_out_result = apply_allgather_and_slice(rs_out, mesh_config, ccl_manager, hidden_size)
     else:
-        tt_out = apply_output_projection(tt_sdpa_out, weights, activation_dtype)
+        tt_out = apply_output_projection(
+            tt_sdpa_out, weights, activation_dtype, keep_bf16=attention_bf16_output(program_config)
+        )
         tt_sdpa_out.deallocate(True)
         tt_out_result = apply_allreduce(tt_out, mesh_config, ccl_manager, hidden_size)
     return tt_out_result

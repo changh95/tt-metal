@@ -4,7 +4,7 @@
 import ttnn
 
 from .config import AttentionConfig, ProgramConfig
-from .operations import apply_rope
+from .operations import apply_rope, attention_bf16_output
 from .weights import AttentionWeights
 
 
@@ -45,7 +45,8 @@ def decode_forward(
         ccl_manager: Communication manager
 
     Returns:
-        Attention output [1, 1, batch, hidden_size] bfloat8_b, all-reduced over the TP axis
+        Attention output [1, 1, batch, hidden_size], all-reduced over the TP axis; bfloat8_b by default, bfloat16 with
+        the SOLAR_OPEN_ATTENTION_BF16_OUTPUT option (operations.attention_bf16_output)
     """
     _, seq_len, batch_size, hidden_size = hidden_states.shape
 
@@ -63,12 +64,29 @@ def decode_forward(
     # produced silent corruption (every odd Q/K/V head returned the previous
     # user's row).
     qkv_memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if mesh_config.tp > 1 else ttnn.DRAM_MEMORY_CONFIG
-    xqkv_fused = ttnn.matmul(hidden_states, weights.wqkv, dtype=ttnn.bfloat16, memory_config=qkv_memory_config)
-
-    # Split into Q, K, V heads
     num_local_heads = mesh_config.shard_size(config.num_heads)
     num_local_kv_heads = mesh_config.shard_size(config.num_kv_heads)
     head_dim = config.head_dim
+    # Explicit 1D program config for the width-sharded TP>1 layout (SolarOpenAttentionProgramConfig: (8, 5) cores
+    # x 1 output tile, 60 -> 20 us per layer); None = auto. ttnn drops a bf16 x bfp8 matmul from HiFi2 to LoFi
+    # when a program config is given, so the compute config restates the auto fidelity.
+    qkv_program_config = None
+    qkv_compute_config = None
+    if mesh_config.tp > 1:
+        qkv_n = (num_local_heads + 2 * num_local_kv_heads) * head_dim  # per-device fused N (1280 at TP=8)
+        qkv_program_config = program_config.get_decode_qkv_config(batch_size, qkv_n, hidden_size)
+        if qkv_program_config is not None:
+            qkv_compute_config = program_config.get_decode_qkv_compute_config(mesh_device.arch())
+    xqkv_fused = ttnn.matmul(
+        hidden_states,
+        weights.wqkv,
+        dtype=ttnn.bfloat16,
+        memory_config=qkv_memory_config,
+        program_config=qkv_program_config,
+        compute_kernel_config=qkv_compute_config,
+    )
+
+    # Split into Q, K, V heads
 
     # One user per core on the grid RoPE and SDPA decode expect (see ProgramConfig.get_decode_user_grid).
     # This placement is load-bearing: with a bare L1_HEIGHT_SHARDED_MEMORY_CONFIG the op falls back to
@@ -179,10 +197,13 @@ def decode_forward(
     )
 
     tt_sdpa_out.deallocate(True)
-    # Bias-free: go straight from the width-sharded matmul output to the L1-interleaved bfloat8_b tensor the reshape
-    # and all_reduce below consume (the folded o_proj bias add used to perform this reshard as a side effect).
+    # Bias-free: go straight from the width-sharded matmul output to the L1-interleaved tensor the reshape and
+    # all_reduce below consume (the folded o_proj bias add used to perform this reshard as a side effect). Phase 1
+    # rounds the per-device partial to bfloat8_b before the 8-way sum; the bf16-output option keeps it bf16
+    # (one launch fewer per layer, 256 KiB instead of 136 KiB per device on the all_reduce wire).
     tt_out = ttnn.to_memory_config(tt_out, ttnn.L1_MEMORY_CONFIG)
-    tt_out = ttnn.typecast(tt_out, ttnn.bfloat8_b)
+    if not attention_bf16_output(program_config):
+        tt_out = ttnn.typecast(tt_out, ttnn.bfloat8_b)
 
     # Calculate padded hidden size for tile-aligned CCL operations.
     local_hidden = hidden_size // mesh_config.tp
