@@ -88,8 +88,10 @@ def prefill_forward(
     tt_q, tt_k, tt_v = split_qkv_heads_prefill(xqkv_fused, num_local_heads, num_local_kv_heads)
     xqkv_fused.deallocate(True)
 
-    # Apply RoPE (use per-user seq_len positions)
-    if batch_size > 1:
+    # Apply RoPE (use per-user seq_len positions). A packed multi-user pass (batch_size > 1) needs the S-row cos/sin:
+    # Model.prepare_inputs_prefill already hands those over (cached per S), so the slice below only runs for callers
+    # that still pass the T = B*S-row (or longer) matrices -- it is a device op that allocates per layer per call.
+    if batch_size > 1 and rope_mats[0].shape[2] != seq_len:
         rope_mats_sliced = [rope_mats[0][:, :, :seq_len, :], rope_mats[1][:, :, :seq_len, :]]
     else:
         rope_mats_sliced = rope_mats

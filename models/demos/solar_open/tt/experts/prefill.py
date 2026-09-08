@@ -1,7 +1,19 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prefill forward pass for experts (seq_len>1)."""
+"""Prefill forward pass for experts (seq_len>1).
+
+Trace safety (phase 3a(2), design_traced_prefill.md): on the dense (EP=1) path every split of a prefill chunk takes one
+of the MOE_PATH_* paths chosen by ``moe_prefill_path`` from the split length alone (pure, no device state): the dense
+bmm for splits up to ``dense_bmm_max_tokens`` (the traced 128-token prefill), the host-planned expert-sorted hot/cold
+path for long eager splits (``_sorted_moe_plan`` reads the per-expert token counts back to the host -- never under a
+trace capture, the captured plan would be replayed for other prompts), and the static per-expert loop for long splits
+listed in ``ProgramConfig.trace_safe_split_lens`` (a traced 1K+ bucket's splits; ~2.5x the sorted path's cost, the
+placeholder until a trace-safe sorted plan exists). ``is_trace_safe_prefill_len`` tells ModelArgs which prefill lengths
+may be traced. The path's persistent device helpers (``down_proj_padded``, the one-hot identities of the sorted split
+lengths) are built on the FIRST prefill call of any length (``_ensure_prefill_helpers``), so no persistent allocation
+happens after a trace was captured.
+"""
 
 import os
 
@@ -111,8 +123,8 @@ def _process_prefill_chunk(
     # sparsity would only add pairs. nnz is left to the kernel for the gate/up call -- it must equal
     # count_nonzero exactly when given.
     dense_moe = ep == 1 and dense_core_grid is not None
-    if dense_moe and weights.down_proj_padded is None:
-        _ensure_dense_weights(weights)
+    if dense_moe:
+        _ensure_prefill_helpers(weights, config, program_config)  # idempotent; allocates on the first call only
     group_mask = (
         None if dense_moe else _group_expert_mask(routing_weights, seq_len, config.num_experts)
     )  # [1, S/32, 1, E] row-major
@@ -155,9 +167,17 @@ def _process_prefill_chunk(
 
         if dense_moe:
             hidden_4D = ttnn.unsqueeze_to_4D(hidden_split)  # [1, 1, split, H] (view of the split)
-            bmm_config = _dense_bmm_config(dense_core_grid, split_len, weights, program_config.dense_bmm_max_tokens)
+            # Path selection (moe_prefill_path, pure): the one-launch dense bmm for short splits, the host-planned
+            # sorted hot/cold path for long eager splits, the static per-expert loop for long splits that must stay
+            # trace-safe (program_config.trace_safe_split_lens) or for models with too few experts to sort.
+            path = moe_prefill_path(split_len, program_config, config.num_experts, weights.num_always_on_experts)
+            bmm_config = (
+                _dense_bmm_config(dense_core_grid, split_len, weights, program_config.dense_bmm_max_tokens)
+                if path == MOE_PATH_DENSE_BMM
+                else None
+            )
             plan = None
-            if bmm_config is None:
+            if path == MOE_PATH_HOST_PLANNED:
                 plan = _sorted_moe_plan(
                     routing_tokens_all,
                     token_offset,
@@ -165,7 +185,9 @@ def _process_prefill_chunk(
                     config,
                     program_config.dense_bmm_max_tokens,
                     always_on=weights.num_always_on_experts,
+                    trace_safe_split_lens=program_config.trace_safe_split_lens,
                 )
+            LAST_PREFILL_MOE_PATH.update(split=split_len, path=path, sorted=plan is not None)
             if plan is not None:
                 next_states_reduced = _sorted_moe_forward(
                     hidden_4D,
@@ -182,7 +204,15 @@ def _process_prefill_chunk(
                     routing_split = _expert_major_routing(
                         routing_tokens_all, token_offset, split_len, config.num_experts
                     )
-                gate_up = _dense_gate_up(hidden_4D, bmm_config, weights, config, activation_dtype, dense_core_grid)
+                gate_up = _dense_gate_up(
+                    hidden_4D,
+                    bmm_config,
+                    weights,
+                    config,
+                    activation_dtype,
+                    dense_core_grid,
+                    program_config=program_config,
+                )
                 next_states_reduced = _dense_tail(
                     gate_up,
                     routing_split,
@@ -195,6 +225,7 @@ def _process_prefill_chunk(
                     down_program_config=_dense_down_program_config(program_config, split_len, config.hidden_size, ip),
                 )
         else:
+            LAST_PREFILL_MOE_PATH.update(split=split_len, path=MOE_PATH_SPARSE_EP, sorted=False)
             # Group tokens into tiles: [1, B, split, H] -> [1, G, 32, H]. This reshape is a view of
             # hidden_split, so deallocating hidden_4D below releases the split itself (intended).
             hidden_4D = ttnn.unsqueeze_to_4D(hidden_split)
@@ -306,12 +337,19 @@ def _expert_major_routing(routing_tokens_all, token_offset, split_len, num_exper
     return ttnn.reshape(routing_t, (1, num_experts, split_len, 1))
 
 
-def _dense_gate_up(hidden_4D, bmm_config, weights, config, activation_dtype, dense_core_grid):
+def _dense_gate_up(hidden_4D, bmm_config, weights, config, activation_dtype, dense_core_grid, program_config=None):
     """Fused gate/up projection for a whole split, [1, 1, split, H] -> [1, E, split, 2Ip]. Consumes hidden_4D.
     Short splits (bmm_config given): replicate the activations per expert and run ONE batched matmul (one expert
-    per core; 128 separate launches cost ~30 us each on device, which dominates 128-token prefills). Otherwise one
-    ttnn.linear per expert over the whole split (weight slice taken and freed on demand), concatenated."""
+    per core; 128 separate launches cost ~30 us each on device, which dominates 128-token prefills); with
+    ``program_config.dense_activation_bfp8`` the activation is rounded to bfloat8_b before the replication (half the
+    broadcast bytes, bfp8 in0 for the bmm -- a numerics switch, off by default). Otherwise one linear per expert over
+    the whole split (weight slice taken and freed on demand; ``_expert_linear``: minimal_matmul with
+    ``program_config.dense_expert_gate_up_minimal`` or the auto ttnn.linear), concatenated."""
     if bmm_config is not None:
+        if program_config is not None and program_config.dense_activation_bfp8 and hidden_4D.dtype != ttnn.bfloat8_b:
+            hidden_8 = ttnn.typecast(hidden_4D, ttnn.bfloat8_b)
+            hidden_4D.deallocate(True)
+            hidden_4D = hidden_8
         hidden_rep = ttnn.repeat(hidden_4D, ttnn.Shape((1, config.num_experts, 1, 1)))
         hidden_4D.deallocate(True)
         gate_up = ttnn.matmul(
@@ -325,19 +363,11 @@ def _dense_gate_up(hidden_4D, bmm_config, weights, config, activation_dtype, den
         hidden_rep.deallocate(True)
         return gate_up
     hidden, n = weights.gate_up_proj.shape[2], weights.gate_up_proj.shape[3]
+    gu_config = _dense_expert_gate_up_config(program_config, dense_core_grid, hidden_4D.shape[2], hidden, n)
     per_expert = []
     for e in range(config.num_experts):
         w_e = _expert_slice(weights.gate_up_proj, e, hidden, n)
-        per_expert.append(
-            ttnn.linear(
-                hidden_4D,
-                w_e,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                dtype=activation_dtype,
-                core_grid=dense_core_grid,
-                compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
-            )
-        )
+        per_expert.append(_expert_linear(hidden_4D, w_e, gu_config, dense_core_grid, activation_dtype))
         w_e.deallocate(True)
     hidden_4D.deallocate(True)
     gate_up = ttnn.concat(per_expert, dim=1)
@@ -371,6 +401,59 @@ def _dense_down_matmul(down_input, weights, activation_dtype, dense_core_grid, d
         compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
         **placement,
     )
+
+
+def _dense_expert_gate_up_config(program_config, dense_core_grid, m, k, n):
+    """``ttnn.MinimalMatmulConfig`` of the per-expert fused gate|up linear ``[1, 1, m, k] x [1, 1, k, n]`` of the dense
+    per-expert loop / the sorted hot group (``ProgramConfig.get_dense_expert_gate_up_config`` with the dense grid as
+    the fit check), or None for ``ttnn.linear``'s auto config."""
+    if program_config is None:
+        return None
+    return program_config.get_dense_expert_gate_up_config(m, k, n, grid=dense_core_grid)
+
+
+def _hot_down_kconcat_minimal_config(program_config, dense_core_grid, m, k, n):
+    """``ttnn.MinimalMatmulConfig`` of the hot group's K-concatenated down ``[1, 1, m, k = n_hot * Ip] x [1, 1, k, n]``
+    (``ProgramConfig.get_hot_down_kconcat_config``), or None when the hot down keeps the perf-p1 forms."""
+    if program_config is None:
+        return None
+    return program_config.get_hot_down_kconcat_config(m, k, n, grid=dense_core_grid)
+
+
+def _expert_linear(hidden_4D, w_e, minimal_config, dense_core_grid, activation_dtype):
+    """One expert's fused gate|up over a whole split: ``hidden_4D`` [1, 1, split, K] x ``w_e`` [1, 1, K, N] ->
+    [1, 1, split, N] in ``activation_dtype`` (DRAM). ``ttnn.experimental.minimal_matmul`` with ``minimal_config`` when
+    given (phase 3: 46 vs 81 us per hot expert at 1024 tokens on P150, ``MinimalMatmulBlocking``), else ``ttnn.linear``
+    with ttnn's auto config on ``dense_core_grid`` (a 2D multicast config with in0_block_w 4)."""
+    if minimal_config is not None:
+        return ttnn.experimental.minimal_matmul(
+            hidden_4D,
+            w_e,
+            config=minimal_config,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=activation_dtype,
+            compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
+        )
+    return ttnn.linear(
+        hidden_4D,
+        w_e,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        dtype=activation_dtype,
+        core_grid=dense_core_grid,
+        compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
+    )
+
+
+def _glu(gate, up, config, dtype=None):
+    """``apply_glu`` with an explicit output dtype: ``dtype`` None (or the dtype of ``up``) is the plain
+    ``apply_glu``; otherwise the same single fused binary op ``up * silu(gate)`` packs its output in ``dtype`` (the hot
+    group's K-concatenated down wants bf16 GLU pieces: their 320-B rows make the last-dim concat an exact page copy)."""
+    if dtype is None or dtype == up.dtype:
+        return apply_glu(gate, up, config)
+    activation = getattr(config, "activation", config)
+    if activation != "silu":
+        raise NotImplementedError(f"activation {activation!r} (only silu is implemented for Solar-Open)")
+    return ttnn.mul(up, gate, input_tensor_b_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)], dtype=dtype)
 
 
 def _dense_tail(
@@ -409,7 +492,9 @@ _SORTED_MOE_MAX_HOT = 16  # more hot experts than this -> dense per-expert loop 
 # steer the hot/cold split and the sorted-vs-dense choice, never correctness. perf-p1 (2026-09-07): with the hot
 # group as per-expert linears (HOT_EXPERTS_PER_EXPERT_LINEAR) its wall time at 1024 tokens fits 0.39 + 0.136 ms x
 # n_hot (measured 0.93 / 1.48 / 2.42 ms at 4 / 8 / 15 hot experts vs 1.25 / 2.26 / 4.06 for repeat + bmm, i.e.
-# 0.23 + 0.255 x n_hot) -> _HOT_FIXED_MS, _HOT_PER_EXPERT_MS = 0.4, 0.135.
+# 0.23 + 0.255 x n_hot) -> _HOT_FIXED_MS, _HOT_PER_EXPERT_MS = 0.4, 0.135. Phase 3 (the minimal_matmul gate|up and
+# the K-concatenated hot down of SolarOpenProgramConfig) makes the hot group cheaper (~-35 us per expert, ~-0.3 ms at
+# 15 hot); the constants are conservative until re-derived from a layer-0 tracy (pinned by tests/unit/test_p1_layout).
 _SORTED_FIXED_MS, _SORTED_PER_KROW_MS, _HOT_FIXED_MS, _HOT_PER_EXPERT_MS = 0.5, 0.23, 0.4, 0.135
 _DENSE_PER_EXPERT_MS = 0.15  # per-expert cost of the dense loop over a 1024-token split (gate/up + down + slices)
 # Measured on P150x8 (PR #55589): the sorted path halves E=128 prefill at ISL >= 1024 but is slower than the dense
@@ -427,7 +512,11 @@ _SORTED_MOE_MIN_EXPERTS = 64
 #   fast_reduce_nc over n_hot bfloat8_b per-expert outputs. Measured on P150 at 1024 tokens (tests/perf/
 #   test_layout_candidates.py, wall of the whole hot group, n_hot 4 / 8 / 15): K-concat 1.07 / 1.67 / 2.75 ms vs
 #   bmm + fast_reduce_nc 0.93 / 1.48 / 2.42 ms (phase-1 repeat + bmm form: 1.25 / 2.26 / 4.06), PCC vs fp32 equal
-#   within 3e-5 -- so it stays OFF (kept as the measured alternative).
+#   within 3e-5 -- so it stays OFF (kept as the measured alternative). Phase 3 traced that verdict to the bfp8 act
+#   pieces (160-B rows: the concat takes the transpose fallback, 71-204 us) and the legacy 2D config (150 us at 15
+#   hot): ``program_config.hot_down_kconcat_minimal`` (SolarOpenProgramConfig default) runs the K-concat over bf16
+#   GLU pieces with a minimal_matmul blocking (concat 36 + matmul 117 us at 15 hot vs bmm 394 + reduce 205) and takes
+#   precedence over this switch; HOT_DOWN_KCONCAT only matters when that field is None.
 # - ELIDE_ROUTING_COPIES: skip the routing-tensor copies the sorted path never reads / can avoid: the expert-major
 #   [E, S, 1] re-tiling of the chunk's routing weights (built per split on demand for the dense bmm / per-expert-loop
 #   splits only), the [1, E * cap] row-major flattening of the cold index tensor (ttnn.embedding takes [E, cap]) and
@@ -435,6 +524,67 @@ _SORTED_MOE_MIN_EXPERTS = 64
 HOT_EXPERTS_PER_EXPERT_LINEAR = True
 HOT_DOWN_KCONCAT = False
 ELIDE_ROUTING_COPIES = True
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Prefill MoE path selection (phase 3a(2), design_traced_prefill.md). One split of the dense (EP=1) path runs as
+#   MOE_PATH_DENSE_BMM     splits <= dense_bmm_max_tokens: activations replicated per expert, ONE batched gate|up
+#                          matmul, dense down bmm, fast_reduce_nc -- the traced 128-token prefill; static and device-only
+#   MOE_PATH_STATIC_LOOP   one ttnn.linear per expert over the whole split + the dense tail: static and device-only
+#                          (trace-safe) but ~2.5x the sorted path's cost at 1024 tokens; taken for the splits listed in
+#                          program_config.trace_safe_split_lens and for models with < _SORTED_MOE_MIN_EXPERTS experts
+#   MOE_PATH_HOST_PLANNED  the expert-sorted hot/cold path planned from a device->host read of the per-expert token
+#                          counts (_sorted_moe_plan; it falls back to the per-expert loop when sorting is not cheaper):
+#                          every long eager split. NEVER under a trace capture -- the captured plan would be replayed
+#                          for other prompts.
+# The EP > 1 sparse_matmul path of multi-row meshes (MOE_PATH_SPARSE_EP) uses static masks and is trace-safe.
+MOE_PATH_DENSE_BMM = "dense_bmm"
+MOE_PATH_STATIC_LOOP = "static_loop"
+MOE_PATH_HOST_PLANNED = "host_planned"
+MOE_PATH_SPARSE_EP = "sparse_ep"
+TRACE_SAFE_MOE_PATHS = frozenset({MOE_PATH_DENSE_BMM, MOE_PATH_STATIC_LOOP, MOE_PATH_SPARSE_EP})
+# Path of the LAST split _process_prefill_chunk processed ({"split", "path", "sorted"}); read by tests.
+LAST_PREFILL_MOE_PATH = {}
+
+
+def _pieces(length, size):
+    """Piece lengths ``ttnn.split(x, size)`` cuts a ``length``-long axis into: full pieces, then the remainder."""
+    return [size] * (length // size) + ([length % size] if length % size else [])
+
+
+def prefill_split_lens(seq_len, program_config):
+    """Distinct split lengths (first-appearance order) the MoE processes for a ``seq_len``-token prefill: the sequence
+    is cut into ``sequence_chunk_size`` chunks (prefill_forward) and every chunk into
+    ``get_down_split_size(chunk_len)`` splits (_process_prefill_chunk). Pure: mirrors the two ttnn.split calls."""
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    lens = []
+    for chunk_len in _pieces(seq_len, program_config.sequence_chunk_size):
+        for split_len in _pieces(chunk_len, program_config.get_down_split_size(chunk_len)):
+            if split_len not in lens:
+                lens.append(split_len)
+    return tuple(lens)
+
+
+def moe_prefill_path(split_len, program_config, num_experts, always_on=0, dense_moe=True):
+    """The MoE path (a MOE_PATH_* constant) _process_prefill_chunk takes for one ``split_len``-token split.
+    ``num_experts`` counts the expert slots including ``always_on`` fused shared-expert slots; ``dense_moe`` is False
+    on the EP > 1 sparse path of multi-row meshes. Pure."""
+    if not dense_moe:
+        return MOE_PATH_SPARSE_EP
+    if split_len <= program_config.dense_bmm_max_tokens:
+        return MOE_PATH_DENSE_BMM
+    if num_experts - always_on < _SORTED_MOE_MIN_EXPERTS or split_len in program_config.trace_safe_split_lens:
+        return MOE_PATH_STATIC_LOOP
+    return MOE_PATH_HOST_PLANNED
+
+
+def is_trace_safe_prefill_len(seq_len, program_config, num_experts, always_on=0, dense_moe=True):
+    """True when every split of a ``seq_len``-token prefill takes a trace-safe MoE path (no device->host read, static
+    shapes) -- the condition for listing ``seq_len`` among ModelArgs' traced prefill lengths. Pure."""
+    return all(
+        moe_prefill_path(split_len, program_config, num_experts, always_on, dense_moe) in TRACE_SAFE_MOE_PATHS
+        for split_len in prefill_split_lens(seq_len, program_config)
+    )
 
 
 def _plan_from_counts(routed_counts, split_len, num_experts, always_on=0):
@@ -469,7 +619,9 @@ def _plan_from_counts(routed_counts, split_len, num_experts, always_on=0):
     return best
 
 
-def _sorted_moe_plan(routing_tokens_all, token_offset, split_len, config, dense_bmm_max_tokens, always_on=0):
+def _sorted_moe_plan(
+    routing_tokens_all, token_offset, split_len, config, dense_bmm_max_tokens, always_on=0, trace_safe_split_lens=()
+):
     """Host-side plan for one split from the per-expert routed-token counts (one small device->host read).
 
     Real MoE routing is skewed (the hottest expert of a 1024-token split often takes a large share of the
@@ -487,9 +639,12 @@ def _sorted_moe_plan(routing_tokens_all, token_offset, split_len, config, dense_
     if E_routed < _SORTED_MOE_MIN_EXPERTS:
         return None
     # This does a device->host read of the per-expert counts, so it must never run under trace capture (a captured
-    # plan would be replayed for other prompts). It cannot: the sorted path is only taken for splits longer than
-    # program_config.dense_bmm_max_tokens (256) and the only traced prefill length is 128 tokens.
+    # plan would be replayed for other prompts). moe_prefill_path only routes a split here when it is longer than
+    # program_config.dense_bmm_max_tokens (256) AND not listed in program_config.trace_safe_split_lens (the splits of
+    # the traced prefill buckets; the only shipped bucket, 128 tokens, never reaches this function) -- asserted again
+    # here so no caller can bypass the selection.
     assert split_len > dense_bmm_max_tokens, "the sorted MoE path is for eager (untraced) long splits only"
+    assert split_len not in trace_safe_split_lens, f"split {split_len} is trace-safe only (trace_safe_split_lens)"
     routing_tokens = ttnn.slice(routing_tokens_all, [0, 0, token_offset, 0], [1, 1, token_offset + split_len, E])
     routing_t = ttnn.transpose(routing_tokens, 2, 3)  # [1, 1, E, split]
     if split_len != routing_tokens_all.shape[2]:  # a full-range slice aliases its input
@@ -532,12 +687,14 @@ def _sorted_moe_forward(
     its routed tokens, then zero-weight fillers); ttnn.embedding gathers those rows (and one-hot rows from a cached
     identity), gate/up and down run as batched matmuls over the gathered [E, cap, *] rows only, each row is scaled by
     its slot weight (zeroed for hot experts) and scattered back with one-hot^T @ rows. Hot experts (their routed-token
-    count exceeds `cap`): gate/up run as one ttnn.linear per hot expert over the whole split (weight slices taken on
-    demand and freed; HOT_EXPERTS_PER_EXPERT_LINEAR, off = the phase-1 repeat + batched matmul), the GLU outputs are
-    weighted by their routing weights, and the down projections run as one batched matmul reduced over the hot
-    experts with fast_reduce_nc (or, HOT_DOWN_KCONCAT, summed inside one K-concatenated matmul -- measured slower).
-    The math equals the dense path. ``program_config`` supplies the 1D config of the cold down bmm (rows =
-    cap, see ``_dense_down_program_config``); the hot down over the whole split keeps the auto config."""
+    count exceeds `cap`): gate/up run as one linear per hot expert over the whole split (weight slices taken on
+    demand and freed; HOT_EXPERTS_PER_EXPERT_LINEAR, off = the phase-1 repeat + batched matmul; ``_expert_linear``:
+    minimal_matmul with ``program_config.dense_expert_gate_up_minimal`` or the auto ttnn.linear), the GLU outputs are
+    weighted by their routing weights, and the down projections + the sum over the hot experts run as ONE
+    K-concatenated minimal_matmul over bf16 GLU pieces (``program_config.hot_down_kconcat_minimal``; without it the
+    perf-p1 forms: one batched matmul reduced with fast_reduce_nc, or HOT_DOWN_KCONCAT's 2D K-concat). The math
+    equals the dense path. ``program_config`` also supplies the 1D config of the cold down bmm (rows = cap, see
+    ``_dense_down_program_config``)."""
     routing_t, cap, hot_ids, cold_mask_t = plan
     E, H, ip = config.num_experts, config.hidden_size, weights.intermediate_padded_per_device
     device = weights.gate_up_proj.device()
@@ -594,14 +751,22 @@ def _sorted_moe_forward(
         act, weights, activation_dtype, dense_core_grid, _dense_down_program_config(program_config, cap, H, ip)
     )
     act.deallocate(True)
-    out = ttnn.matmul(  # scatter back: out[split, H] = onehot^T [split, E*cap] @ down[E*cap, H]
+    # Scatter back: out[split, H] = onehot^T [split, E*cap] @ down[E*cap, H]. A token's 8 (+1) expert contributions
+    # sit at K positions e * cap + c that depend on the sorted LAYOUT (c = the token's rank among its expert's routed
+    # tokens); with a bf16 destination the partial sums are rounded at K-block boundaries, so the same token gets a
+    # slightly different sum when other tokens change its rank (slot / co-batch dependent numerics, measured 2026-09-08
+    # in a packed 32 x 128 pass: fillers of one prompt in different slots disagree in 33/720 top-1 steps, PCC min
+    # 0.986). SORTED_SCATTER_FP32_DEST accumulates the 8 values in fp32 and rounds once (layout independent).
+    out = ttnn.matmul(
         onehot,
         ttnn.reshape(down, (1, 1, E * cap, H)),
         transpose_a=True,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         dtype=activation_dtype,
         core_grid=dense_core_grid,
-        compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
+        compute_kernel_config=_SCATTER_COMPUTE_KERNEL_CONFIG
+        if SORTED_SCATTER_FP32_DEST
+        else _DENSE_COMPUTE_KERNEL_CONFIG,
     )
     onehot.deallocate(True)
     down.deallocate(True)
@@ -609,24 +774,22 @@ def _sorted_moe_forward(
     # ---- hot experts: dense over the whole split ----
     if hot_ids:
         n_hot = len(hot_ids)
+        kd_rows, kd_cols = weights.down_proj_padded.shape[2], weights.down_proj_padded.shape[3]
+        # Phase 3: the hot down as ONE K-concatenated minimal_matmul over bf16 GLU pieces (decided here because the
+        # GLU must then pack bf16); None -> the perf-p1 forms below.
+        kconcat_config = _hot_down_kconcat_minimal_config(
+            program_config, dense_core_grid, split_len, n_hot * kd_rows, kd_cols
+        )
         if HOT_EXPERTS_PER_EXPERT_LINEAR:
-            # One ttnn.linear per hot expert over the whole split (full-grid 2D matmul; the [1, 1, H, 2Ip] weight
-            # slice is taken and freed on demand), stacked along the expert dim -> [1, n_hot, split, 2Ip]. Replaces
-            # ttnn.repeat of the activations x n_hot (120 MB written for 15 experts at 1024 tokens) + one batched
-            # matmul with one expert per core (22 TFLOP/s).
+            # One linear per hot expert over the whole split (the [1, 1, H, 2Ip] weight slice is taken and freed on
+            # demand; minimal_matmul blocking or the full-grid auto 2D matmul, _expert_linear), stacked along the
+            # expert dim -> [1, n_hot, split, 2Ip]. Replaces ttnn.repeat of the activations x n_hot (120 MB written
+            # for 15 experts at 1024 tokens) + one batched matmul with one expert per core (22 TFLOP/s).
+            gu_config = _dense_expert_gate_up_config(program_config, dense_core_grid, split_len, H, 2 * ip)
             gu_list = []
             for e in hot_ids:
                 w_e = _expert_slice(weights.gate_up_proj, e, H, 2 * ip)
-                gu_list.append(
-                    ttnn.linear(
-                        hidden_4D,
-                        w_e,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        dtype=activation_dtype,
-                        core_grid=dense_core_grid,
-                        compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
-                    )
-                )
+                gu_list.append(_expert_linear(hidden_4D, w_e, gu_config, dense_core_grid, activation_dtype))
                 w_e.deallocate(True)
             if n_hot == 1:
                 gu_hot = gu_list[0]
@@ -651,7 +814,8 @@ def _sorted_moe_forward(
         gate_h = ttnn.slice(gu_hot, [0, 0, 0, 0], [1, n_hot, split_len, ip])
         up_h = ttnn.slice(gu_hot, [0, 0, 0, ip], [1, n_hot, split_len, 2 * ip])
         gu_hot.deallocate(True)
-        act_h = apply_glu(gate_h, up_h, config)  # [1, n_hot, split, Ip]
+        # [1, n_hot, split, Ip]; bf16 for the K-concatenated down (its pieces then concat as exact page copies)
+        act_h = _glu(gate_h, up_h, config, dtype=ttnn.bfloat16 if kconcat_config is not None else None)
         gate_h.deallocate(True)
         up_h.deallocate(True)
         # routing weights of the hot experts, [1, n_hot, split, 1]: gather rows of routing^T [E, split] (one op, no
@@ -668,8 +832,32 @@ def _sorted_moe_forward(
         rw_rows.deallocate(True)
         act_h = ttnn.mul(act_h, rw_hot, output_tensor=act_h)
         rw_hot.deallocate(True)
-        kd_rows, kd_cols = weights.down_proj_padded.shape[2], weights.down_proj_padded.shape[3]
-        if HOT_DOWN_KCONCAT and n_hot > 1:
+        if kconcat_config is not None:
+            # sum_e act_e @ down_e as ONE minimal_matmul over the concatenated K: [split, n_hot * Ip] x [n_hot * Ip, H].
+            # The bf16 act pieces [1, 1, split, Ip] have 320-B rows, so the last-dim concat is an exact page copy
+            # (25 / 28 / 36 us at n_hot 4 / 8 / 15 on P150; bfp8 pieces of 160-B rows take the transpose fallback);
+            # the sum over the hot experts moves into the matmul accumulation (no [n_hot, split, H] output, no
+            # fast_reduce_nc: 50 / 74 / 117 us vs 109 + 64 / 213 + 117 / 394 + 205, with better PCC).
+            if n_hot > 1:
+                act_parts = [ttnn.slice(act_h, [0, i, 0, 0], [1, i + 1, split_len, ip]) for i in range(n_hot)]
+                act_h.deallocate(True)
+                act_cat = ttnn.concat(act_parts, dim=3)  # [1, 1, split, n_hot * Ip]
+                for t_e in act_parts:
+                    t_e.deallocate(True)
+            else:
+                act_cat = act_h  # already [1, 1, split, Ip]
+            wd_cat = _concat_expert_slices(weights.down_proj_padded, hot_ids, kd_rows, kd_cols, dim=2)
+            hot_out = ttnn.experimental.minimal_matmul(  # [1, 1, split, H]
+                act_cat,
+                wd_cat,
+                config=kconcat_config,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=activation_dtype,
+                compute_kernel_config=_DENSE_COMPUTE_KERNEL_CONFIG,
+            )
+            act_cat.deallocate(True)
+            wd_cat.deallocate(True)
+        elif HOT_DOWN_KCONCAT and n_hot > 1:
             # sum_e act_e @ down_e as ONE matmul over the concatenated K: [split, n_hot * Ip] x [n_hot * Ip, H]. The
             # sum over the hot experts moves into the matmul accumulation instead of fast_reduce_nc over n_hot
             # bfloat8_b per-expert outputs ([n_hot, split, H], 60 MB read at 15 x 1024).
@@ -757,7 +945,8 @@ def _hot_down_kconcat_matmul(act_cat, wd_cat, activation_dtype, dense_core_grid,
 
 
 def _eye(weights, n, _unused=None):
-    """Cached [n, n] bf16 identity on device (one-hot table for the sorted path's scatter matmul)."""
+    """Cached [n, n] bf16 identity on device (one-hot table for the sorted path's scatter matmul). Persistent: built
+    for the sorted split lengths by _ensure_prefill_helpers on the first prefill call, before any trace capture."""
     tables = weights.eye_tables
     if tables is None:
         tables = {}
@@ -771,7 +960,12 @@ def _eye(weights, n, _unused=None):
 
 def _bmm_config(core_grid, mt, kt, nt):
     """MatmulMultiCoreReuseProgramConfig with one [mt x nt]-tile output block per core (batched matmul, one batch
-    entry per core)."""
+    entry per core). Phase 3 (tests/perf/test_prefill_matmul_candidates.py): the all-expert gate|up bmm
+    [1, E, S, 4096] x [1, E, 4096, 320] runs 740 / 748 / 763 / 808 us at S = 32 / 64 / 96 / 128 with this config
+    (in0_block_w 4, subblock 1x2) -- flat in S, i.e. bound by streaming the 178 MB of expert weights per launch --
+    and no in0_block_w 8-32 / Mt x 2 / 1 x 5 / 8x8-grid variant beats it (751-1033 us, PCC falls with in0_block_w
+    >= 16), so it is kept as is; fewer expert visits per token (packed multi-user prefill) or a different kernel are
+    the levers for that op."""
     return ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(core_grid.x, core_grid.y),
         in0_block_w=next(d for d in (6, 5, 4, 3, 2, 1) if kt % d == 0),
@@ -787,6 +981,18 @@ def _bmm_config(core_grid, mt, kt, nt):
 _DENSE_COMPUTE_KERNEL_CONFIG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False, fp32_dest_acc_en=False, packer_l1_acc=True
 )
+# fp32 destination accumulation for the sorted path's one-hot scatter matmul (SORTED_SCATTER_FP32_DEST, env
+# SOLAR_OPEN_SORTED_SCATTER_FP32, default 1): the per-token sum over its expert slots is accumulated in fp32 and rounded
+# once, so it no longer depends on where the slots fall relative to the K blocks (see _sorted_moe_forward). Measured
+# 2026-09-08 (phase-3a verify): teacher-forced b32 through a 32 x 128 packed pass (T = 4096 sorted MoE) vs the bf16 HF
+# reference 0.9219 / 0.9602 / 0.9211 / 0.97775 / 0.99014 / KL 0.0382 -> 0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 /
+# 0.0304 and the 8 slot copies of a prompt bit-identical again (1792/1792 vs 1756/1792); real layer 0 prefill_1024 mlp /
+# decoder PCC unchanged (0.999913 / 0.999853); TTFT 1K 416 vs 388-401 ms, 8K 2920 vs 2907-2927 (neutral). `0` restores
+# the phase-2 bf16-destination form.
+_SCATTER_COMPUTE_KERNEL_CONFIG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+)
+SORTED_SCATTER_FP32_DEST = os.getenv("SOLAR_OPEN_SORTED_SCATTER_FP32", "1") == "1"
 
 
 def _ensure_dense_weights(weights: ExpertWeights):
@@ -801,6 +1007,31 @@ def _ensure_dense_weights(weights: ExpertWeights):
         else weights.down_proj
     )
     object.__setattr__(weights, "down_proj_padded", down_padded)  # ExpertWeights is a frozen dataclass
+
+
+def _sorted_split_lens(program_config: ProgramConfig, num_experts, always_on=0):
+    """Split lengths the host-planned sorted path can run for -- the split size of every chunk length
+    (``base_down_split_size``; its halved long-context variant only when ``sequence_chunk_size`` exceeds 32K) that
+    ``moe_prefill_path`` routes to MOE_PATH_HOST_PLANNED -- i.e. the one-hot identities to prebuild. Pure."""
+    chunk = program_config.sequence_chunk_size
+    candidates = {min(program_config.get_down_split_size(n), chunk) for n in (min(chunk, 32 * 1024), chunk)}
+    return sorted(
+        s for s in candidates if moe_prefill_path(s, program_config, num_experts, always_on) == MOE_PATH_HOST_PLANNED
+    )
+
+
+def _ensure_prefill_helpers(weights: ExpertWeights, config: ExpertConfig, program_config: ProgramConfig):
+    """Build the dense path's PERSISTENT device helpers on the first prefill call of ANY length -- the eager compile
+    pass of every flow -- instead of lazily at the first split that needs them: ``down_proj_padded`` (an alias for
+    Solar's tile-aligned Ip, see _ensure_dense_weights) and the ``[split, split]`` bf16 one-hot identities of the
+    sorted path's split lengths (2 MiB per layer per device at 1024 tokens). A persistent buffer allocated AFTER a
+    trace was captured -- e.g. by the first eager 1K prefill following the 128-token / decode captures -- can land in
+    that trace's freed scratch and be clobbered by a later replay (tt-metal #52176); the harness's eager pre-compile
+    of every length only mitigates this. Idempotent (dict lookups after the first call)."""
+    if weights.down_proj_padded is None:
+        _ensure_dense_weights(weights)
+    for split_len in _sorted_split_lens(program_config, config.num_experts, weights.num_always_on_experts):
+        _eye(weights, split_len)
 
 
 def _dense_bmm_config(core_grid, split_len, weights: ExpertWeights, max_tokens):
@@ -864,6 +1095,10 @@ def prefill_forward(
 
     Returns:
         Expert output [1, batch, seq_len, hidden_size]
+
+    Trace safety: a call may be captured in a trace only when ``is_trace_safe_prefill_len(seq_len, program_config,
+    config.num_experts, weights.num_always_on_experts)`` holds (every split on a static, device-only MoE path); the
+    host-planned sorted path asserts it is never reached for a trace-safe split length.
     """
     batch_dim = 1
     seq_dim = 2

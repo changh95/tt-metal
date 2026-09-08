@@ -19,7 +19,8 @@ Recorded (P150x8, 2026-09-07, layer 0, traced replay per layer, blocking mean): 
 walls are host-load sensitive: the first run of a session measured 4.7 / 10.7). Per-lever history in the README's
 "Recorded baselines" (perf rows) and scratchpad/phase2/perf_log.md.
 
-Per case (decode_b1 / decode_b32 / prefill_128 / prefill_1024) it
+Per case (decode_b1 / decode_b32 / prefill_128 / prefill_1024 / prefill_8192 -- the 8K case, 2 x 4096-token MoE chunks of
+4 sorted splits each, is the eager long-prefill sample for the phase-3 profile and takes ~2 min to compile) it
   1. builds layer 0 with the REAL weights (same path as tests/test_layer0_real_weights.py) and real token embeddings,
   2. runs one LABELED eager step (a signpost between every sub-block: input norm, attention, residual, post norm,
      router, experts + shared expert + all_reduce, residual),
@@ -133,8 +134,8 @@ def _labeled_step(layer, tt_hidden, rope_mats, tt_position_idx, page_table_tt, i
 @pytest.mark.timeout(3600)
 @pytest.mark.parametrize(
     "batch_size, seq_len",
-    [(1, 1), (32, 1), (1, 128), (1, 1024)],
-    ids=["decode_b1", "decode_b32", "prefill_128", "prefill_1024"],
+    [(1, 1), (32, 1), (1, 128), (1, 1024), (1, 8192)],
+    ids=["decode_b1", "decode_b32", "prefill_128", "prefill_1024", "prefill_8192"],
 )
 @parametrize_mesh_with_fabric([(1, 8)])
 def test_layer0_device_perf(mesh_device, device_params, batch_size, seq_len, layer0_weights, reset_seeds):

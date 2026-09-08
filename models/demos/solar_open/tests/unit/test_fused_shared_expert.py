@@ -33,6 +33,7 @@ Run (random weights, no checkpoint needed):
 import collections
 import contextlib
 import dataclasses
+import operator
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -72,20 +73,28 @@ FULL_WEIGHT_CHECK_DEVICES = (0, -1)
 
 
 @contextlib.contextmanager
-def count_launches(*names):
-    """Count calls of the named ``ttnn`` entry points (e.g. ``linear``) made inside the block: yields a Counter."""
+def count_launches(*names, filters=None):
+    """Count calls of the named ``ttnn`` entry points (e.g. ``linear``) made inside the block: yields a Counter.
+    ``filters`` maps a name to a predicate ``(args, kwargs) -> bool``; only calls it accepts are counted."""
     counts = collections.Counter()
+    filters = filters or {}
 
     def counting(name, original):
+        accept = filters.get(name)
+
         def wrapper(*args, **kwargs):
-            counts[name] += 1
+            if accept is None or accept(args, kwargs):
+                counts[name] += 1
             return original(*args, **kwargs)
 
         return wrapper
 
     with contextlib.ExitStack() as stack:
         for name in names:
-            stack.enter_context(mock.patch.object(ttnn, name, counting(name, getattr(ttnn, name))))
+            # dotted names address sub-namespaces, e.g. "experimental.minimal_matmul"
+            owner, _, attr = name.rpartition(".")
+            target = ttnn if not owner else operator.attrgetter(owner)(ttnn)
+            stack.enter_context(mock.patch.object(target, attr, counting(name, getattr(target, attr))))
         yield counts
 
 
@@ -244,14 +253,24 @@ def test_fused_shared_expert_equivalence(mesh_device, device_params, batch_size,
     def run(block, label):
         experts_prefill.LAST_SORTED_MOE_PLAN.clear()
         tt_in = upload()
-        with tm.count_ccl_ops() as ccl_counts, count_launches("linear") as launches:
+        # Phase 3: the hot experts' gate|up runs as ttnn.experimental.minimal_matmul when
+        # SolarOpenProgramConfig.dense_expert_gate_up_minimal is set (experts/prefill.py _expert_linear), so both entry
+        # points count as one "linear" launch each -- but only the gate|up form (weight K == hidden_size): the hot
+        # group's K-concatenated down (hot_down_kconcat_minimal, weight K = n_hot x Ip) is one launch per sorted split
+        # with hot experts, i.e. present in every fused split (always-on slot) and only in the unfused splits with a
+        # routed hot expert, which the per-hot-expert expectation below does not model.
+        gate_up_only = {"experimental.minimal_matmul": lambda args, kwargs: args[1].shape[-2] == hidden_size}
+        with tm.count_ccl_ops() as ccl_counts, count_launches(
+            "linear", "experimental.minimal_matmul", filters=gate_up_only
+        ) as launches:
             tt_out = block(tt_in, is_decode=is_decode)
         out = ttnn.to_torch(tt_out, mesh_composer=mesh_composer)[..., :num_tokens, :hidden_size]
         tm.assert_replicated(tt_out, f"{label} MoE output")
         tt_out.deallocate(True)
         plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
         assert dict(ccl_counts) == expected_ccl, f"{label}: expected {expected_ccl}, launched {dict(ccl_counts)}"
-        return out.reshape(num_tokens, hidden_size).float(), launches["linear"], plan
+        linears = launches["linear"] + launches["experimental.minimal_matmul"]
+        return out.reshape(num_tokens, hidden_size).float(), linears, plan
 
     out_u, linears_u, plan_u = run(unfused, "unfused")
     out_f, linears_f, plan_f = run(fused, "fused")

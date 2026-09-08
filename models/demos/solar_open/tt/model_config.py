@@ -12,6 +12,7 @@ host weight path (contract C1): whole-model bf16 from_pretrained -> Meta-permute
 with SOLAR_OPEN_STREAMING_LOAD=1, the per-layer streaming LazyStateDict that presents the same keys lazily.
 """
 
+import dataclasses
 import gc
 import json
 import os
@@ -25,11 +26,15 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 import ttnn
 from models.common.utility_functions import is_blackhole, is_wormhole_b0
 from models.demos.solar_open.config import MoEOptions
+from models.demos.solar_open.tt.expert_configs import SolarOpenProgramConfig
+from models.demos.solar_open.tt.experts.prefill import is_trace_safe_prefill_len
 from models.demos.solar_open.utils.general_utils import resolve_rope_theta
 from models.tt_transformers.tt.common import (
     calculate_prefill_warmup_seq_lens,
     cap_seq_lens_to_max_prefill_chunk_size,
+    get_all_padded_prefill_lengths,
     get_base_model_name,
+    get_padded_prefill_len,
 )
 from models.tt_transformers.tt.load_checkpoints import convert_hf_qkv_to_meta_format
 
@@ -39,6 +44,190 @@ DEFAULT_HF_MODEL = "upstage/Solar-Open-100B"
 MODEL_NAME = "Solar-Open-100B"
 # Key suffix of the router's selection bias - the only fp32 tensor in the checkpoint; it must stay fp32 (C1).
 ROUTER_BIAS_SUFFIX = "e_score_correction_bias"
+
+# Traced prefill lengths per (model, device name) -- phase 3a(2), design_traced_prefill.md. 128 tokens on P150x8 is the
+# validated bucket (its MoE runs the dense bmm path, trace-safe by construction; 150-168 ms TTFT). 1K / 2K / 4K are
+# NO-GO for phase 3a: a whole-forward trace removes at most the 55-65 ms of exposed host time of a 1K prefill (~360 ms
+# kernel floor vs 413-426 ms eager), while every trace-safe MoE formulation costs more per 1024-token split than the
+# host-planned expert-sorted path saves (static per-expert loop +13 ms/layer; device-planned sorted (C) +1.2..+3.7
+# ms/layer until the sparse_matmul kernel work of item 4b). Adding a length here requires ALL of: (a) a trace-safe MoE
+# path for its splits -- experts/prefill.py is_trace_safe_prefill_len: every split <= dense_bmm_max_tokens or listed in
+# SolarOpenProgramConfig.trace_safe_split_lens (ModelArgs refuses the entry otherwise); (b) the trace region of design
+# 6.3 (160 MB for {128, 1K, 2K}, 256 MB with 4K; models/model_trace_region_sizes.yaml solar-open-100b); (c) for 4096
+# also capped_warmup_seq_len >= 4096 (the list is capped by it); (d) the prepare-all-then-record-all capture order of
+# design 6.4 (tt-metal #52176); (e) the traced-vs-eager equivalence test of tests/unit/test_traced_prefill.py for the
+# bucket. The router helpers of every entry are persistent (router_persistent_token_counts).
+TRACE_PREFILL_SEQ_LENS = {MODEL_NAME: {"P150x8": [128]}}  # format: model_name: {device_name: [sequence_lengths]}
+# Expert slots of Solar-Open-100B: validates the trace table when no HF config is loaded (dummy weights).
+_SOLAR_NUM_EXPERTS = 128
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 3a(1): packed / batched multi-user prefill on the single-row (1x8) mesh -- scratchpad design_packed_prefill.md.
+#
+# The tt_transformers Generator already has a complete batched-prefill path (slot placement, -1 page-table rows for
+# unused slots, per-user last-token extraction) that ``ModelArgs.disable_batched_prefill`` switches off. Everything
+# below the Generator is token-major: the MoE sees ``[1, 1, B*S, H]`` and never looks at users, the router works on
+# ``T = B*S`` rows and ``attention/prefill.py`` reshapes to ``[B, 1, S, -1]`` and fills the paged KV cache per user
+# with its own page-table row. Packing B short prompts into one forward therefore replaces B dense-bmm 128-token
+# passes (~180 ms kernel each, 1.4 ms/token) by one expert-sorted pass at ~0.4 ms/token.
+#
+# Knobs (environment, read once by ModelArgs):
+#   SOLAR_OPEN_BATCHED_PREFILL=1              turn the batched path on (default OFF: byte-identical to phase 2)
+#   SOLAR_OPEN_BATCHED_PREFILL_TOKENS=<n>     token budget of one packed pass, B_mb x S <= n (default 1024 = 8 x 128;
+#                                             4096 = 32 x 128 in one pass; clamped to 256..8192, see the v1 cap below)
+#   SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN=<n> largest PADDED per-user prefill length that is packed (default 128:
+#                                             the 1K+ buckets already run the sorted MoE per user at a flat per-token
+#                                             cost, so packing them buys little TTFT-last and costs TTFT-mean)
+BATCHED_PREFILL_MIN_TOKENS = 256
+# v1 runs the tt_transformers batched path, whose head applies norm + lm_head to ALL B*S rows ([T, 24576] bf16 per
+# device = 50 MiB at 1K, 201 MiB at 4K, 400 MiB at 8K) and reads one 32-row tile per user back; 8K tokens per pass
+# is the DRAM-safe cap until a gather head exists (design 2.6).
+BATCHED_PREFILL_MAX_TOKENS = 8 * 1024
+BATCHED_PREFILL_DEFAULT_TOKENS = 1024
+BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN = 128
+# Device batch sizes the tt_transformers batched-prefill path pads a pass to (generator.SUPPORTED_PREFILL_BATCH_SIZES).
+BATCHED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+
+
+def _env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_int(name, default):
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} is not an integer") from exc
+
+
+def padded_prefill_batch(num_users):
+    """Rows the tt_transformers batched-prefill pass allocates for ``num_users`` users re-slotted to ``0..num_users-1``
+    (the smallest supported device batch >= the user count; the parent pads tokens / page-table rows up to it)."""
+    num_users = int(num_users)
+    return next((b for b in BATCHED_PREFILL_BATCH_SIZES if b >= num_users), num_users)
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedPrefillOptions:
+    """Policy knobs of the packed multi-user prefill (see the module comment above for the env names)."""
+
+    enabled: bool = False
+    tokens_per_pass: int = BATCHED_PREFILL_DEFAULT_TOKENS
+    max_seq_len: int = BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN
+
+    def __post_init__(self):
+        if self.tokens_per_pass % 32 != 0 or not (
+            BATCHED_PREFILL_MIN_TOKENS <= self.tokens_per_pass <= BATCHED_PREFILL_MAX_TOKENS
+        ):
+            raise ValueError(
+                f"tokens_per_pass must be a multiple of 32 in [{BATCHED_PREFILL_MIN_TOKENS}, "
+                f"{BATCHED_PREFILL_MAX_TOKENS}], got {self.tokens_per_pass}"
+            )
+        if self.max_seq_len < 32 or self.max_seq_len % 32 != 0:
+            raise ValueError(f"max_seq_len must be a positive multiple of 32, got {self.max_seq_len}")
+
+    @classmethod
+    def from_env(cls):
+        enabled = _env_flag("SOLAR_OPEN_BATCHED_PREFILL", False)
+        tokens = _env_int("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", BATCHED_PREFILL_DEFAULT_TOKENS)
+        clamped = min(max(tokens, BATCHED_PREFILL_MIN_TOKENS), BATCHED_PREFILL_MAX_TOKENS)
+        if clamped != tokens:
+            logger.warning(
+                f"SOLAR_OPEN_BATCHED_PREFILL_TOKENS={tokens} clamped to {clamped} (the v1 batched path runs lm_head on "
+                f"every token of a pass; {BATCHED_PREFILL_MAX_TOKENS} tokens is its DRAM-safe cap)"
+            )
+        max_seq_len = _env_int("SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN", BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN)
+        return cls(enabled=enabled, tokens_per_pass=clamped, max_seq_len=max_seq_len)
+
+    def users_per_pass(self, seq_len):
+        """Users of padded length ``seq_len`` that fit one pass (0 when the length is not packed at all)."""
+        seq_len = int(seq_len)
+        if seq_len > self.max_seq_len or seq_len > self.tokens_per_pass:
+            return 0
+        return self.tokens_per_pass // seq_len
+
+    def describe(self):
+        return (
+            f"batched prefill {'ON' if self.enabled else 'OFF'} (tokens_per_pass={self.tokens_per_pass}, "
+            f"max_seq_len={self.max_seq_len})"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedPrefillPass:
+    """One packed pass: ``users`` (positions in the caller's request batch, re-slotted to ``0..len-1`` on the device)
+    sharing the padded per-user length ``seq_len``."""
+
+    users: tuple
+    seq_len: int
+
+    @property
+    def padded_batch(self):
+        return padded_prefill_batch(len(self.users))
+
+    @property
+    def num_tokens(self):
+        return self.padded_batch * self.seq_len
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedPrefillPlan:
+    """Packed passes (shortest bucket first) plus the users that stay on the per-user path."""
+
+    passes: tuple
+    sequential: tuple
+
+    @property
+    def packed_users(self):
+        return tuple(u for p in self.passes for u in p.users)
+
+
+def plan_batched_prefill(prompt_lens, options: BatchedPrefillOptions, num_cached=None):
+    """Group the users of one prefill call into packed passes.
+
+    A user is packable when it has no cached prefix and its padded prefill length (``get_padded_prefill_len``, the
+    bucket the tt_transformers Generator pads to: 128 / 1024 / 2K / ...) is at most ``options.max_seq_len``. Users of
+    one bucket are packed in request order, ``options.users_per_pass(S)`` per pass, the remainder forming a smaller
+    last pass; a bucket with a single packable user is not a pass (the Generator's batched path needs B > 1 and the
+    per-user path keeps its 128-token trace). Buckets are ordered shortest first so the many short users are not held
+    behind a long one. Users that are not packed are returned in request order in ``sequential``.
+    """
+    lens = [int(n) for n in (prompt_lens.tolist() if isinstance(prompt_lens, torch.Tensor) else prompt_lens)]
+    cached = [0] * len(lens) if num_cached is None else [int(n) for n in num_cached]
+    if len(cached) != len(lens):
+        raise ValueError(f"num_cached has {len(cached)} entries for {len(lens)} users")
+    if not options.enabled:
+        return BatchedPrefillPlan(passes=(), sequential=tuple(range(len(lens))))
+
+    buckets = {}
+    sequential = []
+    for user, (length, n_cached) in enumerate(zip(lens, cached)):
+        padded = get_padded_prefill_len(length - n_cached) if length > n_cached else None
+        if n_cached != 0 or padded is None or options.users_per_pass(padded) < 2:
+            sequential.append(user)
+            continue
+        buckets.setdefault(padded, []).append(user)
+
+    passes = []
+    for seq_len in sorted(buckets):
+        users = buckets[seq_len]
+        if len(users) < 2:
+            sequential.extend(users)
+            continue
+        per_pass = options.users_per_pass(seq_len)
+        for start in range(0, len(users), per_pass):
+            chunk = users[start : start + per_pass]
+            if len(chunk) == 1:
+                sequential.append(chunk[0])  # a trailing single user runs on the per-user path (traceable at 128)
+            else:
+                passes.append(BatchedPrefillPass(users=tuple(chunk), seq_len=seq_len))
+    return BatchedPrefillPlan(passes=tuple(passes), sequential=tuple(sorted(sequential)))
 
 
 class ModelArgs:
@@ -134,7 +323,21 @@ class ModelArgs:
             self.processor = None  # text-only model, no vision processor
             self.stop_token_ids = self._load_stop_token_ids()
 
-        self.disable_batched_prefill = True
+        # Phase 3a(1): packed / batched multi-user prefill (module comment above, design_packed_prefill.md). The
+        # tt_transformers Generator batches equal-length users into one forward when ``disable_batched_prefill`` is
+        # False; the Solar policy (which users, how many per pass, never traced) lives in ``plan_batched_prefill`` and
+        # ``tt/model.py: prefill_forward_text_batched``. Default OFF (SOLAR_OPEN_BATCHED_PREFILL=1 flips it): with the
+        # flag on, a plain Generator call with several equal-length users runs one batched pass (host sampling only --
+        # the on-device sampling contract of the batched path is not implemented, keep sampling_params=None) and any
+        # attempt to TRACE such a pass is refused (packed_prefill_trace_shapes).
+        self.batched_prefill = BatchedPrefillOptions.from_env()
+        self.disable_batched_prefill = not self.batched_prefill.enabled
+        # (padded_batch, per-user seq_len) pairs whose batched prefill may be traced. Empty until the traced-prefill
+        # work provides a trace-safe MoE for T = B x S: the expert-sorted MoE reads the per-expert counts back to the
+        # host (experts/prefill.py _sorted_moe_plan) and the router's [T, E] helpers are transient above 128 rows, so a
+        # captured 8 x 128 pass would replay garbage. Model.prepare_prefill_inputs_trace refuses any other batched
+        # capture; prefill_forward_text_batched runs those passes eagerly. Owned by the traced-prefill implementer.
+        self.packed_prefill_trace_shapes = set()
         self.capped_warmup_seq_len = 2048
         self.trace_prefill_supported_seq_lens = self.get_trace_prefill_supported_seq_lens()
 
@@ -210,32 +413,78 @@ class ModelArgs:
             and num_cached_tokens == 0
         )
 
-    def get_trace_prefill_supported_seq_lens(self):
-        # No default traced prefill lengths: only validated (model, device) pairs below get traced prefill.
-        # TODO: https://github.com/tenstorrent/tt-metal/issues/32818
-        default_supported_seq_lens = {}
+    def can_enable_batched_prefill_trace(self, padded_batch, prefill_seq_len):
+        """Whether a packed pass of ``padded_batch`` users x ``prefill_seq_len`` tokens may replay a trace.
 
-        # Traced prefill is validated at ISL 128 on P150x8 only (other SKUs fall through to the empty default, which
-        # is safe: eager prefill).
-        model_specific_supported_seq_lens = {
-            MODEL_NAME: {
-                "P150x8": [128],
-            },
-            # format: model_name : {device_name : [sequence_lengths]}
-        }
-
-        model_name = self.model_name
-        device_name = determine_device_name(self.mesh_device)
-
-        # If there is no entry for a model in model_specific_supported_seq_lens, use the entry in default_supported_seq_lens
-        result = model_specific_supported_seq_lens.get(model_name, {}).get(
-            device_name, default_supported_seq_lens.get(device_name)
+        Only shapes listed in ``packed_prefill_trace_shapes`` (none today, see __init__) and whose per-user length is
+        itself a traced length. ``prefill_forward_text_batched`` forces eager execution for every other pass; the
+        Generator's own ``can_enable_trace(prefill_seq_len)`` cannot see the batch and would trace a 32 x 128 pass.
+        """
+        return (int(padded_batch), int(prefill_seq_len)) in self.packed_prefill_trace_shapes and self.can_enable_trace(
+            int(prefill_seq_len)
         )
 
-        if result is not None:
-            return cap_seq_lens_to_max_prefill_chunk_size(result, self.capped_warmup_seq_len)
-        else:
+    def get_trace_prefill_supported_seq_lens(self):
+        """Prefill lengths whose forward is captured in a trace on this (model, device): the TRACE_PREFILL_SEQ_LENS
+        entry, capped at ``capped_warmup_seq_len`` (a 4096 entry is silently dropped unless the cap is raised too) and
+        checked against the experts' path selection: every split of a traced length must take a trace-safe MoE path
+        (``is_trace_safe_prefill_len``), else the capture would record the host-planned sorted path's plan for ONE
+        prompt and replay it for all others. No default for other (model, device) pairs: eager prefill."""
+        # TODO: https://github.com/tenstorrent/tt-metal/issues/32818
+        result = TRACE_PREFILL_SEQ_LENS.get(self.model_name, {}).get(determine_device_name(self.mesh_device))
+        if result is None:
             return []
+        seq_lens = cap_seq_lens_to_max_prefill_chunk_size(list(result), self.capped_warmup_seq_len)
+        self._check_trace_safe_prefill_lens(seq_lens)
+        return seq_lens
+
+    def _check_trace_safe_prefill_lens(self, seq_lens):
+        """Raise ValueError when a traced prefill length has a split the experts would run on the host-planned
+        expert-sorted MoE path (see TRACE_PREFILL_SEQ_LENS). Uses the shipped SolarOpenProgramConfig defaults (the
+        chunk / split sizes and trace_safe_split_lens do not depend on the compute grid) and the expert count of the
+        HF config (Solar's 128 without one); the fused shared expert's always-on slot does not change the selection."""
+        program_config = SolarOpenProgramConfig()
+        num_experts = self.hf_config.num_local_experts if self.hf_config is not None else _SOLAR_NUM_EXPERTS
+        dense_moe = self.mesh_device.shape[0] == 1  # single-row meshes run the dense (EP=1) prefill MoE
+        for seq_len in seq_lens:
+            if not is_trace_safe_prefill_len(seq_len, program_config, num_experts, dense_moe=dense_moe):
+                raise ValueError(
+                    f"traced prefill length {seq_len} is not trace-safe: a split of it takes the host-planned "
+                    "expert-sorted MoE path (a device->host read per split, experts/prefill.py _sorted_moe_plan). "
+                    "List the split length in SolarOpenProgramConfig.trace_safe_split_lens (static per-expert loop) "
+                    "or provide a trace-safe sorted plan before adding the length to TRACE_PREFILL_SEQ_LENS."
+                )
+
+    @property
+    def batched_prefill_token_counts(self):
+        """Row counts ``T = padded_batch x per-user length`` of the packed multi-user prefill passes
+        (``BatchedPrefillOptions``: every padded prefill length <= ``max_seq_len`` times every device batch size >= 2
+        that fits the pass token budget); empty while the batched prefill is off. The router keeps its ``[T, E]``
+        helpers for them (``router_persistent_token_counts``) so a pass neither rebuilds them per layer nor -- once its
+        shape is admitted to ``packed_prefill_trace_shapes`` -- allocates them inside a capture."""
+        options = getattr(self, "batched_prefill", None)
+        if options is None or not options.enabled:
+            return []
+        counts = set()
+        for seq_len in get_all_padded_prefill_lengths(options.max_seq_len):
+            for batch in BATCHED_PREFILL_BATCH_SIZES:
+                if batch >= 2 and batch * seq_len <= options.tokens_per_pass:
+                    counts.add(batch * seq_len)
+        return sorted(counts)
+
+    @property
+    def router_persistent_token_counts(self):
+        """Token counts whose ``[T, E]`` router helpers ``TopKRouter`` prebuilds and keeps (design_traced_prefill.md
+        6.1): the decode batch, the batched-decode padding width 32, every traced prefill length and the packed-prefill
+        row counts. ``Model`` hands it to every layer's router (``TopKRouter(persistent_token_counts=...)``): a token
+        count captured in a trace with transient helpers would record their allocation into the trace."""
+        counts = {
+            self.max_local_batch_size,
+            32,
+            *self.trace_prefill_supported_seq_lens,
+            *self.batched_prefill_token_counts,
+        }
+        return sorted(counts)
 
     def encode_prompt(self, prompt_text, instruct=False, system_prompt_text=None, **template_kwargs):
         """Encode a prompt (str, or an already-built list of chat messages) through Solar's chat template.

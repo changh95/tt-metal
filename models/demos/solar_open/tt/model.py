@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import contextlib
+import dataclasses
+import time
+
 import torch
 from loguru import logger
 
@@ -15,6 +19,7 @@ from models.tt_transformers.tt.common import copy_host_to_device, rope_scaling_m
 from models.tt_transformers.tt.rope import RotarySetup
 
 from .layer import DecoderLayer
+from .model_config import BatchedPrefillOptions, plan_batched_prefill
 from .rms_norm import RMSNorm
 
 
@@ -120,6 +125,7 @@ class Model:
         users_row_sharded=False,
         moe_options=None,
         max_seq_len=None,
+        router_persistent_token_counts=None,
     ):
         """
         Initialize the Solar-Open model
@@ -236,6 +242,7 @@ class Model:
                 users_row_sharded=users_row_sharded,
                 tokens_per_device=max_local_batch_size,
                 moe_options=moe_options,
+                router_persistent_token_counts=router_persistent_token_counts,
             )
             for layer_idx in range(hf_config.num_hidden_layers)
         ]
@@ -371,6 +378,9 @@ class Model:
             users_row_sharded=users_row_sharded,
             moe_options=moe_options or getattr(args, "moe_options", None),
             max_seq_len=getattr(args, "max_seq_len", None),
+            # Router [T, E] helpers kept for every traced prefill length and packed-prefill row count (phase 3a):
+            # with the defaults this is the router's own {batch, 32, 128} set.
+            router_persistent_token_counts=getattr(args, "router_persistent_token_counts", None),
         )
 
         # Add tt_transformers compatible attributes
@@ -1099,7 +1109,29 @@ class Model:
     def prepare_prefill_inputs_trace(
         self, tokens, start_pos=0, page_table=None, chunk_page_table=None, last_token_idx=None, **kwargs
     ):
-        """Prepare inputs on host so we later send them to device"""
+        """Prepare inputs on host so we later send them to device.
+
+        Trace-safety guard for the batched (multi-user) prefill: the tt_transformers Generator decides to trace a
+        pass from the PER-USER length (``can_enable_trace(128)`` is True), but a packed pass of ``T = B x S`` tokens
+        runs the expert-sorted MoE for every split above 256 tokens, which reads the per-expert counts back to the
+        host (``experts/prefill.py: _sorted_moe_plan``), and the router's ``[T, E]`` helpers are transient above 128
+        rows -- a captured graph would replay garbage or hang. Only the shapes in
+        ``ModelArgs.packed_prefill_trace_shapes`` (filled by the traced-prefill work once a trace-safe MoE exists) may
+        be captured; everything else fails here, before the compile pass and the capture, instead of corrupting a
+        trace. ``prefill_forward_text_batched`` never reaches this for an unlisted shape (it forces eager passes).
+        """
+        batch_size = int(kwargs.get("batch_size", 1) or 1)
+        if batch_size > 1:
+            per_user_seq_len = int(tokens.shape[-1])
+            allowed = getattr(getattr(self, "args", None), "packed_prefill_trace_shapes", None) or set()
+            if (batch_size, per_user_seq_len) not in allowed:
+                raise RuntimeError(
+                    f"Refusing to capture a batched prefill trace for {batch_size} users x {per_user_seq_len} tokens: "
+                    f"the MoE path at T={batch_size * per_user_seq_len} tokens is not trace-safe (host readback of the "
+                    "expert-sorted plan, transient router helpers). Run the pass eagerly (enable_trace=False, or "
+                    "tt/model.py: prefill_forward_text_batched) or list the shape in "
+                    f"ModelArgs.packed_prefill_trace_shapes once a trace-safe MoE exists (allowed: {sorted(allowed)})."
+                )
         host_inputs = self.prepare_inputs_prefill(
             tokens,
             start_pos=start_pos,
@@ -1181,6 +1213,13 @@ class Model:
         # prefill that allocation happens with the trace live -- and is then discarded, since the replay
         # uses the matrices that were bound when the trace was captured.
         seq_len = self.args.max_seq_len if trace_enabled else tokens_embd.shape[-2]
+        if batch_size > 1 and not trace_enabled and not batched_prefill:
+            # Packed multi-user pass: ``tokens`` is [B, S] and every user starts at position 0, so the layers need
+            # the S-row cos/sin (the same cached slice a single-user S-token prefill uses). attention/prefill.py
+            # then skips its per-layer, per-call re-slice of the T-row matrices (2 device ops x 48 layers per pass).
+            if seq_len % batch_size != 0:
+                raise ValueError(f"packed prefill of {seq_len} tokens is not divisible by batch_size={batch_size}")
+            seq_len //= batch_size
         rot_mats_global = self._prefill_rope_slices.get(seq_len)
         if rot_mats_global is None:
             rot_mats_global = [
@@ -1372,3 +1411,228 @@ class Model:
                 token_logit.deallocate(True)
                 results.append(result)
         return results
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 3a(1): packed / batched multi-user prefill driver (design_packed_prefill.md 2.5). Wraps the tt_transformers
+# ``Generator.prefill_forward_text`` with the Solar policy; the demo and tests/unit/test_batched_prefill.py call it in
+# place of the plain generator call. The plain ``Generator`` keeps working: with SOLAR_OPEN_BATCHED_PREFILL=1 it
+# batches every equal-length multi-user call itself (one pass, no microbatching), with the flag off it is sequential.
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedPrefillPassRecord:
+    """One prefill pass of ``prefill_forward_text_batched`` for the TTFT log (``generator.batched_prefill_pass_log``).
+
+    ``ttft_s`` is the wall time from the start of the call to the end of this pass, i.e. the time to first token of
+    every user in it (the tt_transformers batched path reads the users' logits back before returning); ``duration_s``
+    is the pass alone. ``seq_len`` is the padded per-user length of a packed pass and 0 for a per-user (sequential)
+    pass, whose ``users`` then holds the users of that Generator call in request order.
+    """
+
+    users: tuple
+    slots: tuple
+    seq_len: int
+    padded_batch: int
+    packed: bool
+    traced: bool
+    duration_s: float
+    ttft_s: float
+
+
+@contextlib.contextmanager
+def batched_prefill_flag(model_args_list, enabled):
+    """Set ``disable_batched_prefill`` on every ModelArgs for one Generator call and restore it afterwards.
+
+    The Generator reads the attribute per call, so a packed pass can lift the flag while the per-user remainder (and
+    every call made without this driver) keeps the configured value. The gemma4 P150x8 generator uses the same trick.
+    """
+    previous = [getattr(args, "disable_batched_prefill", True) for args in model_args_list]
+    for args in model_args_list:
+        args.disable_batched_prefill = not enabled
+    try:
+        yield
+    finally:
+        for args, value in zip(model_args_list, previous):
+            args.disable_batched_prefill = value
+
+
+def _as_int_list(values):
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        values = values.tolist()
+    return [int(v) for v in values]
+
+
+def prefill_forward_text_batched(
+    generator,
+    tokens,
+    page_table=None,
+    kv_cache=None,
+    prompt_lens=None,
+    empty_slots=None,
+    enable_trace=True,
+    start_pos=None,
+    sampling_params=None,
+    warmup_prefill=False,
+    options: BatchedPrefillOptions = None,
+    **kwargs,
+):
+    """Prefill ``tokens [B, L]`` for B users, packing equal-length short prompts into batched passes.
+
+    Same contract as ``Generator.prefill_forward_text`` (host-sampling form: returns logits ``[B, 1, vocab]`` in
+    request order) plus the microbatch policy of ``model_config.plan_batched_prefill``:
+
+    * users of one padded-length bucket <= ``options.max_seq_len`` run ``options.users_per_pass(S)`` at a time through
+      the Generator's batched path, re-slotted to ``0..m-1`` -- safe because the paged KV fill uses each user's OWN
+      page-table row (``attention/prefill.py``, ``paged_fill_cache(..., batch_idx=0)`` per user), so the physical
+      blocks are the user's whatever row it occupies in the pass; ``page_table`` is therefore required;
+    * a packed pass is traced only when ``ModelArgs.can_enable_batched_prefill_trace(padded_batch, S)`` allows it
+      (no shape today: the T = B x S MoE is not trace-safe, see ``Model.prepare_prefill_inputs_trace``);
+    * everything else -- the users the plan leaves out (long buckets, cached prefixes), calls with on-device
+      ``sampling_params`` (the batched sampling contract is not implemented), unpaged KV, hidden-state requests,
+      row-sharded / data-parallel models, or ``options.enabled`` False -- runs today's per-user path unchanged, one
+      Generator call per remaining user when packed passes exist (exact per-user TTFT in the log) and one call for
+      the whole batch otherwise.
+
+    The pass log is left in ``generator.batched_prefill_pass_log`` (``BatchedPrefillPassRecord`` per pass; the demo
+    derives TTFT first / mean / last from it). ``warmup_prefill`` is forwarded to the first Generator call only.
+    """
+    t_call = time.perf_counter()
+    model_args_list = list(generator.model_args)
+    primary = model_args_list[0]
+    if options is None:
+        options = getattr(primary, "batched_prefill", None) or BatchedPrefillOptions()
+
+    batch_size = int(tokens.shape[0])
+    prompt_lens = _as_int_list(prompt_lens) if prompt_lens is not None else [int(tokens.shape[1])] * batch_size
+    if len(prompt_lens) != batch_size:
+        raise ValueError(f"prompt_lens has {len(prompt_lens)} entries for {batch_size} users")
+    empty_slots = _as_int_list(empty_slots) if empty_slots is not None else list(range(batch_size))
+    if len(empty_slots) != batch_size:
+        raise ValueError(f"empty_slots has {len(empty_slots)} entries for {batch_size} users")
+    num_cached = _as_int_list(start_pos)
+
+    log = []
+    generator.batched_prefill_pass_log = log
+
+    packable = (
+        options.enabled
+        and batch_size > 1
+        and page_table is not None
+        and sampling_params is None
+        and getattr(generator, "data_parallel", 1) == 1
+        and not getattr(generator.model[0], "users_row_sharded", False)
+        and not kwargs.get("return_hidden_states", False)
+    )
+    plan = plan_batched_prefill(prompt_lens, options, num_cached=num_cached) if packable else None
+
+    def record(users, seq_len, padded_batch, packed, traced, t0):
+        t1 = time.perf_counter()
+        log.append(
+            BatchedPrefillPassRecord(
+                users=tuple(users),
+                slots=tuple(empty_slots[u] for u in users),
+                seq_len=seq_len,
+                padded_batch=padded_batch,
+                packed=packed,
+                traced=traced,
+                duration_s=t1 - t0,
+                ttft_s=t1 - t_call,
+            )
+        )
+
+    if plan is None or not plan.passes:
+        # Nothing to pack: the per-user path exactly as today, in one Generator call. The flag is lowered for the call
+        # so the Generator does not batch on its own what the policy declined (e.g. equal-length 2K users).
+        t0 = time.perf_counter()
+        with batched_prefill_flag(model_args_list, False):
+            out = generator.prefill_forward_text(
+                tokens,
+                page_table=page_table,
+                kv_cache=kv_cache,
+                prompt_lens=prompt_lens,
+                empty_slots=empty_slots,
+                enable_trace=enable_trace,
+                start_pos=start_pos,
+                sampling_params=sampling_params,
+                warmup_prefill=warmup_prefill,
+                **kwargs,
+            )
+        record(range(batch_size), 0, 1, False, bool(enable_trace), t0)
+        return out
+
+    logger.info(
+        f"Packed prefill of {batch_size} users ({options.describe()}): "
+        + ", ".join(f"{len(p.users)}x{p.seq_len} (device batch {p.padded_batch})" for p in plan.passes)
+        + (f"; sequential users {list(plan.sequential)}" if plan.sequential else "")
+    )
+    output = torch.zeros(batch_size, 1, primary.vocab_size)
+    slots_before = set(getattr(generator, "_slots_prefilled_since_decode", set()))
+    first_call = True
+    for pass_ in plan.passes:
+        users = list(pass_.users)
+        traced = bool(enable_trace) and primary.can_enable_batched_prefill_trace(pass_.padded_batch, pass_.seq_len)
+        t0 = time.perf_counter()
+        with batched_prefill_flag(model_args_list, True):
+            # The Generator places request i at device row empty_slots[i]; with slots 0..m-1 the pass is padded to the
+            # smallest supported batch >= m (never to the highest real slot) and the per-user page-table rows carry the
+            # users' real blocks. Packed users have no cached prefix (plan), so start_pos is None here.
+            res = generator.prefill_forward_text(
+                tokens[users],
+                page_table=page_table[users],
+                kv_cache=kv_cache,
+                prompt_lens=[prompt_lens[u] for u in users],
+                empty_slots=list(range(len(users))),
+                enable_trace=traced,
+                start_pos=None,
+                sampling_params=None,
+                warmup_prefill=warmup_prefill and first_call,
+                **kwargs,
+            )
+        first_call = False
+        output[users] = res
+        record(users, pass_.seq_len, pass_.padded_batch, True, traced, t0)
+
+    for user in plan.sequential:
+        t0 = time.perf_counter()
+        with batched_prefill_flag(model_args_list, False):
+            res = generator.prefill_forward_text(
+                tokens[user : user + 1],
+                page_table=page_table[user : user + 1],
+                kv_cache=kv_cache,
+                prompt_lens=[prompt_lens[user]],
+                empty_slots=[empty_slots[user]],
+                enable_trace=enable_trace,
+                start_pos=[num_cached[user]] if num_cached is not None else None,
+                sampling_params=None,
+                warmup_prefill=warmup_prefill and first_call,
+                **kwargs,
+            )
+        first_call = False
+        output[user] = res[0]
+        record([user], 0, 1, False, bool(enable_trace), t0)
+
+    # The Generator recorded the re-slotted 0..m-1 of every packed pass; the decode-side bookkeeping wants the slots
+    # that were really refreshed (vLLM async scheduling keeps device-fed tokens for all other slots).
+    generator._slots_prefilled_since_decode = slots_before | set(empty_slots)
+    return output
+
+
+def summarize_batched_prefill_log(pass_log, num_users):
+    """TTFT first / mean / last (seconds) over ``num_users`` from a ``prefill_forward_text_batched`` pass log.
+
+    Every user of a pass gets the pass's end time. A single sequential Generator call over several users (no packed
+    passes) is one record, so its users all report the call's end time -- the sweep's ``c, (B+1)/2 c, B c`` reading of
+    a sequential loop is the more faithful one for that case (``text_demo.py`` uses it when nothing was packed).
+    """
+    ttft = [None] * num_users
+    for rec in pass_log:
+        for user in rec.users:
+            if 0 <= user < num_users:
+                ttft[user] = rec.ttft_s
+    known = [t for t in ttft if t is not None]
+    if not known:
+        return None
+    return {"first": min(known), "mean": sum(known) / len(known), "last": max(known), "per_user": ttft}

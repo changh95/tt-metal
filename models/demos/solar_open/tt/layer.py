@@ -48,6 +48,7 @@ class DecoderLayer:
         users_row_sharded=False,
         tokens_per_device=32,
         moe_options=None,
+        router_persistent_token_counts=None,
     ):
         self.layer_idx = layer_idx
         self.input_layernorm = RMSNorm(
@@ -74,6 +75,7 @@ class DecoderLayer:
             mesh_config=mesh_config,
             tokens_per_device=tokens_per_device,
             moe_options=moe_options,
+            router_persistent_token_counts=router_persistent_token_counts,
         )
 
         # SolarOpenConfig declares no layer_types: get_layer_types synthesizes ["full_attention"] * num_layers.

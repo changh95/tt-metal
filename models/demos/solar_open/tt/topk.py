@@ -39,10 +39,14 @@ bias (real layer 0: |bias| <= 0.002) and than the gaps between the top experts' 
 always accumulated in fp32 (see ``compute_config``).
 
 Trace safety: every per-call tensor is produced by a device op. The per-token-count bias copy and the bf16 zeros
-that seed the scatter are persistent for the traced token counts (prebuilt for the decode batch, 32 and the traced
-prefill length 128; other token counts <= ``_KEEP_ROW_TENSORS_UP_TO`` are built lazily and kept), so captured
-graphs never allocate them. Longer token counts build them per call and free them afterwards (two device ops; the
-128K fp32 bias copy is 64 MiB per device); such lengths must only run eagerly.
+that seed the scatter are persistent for the traced token counts (``persistent_token_counts``: prebuilt in
+``__init__`` for the decode batch and, by default, 32 and the traced prefill length 128 -- ``Model`` passes
+``ModelArgs.router_persistent_token_counts`` to extend the set to every traced prefill length and the packed
+multi-user prefill row counts; other token counts <= ``_KEEP_ROW_TENSORS_UP_TO`` are built lazily and kept), so
+captured graphs never allocate them. Longer token counts build them per call and free them afterwards (two device
+ops; the 128K fp32 bias copy is 64 MiB per device); such lengths must only run eagerly. A trace capture of a token
+count whose helpers are transient would record their allocation and re-run it on every replay: the traced-prefill
+equivalence test (tests/unit/test_traced_prefill.py) asserts persistence for every traced length.
 """
 
 import torch
@@ -56,9 +60,13 @@ from .linear_configs import grid_fits, mcast_1d_linear_config
 
 # Per-token-count helper tensors ([T, E] bias copy for the fused op, [T, E] bf16 zeros for the scatter) are kept
 # for T up to this bound and built-and-freed per call above it. Only the traced token counts need to persist (the
-# decode batch, 32 and the traced prefill length 128, prebuilt in __init__); keeping every prefill length up to 4096
-# would retain up to ~5 MiB per layer per distinct length (250 MiB per device over a 1K/2K/4K length sweep x 48 layers).
+# decode batch, 32 and the traced prefill length 128 by default, plus whatever ``persistent_token_counts`` names --
+# prebuilt in __init__); keeping every prefill length up to 4096 would retain up to ~5 MiB per layer per distinct
+# length (250 MiB per device over a 1K/2K/4K length sweep x 48 layers; 0.75 MiB per layer at 1024 rows with the fused
+# fp32 router: the 279 MiB budget of design_traced_prefill.md 6.1 for all of 256 / 512 / 1K / 2K / 4K).
 _KEEP_ROW_TENSORS_UP_TO = 128
+# Default persistent token counts besides the decode batch: the batched-decode padding width and the traced prefill@128.
+_DEFAULT_PERSISTENT_TOKEN_COUNTS = (32, 128)
 
 # Token counts at or below this run the router in L1 (decode and the traced prefill@128); longer ones in DRAM.
 _L1_MAX_TOKENS = 128
@@ -111,6 +119,10 @@ class TopKRouter:
         always_on_slots: number of trailing always-on expert columns to append to the dense routing tensor with the
             constant weight 1.0 (0 = plain ``[tokens, num_experts]`` output; the MLP passes 1 when the shared expert
             is fused into the routed experts). The linear / bias / top-k still see ``num_experts`` scores.
+        persistent_token_counts: row counts whose ``[T, E]`` helper tensors are prebuilt here and kept for the life
+            of the router (besides ``tokens_per_device``, which is always persistent): every token count that may run
+            under a trace capture -- the traced prefill lengths and the packed multi-user prefill row counts of
+            ``ModelArgs.router_persistent_token_counts``. ``None`` = the phase-2 default ``(32, 128)``.
     """
 
     def __init__(
@@ -122,6 +134,7 @@ class TopKRouter:
         tokens_per_device=32,
         moe_options=None,
         always_on_slots=0,
+        persistent_token_counts=None,
     ):
         options = moe_options or MoEOptions()
         self.mesh_device = mesh_device
@@ -130,6 +143,13 @@ class TopKRouter:
         if always_on_slots < 0:
             raise ValueError(f"always_on_slots must be >= 0, got {always_on_slots}")
         self.always_on_slots = always_on_slots
+        if persistent_token_counts is None:
+            persistent_token_counts = _DEFAULT_PERSISTENT_TOKEN_COUNTS
+        counts = {tokens_per_device, *persistent_token_counts}
+        if any(not isinstance(t, int) or isinstance(t, bool) or t <= 0 for t in counts):
+            raise ValueError(f"persistent_token_counts must be positive ints, got {sorted(counts, key=str)}")
+        # Token counts whose helper tensors are prebuilt below and never freed (see _get_row_tensors).
+        self.persistent_token_counts = frozenset(counts)
         # Width of the emitted dense routing tensor (== the expert slot count of the experts' weight tensors).
         self.num_slots = self.num_experts + always_on_slots
         self.hidden_dim = hf_config.hidden_size
@@ -195,9 +215,10 @@ class TopKRouter:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
-        # {tokens: (bias_wide, seed)}: decode batch, the batched-decode padding width and the traced prefill length.
+        # {tokens: (bias_wide, seed)}: the persistent token counts (decode batch, the batched-decode padding width, the
+        # traced prefill lengths, ...), prebuilt here so no traced graph ever allocates them.
         self._row_tensors = {}
-        for tokens in {tokens_per_device, 32, 128}:
+        for tokens in sorted(self.persistent_token_counts):
             self._get_row_tensors(tokens, keep=True)
 
     def _scatter_seed(self, tokens):
@@ -225,7 +246,8 @@ class TopKRouter:
         broadcasts the ``[1, E]`` bias itself); ``seed`` is the ``[tokens, num_slots]`` bf16 TILE tensor the scatter
         starts from (zeros, or the always-on seed of ``_scatter_seed``; scatter is out-of-place, so it is reused
         across calls). ``transient`` tells the caller to free both after use (token counts above
-        ``_KEEP_ROW_TENSORS_UP_TO`` and not forced with ``keep``); the persistent seed row itself is never freed.
+        ``_KEEP_ROW_TENSORS_UP_TO`` that are neither in ``persistent_token_counts`` nor forced with ``keep``); the
+        persistent seed row itself is never freed.
         """
         cached = self._row_tensors.get(tokens)
         if cached is not None:
@@ -236,7 +258,7 @@ class TopKRouter:
         zeros = self._scatter_seed(tokens)
         row_tensors = (bias_wide, zeros)
 
-        if keep or tokens <= _KEEP_ROW_TENSORS_UP_TO:
+        if keep or tokens in self.persistent_token_counts or tokens <= _KEEP_ROW_TENSORS_UP_TO:
             self._row_tensors[tokens] = row_tensors
             return row_tensors, False
         return row_tensors, True

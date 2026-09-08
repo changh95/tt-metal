@@ -97,6 +97,7 @@ class MLP:
         mesh_config=None,
         tokens_per_device=32,
         moe_options=None,
+        router_persistent_token_counts=None,
     ):
         """
         Args:
@@ -110,6 +111,9 @@ class MLP:
             mesh_config: ``MeshConfig`` (TP over the mesh columns)
             tokens_per_device: decode batch per device (the router prebuilds its bias tile for it)
             moe_options: ``MoEOptions``; None selects the Solar-Open defaults
+            router_persistent_token_counts: token counts whose ``[T, E]`` router helpers are prebuilt and kept
+                (``ModelArgs.router_persistent_token_counts``: traced prefill lengths, packed-prefill row counts);
+                None = the router's default ``(32, 128)`` plus the decode batch
         """
         assert mesh_config is not None, "MLP requires a MeshConfig (Model builds a default one)"
         options = moe_options or MoEOptions()
@@ -145,6 +149,7 @@ class MLP:
             tokens_per_device=tokens_per_device,
             moe_options=options,
             always_on_slots=1 if fuse_shared else 0,
+            persistent_token_counts=router_persistent_token_counts,
         )
 
         expert_config = ExpertConfig(

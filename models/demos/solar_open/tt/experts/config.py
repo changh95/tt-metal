@@ -70,6 +70,76 @@ class IndexedRouting:
         self.weights.deallocate(True)
 
 
+@dataclass(frozen=True)
+class MinimalMatmulBlocking:
+    """Blocking of one ``ttnn.experimental.minimal_matmul`` ``[M, K] x [K, N]`` (the newer 2D matmul kernel: in0 reuse
+    across N blocks, deferred writes, one weight with no batch dim): the core grid, the K block and the output subblock,
+    all in tiles. ``config(m, k, n)`` derives the per-core M / N blocks the way the kernel partitions its output -- M
+    over the grid's x axis and N over y when M > N (the kernel transposes its grid for tall outputs), else M over y and
+    N over x; each axis is padded up to a multiple of its core count and every core owns one ``[M_block x N_block]``
+    block -- snaps the K block to a divisor of Kt (a non-dividing K block would make the kernel read padded K tiles)
+    and the subblock to divisors of the blocks within the destination-register budget (``dst_tiles``: 8 with a bf16
+    destination, 4 with fp32 accumulation; the kernel requires ``subblock_h | M_block``, ``subblock_w | N_block`` and
+    ``subblock_h * subblock_w <= dst``). The kernel needs a grid of at least 2x2 that fits the device: ``fits``.
+
+    Solar-Open TP=8 (phase 3, tests/perf/test_prefill_matmul_candidates.py on P150): the per-expert fused gate|up
+    ``[1024, 4096] x [4096, 320]`` with ``cores (11, 5), k_block 16, subblock (3, 2)`` -> M_block 3 (33 padded rows
+    over 11 columns), N_block 2, 46 us vs 81 us for ``ttnn.linear``'s auto config; the hot group's K-concatenated down
+    ``[1024, n_hot * 160] x [n_hot * 160, 4096]`` with ``cores (11, 10), k_block 5, subblock (4, 2)`` -> M_block 4,
+    N_block 12, 50 / 74 / 117 us at n_hot 4 / 8 / 15.
+    """
+
+    cores: tuple[int, int]
+    k_block: int
+    subblock: tuple[int, int] = (1, 1)
+    dst_tiles: int = 8
+
+    def __post_init__(self):
+        if not (isinstance(self.cores, tuple) and len(self.cores) == 2 and min(self.cores) >= 2):
+            raise ValueError(f"MinimalMatmulBlocking.cores must be an (x, y) grid of at least 2x2, got {self.cores}")
+        if self.k_block < 1:
+            raise ValueError(f"MinimalMatmulBlocking.k_block must be positive, got {self.k_block}")
+        if not (isinstance(self.subblock, tuple) and len(self.subblock) == 2 and min(self.subblock) >= 1):
+            raise ValueError(f"MinimalMatmulBlocking.subblock must be a positive (h, w) pair, got {self.subblock}")
+        if self.dst_tiles < 1:
+            raise ValueError(f"MinimalMatmulBlocking.dst_tiles must be positive, got {self.dst_tiles}")
+
+    def fits(self, grid) -> bool:
+        """True when ``cores`` fits the compute grid ``grid`` (an object with ``x`` / ``y`` or an (x, y) pair)."""
+        if grid is None:
+            return False
+        gx, gy = (grid.x, grid.y) if hasattr(grid, "x") else tuple(grid)
+        return self.cores[0] <= gx and self.cores[1] <= gy
+
+    def blocks(self, m: int, k: int, n: int) -> tuple[int, int, int, int, int]:
+        """``(M_block, K_block, N_block, subblock_h, subblock_w)`` in tiles for an ``[m, k] x [k, n]`` product."""
+        Mt, Kt, Nt = -(-m // 32), -(-k // 32), -(-n // 32)
+        core_x, core_y = self.cores
+        m_cores, n_cores = (core_x, core_y) if m > n else (core_y, core_x)
+        m_block = -(-Mt // m_cores)
+        n_block = -(-Nt // n_cores)
+        k_block = max(d for d in range(1, min(self.k_block, Kt) + 1) if Kt % d == 0)
+        sub_h = max(d for d in range(1, min(self.subblock[0], m_block) + 1) if m_block % d == 0)
+        sub_w = max(d for d in range(1, min(self.subblock[1], n_block) + 1) if n_block % d == 0)
+        while sub_h * sub_w > self.dst_tiles:  # over the dst budget: narrow the subblock first, then shorten it
+            if sub_w > 1:
+                sub_w = max(d for d in range(1, sub_w) if n_block % d == 0)
+            else:
+                sub_h = max(d for d in range(1, sub_h) if m_block % d == 0)
+        return m_block, k_block, n_block, sub_h, sub_w
+
+    def config(self, m: int, k: int, n: int) -> ttnn.MinimalMatmulConfig:
+        m_block, k_block, n_block, sub_h, sub_w = self.blocks(m, k, n)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=m_block,
+            K_block_size=k_block,
+            N_block_size=n_block,
+            subblock_h=sub_h,
+            subblock_w=sub_w,
+            compute_with_storage_grid_size=ttnn.CoreCoord(*self.cores),
+        )
+
+
 @dataclass
 class ProgramConfig:
     """
@@ -137,6 +207,37 @@ class ProgramConfig:
     # of Kt tiles, per_core_N = Nt / cores) instead of ttnn's ``core_grid=`` auto choice (which picks in0_block_w 1
     # for Kt = 5 and runs 2.7x slower at S = 128). None keeps the auto config. See get_dense_down_config.
     dense_down_cores: tuple[int, int] | None = None
+    # get_dense_down_config: the tallest out_subblock_h <= this value that divides per_core_M with out_subblock_h *
+    # out_subblock_w <= 8 destination tiles (bf16 destination, the dense compute config). The subblock only sets how
+    # many output tiles one compute pass accumulates (bit-identical output); 1 = one tile row per pass (the phase-2
+    # config), 4 = the whole [Mt x 2] block at <= 128 rows (measured on P150: 650 -> 596 us at 128 rows, 524 -> 484 at
+    # 96, -8 %).
+    dense_down_max_subblock_h: int = 1
+    # Dense-path per-expert fused gate|up linear [1, 1, split, H] x [1, 1, H, 2Ip] (the sorted path's hot group and
+    # the per-expert loop of long splits) as ttnn.experimental.minimal_matmul with this blocking; None keeps
+    # ttnn.linear with ttnn's ``core_grid=`` auto config (a 2D multicast config with in0_block_w 4). See
+    # get_dense_expert_gate_up_config.
+    dense_expert_gate_up_minimal: MinimalMatmulBlocking | None = None
+    # Hot group's down projection + sum over the hot experts as ONE K-concatenated minimal_matmul
+    # [1, 1, split, n_hot * Ip] x [1, 1, n_hot * Ip, H] over bf16 GLU pieces (the sum moves into the matmul's
+    # accumulation); None keeps the batched per-expert matmul (auto config) + fast_reduce_nc. See
+    # get_hot_down_kconcat_config.
+    hot_down_kconcat_minimal: MinimalMatmulBlocking | None = None
+    # Dense bmm path (splits <= dense_bmm_max_tokens, i.e. the traced 128-token prefill): round the activation to
+    # bfloat8_b BEFORE its per-expert replication (ttnn.repeat), so the broadcast writes half the bytes and the gate|up
+    # bmm reads bfp8 in0 (measured on P150 at 128 tokens: 633 -> 366 us + bmm 808 -> 771 us per layer). A numerics
+    # change of every routed expert's input on that path (the sorted / per-expert paths keep bf16 activations): off
+    # unless the teacher-forced accuracy test admits it.
+    dense_activation_bfp8: bool = False
+    # Split lengths (tokens) whose MoE must be TRACE-SAFE (no device->host read, static shapes, no persistent
+    # allocation). A split longer than dense_bmm_max_tokens normally takes the host-planned expert-sorted hot/cold path
+    # (prefill._sorted_moe_plan reads the per-expert token counts back to the host per split): a trace capture would
+    # record ONE prompt's plan and replay it for every other prompt. Splits listed here take the static per-expert
+    # loop instead (device-only; ~2.5x the sorted path's cost at 1024 tokens -- the placeholder until a trace-safe
+    # sorted plan exists, design_traced_prefill.md (C)). Empty by default: the only shipped traced prefill bucket
+    # (128 tokens) runs the one-launch dense bmm, trace-safe by construction. Consulted by prefill.moe_prefill_path;
+    # ModelArgs.get_trace_prefill_supported_seq_lens refuses a traced length whose splits are not trace-safe.
+    trace_safe_split_lens: tuple[int, ...] = ()
 
     def __post_init__(self):
         """Validate configuration on creation"""
@@ -163,6 +264,19 @@ class ProgramConfig:
             raise ValueError(f"dense_grid_max_width must be positive, got {self.dense_grid_max_width}")
         if self.dense_bmm_max_tokens <= 0 or self.dense_bmm_max_tokens % 32 != 0:
             raise ValueError(f"dense_bmm_max_tokens must be a positive multiple of 32, got {self.dense_bmm_max_tokens}")
+        if not 1 <= self.dense_down_max_subblock_h <= 8:
+            raise ValueError(f"dense_down_max_subblock_h must be in 1..8, got {self.dense_down_max_subblock_h}")
+        for name in ("dense_expert_gate_up_minimal", "hot_down_kconcat_minimal"):
+            blocking = getattr(self, name)
+            if blocking is not None and not isinstance(blocking, MinimalMatmulBlocking):
+                raise ValueError(f"{name} must be a MinimalMatmulBlocking or None, got {blocking!r}")
+        if not isinstance(self.trace_safe_split_lens, (tuple, list)) or any(
+            not isinstance(n, int) or n <= 0 or n % 32 != 0 for n in self.trace_safe_split_lens
+        ):
+            raise ValueError(
+                f"trace_safe_split_lens must be a tuple of positive multiples of 32, got {self.trace_safe_split_lens!r}"
+            )
+        self.trace_safe_split_lens = tuple(sorted(set(self.trace_safe_split_lens)))
 
     def _validate_cores(self, name: str, cores: tuple[int, int]):
         """Validate core grid dimensions"""
@@ -333,9 +447,12 @@ class ProgramConfig:
 
         1D multicast of in0 over ``dense_down_cores``, the whole K (``Kt`` tiles) as one block, ``per_core_N = Nt /
         cores`` and one ``[per_core_M x per_core_N]`` output block per core (``out_subblock_w`` = the widest divisor
-        of per_core_N <= 4 with out_subblock_h 1). Measured on P150 for Solar-Open (Kt = 5, Nt = 128, 8x8 cores):
-        311 / 642 / 1096 us at m = 32 / 128 / 256 vs 396 / 1148 / 1716 us for the auto config (in0_block_w 1).
-        Requires ``Nt % cores == 0`` and ``m % 32 == 0``; raises otherwise (no silent fallback)."""
+        of per_core_N <= 4; ``out_subblock_h`` = the tallest divisor of per_core_M <= ``dense_down_max_subblock_h``
+        with out_subblock_h * out_subblock_w <= 8 destination tiles). Measured on P150 for Solar-Open (Kt = 5, Nt =
+        128, 8x8 cores): 311 / 642 / 1096 us at m = 32 / 128 / 256 vs 396 / 1148 / 1716 us for the auto config
+        (in0_block_w 1) with out_subblock_h 1; the [Mt x 2] subblock (dense_down_max_subblock_h 4) takes 128 rows to
+        596 us and 96 rows 524 -> 484 us, bit-identical (phase 3). Requires ``Nt % cores == 0`` and ``m % 32 == 0``;
+        raises otherwise (no silent fallback)."""
         if self.dense_down_cores is None:
             return None
         core_x, core_y = self.dense_down_cores
@@ -348,10 +465,14 @@ class ProgramConfig:
             )
         per_core_N = Nt // num_cores
         out_subblock_w = max(d for d in (4, 2, 1) if per_core_N % d == 0)
+        # dst-register budget of the bf16-destination dense compute config: 8 tiles per compute pass
+        out_subblock_h = max(
+            h for h in range(1, min(Mt, self.dense_down_max_subblock_h) + 1) if Mt % h == 0 and h * out_subblock_w <= 8
+        )
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(core_x, core_y),
             in0_block_w=Kt,
-            out_subblock_h=1,
+            out_subblock_h=out_subblock_h,
             out_subblock_w=out_subblock_w,
             out_block_h=Mt,
             out_block_w=per_core_N,
@@ -361,6 +482,25 @@ class ProgramConfig:
             fused_activation=None,
             mcast_in0=True,
         )
+
+    def get_dense_expert_gate_up_config(self, m: int, k: int, n: int, grid=None) -> ttnn.MinimalMatmulConfig | None:
+        """``ttnn.MinimalMatmulConfig`` of the dense-path per-expert fused gate|up linear ``[1, 1, m, k] x [1, 1, k,
+        n]`` (sorted hot group, per-expert loop) from ``dense_expert_gate_up_minimal``, or None (caller runs
+        ``ttnn.linear`` with the auto config) when the blocking is unset or does not fit ``grid`` (the compute grid the
+        caller may use; None = no grid check)."""
+        blocking = self.dense_expert_gate_up_minimal
+        if blocking is None or (grid is not None and not blocking.fits(grid)):
+            return None
+        return blocking.config(m, k, n)
+
+    def get_hot_down_kconcat_config(self, m: int, k: int, n: int, grid=None) -> ttnn.MinimalMatmulConfig | None:
+        """``ttnn.MinimalMatmulConfig`` of the hot group's K-concatenated down ``[1, 1, m, k = n_hot * Ip] x [1, 1, k,
+        n = H]`` from ``hot_down_kconcat_minimal``, or None (caller keeps the batched matmul + fast_reduce_nc) when the
+        blocking is unset or does not fit ``grid``."""
+        blocking = self.hot_down_kconcat_minimal
+        if blocking is None or (grid is not None and not blocking.fits(grid)):
+            return None
+        return blocking.config(m, k, n)
 
     def get_prefill_gate_up_config(
         self, m: int, n: int, k: int = None

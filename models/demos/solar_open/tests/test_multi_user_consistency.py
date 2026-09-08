@@ -127,6 +127,12 @@ def _compare(name, ref, other, ref_slots, other_slots):
     for p_ref, p_other in zip(ref_slots, other_slots):
         a = ref[p_ref].float()
         b = other[p_other].float()
+        # A NaN / inf logit row makes every comparison below vacuous (PCC nan compares False against any floor), so
+        # it is a failure of its own -- measured once on 2026-09-08 (C2 filler repeat: PCC nan, 53/744 flips).
+        assert torch.isfinite(a).all() and torch.isfinite(b).all(), (
+            f"[{name}] non-finite logits: ref slot {p_ref} finite={bool(torch.isfinite(a).all())}, "
+            f"other slot {p_other} finite={bool(torch.isfinite(b).all())}"
+        )
         a_c = a - a.mean(dim=-1, keepdim=True)
         b_c = b - b.mean(dim=-1, keepdim=True)
         pcc = (a_c * b_c).sum(-1) / (a_c.norm(dim=-1) * b_c.norm(dim=-1) + 1e-12)

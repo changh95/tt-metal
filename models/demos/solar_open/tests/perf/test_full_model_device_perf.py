@@ -42,7 +42,10 @@ DECODE_STEPS = {
     1: int(os.getenv("SOLAR_OPEN_PERF_B1_STEPS", "12")),
     32: int(os.getenv("SOLAR_OPEN_PERF_B32_STEPS", "30")),
 }
-FLUSH_EVERY = 5
+# Profiler flush cadence (steps / prefill users between ReadDeviceProfiler calls). 5 kept the b1 run inside the
+# 20000-op buffer; the b32 run (30 steps + 32 prefill users) aborted at teardown on 2026-09-08 with
+# "End marker found without a corresponding start marker" (a core's marker buffer wrapped) -> use 2 for b32.
+FLUSH_EVERY = int(os.getenv("SOLAR_OPEN_PERF_FLUSH_EVERY", "5"))
 
 
 def _flush(mesh_device):

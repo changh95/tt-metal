@@ -26,12 +26,21 @@ Uses the refactored TestFactory and MeshConfig patterns:
 
     pytest models/demos/solar_open/demo/text_demo.py -k "prefill_128 and 1x8"
     pytest models/demos/solar_open/demo/text_demo.py -k "batch32 and 1x8 and not 16k and not 32k"
+    pytest models/demos/solar_open/demo/text_demo.py -k "packed_b32_128 and 1x8"   # 32 users, packed 8 x 128 prefill
     pytest models/demos/solar_open/demo/text_demo.py -k "batch32_16k and 1x8"      # 32 users x 2-15K-token contexts
     SOLAR_OPEN_KV_BUDGET_GIB=13 pytest models/demos/solar_open/demo/text_demo.py -k "batch32_32k and 1x8"
     pytest models/demos/solar_open/demo/text_demo.py -k "prefill_64k and 1x8"      # single user, 64K prefill
 
 A paged KV pool above the per-device budget (tt/common.py: 8 GiB with bfp8 experts, 14 GiB with bfp4, env
 SOLAR_OPEN_KV_BUDGET_GIB clamped to 14.5 / 20 GiB) skips the case before anything is loaded.
+
+Packed multi-user prefill (phase 3a(1), ``tt/model.py: prefill_forward_text_batched``): every multi-user case on a
+single-row mesh runs its prefill as packed passes when ``SOLAR_OPEN_BATCHED_PREFILL=1`` is set (or the case's
+``batched_prefill`` column is True, as in ``packed_b32_128``): equal-length short prompts (padded length <=
+``SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN``, default 128) go ``SOLAR_OPEN_BATCHED_PREFILL_TOKENS // S`` users at a time
+(default 1024 tokens = 8 x 128) through one eager forward each; longer prompts (the 16k / 32k cases) stay sequential
+unless the two knobs are raised. The compile pass runs the full batch eagerly once, the KV cache is cleared and the
+timed pass repeats it; TTFT first / mean / last come from the per-pass log.
 """
 
 import json
@@ -47,6 +56,7 @@ from models.common.utility_functions import is_blackhole
 from models.demos.solar_open.config import MoEOptions
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
 from models.demos.solar_open.tt.common import check_kv_budget, create_tt_model
+from models.demos.solar_open.tt.model import prefill_forward_text_batched, summarize_batched_prefill_log
 from models.demos.utils.device_sku import get_current_device_sku_name
 from models.demos.utils.llm_demo_utils import create_benchmark_data, verify_perf
 from models.demos.utils.model_targets import resolve_perf_targets
@@ -260,7 +270,7 @@ def prepare_solar_open_generator_args(
 # invocations can still target them explicitly with -k.
 @pytest.mark.timeout(7200)
 @pytest.mark.parametrize(
-    "input_prompts, data_parallel, batch_size, repeat_batches, max_seq_len, max_generated_tokens, page_params, sampling_params, enable_decode_trace, enable_prefill_trace, warmup_prefill, users_row_sharded, long_context_mode, stop_at_eos, run_in_ci, reasoning_effort",
+    "input_prompts, data_parallel, batch_size, repeat_batches, max_seq_len, max_generated_tokens, page_params, sampling_params, enable_decode_trace, enable_prefill_trace, warmup_prefill, users_row_sharded, long_context_mode, stop_at_eos, run_in_ci, reasoning_effort, batched_prefill",
     [
         (
             "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
@@ -279,6 +289,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             True,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Same as prefill_128 with the first ENGLISH prompt (prefill_128 runs the first, Korean, prompt of the KO/EN file)
         (
@@ -298,6 +309,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Non-greedy on-device sampling with Solar's recommended temperature / top_p; top_k is capped at 32 (MAX_TOP_K)
         (
@@ -317,6 +329,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # reasoning_effort=high: the model thinks in a <|think|> block before <|content|>, so it needs a 2K token budget
         (
@@ -336,6 +349,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             "high",  # reasoning_effort
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_1k.json",  # input_prompts
@@ -354,6 +368,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_4k.json",  # input_prompts
@@ -372,6 +387,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_8k.json",  # input_prompts
@@ -390,6 +406,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_16k.json",  # input_prompts
@@ -408,6 +425,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_32k.json",  # input_prompts
@@ -426,6 +444,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_64k.json",  # input_prompts
@@ -444,6 +463,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_128k.json",  # input_prompts
@@ -462,6 +482,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Batch 128
         (
@@ -481,6 +502,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             True,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Batch 128 with logprobs (top-5)
         (
@@ -505,6 +527,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Long-context mode: 1 user per row with 128k tokens, batch=128 for decode throughput
         (
@@ -524,6 +547,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Long-context mode: short prefill, long decode
         (
@@ -543,6 +567,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Batch 32 on a single-row mesh (8x Blackhole P150): TP=8, EP=1, users are NOT row-sharded and the MoE runs the
         # union-of-experts decode on the whole 32-user tile (see experts/decode.py). 16 Korean + 16 English prompts.
@@ -566,6 +591,33 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+        ),
+        # Batch 32 with PACKED prefill (phase 3a(1), design_packed_prefill.md): the same 32 prompts as batch32, but the
+        # 32 x 128-token prefill runs as packed multi-user passes (SOLAR_OPEN_BATCHED_PREFILL_TOKENS tokens per pass,
+        # default 1024 = four passes of 8 users; 4096 = one pass of 32) through tt/model.py prefill_forward_text_batched
+        # instead of 32 sequential traced 128-token prefills (TTFT-last 4.9 s). Packed passes are always eager (the
+        # T = B x 128 MoE is not trace-safe), so enable_prefill_trace is off; the decode trace is unchanged. The demo
+        # logs TTFT first / mean / last from the per-pass log. Separate id on purpose: the plain batch-32 command
+        # `-k "batch32 and 1x8 and not 16k and not 32k"` must not pick this case up.
+        (
+            "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
+            1,  # data_parallel
+            32,  # batch_size
+            1,  # repeat_batches
+            8 * 1024,  # max_seq_len
+            512,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 32 * (8 * 1024 // 64)},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding)
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace (packed passes are eager; no single-user 128-token trace is needed)
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            True,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            True,  # batched_prefill (forces SOLAR_OPEN_BATCHED_PREFILL=1 for this case)
         ),
         # Batch 32 x 16K context (phase 2, design_misc.md (b)): 32 users each read a DIFFERENT clip (2K..15K tokens)
         # of the cached Frankenstein text followed by a KO/EN question about it (distinct contexts keep the union of
@@ -590,6 +642,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos (measure a fixed 256 steps)
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Batch 32 x 32K context: clips of 4K..31K tokens, page table 32 x 512 blocks = 16384 blocks = 12.75 GiB of KV
         # per device. Above the 8 GiB bfp8 default budget on purpose: the case SKIPS unless SOLAR_OPEN_KV_BUDGET_GIB=13
@@ -614,6 +667,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos (measure a fixed 256 steps)
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
         # Seqlen sweep: 1k-128k context lengths, one step per seqlen (on single-row meshes, >64k steps are skipped)
         (
@@ -645,6 +699,7 @@ def prepare_solar_open_generator_args(
             # via -k "seqlen-sweep".
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
         ),
     ],
     ids=[
@@ -664,6 +719,7 @@ def prepare_solar_open_generator_args(
         "long_context_128k",
         "long_context_short_prefill_long_decode",
         "batch32",
+        "packed_b32_128",
         "batch32_16k",
         "batch32_32k",
         "seqlen-sweep",
@@ -689,6 +745,7 @@ def test_solar_open_demo(
     stop_at_eos,
     run_in_ci,
     reasoning_effort,
+    batched_prefill,
     is_ci_env,
     request,
     state_dict,
@@ -737,6 +794,11 @@ def test_solar_open_demo(
         f"Chat template: reasoning_effort={os.environ['SOLAR_OPEN_REASONING_EFFORT']}, "
         f"default_system_prompt={os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}"
     )
+    # Packed multi-user prefill (phase 3a(1)): the case column wins over the environment; None keeps the env default
+    # (SOLAR_OPEN_BATCHED_PREFILL, off unless set), so `batch32` runs either arm of the A/B from the shell. ModelArgs
+    # reads the env at construction, i.e. below in prepare_solar_open_generator_args.
+    if batched_prefill is not None:
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "1" if batched_prefill else "0")
 
     # Use our refactored TestFactory for consistent setup
     setup = TestFactory.setup_test(mesh_device, use_real_weights=False)
@@ -846,6 +908,16 @@ def test_solar_open_demo(
         f"(cold run: HF host load + ttnn cache build; warm run: cache-only)"
     )
     log_device_memory(mesh_device, "after model load")
+
+    # Packed multi-user prefill applies to the single-row multi-user path only (row-sharded / long-context prefills
+    # have their own branches below). With the flag off this is False and the prefill branch is byte-identical to
+    # phase 2; with it on, prefill_forward_text_batched decides per user what is packed (see its docstring).
+    batched_prefill_options = model_args[0].batched_prefill
+    use_batched_prefill = (
+        batched_prefill_options.enabled and global_batch_size > 1 and not users_row_sharded and not long_context_mode
+    )
+    logger.info(f"Prefill policy: {batched_prefill_options.describe()} -> packed prefill path {use_batched_prefill}")
+    ttft_summary = None  # TTFT first / mean / last of the first batch (seconds), filled after its prefill
 
     # Create on-device sampling params
     SAMPLING_BATCH_SIZE = 32
@@ -1085,6 +1157,61 @@ def test_solar_open_demo(
             profiler.end(f"inference_prefill", iteration=batch_idx)
             logger.info("Row-parallel batched prefill finished")
 
+        elif use_batched_prefill:
+            # Packed multi-user prefill (phase 3a(1)). The compile pass runs the FULL batch through the exact packed
+            # shapes the timed pass uses (a new (B_pad, S) shape compiles its programs on first use, 30-60 s), then the
+            # KV cache is cleared (as the row-sharded branch does) so the timed pass rewrites every user's blocks.
+            logger.info("Starting packed prefill compile pass (full batch, eager)...")
+            profiler.start(f"compile_prefill", iteration=batch_idx)
+            prefill_forward_text_batched(
+                generator,
+                input_tokens_prefill_pt,
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=warmup_prefill,
+            )
+            profiler.end(f"compile_prefill", iteration=batch_idx)
+            logger.info("Packed prefill compile pass done")
+
+            for i in range(len(model)):
+                model[i].clear_kv_caches()
+            ttnn.synchronize_device(mesh_device)  # keep the (async) cache clear out of the prefill timing
+
+            logger.info("Starting packed prefill...")
+            profiler.start(f"inference_prefill", iteration=batch_idx)
+            logits = prefill_forward_text_batched(
+                generator,
+                input_tokens_prefill_pt,
+                page_table=page_table,
+                kv_cache=tt_kv_cache,
+                prompt_lens=decoding_pos,
+                enable_trace=enable_prefill_trace,
+                warmup_prefill=False,
+            )
+            prefilled_token = torch.argmax(logits, dim=-1)
+            profiler.end(f"inference_prefill", iteration=batch_idx)
+            logger.info("Packed prefill finished")
+            for rec in generator.batched_prefill_pass_log:
+                kind = (
+                    f"packed {len(rec.users)} x {rec.seq_len} (device batch {rec.padded_batch})"
+                    if rec.packed
+                    else "per-user"
+                )
+                logger.info(
+                    f"  prefill pass {kind}: users {list(rec.users)} -> slots {list(rec.slots)}, "
+                    f"{'traced' if rec.traced else 'eager'}, {rec.duration_s * 1000:.0f} ms, TTFT {rec.ttft_s * 1000:.0f} ms"
+                )
+            summary = summarize_batched_prefill_log(generator.batched_prefill_pass_log, global_batch_size)
+            if summary is not None:
+                logger.info(
+                    f"Packed prefill TTFT over {global_batch_size} users: first {summary['first'] * 1000:.0f} ms, "
+                    f"mean {summary['mean'] * 1000:.0f} ms, last {summary['last'] * 1000:.0f} ms"
+                )
+                if batch_idx == 0:
+                    ttft_summary = summary
+
         else:
             # Standard sequential prefill (batch_size < num_rows)
             logger.info("Starting prefill warmup...")
@@ -1262,6 +1389,13 @@ def test_solar_open_demo(
         (num_tokens_generated_decode[0] - 1) / total_inference_decode_time * effective_batch_size
     )  # total t/s
 
+    # TTFT first / mean / last over the users of the first batch. Packed prefill: from the per-pass log (every user of
+    # a pass gets the pass's end time). Sequential per-user loop (today's path): the sweep harness's reading of the
+    # per-user average c = inference_prefill / B -> first c, mean (B + 1) / 2 c, last B c (exact for a uniform loop).
+    if ttft_summary is None:
+        c = avg_time_to_first_token
+        ttft_summary = {"first": c, "mean": (effective_batch_size + 1) / 2 * c, "last": effective_batch_size * c}
+
     measurements = {
         # Required measurements
         "compile_prefill": compile_prefill_time,
@@ -1275,6 +1409,10 @@ def test_solar_open_demo(
         # Optional measurements
         "Total compile time": compile_prefill_time + compile_decode_time,
         "Full demo runtime": profiler.get_duration("run"),
+        # Multi-user TTFT (seconds): the first / mean / last user of the batch (see ttft_summary above)
+        "prefill_ttft_first": ttft_summary["first"],
+        "prefill_ttft_mean": ttft_summary["mean"],
+        "prefill_ttft_last": ttft_summary["last"],
     }
 
     # Performance logging (like tt-transformers)
@@ -1284,6 +1422,11 @@ def test_solar_open_demo(
     logger.info(f"Decode compile time: {round(compile_decode_time, 2)}s")
     logger.info("")
     logger.info(f"Average Time to First Token (TTFT): {round(avg_time_to_first_token * 1000, 2)}ms")
+    logger.info(
+        f"TTFT over {effective_batch_size} users ({'packed' if use_batched_prefill else 'sequential'} prefill): "
+        f"first {round(ttft_summary['first'] * 1000, 1)}ms, mean {round(ttft_summary['mean'] * 1000, 1)}ms, "
+        f"last {round(ttft_summary['last'] * 1000, 1)}ms"
+    )
     logger.info(
         f"Average decode speed: {round(avg_decode_iteration_time * 1000, 2)}ms @ {round(decode_tok_s_user, 2)} tok/s/user ({round(decode_tok_s, 2)} tok/s throughput)"
     )
