@@ -61,6 +61,7 @@ expert gate 0.99927 -> 0.99973, width-sharded decode norm 0.999963 -> 0.999994 (
 | `demo/text_demo.py`, `demo/sample_prompts/` | generation demo; `input_data_questions_ko_en_prefill_128.json` = 16 Korean + 16 English prompts; `input_data_ko_en_long_ctx_{16k,32k}.json` = 32 distinct clips (2-15K / 4-31K tokens) of the cached Frankenstein text, each followed by a KO/EN question about it (`"context_question": true`) |
 | `tt/vllm_support.py`, `vllm_plugins/solar_open_parsers.py` | vllm-free helpers of the vLLM wrapper `SolarOpenForCausalLM` (`models/tt_transformers/tt/generator_vllm.py`): request validation, 48-layer KV spec, token capacity from the KV budget, `from_torch` pool allocator, stop ids, template kwargs, parser registration; the plugin file registers Upstage's reasoning / tool parsers (see "Serving with vLLM") |
 | `tests/` | unit tests (`tests/unit/`), real-weight layer-0 test, multi-user consistency test, `tests/accuracy/` (host-side HF bf16 reference generator + teacher-forced whole-model accuracy test) |
+| `tests/test_multi_user_regression.py`, `tests/sweep/` | ISL/OSL x batch multi-user regression sweep (tt-inference-server benchmark pairs x batch 1-32, section "ISL/OSL x batch sweep"); `sweep/run_sweep.sh` = one pytest process per batch with timeouts, thermal gates, board reset and a ledger; `sweep/report.py` = jsonl -> Markdown tables and batch x ISL/OSL matrices |
 | `unit_test_thresholds.json` | PCC thresholds per component (key `Solar-Open-100B`) |
 
 ## Prerequisites
@@ -277,6 +278,115 @@ behaviour change: under `reasoning_effort=low` the bfp4 model answers directly (
 vs 25 of 32 with bfp8; it puts `<|content|>` above `<|think|>` at the first token of all 4 reference prompts, against
 2-3.75-logit bf16 margins). `test_teacher_forced.py` therefore carries a separate, looser floor set for bfp4.
 
+## ISL/OSL x batch sweep (multi-user regression)
+
+`tests/test_multi_user_regression.py` runs the tt-inference-server benchmark grid (`BENCHMARK_ISL_OSL_PAIRS`: ISL/OSL
+128/128, 128/1024, 1024/128, 2048/128, 4096/128, 8192/128, 8192/1024, 16384/128, 32768/128) at batch 1, 2, 4, 8, 16 and
+32 on the 1x8 mesh, one pytest case per batch: the model is built once for that batch with a paged pool of
+`min(64K, SOLAR_OPEN_REGRESSION_KV_TOKENS // B)` tokens per user (default 512K tokens in total = 6.4 GiB of bfp8 KV per
+device at 13,056 B/token, inside the 8 GiB default budget: 64K per user up to batch 8, 32K at batch 16, 16K at batch
+32), and every pair with ISL + OSL inside that context runs the way the benchmark client does it -- all users prefilled
+(sequentially, as the single-row mesh does), then exactly OSL decode steps without EOS stopping: 51 cells
+(9 + 9 + 9 + 9 + 8 + 7; the cells above a batch's context are reported as `-`). Prompts: ISL 128 = the 32 KO/EN QA
+prompts (cycled for a batch above 32), the other lengths the tt_transformers Gutenberg files
+`input_data_long_{1k,2k,4k,8k,16k,32k}.json` (one prompt per file, the same excerpt for every user; 953 / 1714 / 3810 /
+7541 / 16131 / 30263 tokens with Solar's tokenizer, i.e. padded prefill lengths 1024 .. 32768, the QA prompts 78-84
+tokens -> 128). Every prompt goes through the chat template (`reasoning_effort=low` as in the demo; the long files
+contribute their context alone as the user message, like the demo's `prefill_1k`..`prefill_32k` cases). Every batch
+of the sweep maps onto the Blackhole decode user grids of `tt/attention/config.py` (batch <= 8 and multiples of 32 on
+the 8x8 grid, 16 on the 13x10 device grid with an 8x2 concat grid); the decode batch equals `max_local_batch_size`.
+
+Per cell the jsonl row records the encoded / padded ISL, the eager compile time of the prefill length, the prefill
+total and per user, the TTFT of the first / mean / last user (sequential per-user prefill: user k waits k x the
+per-user prefill), the first traced decode step, the decode step mean / p50 / p99, tok/s per user and aggregate, the
+e2e time, the board temperatures around the prefill and the min AI clock (with the thermal gate on), the git revision,
+the tag, the page-table seed, and the checks. Gates (any failure marks the cell `FAIL`; the batch case fails at the
+end, after every pair has run and been recorded): every token id inside the vocabulary; the first generated token of
+every user in {`<|think|>` 22, `<|content|>` 23} (the template ends the prompt with `<|begin|>assistant`, so garbage
+prefill logits fail here even when the decoded garbage is diverse); at most max(1, B/4) users flagged by the
+degeneracy heuristic (a run of > 48 identical tokens or < 15 % distinct tokens in the stop-truncated generation);
+ISL 128: the answer keyword (`QA_KEYWORDS`, Korean prompts also accept the English answer) anywhere in the
+stop-truncated generation -- think block plus answer, the reasoning usually states the answer -- for >= 50 % of the
+users, recorded as `qa_accuracy`, with `qa_answer_accuracy` (keyword inside the `<|content|>` answer) and
+`content_reached` (users that got past their think block within OSL; think-only outputs at OSL 128 are the expected
+miss, not garbage) as information. The long prompts additionally record how many users agree with user 0 over the
+first 16 tokens (isolation signal, reported not asserted: greedy decode is not bit-reproducible on device).
+
+Mechanics inherited from the GPT-OSS sweep on this box: `warmup_prefill=False` everywhere with an explicit eager
+pre-compile of every prefill length BEFORE the first trace is captured (programs compiled while a trace is live were
+placed in a trace's freed range and overwritten by a later replay: a garbage prefill or a hang some pairs later), one
+untimed warm pass per padded length (the first pair's warm pass also captures the prefill@128 and decode traces), a
+seeded page table (`SOLAR_OPEN_REGRESSION_PAGE_TABLE_SEED`, default 1234, the demo's random block permutation from that
+seed), and a thermal gate (`SOLAR_OPEN_REGRESSION_COOLDOWN_C`, wait up to `_COOLDOWN_TIMEOUT_S`) before each timed
+prefill and before the first decode step of a pair: a traced decode step launched while board 1 is throttled
+(> 84-87 C, AI clock 1350 -> 800 MHz) has deadlocked paged SDPA decode on this box. The gate returns as soon as every
+board is below the limit and none is clock-throttled; with the mesh open the fabric routers and dispatch cores spin at
+full clock (64-87 W per board at idle), so board 1 settles at ~85 C and a limit below that is only met while the box
+is still warming up -- the wait therefore also returns once the boards have stopped cooling (no 0.5 C drop over ~6
+tt-smi samples, ~35 s) provided the min AI clock is back at `SOLAR_OPEN_REGRESSION_FULL_AICLK_MHZ` (1350), and runs to
+the timeout otherwise (measured 2026-09-08 with the 78 C / 120 s setting: 33-75 s per gate; board 1 at 1025-1250 MHz
+right after a 16K / 32K prefill and back at 1350 MHz before the decode started). The harness builds the model
+through `tt/common.py::create_tt_model` (the demo's path) rather than importing `demo/text_demo.py`, whose import
+chain opens the devices at collection time, so it can be collected on the host (`SOLAR_OPEN_NUM_DEVICES=8`) while a
+device run is active. `SOLAR_OPEN_REGRESSION_DECODE_TRACE=0` runs decode eagerly (debug).
+
+```bash
+source env.sh                                                  # python_env, TT_METAL_HOME, HF_MODEL, TT_CACHE_PATH, MESH_DEVICE=P150x8
+T=models/demos/solar_open/tests/test_multi_user_regression.py
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T --collect-only -q           # host: the 6 node ids test_multi_user_regression[blackhole-1x8-batch{1,2,4,8,16,32}]
+SOLAR_OPEN_REGRESSION_COOLDOWN_C=78 SOLAR_OPEN_REGRESSION_TIMEOUT_S=3600 timeout 4000 pytest "$T::test_multi_user_regression[blackhole-1x8-batch32]" --timeout-method thread   # the marker overrides --timeout, hence the env
+SOLAR_OPEN_REGRESSION_PAIRS="128:128,8192:1024" pytest "$T::test_multi_user_regression[blackhole-1x8-batch1]"   # subset of pairs
+models/demos/solar_open/tests/sweep/run_sweep.sh               # all six batches, one pytest process each
+BATCHES="16 32" TAG=_rerun LOG_DIR=/tmp/solar_sweep models/demos/solar_open/tests/sweep/run_sweep.sh
+python models/demos/solar_open/tests/sweep/report.py --matrix  # jsonl -> per-batch tables + batch x ISL/OSL matrices (step ms, TTFT, tok/s, status)
+```
+
+Select cases by their exact node id (`-k batch1` also matches `batch16`). `tests/sweep/run_sweep.sh` runs one pytest
+process per batch under `timeout` (`TMO`, default 3600 s per batch; the batch-32 8192/1024 cell alone is 32 sequential
+8K prefills, ~100 s, plus 1024 steps at ~65 ms), with a cool-start gate (`START_BELOW_C`, 60 C), the in-run thermal gate
+(`COOLDOWN_C` 78 / `COOLDOWN_TIMEOUT_S` 120), a per-batch log and a ledger line per attempt (`$LOG_DIR/runs.txt`), and
+after any failure kills leftover python processes holding `/dev/tenstorrent/*`, runs `tt-smi -r`, waits for < 60 C and
+retries a timed-out batch once (an assertion failure is recorded and the sweep moves on to the next batch; the failing
+cell stays in the jsonl with its sample output). Results: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8<tag>.jsonl`
+(`SOLAR_OPEN_REGRESSION_TAG` / `TAG`), one row per cell, the schema of the GPT-OSS sweep (`report.py` renders both);
+`report.py` keeps the latest row per (batch, ISL, OSL), so re-running one batch replaces its cells, and `--out` writes
+the Markdown (the driver writes `$LOG_DIR/REPORT<tag>.md` at the end). Measured wall for the 51 cells on a warm cache
+(2026-09-08): 96 min of pytest time (batch 1 / 2 / 4 / 8 / 16 / 32 = 11.2 / 10.4 / 15.4 / 21.1 / 18.8 / 18.9 min, model
+build from the warm cache included) plus the cool-start gates, 1 h 49 min end to end. Device rules of this box: one device process at a time; never `pytest --collect-only demo/text_demo.py`
+while a run is active; if a run hangs past its timeout, kill the leftover python holding `/dev/tenstorrent/*`,
+`tt-smi -r`, wait for < 60 C and rerun that batch once.
+
+### Recorded sweep (2026-09-08, 156304d63b5, tag `_p2`)
+
+`generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p2.jsonl` (51 rows, `logs/REPORT_p2.md`, ledger
+`logs/runs.txt`, per-batch logs `logs/sweep_b<N>_a1.log`): **51 / 51 cells ok** on the first attempt of every batch (no
+timeout, no reset); QA keyword accuracy 1.00 in all twelve ISL-128 cells (the answer is stated inside the think block;
+`qa_answer_accuracy` 0.88-1.0 at OSL 1024, where 15/16 and 31/32 users reached `<|content|>`, 0-0.06 at OSL 128 where
+almost every user is still thinking), 0 first-token failures, 0 degenerate users. Skipped by the context budget: B16
+32768/128, B32 16384/128 and 32768/128. Page-table seed 1234, bfp8 experts, `reasoning_effort=low`, traced decode.
+
+The batch x ISL/OSL matrices (decode step ms, TTFT mean / last user, aggregate tok/s) are recorded once, under "Recorded
+baselines" -> "ISL/OSL x batch sweep (2026-09-08, tag `_p2`)" at the end of this file; the full report (`SWEEP_REPORT.md`:
+setup, per-batch tables with every column, matrices, skipped cells, harness changes, per-cell output checks and per-cell
+temperatures / AI clocks) is generated from the jsonl, on this box under `/home/eslim/experiments/solar/results/sweep/`
+next to a copy of the jsonl.
+
+Reading the numbers: (1) the per-user prefill is flat over the batch for ISL <= 4K (128 tokens: 150-164 ms/user at
+every batch; 8K: 3.9 s/user at B1-4) and thermal beyond that -- board 1 throttles during a sustained prefill
+(min AI clock after the 16K / 32K prefills 1025-1250 MHz, 88-90 C), so the 32K prefill costs 14.1 s/user at B1 but
+16.0 / 23.8 / 25.6 s/user at B2 / 4 / 8, and the decode that follows a long prefill is slower than the same context at
+a smaller batch (8192/1024 at B32: 73 ms/step mean, p99 102 ms); those cells are limited by this box's cooling, not by
+the model. (2) The ISL-128 cells decode slower than the long-prompt cells of the same batch (B8: 42.6 vs 31.4 ms/step,
+B32: 60.6 vs 34.9): the 32 QA prompts are distinct, so a step touches more distinct experts than 32 users generating
+the same Frankenstein continuation -- the QA cells are the realistic multi-user decode numbers and the long-prompt cells
+(one prompt for every user) understate the MoE cost; B32 128/1024 at 60.9 ms/step matches the demo's b32 plateau (63
+ms). (3) The long prompts' cross-user agreement over the first 16 tokens is complete up to 2K at every batch and drops
+with batch and ISL (8K: 5/8, 9/16, 4/32; 16K: 1/4, 1/8, 2/16; 32K: 1/4, 1/8): the recorded `user_heads` show every
+variant is coherent Frankenstein text (a `<|think|>` / `<|content|>` opening or wording near-tie), and the variants come
+in runs of consecutive users (e.g. B16 8192/128: users 0-4 one wording, 5-15 another), i.e. a time-correlated factor
+during the sequential prefill rather than independent noise; the GPT-OSS sweep on the same box showed the same (3/8 at
+32K B8, 9/16 at 16K B16). Reported, not asserted.
+
 ## Memory per device (TP=8)
 
 | item | bfp8 experts | bfp4 experts |
@@ -487,6 +597,7 @@ below. Demo `b1` = `prefill_128` (78-token KO prompt, 4K paged context, traced p
 | teacher-forced b32 (same metrics) | 0.9180 / 0.9602 / 0.9227 / 0.98222 / 0.99219 / 0.0324 | 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.0312 | per prompt 0.9062 / 0.8906 / 0.9844 / 0.9375; TF decode 74.0 -> 49.0 ms/step (fp32-dst variant 0.9258 / 0.9646 / 0.9164 / 0.98038 / 0.99123 / 0.0311) |
 | decoder component PCC decode b1 / b32 / b16, prefill 128 / 1024 / 4096 (random weights, pos0) | 0.99325 / 0.99637 / 0.99644, 0.99618 / 0.99561 / 0.99658 | 0.99349 / 0.99729 / 0.99713, 0.99603 / 0.99561 / 0.99658 | paged == unpaged; with the fp32-dst qkv variant 0.99341 / 0.99680 / 0.99704 (pos70000 0.99332 / 0.99701 / 0.99684, 0.99611 / 0.99568 / 0.99657) |
 | real-weight layer 0 decoder PCC b1 / b32 / 128 / 1024 | 0.99844 / 0.99876 / 0.99997 / 0.99982 (after lever A) | 0.99871 / 0.99886 / 0.99997 / 0.99996 | mlp 0.99980 / 0.99966 / 0.99985 / 0.99988; router flips 0/1, 1/32, 2/128, 6/1024 (0 decisive) in both; fp32-dst qkv variant 0.99855 / 0.99891 |
+| ISL/OSL x batch sweep, 51 cells (`tests/test_multi_user_regression.py`, 2026-09-08, tag `_p2`) | not run | **51/51 ok**; decode 17.9 (B1) .. 60.6 (B32) ms/step at ISL 128, 918 tok/s aggregate at B32 1024/128; TTFT 150-164 ms/user at ISL 128 for every batch | matrices in "ISL/OSL x batch sweep (2026-09-08, tag `_p2`)" at the end of this section, caveats in the sweep section; full report `SWEEP_REPORT.md` (per-batch tables, per-cell checks, thermal data); long-context cells at B >= 4 throttle board 1 |
 
 Numerics of the phase-2 tree are PCC- but not bit-equivalent to phase 1 (single-K-block expert gate|up, indexed
 single-user path, 1D configs); every component, real-weight and teacher-forced floor holds, see the rows below.
@@ -620,3 +731,60 @@ dtype (`THRESHOLDS["bfp4"]`: 0.87 / 0.84 / 0.92 / 0.87 / 0.95 / 0.96 / KL <= 0.1
 | `SOLAR_OPEN_FUSE_SHARED_EXPERT=1` (phase-2 fusion row: shared expert as always-on slot 128; `tests/unit/test_fused_shared_expert.py -k 1x8`, random layer-0 weights, final tree) | fused vs unfused MLP, both vs `SolarOpenMoE`, weights / router columns bit-identical, one all_reduce, `ttnn.linear` launch count | PASSED 8/8 on the final tree (2026-09-07 16:52-17:14, `scratchpad/gate_p0/u_fused2.log` + `u_fused3.log`): fused vs unfused PCC decode b1 / b8 / b32 0.99890 / 0.99887 / 0.99889, prefill 128 / 1024 / 4096 0.99903 / 0.99928 / 0.99940 (floor `FUSED_VS_UNFUSED_PCC` 0.998: the phase-1 shared expert measured 0.9993-0.9994 against the fused slot, the perf-p0 1D configs moved the UNFUSED output closer to HF -- decode b1 vs HF 0.99822 -> 0.99896 -- while the fused slot (bfp8 activations, routed compute config) stays at 0.99827, so the two forms now agree at the bfp8-activation floor); vs HF unfused 0.99896 / 0.99898 / 0.99857 / 0.99863 / 0.99915 / 0.99931, fused 0.99827 / 0.99825 / 0.99780 / 0.99894 / 0.99919 / 0.99924 (the fused block is the less accurate one on decode, equal on prefill); fused weights and routed router columns bit-identical, `{'all_reduce': 1}` on both; linears 4 -> 1 (decode, prefill 128), 4 -> 2 (1K: one sorted split, always-on hot linear), 5 -> 6 (4K: 4 sorted splits, one of which also has a routed hot expert -- the expectation is `unfused - 3 x chunks + one always-on linear per sorted split`). Perf / teacher-forced ladder in fused mode NOT measured (single-user decode falls back to the batched union path, so fused b1 is slower than the unfused default): the default stays 0 | 2026-09-07 |
 | test_vllm_wrapper_import (host only, no device, vllm absent) | vllm_support plumbing with mocked ttnn / mesh + AST checks of `SolarOpenForCausalLM` | PASSED: 35 cases, the 4 cases that import the wrapper class skipped (vllm not installed); token capacities 657,920 (8 GiB bfp8 default) / 1,151,360 (14 GiB bfp4) / 1,069,120 (13 GiB); 48 FullAttentionSpec keys; 96 `from_torch` calls for 48 layers; 25.5 GiB pool refused before any allocation. UNTESTED against a live vLLM | 2026-09-07 |
 | test_streaming_loader (host only, no device; `SOLAR_OPEN_STREAMING_LOAD=1` loader) | Part A synthetic 3-shard checkpoint (11 tests) + Part B real layer 0 / embed / norm / lm_head vs `from_pretrained(num_hidden_layers=1)` | PASSED 13/13 (27 s with a cold page cache): 16 real tensors sha256-identical to the phase-1 path; lazy loader 7.43 GB in 398 preads, 2 fused builds, 0 repeat reads, peak RSS 3.1 GB (reference subprocess 10.5 GB peak, 8.3 s); layout validation on the lazy dict reads 0 tensor bytes; before: phase-1 cold build 393 GB peak RSS (device smoke / full cold build pending) | 2026-09-07 |
+
+### ISL/OSL x batch sweep (2026-09-08, 156304d63b5, tag `_p2`)
+
+`tests/test_multi_user_regression.py` via `tests/sweep/run_sweep.sh` (TMO 4000 s, cooldown gate 78 C / 120 s, cool-start < 60 C): 1x8 mesh,
+TP=8, bfp8 experts / attention / KV, traced decode, prefill traced at 128 only (eager 1K-32K), sequential per-user prefill, KV pool
+`min(64K, 512K // B)` tokens per user (64K at B 1-8, 32K at B 16, 16K at B 32), page-table seed 1234, `reasoning_effort=low`, greedy, exactly
+OSL steps. **51 / 51 cells ok** on the first attempt of every batch (96 min of pytest, 1 h 49 min end to end); 0 first-token failures, 0
+degenerate users, QA keyword accuracy 1.00 in the 12 ISL-128 cells. Skipped by the context rule (`-` below): B16 32768/128, B32 16384/128 and
+32768/128. Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p2.jsonl` (51 rows; `logs/REPORT_p2.md` = `report.py
+--matrix`); the full report `SWEEP_REPORT.md` (per-batch tables with every column, per-cell checks, per-cell temperatures and AI clocks,
+harness changes) is generated from that jsonl and kept on this box under `/home/eslim/experiments/solar/results/sweep/` with a copy of the
+jsonl. Caveats (board-1 throttling on the long-context cells at B >= 4, shared-prompt decode understating the MoE cost, cross-user
+agreement pattern) are in the sweep section's "Reading the numbers".
+
+Decode step ms (mean, steady state):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 17.9 | 17.6 | 17.8 | 18.1 | 18.6 | 19.2 | 19.1 | 20.4 | 22.1 |
+| 2 | 32.9 | 33.1 | 30.8 | 30.9 | 31.2 | 31.8 | 32.1 | 33.4 | 34.7 |
+| 4 | 37.4 | 37.3 | 31.7 | 32.0 | 32.4 | 32.8 | 32.9 | 39.1 | 42.9 |
+| 8 | 42.6 | 42.6 | 31.4 | 31.7 | 32.9 | 36.1 | 40.5 | 43.2 | 54.9 |
+| 16 | 51.4 | 51.0 | 34.7 | 35.3 | 36.1 | 43.4 | 44.9 | 55.1 | - |
+| 32 | 60.6 | 60.9 | 34.9 | 35.6 | 48.1 | 57.1 | 73.3 | - | - |
+
+TTFT mean over users, ms (= per-user prefill x (B+1)/2):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 163 | 168 | 426 | 798 | 1944 | 3915 | 3285 | 7075 | 14147 |
+| 2 | 229 | 239 | 629 | 1192 | 2312 | 5868 | 6039 | 12178 | 24071 |
+| 4 | 377 | 392 | 1174 | 2110 | 3973 | 9831 | 9945 | 27484 | 59456 |
+| 8 | 676 | 680 | 2259 | 3807 | 7212 | 21144 | 20976 | 53561 | 115169 |
+| 16 | 1276 | 1275 | 3680 | 6852 | 14793 | 42676 | 43632 | 103898 | - |
+| 32 | 2551 | 2471 | 6921 | 13723 | 39646 | 93760 | 95009 | - | - |
+
+TTFT last user, ms (whole batch admitted = B x per-user prefill):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 163 | 168 | 426 | 798 | 1944 | 3915 | 3285 | 7075 | 14147 |
+| 2 | 306 | 319 | 839 | 1589 | 3083 | 7824 | 8052 | 16237 | 32094 |
+| 4 | 603 | 627 | 1878 | 3377 | 6356 | 15729 | 15912 | 43974 | 95129 |
+| 8 | 1201 | 1210 | 4016 | 6768 | 12821 | 37590 | 37290 | 95219 | 204746 |
+| 16 | 2402 | 2400 | 6926 | 12897 | 27845 | 80332 | 82132 | 195572 | - |
+| 32 | 4947 | 4792 | 13423 | 26614 | 76890 | 181838 | 184260 | - | - |
+
+Aggregate decode tok/s:
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 56 | 57 | 56 | 55 | 54 | 52 | 52 | 49 | 45 |
+| 2 | 61 | 60 | 65 | 65 | 64 | 63 | 62 | 60 | 58 |
+| 4 | 107 | 107 | 126 | 125 | 124 | 122 | 122 | 102 | 93 |
+| 8 | 188 | 188 | 255 | 252 | 243 | 221 | 198 | 185 | 146 |
+| 16 | 311 | 314 | 461 | 454 | 443 | 369 | 357 | 290 | - |
+| 32 | 528 | 526 | 918 | 899 | 665 | 561 | 436 | - | - |
