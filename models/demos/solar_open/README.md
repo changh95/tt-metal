@@ -597,7 +597,7 @@ below. Demo `b1` = `prefill_128` (78-token KO prompt, 4K paged context, traced p
 | teacher-forced b32 (same metrics) | 0.9180 / 0.9602 / 0.9227 / 0.98222 / 0.99219 / 0.0324 | 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.0312 | per prompt 0.9062 / 0.8906 / 0.9844 / 0.9375; TF decode 74.0 -> 49.0 ms/step (fp32-dst variant 0.9258 / 0.9646 / 0.9164 / 0.98038 / 0.99123 / 0.0311) |
 | decoder component PCC decode b1 / b32 / b16, prefill 128 / 1024 / 4096 (random weights, pos0) | 0.99325 / 0.99637 / 0.99644, 0.99618 / 0.99561 / 0.99658 | 0.99349 / 0.99729 / 0.99713, 0.99603 / 0.99561 / 0.99658 | paged == unpaged; with the fp32-dst qkv variant 0.99341 / 0.99680 / 0.99704 (pos70000 0.99332 / 0.99701 / 0.99684, 0.99611 / 0.99568 / 0.99657) |
 | real-weight layer 0 decoder PCC b1 / b32 / 128 / 1024 | 0.99844 / 0.99876 / 0.99997 / 0.99982 (after lever A) | 0.99871 / 0.99886 / 0.99997 / 0.99996 | mlp 0.99980 / 0.99966 / 0.99985 / 0.99988; router flips 0/1, 1/32, 2/128, 6/1024 (0 decisive) in both; fp32-dst qkv variant 0.99855 / 0.99891 |
-| ISL/OSL x batch sweep, 51 cells (`tests/test_multi_user_regression.py`, 2026-09-08, tag `_p2`) | not run | **51/51 ok**; decode 17.9 (B1) .. 60.6 (B32) ms/step at ISL 128, 918 tok/s aggregate at B32 1024/128; TTFT 150-164 ms/user at ISL 128 for every batch | matrices in "ISL/OSL x batch sweep (2026-09-08, tag `_p2`)" at the end of this section, caveats in the sweep section; full report `SWEEP_REPORT.md` (per-batch tables, per-cell checks, thermal data); long-context cells at B >= 4 throttle board 1 |
+| ISL/OSL x batch sweep, 54 cells (`tests/test_multi_user_regression.py`, 2026-09-08, tag `_p2`) | not run | **54/54 ok** (51 under the 512K-token rule + the 3 long cells with `SOLAR_OPEN_REGRESSION_KV_TOKENS=1056000 SOLAR_OPEN_KV_BUDGET_GIB=13.5 SOLAR_OPEN_REGRESSION_POW2_CONTEXT=0`); decode 17.9 (B1) .. 60.6 (B32) ms/step at ISL 128, 918 tok/s aggregate at B32 1024/128; TTFT 150-164 ms/user at ISL 128 for every batch | matrices in "ISL/OSL x batch sweep (2026-09-08, tag `_p2`)" at the end of this section, caveats in the sweep section; full report `SWEEP_REPORT.md` (per-batch tables, per-cell checks, thermal data); long-context cells at B >= 4 throttle board 1 |
 
 Numerics of the phase-2 tree are PCC- but not bit-equivalent to phase 1 (single-K-block expert gate|up, indexed
 single-user path, 1D configs); every component, real-weight and teacher-forced floor holds, see the rows below.
@@ -738,8 +738,11 @@ dtype (`THRESHOLDS["bfp4"]`: 0.87 / 0.84 / 0.92 / 0.87 / 0.95 / 0.96 / KL <= 0.1
 TP=8, bfp8 experts / attention / KV, traced decode, prefill traced at 128 only (eager 1K-32K), sequential per-user prefill, KV pool
 `min(64K, 512K // B)` tokens per user (64K at B 1-8, 32K at B 16, 16K at B 32), page-table seed 1234, `reasoning_effort=low`, greedy, exactly
 OSL steps. **51 / 51 cells ok** on the first attempt of every batch (96 min of pytest, 1 h 49 min end to end); 0 first-token failures, 0
-degenerate users, QA keyword accuracy 1.00 in the 12 ISL-128 cells. Skipped by the context rule (`-` below): B16 32768/128, B32 16384/128 and
-32768/128. Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p2.jsonl` (51 rows; `logs/REPORT_p2.md` = `report.py
+degenerate users, QA keyword accuracy 1.00 in the 12 ISL-128 cells. The three cells the 512K-token context rule skips (B16 32768/128, B32 16384/128 and 32768/128) were filled afterwards with
+`SOLAR_OPEN_REGRESSION_KV_TOKENS=1056000 SOLAR_OPEN_KV_BUDGET_GIB=13.5 SOLAR_OPEN_REGRESSION_POW2_CONTEXT=0` (per-user context
+rounded to a block multiple: 32,960 tokens at B32, 16,480 blocks = 12.8 GiB of KV; 64K/user at B16): B16 32K 65.3 ms/step (245 tok/s,
+TTFT 24.5 s first / 391 s last user), B32 16K 70.2 ms/step (456 tok/s, TTFT 12.1 / 388 s), B32 32K 129.1 ms/step (p99 160; 248 tok/s,
+TTFT 25.6 / 820 s; 32 users x 32K positions of paged SDPA per step), all ok. Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p2.jsonl` (54 rows; `logs/REPORT_p2.md` = `report.py
 --matrix`); the full report `SWEEP_REPORT.md` (per-batch tables with every column, per-cell checks, per-cell temperatures and AI clocks,
 harness changes) is generated from that jsonl and kept on this box under `/home/eslim/experiments/solar/results/sweep/` with a copy of the
 jsonl. Caveats (board-1 throttling on the long-context cells at B >= 4, shared-prompt decode understating the MoE cost, cross-user
@@ -753,8 +756,8 @@ Decode step ms (mean, steady state):
 | 2 | 32.9 | 33.1 | 30.8 | 30.9 | 31.2 | 31.8 | 32.1 | 33.4 | 34.7 |
 | 4 | 37.4 | 37.3 | 31.7 | 32.0 | 32.4 | 32.8 | 32.9 | 39.1 | 42.9 |
 | 8 | 42.6 | 42.6 | 31.4 | 31.7 | 32.9 | 36.1 | 40.5 | 43.2 | 54.9 |
-| 16 | 51.4 | 51.0 | 34.7 | 35.3 | 36.1 | 43.4 | 44.9 | 55.1 | - |
-| 32 | 60.6 | 60.9 | 34.9 | 35.6 | 48.1 | 57.1 | 73.3 | - | - |
+| 16 | 51.4 | 51.0 | 34.7 | 35.3 | 36.1 | 43.4 | 44.9 | 55.1 | 65.3 |
+| 32 | 60.6 | 60.9 | 34.9 | 35.6 | 48.1 | 57.1 | 73.3 | 70.2 | 129.1 |
 
 TTFT mean over users, ms (= per-user prefill x (B+1)/2):
 
@@ -764,8 +767,8 @@ TTFT mean over users, ms (= per-user prefill x (B+1)/2):
 | 2 | 229 | 239 | 629 | 1192 | 2312 | 5868 | 6039 | 12178 | 24071 |
 | 4 | 377 | 392 | 1174 | 2110 | 3973 | 9831 | 9945 | 27484 | 59456 |
 | 8 | 676 | 680 | 2259 | 3807 | 7212 | 21144 | 20976 | 53561 | 115169 |
-| 16 | 1276 | 1275 | 3680 | 6852 | 14793 | 42676 | 43632 | 103898 | - |
-| 32 | 2551 | 2471 | 6921 | 13723 | 39646 | 93760 | 95009 | - | - |
+| 16 | 1276 | 1275 | 3680 | 6852 | 14793 | 42676 | 43632 | 103898 | 207833 |
+| 32 | 2551 | 2471 | 6921 | 13723 | 39646 | 93760 | 95009 | 199994 | 422982 |
 
 TTFT last user, ms (whole batch admitted = B x per-user prefill):
 
@@ -775,8 +778,8 @@ TTFT last user, ms (whole batch admitted = B x per-user prefill):
 | 2 | 306 | 319 | 839 | 1589 | 3083 | 7824 | 8052 | 16237 | 32094 |
 | 4 | 603 | 627 | 1878 | 3377 | 6356 | 15729 | 15912 | 43974 | 95129 |
 | 8 | 1201 | 1210 | 4016 | 6768 | 12821 | 37590 | 37290 | 95219 | 204746 |
-| 16 | 2402 | 2400 | 6926 | 12897 | 27845 | 80332 | 82132 | 195572 | - |
-| 32 | 4947 | 4792 | 13423 | 26614 | 76890 | 181838 | 184260 | - | - |
+| 16 | 2402 | 2400 | 6926 | 12897 | 27845 | 80332 | 82132 | 195572 | 391215 |
+| 32 | 4947 | 4792 | 13423 | 26614 | 76890 | 181838 | 184260 | 387867 | 820329 |
 
 Aggregate decode tok/s:
 
@@ -786,5 +789,5 @@ Aggregate decode tok/s:
 | 2 | 61 | 60 | 65 | 65 | 64 | 63 | 62 | 60 | 58 |
 | 4 | 107 | 107 | 126 | 125 | 124 | 122 | 122 | 102 | 93 |
 | 8 | 188 | 188 | 255 | 252 | 243 | 221 | 198 | 185 | 146 |
-| 16 | 311 | 314 | 461 | 454 | 443 | 369 | 357 | 290 | - |
-| 32 | 528 | 526 | 918 | 899 | 665 | 561 | 436 | - | - |
+| 16 | 311 | 314 | 461 | 454 | 443 | 369 | 357 | 290 | 245 |
+| 32 | 528 | 526 | 918 | 899 | 665 | 561 | 436 | 456 | 248 |

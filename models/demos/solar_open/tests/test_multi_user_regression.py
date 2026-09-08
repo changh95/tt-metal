@@ -53,7 +53,9 @@ and every batch of {1, 2, 4, 8, 16, 32} maps onto the Blackhole user grids of ``
     SOLAR_OPEN_NUM_DEVICES=8 pytest models/demos/solar_open/tests/test_multi_user_regression.py --collect-only -q  # host
 
 Environment knobs (all optional): SOLAR_OPEN_REGRESSION_TAG (suffix of the results file), _KV_TOKENS (total KV
-tokens per mesh, default 512K), _PAIRS ("isl:osl,..."), _COOLDOWN_C / _COOLDOWN_TIMEOUT_S / _FULL_AICLK_MHZ (thermal gate,
+tokens per mesh, default 512K), _POW2_CONTEXT (1 = round the per-user context down to a power of two, the server rule;
+0 = round to a block multiple so e.g. 1,056,000 tokens // 32 users hosts the 32768/128 pair), _PAIRS ("isl:osl,..."),
+_COOLDOWN_C / _COOLDOWN_TIMEOUT_S / _FULL_AICLK_MHZ (thermal gate,
 see below), _PAGE_TABLE_SEED (default 1234), _DECODE_TRACE (0 = eager decode, debug), _TIMEOUT_S (pytest-timeout limit
 per batch case, default 7200; the marker overrides a command-line --timeout, so the driver sets this instead).
 """
@@ -641,7 +643,14 @@ def test_multi_user_regression(mesh_device, device_params, batch_size, state_dic
     config = setup["config"]
     # Per-user context budget, power of two, at most 64K (mirrors the server's context-capped concurrency).
     max_seq_len = min(MAX_CONTEXT_PER_USER, TOTAL_KV_TOKENS // batch_size)
-    max_seq_len = 1 << (max_seq_len.bit_length() - 1)
+    if os.getenv("SOLAR_OPEN_REGRESSION_POW2_CONTEXT", "1") == "1":
+        max_seq_len = 1 << (max_seq_len.bit_length() - 1)
+    else:
+        # SOLAR_OPEN_REGRESSION_POW2_CONTEXT=0: round down to a block multiple instead, so a raised
+        # SOLAR_OPEN_REGRESSION_KV_TOKENS can host a pair whose ISL+OSL just exceeds a power of two
+        # (e.g. 1,056,000 tokens // 32 users = 33,000 -> 32,960 positions for the 32768/128 pair; the
+        # power-of-two rule would fall back to 32,768 and skip it, and 64K x 32 users does not fit DRAM).
+        max_seq_len -= max_seq_len % BLOCK_SIZE
     paged_attention_config = PagedAttentionConfig(
         block_size=BLOCK_SIZE, max_num_blocks=batch_size * (max_seq_len // BLOCK_SIZE)
     )
