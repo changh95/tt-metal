@@ -157,7 +157,8 @@ def test_layout_candidates(mesh_device, device_params, reset_seeds):
             memory_config=ttnn.L1_MEMORY_CONFIG,
             output_tile=tile,
             is_input_a_sparse=True,
-            program_config=down_cfg,
+            program_config=down_cfg.program_config,
+            expert_groups=down_cfg.expert_groups,
             dtype=ttnn.bfloat8_b,
         )
 

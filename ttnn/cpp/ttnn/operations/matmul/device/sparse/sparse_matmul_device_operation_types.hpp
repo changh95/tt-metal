@@ -29,6 +29,15 @@ struct SparseMatmulParams {
     std::optional<const tt::tt_metal::Tile> output_tile;
     std::optional<const tt::tt_metal::experimental::GlobalCircularBuffer> global_cb;
     std::optional<tt::tt_metal::SubDeviceId> sub_device_id;
+    // Expert-group parallelism (EGP). nullopt (default) selects the legacy mcast_in0 program factory and
+    // kernels, byte-for-byte. A value G >= 1 selects SparseMatmulExpertGroupsProgramFactory: the grid is
+    // enlarged to G x (output blocks) cores, the non-zero sparsity slots are numbered by their running rank r
+    // in scan order and group g = r % G owns slot r, every core decides the validity of every slot locally
+    // (no per-slot multicast round trip), and a broadcast in0 ([1,1,M,K] with is_input_b_sparse only) is
+    // multicast ONCE and kept resident in L1 instead of being re-read and re-multicast per expert. The
+    // per-output-tile math and the output layout are unchanged, so the result is bit-identical to the
+    // legacy path. Part of the aggregate, hence of the default program hash.
+    std::optional<uint32_t> expert_groups = std::nullopt;
 };
 
 struct SparseMatmulInputs {

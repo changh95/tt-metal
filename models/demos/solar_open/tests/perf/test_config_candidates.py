@@ -27,6 +27,10 @@ and, with ``SOLAR_OPEN_PERF_OUT=<json>``, written to that file.
     default single-core kernel and a torch fp32 RMSNorm at M = 1 / 32 (lever b), then the ``RMSNorm`` module itself
     (``sharded_decode`` on vs off) on the decode shapes, the component test's HF-shaped ``[32, 1, H]`` input and a
     128-row prefill input: the gate ``decode_norm_applies`` must shard exactly the single-tile-row shapes.
+  * ``egp``: the phase-3b expert-group decode sparse_matmul configs of ``SolarOpenProgramConfig`` (gate|up 11 groups on
+    11x10, batched down 11 groups x 16 tiles on 11x8, the b1 indexed gate|up) vs the legacy configs of the same tree
+    (``DECODE_EGP_LEGACY`` = ``SOLAR_OPEN_DECODE_EGP=off``) at union sizes 8 / 72 / 128: the results must be IDENTICAL
+    (max abs diff 0, the kernels compute the same per-tile math) -- call sites ``experts/decode.py``.
 
     SOLAR_OPEN_PERF_OUT=/path/cand.json pytest models/demos/solar_open/tests/perf/test_config_candidates.py \
         -k 1x1 -x -p no:cacheprovider
@@ -45,7 +49,7 @@ import ttnn
 from models.common.utility_functions import comp_pcc
 from models.demos.solar_open.tests.test_factory import parametrize_mesh_with_fabric
 from models.demos.solar_open.tt.attention_configs import SolarOpenAttentionProgramConfig
-from models.demos.solar_open.tt.expert_configs import SolarOpenProgramConfig
+from models.demos.solar_open.tt.expert_configs import DECODE_EGP_LEGACY, SolarOpenProgramConfig
 from models.demos.solar_open.tt.experts.prefill import _DENSE_COMPUTE_KERNEL_CONFIG, _dense_core_grid
 from models.demos.solar_open.tt.rms_norm import RMSNorm, decode_norm_applies, decode_norm_sharded_configs
 from models.demos.solar_open.tt.shared_expert import shared_expert_program_configs
@@ -412,6 +416,114 @@ def test_config_candidates(mesh_device, device_params, reset_seeds):
             y_on.deallocate(True)
             y_off.deallocate(True)
             xn.deallocate(True)
+
+    # ---------------- 8. expert groups (phase 3b): the shipped EGP decode configs vs the legacy ones, identical ----------------
+    # Same random bfp8 weights, the same union masks; EGP (expert_groups 11) vs legacy (None) must agree bit for bit.
+    pc_egp, pc_legacy = SolarOpenProgramConfig(), SolarOpenProgramConfig(**DECODE_EGP_LEGACY)
+    assert pc_egp.decode_gate_up_expert_groups == 11 and pc_legacy.decode_gate_up_expert_groups is None
+    tile = ttnn.Tile([32, 32])
+    w_gu = up(torch.randn(1, E, H, 2 * IP, generator=g) * 0.02)
+    w_dn = up(torch.randn(1, E, IP, H, generator=g) * 0.02)
+    w_gu_t, w_dn_t = ttnn.to_torch(w_gu).float(), ttnn.to_torch(w_dn).float()
+    x32 = up(torch.randn(1, 1, 32, H, generator=g), dtype=ttnn.bfloat16, mem=ttnn.L1_MEMORY_CONFIG)
+    x1 = up(torch.randn(1, 1, 1, H, generator=g), dtype=ttnn.bfloat16, mem=ttnn.L1_MEMORY_CONFIG)
+    x32_t, x1_t = ttnn.to_torch(x32).float(), ttnn.to_torch(x1).float()
+
+    def sparse_gate_up(x, mask, cfg, users):
+        return lambda: ttnn.sparse_matmul(
+            x,
+            w_gu,
+            sparsity=mask,
+            nnz=None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=tile,
+            program_config=cfg.get_decode_gate_up_config(users, 2 * IP, k=H).program_config,
+            expert_groups=cfg.get_decode_gate_up_config(users, 2 * IP, k=H).expert_groups,
+            dtype=ttnn.bfloat8_b,
+        )
+
+    def sparse_down(act, mask, cfg, users):
+        return lambda: ttnn.sparse_matmul(
+            act,
+            w_dn,
+            sparsity=mask,
+            nnz=None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=tile,
+            is_input_a_sparse=True,
+            program_config=cfg.get_decode_down_config(users, H, k=IP).program_config,
+            expert_groups=cfg.get_decode_down_config(users, H, k=IP).expert_groups,
+            dtype=ttnn.bfloat8_b,
+        )
+
+    for nnz in (8, 72, 128):
+        idx = torch.randperm(E, generator=g)[:nnz]
+        mask_t = torch.zeros(1, 1, 1, E)
+        mask_t[..., idx] = 0.125
+        mask = up(mask_t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, mem=ttnn.L1_MEMORY_CONFIG)
+        active = torch.zeros(E)
+        active[idx] = 1.0
+        # gate|up at 32 users (the b32 union) and at 1 user (the scan path): [1, E, 32, 2Ip], inactive experts all zero
+        for users, x, x_t in ((32, x32, x32_t), (1, x1, x1_t)):
+            ref = torch.matmul(x_t.reshape(1, 1, -1, H).expand(1, E, -1, H), w_gu_t) * active.reshape(1, E, 1, 1)
+            _ab(
+                device,
+                f"egp_gate_up_m{users}_nnz{nnz}",
+                sparse_gate_up(x, mask, pc_legacy, users),
+                sparse_gate_up(x, mask, pc_egp, users),
+                results,
+                ref.reshape(1, 1, 1, E, -1, 2 * IP),
+            )
+            assert results[f"egp_gate_up_m{users}_nnz{nnz}"][
+                "identical"
+            ], f"EGP gate|up differs at nnz {nnz}, M {users}"
+        # batched down: A [1, E, 32, Ip] (zero rows for the inactive experts) at 32 and 16 users (both the EGP grid)
+        act_t = torch.randn(1, E, 32, IP, generator=g) * active.reshape(1, E, 1, 1)
+        act = up(act_t, mem=ttnn.L1_MEMORY_CONFIG)
+        ref_dn = torch.matmul(ttnn.to_torch(act).float(), w_dn_t)
+        for users in (32, 16):
+            _ab(
+                device,
+                f"egp_down_u{users}_nnz{nnz}",
+                sparse_down(act, mask, pc_legacy, users),
+                sparse_down(act, mask, pc_egp, users),
+                results,
+                ref_dn,
+            )
+            assert results[f"egp_down_u{users}_nnz{nnz}"]["identical"], f"EGP down differs at nnz {nnz}, users {users}"
+        act.deallocate(True)
+        mask.deallocate(True)
+    # the b1 indexed gate|up (k = 8 top-k ids, compact [1, k, 1, 2Ip] output): EGP vs legacy, identical
+    ids = torch.randperm(E, generator=g)[:8]
+    indices = up(ids.reshape(1, 1, 1, 8).to(torch.int32), dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT)
+    placeholder = up(torch.ones(1, 1, 1, E), dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    def indexed_gate_up(cfg):
+        c = cfg.get_decode_gate_up_config(1, 2 * IP, k=H)
+        return lambda: ttnn.sparse_matmul(
+            x1,
+            w_gu,
+            sparsity=placeholder,
+            indices=indices,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=tile,
+            program_config=c.program_config,
+            expert_groups=c.expert_groups,
+            dtype=ttnn.bfloat8_b,
+        )
+
+    ref_idx = torch.matmul(x1_t.reshape(1, 1, 1, H).expand(1, 8, 1, H), w_gu_t[:, ids])
+    _ab(
+        device,
+        "egp_gate_up_indexed_k8",
+        indexed_gate_up(pc_legacy),
+        indexed_gate_up(pc_egp),
+        results,
+        ref_idx.reshape(1, 1, 1, 8, 1, 2 * IP),
+    )
+    assert results["egp_gate_up_indexed_k8"]["identical"]
+    for t in (w_gu, w_dn, x32, x1, indices, placeholder):
+        t.deallocate(True)
 
     if PERF_OUT:
         data = json.loads(open(PERF_OUT).read()) if os.path.isfile(PERF_OUT) else {}

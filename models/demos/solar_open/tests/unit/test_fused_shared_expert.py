@@ -13,8 +13,9 @@ with the routed experts' bfp8 activations, so fused and unfused outputs are clos
 but NOT bit-identical, while the fused WEIGHTS and the routed router columns are bit-identical to the unfused ones.
 
 Device test (``-k 1x8``): two ``MLP`` blocks (fused / unfused) built from the same random ``SolarOpenDecoderLayer``
-state dict and run on the same inputs for decode b1 / b8 / b32 (b8: fewer users than
-``ProgramConfig.decode_down_batched_min_tokens``, so the batched path runs the 8x4 down grid in both modes) and prefill
+state dict and run on the same inputs for decode b1 / b8 / b32 (b1 with the fused module: the batched path on ONE
+real token, i.e. the single-user 8x4 down grid; b8 / b32: the batched expert-group down grid -- the same grid in both
+modes for the same user count) and prefill
 128 (dense bmm) / 1024 (expert-sorted hot/cold split) / 4096 (one chunk). Host tests (``-k host``, no device): the concat / typecast / deallocation sequence of
 ``fuse_always_on_expert`` with ttnn mocked out, its guards, the router's pre-seeded scatter tensor, the MLP-side fusion
 guards, and a torch emulation proving that the 129-slot layout with routing column 128 = 1.0 reproduces

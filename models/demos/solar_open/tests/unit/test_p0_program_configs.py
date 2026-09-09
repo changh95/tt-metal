@@ -21,16 +21,21 @@ import pytest
 import ttnn
 from models.demos.solar_open.tt.attention_configs import SolarOpenAttentionProgramConfig
 from models.demos.solar_open.tt.expert_configs import (
+    DECODE_EGP_ENV,
+    DECODE_EGP_LEGACY,
+    DECODE_EGP_PRESETS,
     DENSE_EXPERT_GATE_UP_MINIMAL,
     DENSE_EXPERT_GATE_UP_MINIMAL_ALT,
     HOT_DOWN_KCONCAT_MINIMAL,
     PREFILL_EXPERT_MM_ENV,
     PREFILL_EXPERT_MM_PRESETS,
     SolarOpenProgramConfig,
+    decode_egp_overrides,
     prefill_expert_mm_overrides,
     solar_open_program_config,
 )
-from models.demos.solar_open.tt.experts.config import MinimalMatmulBlocking, ProgramConfig
+from models.demos.solar_open.tt.experts import decode as experts_decode
+from models.demos.solar_open.tt.experts.config import MinimalMatmulBlocking, ProgramConfig, SparseMatmulConfig
 from models.demos.solar_open.tt.experts.prefill import (
     HOT_DOWN_KCONCAT,
     _dense_down_program_config,
@@ -260,6 +265,130 @@ class TestDenseDownConfig:
         assert pc.get_dense_down_config(96, H, IP).out_subblock_h == 1
         with expect_error(ValueError, "dense_down_max_subblock_h"):
             SolarOpenProgramConfig(dense_down_max_subblock_h=0)
+
+
+class TestDecodeExpertGroups:
+    """Phase 3b: the expert-group (EGP) decode sparse_matmul configs. ``_build_matmul_config(expert_groups=G)`` fills the
+    grid with G x ceil(Nt / per_core_N) cores (exact rectangle, >= 2 cores); the getters return the program config and
+    the group count together (SparseMatmulConfig) because neither is legal without the other at the op."""
+
+    @staticmethod
+    def _key(cfg):
+        pc = cfg.program_config
+        g = pc.compute_with_storage_grid_size
+        return (g.x, g.y), pc.per_core_N, pc.out_subblock_w, pc.out_block_w, pc.in0_block_w, cfg.expert_groups
+
+    def test_shipped_defaults(self):
+        pc = SolarOpenProgramConfig()
+        assert (pc.decode_gate_up_cores, pc.decode_gate_up_expert_groups) == ((11, 10), 11)
+        assert (pc.decode_down_cores_batched, pc.decode_down_batched_subblock_w) == ((11, 8), 8)
+        assert (pc.decode_down_batched_expert_groups, pc.decode_down_batched_min_tokens) == (11, 2)
+        assert (pc.decode_down_cores, pc.decode_down_subblock_w, pc.decode_down_expert_groups) == ((8, 4), 4, None)
+        # gate|up: 10 output blocks of 1 tile x 11 groups = the whole 11x10 grid, the whole K as one block
+        for rows in (1, 32):
+            assert self._key(pc.get_decode_gate_up_config(rows, 2 * IP, k=H)) == ((11, 10), 1, 1, 1, 128, 11)
+        # batched down: 8 blocks of 16 tiles x 11 groups = 11x8, out_subblock_w 8 (the widest legal), Kt 5 as one block
+        for users in (2, 8, 16, 32):
+            assert self._key(pc.get_decode_down_config(users, H, k=IP)) == ((11, 8), 16, 8, 8, 5, 11)
+        # single-user down (b1 indexed / scan): the legacy 8x4 x 4 tiles, no groups
+        assert self._key(pc.get_decode_down_config(1, H, k=IP)) == ((8, 4), 4, 4, 4, 5, None)
+        assert isinstance(pc.get_decode_gate_up_config(32, 2 * IP, k=H), SparseMatmulConfig)
+
+    @pytest.mark.parametrize(
+        "cores, n, groups, expected",
+        [
+            ((11, 10), 2 * IP, 11, ((11, 10), 1)),  # 11 x 10 blocks
+            ((10, 10), 2 * IP, 5, ((10, 5), 1)),  # 5 x 10 blocks: the tallest fill of a 10-wide grid is 10x5
+            ((11, 10), 2 * IP, 2, ((10, 2), 1)),  # 20 cores: 10x2 (the wider shape wins the tie with 5x4 / 4x5 / 2x10)
+            ((11, 10), 2 * IP, 1, ((10, 1), 1)),  # G 1 keeps the exact-fill rule of the legacy search
+            ((11, 10), 2 * IP, None, ((10, 1), 1)),
+            ((11, 8), H, 11, ((11, 8), 16)),  # 11 x 8 blocks of 16 tiles
+            ((8, 10), H, 5, ((8, 10), 8)),  # 5 x 16 blocks of 8 tiles
+            ((8, 8), H, 4, ((8, 8), 8)),  # 4 x 16 blocks
+            ((8, 8), H, 2, ((8, 8), 4)),  # 2 x 32 blocks of 4 tiles
+            ((11, 10), H, 11, ((11, 10), 13)),  # 11 x 10 blocks of 13 tiles (the last block holds 11): legal, osw 1
+        ],
+    )
+    def test_exact_fill_with_groups(self, cores, n, groups, expected):
+        cfg = ProgramConfig()._build_matmul_config(
+            cores, 32, n, in0_block_w=5, out_subblock_w=8, k=IP, expert_groups=groups
+        )
+        g = cfg.compute_with_storage_grid_size
+        assert ((g.x, g.y), cfg.per_core_N) == expected
+        # the factory's rectangle rule: G x blocks cores row-major from (0, 0) fill whole rows of the config grid
+        blocks = -(-(-(-n // 32)) // cfg.per_core_N)
+        assert (groups or 1) * blocks == g.x * g.y and g.x * g.y >= 2
+        assert cfg.per_core_N % cfg.out_subblock_w == 0 and cfg.out_block_w == cfg.out_subblock_w
+
+    def test_no_fill_raises(self, expect_error):
+        pc = ProgramConfig()
+        with expect_error(ValueError, "expert_groups=11"):
+            pc._build_matmul_config((8, 8), 32, 2 * IP, k=H, expert_groups=11)  # 11 does not divide any w*h <= 8x8
+        with expect_error(ValueError, "expert_groups=13"):
+            pc._build_matmul_config((11, 10), 32, 2 * IP, k=H, expert_groups=13)  # no multiple of 13 fits 11x10
+        # a group count that does not fill the requested grid shrinks it to a sub-rectangle it does fill: 7 x 10 blocks
+        # = 70 cores as 7 full rows of 10 (the wider shape wins the tie with 7x10)
+        cfg = pc._build_matmul_config((11, 10), 32, 2 * IP, k=H, expert_groups=7)
+        assert (cfg.compute_with_storage_grid_size.x, cfg.compute_with_storage_grid_size.y, cfg.per_core_N) == (
+            10,
+            7,
+            1,
+        )
+        with expect_error(ValueError, "single-core"):
+            pc._build_matmul_config((1, 1), 32, 32, k=H, expert_groups=1)
+
+    def test_field_validation(self, expect_error):
+        for name in ("decode_gate_up_expert_groups", "decode_down_expert_groups", "decode_down_batched_expert_groups"):
+            for bad in (0, -1, 2.0, True, "11"):
+                with expect_error(ValueError, name):
+                    SolarOpenProgramConfig(**{name: bad})
+        assert SolarOpenProgramConfig(decode_gate_up_expert_groups=None).decode_gate_up_expert_groups is None
+
+    def test_legacy_preset_reproduces_phase2(self, monkeypatch, expect_error):
+        assert set(DECODE_EGP_PRESETS) == {"on", "off"} and DECODE_EGP_PRESETS["off"] is DECODE_EGP_LEGACY
+        assert decode_egp_overrides("on") == {} and decode_egp_overrides("") == {}
+        monkeypatch.setenv(DECODE_EGP_ENV, "off")
+        assert decode_egp_overrides() == DECODE_EGP_LEGACY
+        pc = SolarOpenProgramConfig(**decode_egp_overrides())
+        assert self._key(pc.get_decode_gate_up_config(32, 2 * IP, k=H)) == ((5, 2), 1, 1, 1, 128, None)
+        assert self._key(pc.get_decode_down_config(8, H, k=IP)) == ((8, 4), 4, 4, 4, 5, None)
+        assert self._key(pc.get_decode_down_config(16, H, k=IP)) == ((8, 8), 2, 2, 2, 5, None)
+        assert self._key(pc.get_decode_down_config(32, H, k=IP)) == ((8, 8), 2, 2, 2, 5, None)
+        monkeypatch.setenv(DECODE_EGP_ENV, "nonsense")
+        with expect_error(ValueError, "preset"):
+            decode_egp_overrides()
+
+    @pytest.mark.parametrize("grid_xy, egp", [((11, 10), True), ((13, 10), True), ((10, 10), False), ((11, 9), False)])
+    def test_factory_grid_gate(self, grid_xy, egp, monkeypatch):
+        monkeypatch.delenv(DECODE_EGP_ENV, raising=False)
+        mesh_device = MagicMock()
+        mesh_device.compute_with_storage_grid_size.return_value = SimpleNamespace(x=grid_xy[0], y=grid_xy[1])
+        pc = solar_open_program_config(mesh_device)
+        expected = SolarOpenProgramConfig() if egp else SolarOpenProgramConfig(**DECODE_EGP_LEGACY)
+        for name in DECODE_EGP_LEGACY:
+            assert getattr(pc, name) == getattr(expected, name), name
+        # the down / gate|up configs of both arms resolve on their own grids (identity, no shrink)
+        gx, gy = pc.get_decode_gate_up_config(32, 2 * IP, k=H).program_config.compute_with_storage_grid_size.x, None
+        assert gx == (11 if egp else 5)
+
+    def test_decode_passes_program_config_and_groups_together(self):
+        """Source contract: every decode sparse_matmul takes program_config AND expert_groups from one
+        SparseMatmulConfig (an expert-group grid is illegal without its group count and vice versa)."""
+        import inspect
+        import re
+
+        for fn in (
+            experts_decode.decode_forward,
+            experts_decode._decode_forward_indexed,
+            experts_decode._decode_forward_batched,
+        ):
+            src = inspect.getsource(fn)
+            calls = len(re.findall(r"ttnn\.sparse_matmul\(", src))
+            assert calls == 2, fn.__name__
+            assert (
+                len(re.findall(r"program_config=(\w+_cfg)\.program_config,\n\s+expert_groups=\1\.expert_groups,", src))
+                == 2
+            ), fn.__name__
 
 
 class TestMinimalMatmulBlocking:

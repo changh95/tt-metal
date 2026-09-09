@@ -140,6 +140,17 @@ class MinimalMatmulBlocking:
         )
 
 
+@dataclass(frozen=True)
+class SparseMatmulConfig:
+    """One ``ttnn.sparse_matmul`` configuration of the decode expert paths: the 1D-multicast program config and the
+    expert-group count it was built for (``ttnn.sparse_matmul(program_config=..., expert_groups=...)``; None = the
+    legacy kernels). The two travel together because the grid of an EGP config is ``G x output blocks`` cores, which
+    the legacy factory rejects (and vice versa): always pass BOTH fields to the op."""
+
+    program_config: ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig
+    expert_groups: int | None = None
+
+
 @dataclass
 class ProgramConfig:
     """
@@ -173,6 +184,16 @@ class ProgramConfig:
     # been measured; the threshold below is conservative.
     decode_down_cores_batched: tuple[int, int] | None = None
     decode_down_batched_min_tokens: int = 16
+    # Expert-group parallelism (EGP, phase 3b) of the decode sparse_matmuls: ``ttnn.sparse_matmul(expert_groups=G)``
+    # splits the grid into G core groups that each take every G-th active expert concurrently (the activation tile is
+    # multicast once and kept resident in L1, every core decides each expert's validity locally, per-output-tile math
+    # unchanged -> bit-identical to the legacy kernels for the same inputs). None = the legacy kernels. With G the
+    # grid rule of _build_matmul_config becomes ``G x ceil(Nt / per_core_N) == cores`` (the first cores of the grid in
+    # row-major order must fill an exact rectangle, still >= 2 cores). One value per decode sparse_matmul family:
+    # the fused gate|up (every decode path), the single-user down (the b1 indexed / scan paths) and the batched down.
+    decode_gate_up_expert_groups: int | None = None
+    decode_down_expert_groups: int | None = None
+    decode_down_batched_expert_groups: int | None = None
 
     # Core grid sizes for prefill
     prefill_gate_up_cores: tuple[int, int] = (3, 4)
@@ -250,6 +271,11 @@ class ProgramConfig:
         self._validate_cores("prefill_gate_up_cores", self.prefill_gate_up_cores)
         self._validate_cores("prefill_down_cores", self.prefill_down_cores)
 
+        for name in ("decode_gate_up_expert_groups", "decode_down_expert_groups", "decode_down_batched_expert_groups"):
+            groups = getattr(self, name)
+            if groups is not None and (isinstance(groups, bool) or not isinstance(groups, int) or groups < 1):
+                raise ValueError(f"{name} must be None or a positive int (expert groups), got {groups!r}")
+
         if self.sequence_chunk_size <= 0:
             raise ValueError(f"sequence_chunk_size must be positive, got {self.sequence_chunk_size}")
         if self.sequence_chunk_size % 32 != 0:
@@ -302,6 +328,7 @@ class ProgramConfig:
         in0_block_w: int = 1,
         out_subblock_w: int = 1,
         k: int = None,
+        expert_groups: int | None = None,
     ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
         """
         Build MatmulProgramConfig with standard settings.
@@ -317,20 +344,26 @@ class ProgramConfig:
             out_subblock_w: Output subblock width (for sparse matmuls)
             k: Input contraction dimension (used to snap in0_block_w to a
                 divisor of Kt; passing None preserves the configured value).
+            expert_groups: expert-group count G the config is built for (``ttnn.sparse_matmul(expert_groups=G)``):
+                the grid then holds ``G x ceil(Nt / per_core_N)`` cores; None (or 1) = the legacy one-block-per-core
+                rule. The caller must pass the same value to the op (see SparseMatmulConfig).
 
         Returns:
             MatmulMultiCoreReuseMultiCast1DProgramConfig
         """
         core_x, core_y = cores
         Nt = int(math.ceil(n / 32))
+        groups = expert_groups or 1
         # The mcast_in0 sparse matmul hands out ceil(Nt / per_core_N) output blocks to the first
         # cores of the grid in row-major order and multicasts in0 to the bounding box of those
         # cores; the factory requires the two sets to be identical (a partially filled last row
-        # would leave receivers without work and hang). Pick the largest sub-rectangle (w <= core_x,
-        # h <= core_y) whose block count fills it exactly; ties prefer the wider shape (closest to
-        # the requested grid). For the Solar-Open TP=8 shapes (fused gate|up Nt=10 on 5x2, down
-        # Nt=128 on 8x4 / 8x8) this is the identity; for other TP factors it shrinks the grid
-        # instead of tripping the factory's rectangularity check.
+        # would leave receivers without work and hang). With expert_groups = G the factory uses
+        # G x blocks cores (G groups of one block set each) under the same exact-rectangle rule.
+        # Pick the largest sub-rectangle (w <= core_x, h <= core_y) whose core count is G x an
+        # exact block fill; ties prefer the wider shape (closest to the requested grid). For the
+        # Solar-Open TP=8 shapes this is the identity (legacy: fused gate|up Nt=10 on 5x2, down
+        # Nt=128 on 8x4 / 8x8; EGP: gate|up G 11 on 11x10 x 1 tile, down G 11 on 11x8 x 16 tiles);
+        # for other TP factors it shrinks the grid instead of tripping the factory's check.
         best = None
         for w in range(core_x, 0, -1):
             for h in range(core_y, 0, -1):
@@ -339,16 +372,19 @@ class ProgramConfig:
                     # A single-core mcast_in0 sparse_matmul has no multicast receivers and deadlocks the device
                     # (measured 2026-09-07 on P150: 1x1 grid, per_core_N 10 -> hang, board reset needed).
                     continue
-                pcn = (Nt + num_cores - 1) // num_cores
-                if (Nt + pcn - 1) // pcn != num_cores:
+                if num_cores % groups:
+                    continue
+                blocks = num_cores // groups
+                pcn = (Nt + blocks - 1) // blocks
+                if (Nt + pcn - 1) // pcn != blocks:
                     continue
                 if best is None or num_cores > best[0] or (num_cores == best[0] and w > best[1]):
                     best = (num_cores, w, h, pcn)
         if best is None:
             raise ValueError(
-                f"sparse matmul with N = {n} ({Nt} tiles) on a {core_x}x{core_y} grid: no multi-core rectangle is an "
-                "exact fill and a single-core mcast_in0 grid hangs the device; use a grid with >= 2 cores that "
-                f"divides ceil({Nt} / per_core_N)"
+                f"sparse matmul with N = {n} ({Nt} tiles) on a {core_x}x{core_y} grid with expert_groups={expert_groups}: "
+                "no multi-core rectangle is an exact fill and a single-core mcast_in0 grid hangs the device; use a grid "
+                f"with >= 2 cores equal to {groups} x ceil({Nt} / per_core_N)"
             )
         _, core_x, core_y, per_core_N = best
         # The sparse matmul kernel asserts `Kt % in0_block_w == 0`. Different
@@ -412,33 +448,43 @@ class ProgramConfig:
             mcast_in0=True,
         )
 
-    def get_decode_gate_up_config(
-        self, m: int, n: int, k: int = None
-    ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
-        """Get program config for decode gate/up projections"""
-        return self._build_matmul_config(
-            self.decode_gate_up_cores,
-            m,
-            n,
-            in0_block_w=self.decode_gate_up_in0_block_w,
-            out_subblock_w=self.decode_gate_up_subblock_w,
-            k=k,
+    def get_decode_gate_up_config(self, m: int, n: int, k: int = None) -> SparseMatmulConfig:
+        """Program config + expert groups of the decode fused gate|up sparse_matmul (every decode path)."""
+        groups = self.decode_gate_up_expert_groups
+        return SparseMatmulConfig(
+            self._build_matmul_config(
+                self.decode_gate_up_cores,
+                m,
+                n,
+                in0_block_w=self.decode_gate_up_in0_block_w,
+                out_subblock_w=self.decode_gate_up_subblock_w,
+                k=k,
+                expert_groups=groups,
+            ),
+            groups,
         )
 
-    def get_decode_down_config(
-        self, m: int, n: int, k: int = None
-    ) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig:
-        """Get program config for decode down projection (m = tokens in the step)"""
-        cores, subblock_w = self.decode_down_cores, self.decode_down_subblock_w
+    def get_decode_down_config(self, m: int, n: int, k: int = None) -> SparseMatmulConfig:
+        """Program config + expert groups of the decode down sparse_matmul (m = REAL tokens in the step: the batched
+        grid / groups from decode_down_batched_min_tokens tokens on, the single-user ones below)."""
+        cores, subblock_w, groups = self.decode_down_cores, self.decode_down_subblock_w, self.decode_down_expert_groups
         if self.decode_down_cores_batched is not None and m >= self.decode_down_batched_min_tokens:
-            cores, subblock_w = self.decode_down_cores_batched, self.decode_down_batched_subblock_w
-        return self._build_matmul_config(
-            cores,
-            m,
-            n,
-            in0_block_w=self.decode_down_in0_block_w,
-            out_subblock_w=subblock_w,
-            k=k,
+            cores, subblock_w, groups = (
+                self.decode_down_cores_batched,
+                self.decode_down_batched_subblock_w,
+                self.decode_down_batched_expert_groups,
+            )
+        return SparseMatmulConfig(
+            self._build_matmul_config(
+                cores,
+                m,
+                n,
+                in0_block_w=self.decode_down_in0_block_w,
+                out_subblock_w=subblock_w,
+                k=k,
+                expert_groups=groups,
+            ),
+            groups,
         )
 
     def get_dense_down_config(self, m: int, n: int, k: int) -> ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig | None:

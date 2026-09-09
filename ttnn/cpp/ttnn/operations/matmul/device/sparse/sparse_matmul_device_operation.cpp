@@ -392,6 +392,90 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
                 pc->out_block_w);
         }
     }
+
+    // Expert-group parallelism (EGP) contract. Only checked when `expert_groups` is set; the legacy
+    // path is untouched. The factory re-derives every quantity below and TT_FATALs again; these
+    // are the friendlier, earlier messages.
+    if (operation_attributes.expert_groups.has_value()) {
+        const uint32_t expert_groups = operation_attributes.expert_groups.value();
+        TT_FATAL(expert_groups >= 1, "sparse_matmul: expert_groups must be >= 1 (got {})", expert_groups);
+        TT_FATAL(
+            expert_groups <= batch_length,
+            "sparse_matmul: expert_groups ({}) must not exceed the number of sparse slots ({})",
+            expert_groups,
+            batch_length);
+        TT_FATAL(
+            operation_attributes.is_input_b_sparse,
+            "sparse_matmul: expert_groups requires is_input_b_sparse=true (the A-sparse/B-dense mode runs on "
+            "the legacy path only)");
+        // The broadcast-A mode keeps one resident in0 in L1 for the whole op, which needs a single outer A
+        // batch; the A+B-sparse mode has batchA == 1 by construction.
+        TT_FATAL(
+            operation_attributes.is_input_a_sparse || batch_length_A == 1,
+            "sparse_matmul: expert_groups requires input A to have a single outer batch ([1, 1, M, K]) when only "
+            "B is sparse; got A batch length {}",
+            batch_length_A);
+        TT_FATAL(
+            operation_attributes.program_config.has_value() &&
+                std::holds_alternative<operations::matmul::MatmulMultiCoreReuseMultiCast1DProgramConfig>(
+                    operation_attributes.program_config.value()),
+            "sparse_matmul: expert_groups requires a MatmulMultiCoreReuseMultiCast1DProgramConfig");
+        const auto& pc = std::get<operations::matmul::MatmulMultiCoreReuseMultiCast1DProgramConfig>(
+            operation_attributes.program_config.value());
+        TT_FATAL(pc.mcast_in0, "sparse_matmul: expert_groups requires mcast_in0=true");
+        const uint32_t Mt = a_shape_padded[-2] / in0_tile.get_height();
+        const uint32_t Kt = a_shape_padded[-1] / in0_tile.get_width();
+        const uint32_t Nt = b_shape_padded[-1] / in1_tile.get_width();
+        TT_FATAL(
+            pc.in0_block_w != 0 && Kt % pc.in0_block_w == 0,
+            "sparse_matmul: Kt ({}) must be divisible by in0_block_w ({})",
+            Kt,
+            pc.in0_block_w);
+        TT_FATAL(pc.per_core_M != 0 && pc.per_core_N != 0, "sparse_matmul: per_core_M/N must be non-zero");
+        // The resident in0 ring cycles in (h-block, K-block) order, which matches the compute kernel's
+        // consumption order only when at most one of the two per-core block loops has more than one
+        // iteration (per_core_M == out_block_h, or per_core_N == out_block_w).
+        TT_FATAL(
+            operation_attributes.is_input_a_sparse || pc.per_core_M == pc.out_block_h ||
+                pc.per_core_N == pc.out_block_w,
+            "sparse_matmul: expert_groups with a broadcast A requires per_core_M == out_block_h ({} vs {}) or "
+            "per_core_N == out_block_w ({} vs {})",
+            pc.per_core_M,
+            pc.out_block_h,
+            pc.per_core_N,
+            pc.out_block_w);
+        const uint32_t num_blocks_total = (((Mt - 1) / pc.per_core_M) + 1) * (((Nt - 1) / pc.per_core_N) + 1);
+        const auto grid = pc.compute_with_storage_grid_size;
+        const uint32_t num_cores = expert_groups * num_blocks_total;
+        TT_FATAL(
+            num_cores >= 2,
+            "sparse_matmul: expert_groups ({}) x output blocks ({}) must use at least 2 cores",
+            expert_groups,
+            num_blocks_total);
+        TT_FATAL(
+            num_cores <= grid.x * grid.y,
+            "sparse_matmul: expert_groups ({}) x output blocks ({}) = {} cores exceeds the {}x{} grid",
+            expert_groups,
+            num_blocks_total,
+            num_cores,
+            grid.x,
+            grid.y);
+        // The first num_cores cores in row-major order must fill an exact rectangle (in0 is multicast to
+        // the bounding box): either whole rows, or a single partial row.
+        const bool exact_rectangle = grid.x > 0 && (num_cores % grid.x == 0 || num_cores < grid.x);
+        TT_FATAL(
+            exact_rectangle,
+            "sparse_matmul: expert_groups ({}) x output blocks ({}) = {} cores does not fill an exact rectangle of "
+            "the {}x{} grid (use a grid of {} x ceil({}/{}) or change the number of groups)",
+            expert_groups,
+            num_blocks_total,
+            num_cores,
+            grid.x,
+            grid.y,
+            grid.x,
+            num_cores,
+            grid.x);
+    }
 }
 
 SparseMatmulDeviceOperation::spec_return_value_t SparseMatmulDeviceOperation::compute_output_specs(
@@ -520,7 +604,8 @@ std::tuple<SparseMatmulParams, SparseMatmulInputs> sparse_matmul_build_operation
     const std::optional<const tt::tt_metal::Tile>& output_tile,
     const std::optional<const GlobalCircularBuffer>& global_cb,
     const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
-    const std::optional<Tensor>& indices) {
+    const std::optional<Tensor>& indices,
+    const std::optional<uint32_t>& expert_groups) {
     auto sparse_matmul_attributes = SparseMatmulParams{
         nnz,
         is_input_a_sparse,
@@ -533,7 +618,8 @@ std::tuple<SparseMatmulParams, SparseMatmulInputs> sparse_matmul_build_operation
         user_core_coord,
         output_tile,
         global_cb,
-        sub_device_id};
+        sub_device_id,
+        expert_groups};
 
     auto parameters = create_sparse_matmul_attributes(
         input_tensor_a, input_tensor_b, sparsity, sparse_matmul_attributes, {optional_output_tensor});
@@ -567,7 +653,8 @@ SparseMatmulDeviceOperation::tensor_return_value_t sparse_matmul(
     const std::optional<const tt::tt_metal::Tile>& output_tile,
     const std::optional<const GlobalCircularBuffer>& global_cb,
     const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
-    const std::optional<Tensor>& indices) {
+    const std::optional<Tensor>& indices,
+    const std::optional<uint32_t>& expert_groups) {
     auto [params, inputs] = sparse_matmul_build_operation_args(
         input_tensor_a,
         input_tensor_b,
@@ -584,7 +671,8 @@ SparseMatmulDeviceOperation::tensor_return_value_t sparse_matmul(
         output_tile,
         global_cb,
         sub_device_id,
-        indices);
+        indices,
+        expert_groups);
     return ttnn::device_operation::launch<SparseMatmulDeviceOperation>(params, inputs);
 }
 
@@ -628,6 +716,15 @@ SparseMatmulParams create_sparse_matmul_attributes(
         matmul_struct.user_core_coord,
         matmul_struct.output_tile,
         matmul_struct.global_cb,
-        matmul_struct.sub_device_id};
+        matmul_struct.sub_device_id,
+        parameters.expert_groups};
+}
+
+SparseMatmulDeviceOperation::program_factory_t SparseMatmulDeviceOperation::select_program_factory(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
+    if (operation_attributes.expert_groups.has_value()) {
+        return SparseMatmulExpertGroupsProgramFactory{};
+    }
+    return SparseMatmulMultiCoreReuseMcast1DProgramFactory{};
 }
 }  // namespace ttnn::prim

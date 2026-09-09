@@ -24,6 +24,34 @@ DENSE_EXPERT_GATE_UP_MINIMAL_ALT = MinimalMatmulBlocking(cores=(11, 10), k_block
 #   0.999950 / 0.999942 vs 0.999931 / 0.999933 / 0.999924 (the sum over the hot experts moves into the accumulation).
 HOT_DOWN_KCONCAT_MINIMAL = MinimalMatmulBlocking(cores=(11, 10), k_block=5, subblock=(4, 2))
 
+# Phase 3b (2026-09-08): expert-group parallelism (EGP) of the decode sparse_matmuls, `ttnn.sparse_matmul(expert_groups=G)`
+# (design scratchpad/phase3/design_b32_lever.md, kernel results egp_results.md; one-device kernel times, bit-identical
+# to the legacy kernels in every measured case -- 24 op-test cases, 126 sweep configs, 800 random masks, trace replays):
+# - fused gate|up [1,1,32,4096] x [1,128,4096,320]: G 11 on 11x10 (10 blocks x 11 groups, in0_block_w 128, per_core_N 1):
+#   nnz 72 (the b32 union) 668.8 -> 275.8 us (1.03x the DRAM floor), nnz 8 145.8 -> 34.5, nnz 128 1066 -> 493; the b1
+#   indexed k=8 gate|up 68.2 -> 33.0 us. The legacy grid pays a validity round trip per slot (97 us fixed) and re-multicasts
+#   the activation per expert on 10 cores.
+# - batched down [1,128,32,160] x [1,128,160,4096]: G 11 on 11x8 (8 blocks of per_core_N 16, out_subblock_w 8): nnz 72
+#   215.9 -> 143.9 us kernel (+ the unchanged 45.5 us output FILL), nnz 8 143.9 -> 20.5, nnz 128 280 -> 250; every >= 32-core
+#   EGP family is within 5-10 % of the DRAM floor at nnz >= 72. Because the fixed per-slot cost is gone, the batched grid is
+#   also the best down for 2..15 users (decode_down_batched_min_tokens 16 -> 2; the legacy 8x4 x 4 tiles single-user grid
+#   stays for m = 1).
+# - b1 indexed compact-A down (k = 8): no EGP gain (19.4-20.6 vs 15.9 us legacy 8x8 pcn2 / 24.6 us the shipped 8x4 pcn4):
+#   decode_down_expert_groups stays None.
+# SOLAR_OPEN_DECODE_EGP=off restores the phase-2 decode configs on the same tree (the A/B arm of the gates below);
+# solar_open_program_config() applies the same fallback on grids narrower than 11x10 (the EGP grids need 11 columns).
+DECODE_EGP_ENV = "SOLAR_OPEN_DECODE_EGP"
+DECODE_EGP_LEGACY = dict(
+    decode_gate_up_cores=(5, 2),
+    decode_gate_up_expert_groups=None,
+    decode_down_cores_batched=(8, 8),
+    decode_down_batched_subblock_w=2,
+    decode_down_batched_expert_groups=None,
+    decode_down_batched_min_tokens=16,
+)
+DECODE_EGP_PRESETS = {"on": {}, "off": DECODE_EGP_LEGACY}
+DECODE_EGP_MIN_GRID = (11, 10)
+
 # A/B presets of the phase-3 prefill knobs for the accuracy / perf gates (SOLAR_OPEN_PREFILL_EXPERT_MM=<name>):
 # ``tuned`` (default) = the shipped values, ``phase2`` = the phase-2 forms (auto linear, bmm + reduce, out_subblock_h 1),
 # ``gate_up_alt`` = the better-numerics gate|up blocking, ``bfp8_act`` = tuned + the bfp8 activation broadcast of the
@@ -46,28 +74,38 @@ class SolarOpenProgramConfig(ProgramConfig):
     with work to fill the multicast rectangle exactly); the values are performance knobs, never a correctness knob
     (the numerics of every value here were re-validated with the component tests and the teacher-forced accuracy
     test, see the README's "Recorded baselines"). Phase-2 tuning (2026-09-07) from the tracy device profile of the
-    real-weight layer: gate|up in0_block_w 128 and the widest legal down out_subblock_w per grid.
+    real-weight layer: gate|up in0_block_w 128 and the widest legal down out_subblock_w per grid. Phase-3b
+    (2026-09-08): expert-group parallelism of the gate|up and the batched down (see the module constants).
     """
 
-    # Decode. The fused gate|up sparse_matmul has N = 10 tiles per device: 10 cores x 1 tile (any larger
-    # request shrinks to this). in0_block_w 128 = Kt: the whole K as ONE block (was 32 = 4 K-blocks); measured on
-    # P150 (2026-09-07, per layer): nnz 8 (batch 1) 158.7 -> 149.6 us, nnz 112 (batch 32) 1162 -> 961 us (-17 %).
-    # L1: 128 bf16 in0 tiles (256 KB) + 128 bfp8 in1 tiles per core, double-buffered.
-    decode_gate_up_cores: tuple[int, int] = (5, 2)
+    # Decode. The fused gate|up sparse_matmul has N = 10 tiles per device = 10 output blocks of 1 tile; with
+    # expert_groups 11 the 11x10 grid holds 11 groups of those 10 blocks (110 cores), each group streaming every 11th
+    # active expert (legacy: 5x2 = the 10 blocks once, SOLAR_OPEN_DECODE_EGP=off). in0_block_w 128 = Kt: the whole K
+    # as ONE block (was 32 = 4 K-blocks); measured on P150 (2026-09-07, per layer): nnz 8 (batch 1) 158.7 -> 149.6 us,
+    # nnz 112 (batch 32) 1162 -> 961 us (-17 %). L1 per core: the resident 128 bf16 in0 tiles (256 KB, single-buffered
+    # under EGP) + 128 bfp8 in1 tiles double-buffered = 542 KB (legacy 804 KB).
+    decode_gate_up_cores: tuple[int, int] = (11, 10)
     decode_gate_up_in0_block_w: int = 128
+    decode_gate_up_expert_groups: int | None = 11
     # Single-user down projection (N = 128 tiles): 32 cores x per_core_N 4. Kt = 5 is prime, so only 1 or 5
     # divide it; 5 keeps one K-block. out_subblock_w 4 = per_core_N (one compute pass per output block; measured
-    # nnz 8: 178.7 -> 151.9 us incl. the output zero-fill).
+    # nnz 8: 178.7 -> 151.9 us incl. the output zero-fill). No expert groups: the indexed k = 8 compact-A down measured
+    # slower under EGP than the legacy kernels (module constants).
     decode_down_cores: tuple[int, int] = (8, 4)
     decode_down_in0_block_w: int = 5
     decode_down_subblock_w: int = 4
-    # Multi-user steps (>= 16 users): 64 cores x 2 tiles. 128 tiles have no exact-fill rectangle with
-    # w <= 13, h <= 10 at one tile per core; 8x8x2 is the widest exact fill. Set to None by
-    # solar_open_program_config() when the compute grid is smaller than 8x8. out_subblock_w 2 = per_core_N
-    # (measured nnz 112: 437.9 -> 307.7 us, nnz 8: 200.1 -> 190.1).
-    decode_down_cores_batched: tuple[int, int] | None = (8, 8)
-    decode_down_batched_subblock_w: int = 2
-    decode_down_batched_min_tokens: int = 16
+    decode_down_expert_groups: int | None = None
+    # Multi-user steps (>= 2 users): expert_groups 11 on 11x8 = 11 groups x 8 blocks of per_core_N 16 (out_subblock_w
+    # 8, the widest legal subblock), 88 cores; measured nnz 72: 215.9 -> 143.9 us kernel. Legacy (SOLAR_OPEN_DECODE_EGP=off,
+    # and every grid narrower than 11x10): 8x8 x 2 tiles from 16 users on -- 128 tiles have no exact-fill rectangle with
+    # w <= 13, h <= 10 at one tile per core; 8x8x2 is the widest legacy exact fill (out_subblock_w 2 = per_core_N, measured
+    # nnz 112: 437.9 -> 307.7 us, nnz 8: 200.1 -> 190.1); below 16 users the legacy path used the 8x4 grid (fewer multicast
+    # receivers per validity round trip). Set to None by solar_open_program_config() when the compute grid is smaller
+    # than 8x8.
+    decode_down_cores_batched: tuple[int, int] | None = (11, 8)
+    decode_down_batched_subblock_w: int = 8
+    decode_down_batched_expert_groups: int | None = 11
+    decode_down_batched_min_tokens: int = 2
 
     # Prefill sparse path (EP > 1 only; unreachable on a 1x8 mesh, kept for multi-row meshes)
     prefill_gate_up_cores: tuple[int, int] = (5, 2)
@@ -120,17 +158,35 @@ def prefill_expert_mm_overrides(preset: str | None = None) -> dict:
     return dict(PREFILL_EXPERT_MM_PRESETS[name])
 
 
+def decode_egp_overrides(preset: str | None = None) -> dict:
+    """Field overrides of a DECODE_EGP_PRESETS entry: ``preset`` by name, or (None) the one named by the
+    SOLAR_OPEN_DECODE_EGP environment variable (unset / empty = ``on`` = no overrides; ``off`` = the phase-2 decode
+    configs: legacy kernels on 5x2 / 8x4 / 8x8)."""
+    name = (os.getenv(DECODE_EGP_ENV, "") if preset is None else preset).strip() or "on"
+    if name not in DECODE_EGP_PRESETS:
+        raise ValueError(
+            f"{DECODE_EGP_ENV}={name!r}: unknown decode expert-groups preset, expected one of {sorted(DECODE_EGP_PRESETS)}"
+        )
+    return dict(DECODE_EGP_PRESETS[name])
+
+
 def solar_open_program_config(mesh_device) -> SolarOpenProgramConfig:
     """Solar-Open expert program config for the device's compute grid.
 
-    Blackhole (13x10 / 11x10) and Wormhole (8x8) grids both fit the 8x8 batched down grid and the 8x8 dense
-    down grid; anything smaller falls back to the single-user 8x4 grid (itself shrunk by the builder if needed)
-    for every step and to the auto config for the dense prefill down bmm. The phase-3 minimal_matmul blockings need
-    their 11-wide grids (Blackhole); on a narrower grid they drop to the auto forms. SOLAR_OPEN_PREFILL_EXPERT_MM
-    selects an A/B preset of the phase-3 knobs (prefill_expert_mm_overrides).
+    The phase-3b expert-group decode grids (gate|up 11x10, batched down 11x8) need an 11-wide, 10-tall compute grid
+    (Blackhole 11x10 / 13x10); on anything narrower the decode sparse_matmuls fall back to the phase-2 legacy configs
+    (DECODE_EGP_LEGACY, the same as SOLAR_OPEN_DECODE_EGP=off). Blackhole and Wormhole (8x8) grids both fit the 8x8
+    legacy batched down grid and the 8x8 dense down grid; anything smaller falls back to the single-user 8x4 grid
+    (itself shrunk by the builder if needed) for every step and to the auto config for the dense prefill down bmm. The
+    phase-3 minimal_matmul blockings need their 11-wide grids (Blackhole); on a narrower grid they drop to the auto
+    forms. SOLAR_OPEN_PREFILL_EXPERT_MM / SOLAR_OPEN_DECODE_EGP select A/B presets of the phase-3 / 3b knobs
+    (prefill_expert_mm_overrides / decode_egp_overrides).
     """
     grid = mesh_device.compute_with_storage_grid_size()
     overrides = prefill_expert_mm_overrides()
+    overrides.update(decode_egp_overrides())
+    if not (grid.x >= DECODE_EGP_MIN_GRID[0] and grid.y >= DECODE_EGP_MIN_GRID[1]):
+        overrides.update(DECODE_EGP_LEGACY)
     if not (grid.x >= 8 and grid.y >= 8):
         overrides.update(decode_down_cores_batched=None, dense_down_cores=None)
     pc = SolarOpenProgramConfig(**overrides)

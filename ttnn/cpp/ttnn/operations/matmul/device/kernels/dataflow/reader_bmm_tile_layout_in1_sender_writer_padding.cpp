@@ -91,6 +91,19 @@ void kernel_main() {
     // Don't need batch; same as batch from READER args
     constexpr bool compact_output = get_compile_time_arg_val(32);
 
+#ifdef EXPERT_GROUPS
+    // Expert-group parallelism (set only by the sparse matmul EGP factory,
+    // device/sparse/factory/sparse_matmul_expert_groups_program_factory.cpp). The non-zero sparsity slots are
+    // numbered by their running rank r in scan order and this core's group owns slot r iff
+    // r % expert_groups == group_id (indexed mode: entry i iff i % expert_groups == group_id). Output
+    // addressing stays absolute (expanded: slot index, compact: rank, indexed: entry), so the output layout is
+    // identical to the single-group kernel. EXPERT_GROUPS_NNZ is the caller-supplied nnz (0 when none): ranks
+    // beyond it are skipped so this writer and the in0 kernel agree on the set of computed slots even if the
+    // sparsity mask holds more non-zeros than announced (the in0 kernel asserts the contract under watcher).
+    constexpr uint32_t expert_groups = EXPERT_GROUPS;
+    constexpr uint32_t expert_groups_nnz = EXPERT_GROUPS_NNZ;
+#endif  // EXPERT_GROUPS
+
     // When sparsity is disabled, we just loop once
     constexpr uint32_t batchB_lim = batchB == 0 ? 1u : batchB;
 
@@ -137,6 +150,10 @@ void kernel_main() {
 #ifndef OUT_SHARDED
     const uint32_t last_num_blocks_w_dim = get_arg_val<uint32_t>(rt_args_idx++);
 #endif  // OUT_SHARDED
+#ifdef EXPERT_GROUPS
+    // This core's expert group (runtime arg index 21; the first fused-op placeholder in every other build).
+    const uint32_t group_id = get_arg_val<uint32_t>(rt_args_idx++);
+#endif  // EXPERT_GROUPS
 
     constexpr bool fuse_op_all_gather = (bool)get_compile_time_arg_val(30);
     constexpr bool fuse_op_reduce_scatter = (bool)get_compile_time_arg_val(31);
@@ -294,8 +311,48 @@ void kernel_main() {
         // Indexed/gather mode writes to compact output slots, so capture this outer batch's output
         // base and index it by the compact slot (the loop counter) each iteration.
         [[maybe_unused]] const uint32_t out_base_tile_id = out_tensor_start_tile_id;
+#ifdef EXPERT_GROUPS
+        // Running rank of the non-zero slots seen so far in this scan (expert-group ownership key).
+        uint32_t egp_rank = 0;
+#endif  // EXPERT_GROUPS
 
         for (uint32_t bB = 0; bB < batch_loop_lim; ++bB) {
+#ifdef EXPERT_GROUPS
+            if constexpr (use_indices) {
+                // Indexed/gather mode: group (bB % expert_groups) computes entry bB. Absolute addressing
+                // (weights of indices[bB], compact output slot bB) is unchanged from the single-group kernel.
+                if (bB % expert_groups != group_id) {
+                    continue;
+                }
+                const uint32_t expert_id = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_write_addr_sparsity)[bB];
+                ASSERT(expert_id < batchB);
+                in1_batch_tile_id = in1_tensor_start_tile_id + expert_id * KtNt;
+                out_tensor_start_tile_id = out_base_tile_id + bB * MtNt;
+            } else if constexpr (batchB > 0) {
+                // Scan mode: slot bB is computed here iff it is non-zero, its rank belongs to this group and
+                // (with a caller-supplied nnz) its rank is within the announced count. Skipped slots advance
+                // the running weight / expanded-output pointers exactly as in the single-group kernel, so the
+                // expanded output slot stays bB; the compact slot is the rank.
+                const bool is_batch_valid =
+                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_write_addr_sparsity)[bB] != 0;
+                const uint32_t rank = egp_rank;
+                if (is_batch_valid) {
+                    ++egp_rank;
+                }
+                const bool is_mine = is_batch_valid && (rank % expert_groups) == group_id &&
+                                     (expert_groups_nnz == 0 || rank < expert_groups_nnz);
+                if (!is_mine) {
+                    if constexpr (!compact_output) {
+                        out_tensor_start_tile_id += MtNt;
+                    }
+                    in1_batch_tile_id += KtNt;
+                    continue;
+                }
+                if constexpr (compact_output) {
+                    out_tensor_start_tile_id = out_base_tile_id + rank * MtNt;
+                }
+            }
+#else   // EXPERT_GROUPS
             if constexpr (use_indices) {
                 // Gather: jump straight to group indices[bB]'s weight block, scatter its result to
                 // compact output slot bB. Every iterated group is active, so nothing is skipped.
@@ -315,6 +372,7 @@ void kernel_main() {
                     continue;
                 }
             }
+#endif  // EXPERT_GROUPS
 
             uint32_t in1_tensor_current_h_dim_block_tile_id = in1_batch_tile_id;
             uint32_t out_tensor_current_h_dim_block_tile_id = out_tensor_start_tile_id;

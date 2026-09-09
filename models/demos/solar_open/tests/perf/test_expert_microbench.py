@@ -188,6 +188,37 @@ def test_expert_microbench(mesh_device, device_params, reset_seeds):
     bench.run("gu_m32_nnz112_5x2_bw32_in0bfp8", gate_up(x32_bfp8, 112, (5, 2), 32, 1))
     bench.run("gu_m32_nnz112_5x2_bw128_in0bfp8", gate_up(x32_bfp8, 112, (5, 2), 128, 1))
 
+    # ---------------- A-EGP. expert-group parallelism (phase 3b): ttnn.sparse_matmul(expert_groups=G) ----------------
+    # Grid = G x output blocks (gate|up: 10 blocks -> (10, G) or (11, 10) at G 11). Bit-identical to the legacy kernel
+    # (checked here as a torch.equal note per configuration; the op-level matrix is tests/ttnn/unit_tests/operations/
+    # matmul/test_sparse_matmul_expert_groups.py). Shipped: G 11 on 11x10 (gate|up), pcn16 osw8 G 11 on 11x8 (down).
+    def gate_up_egp(x, nnz, G, bw=128, cores=None):
+        cores = cores or ((11, 10) if G == 11 else (10, G))
+        return lambda: ttnn.sparse_matmul(
+            x,
+            w_gu,
+            sparsity=sparsities[nnz],
+            nnz=None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=TILE,
+            program_config=_pc(cores, bw, 1, 1, 1),
+            dtype=ttnn.bfloat8_b,
+            expert_groups=G,
+        )
+
+    for nnz, x in ((8, x1), (8, x32), (64, x32), (112, x32), (128, x32)):
+        tag = f"gu_m{x.shape[2]}_nnz{nnz}"
+        for G in (1, 5, 11):
+            if bench.run(f"{tag}_egp_G{G}_bw128", gate_up_egp(x, nnz, G)) and nnz in (8, 112):
+                legacy = gate_up(x, nnz, (5, 2), 128, 1)()
+                egp = gate_up_egp(x, nnz, G)()
+                bench.note(
+                    f"{tag}_egp_G{G}_bw128_equal_legacy", bool(torch.equal(ttnn.to_torch(legacy), ttnn.to_torch(egp)))
+                )
+                legacy.deallocate(True)
+                egp.deallocate(True)
+    bench.run("gu_m32_nnz112_egp_G11_bw32", gate_up_egp(x32, 112, 11, bw=32))  # K in 4 blocks: a different sum order
+
     # ---------------- A'. indexed / gather mode (top-k ids instead of the 128-slot scan) ----------------
     idx8 = up(sparse_idx[8].reshape(1, 1, 1, 8).to(torch.int32), dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT)
     idx9 = up(sparse_idx[9].reshape(1, 1, 1, 9).to(torch.int32), dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT)
@@ -204,9 +235,31 @@ def test_expert_microbench(mesh_device, device_params, reset_seeds):
             dtype=ttnn.bfloat8_b,
         )
 
+    def gate_up_idx_egp(x, idx, nnz, G=11, cores=(11, 10), bw=128):
+        return lambda: ttnn.sparse_matmul(
+            x,
+            w_gu,
+            sparsity=sparsities[nnz],
+            indices=idx,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=TILE,
+            program_config=_pc(cores, bw, 1, 1),
+            dtype=ttnn.bfloat8_b,
+            expert_groups=G,
+        )
+
     ok_gu_idx = bench.run("gu_m1_idx8_5x2_bw32", gate_up_idx(x1, idx8, 8))
     bench.run("gu_m1_idx9_5x2_bw32", gate_up_idx(x1, idx9, 9))
     bench.run("gu_m1_idx8_5x2_bw128", gate_up_idx(x1, idx8, 8, bw=128))
+    if bench.run("gu_m1_idx8_egp_G11_bw128", gate_up_idx_egp(x1, idx8, 8)):  # shipped b1 indexed gate|up (phase 3b)
+        legacy = gate_up_idx(x1, idx8, 8, bw=128)()
+        egp = gate_up_idx_egp(x1, idx8, 8)()
+        bench.note(
+            "gu_m1_idx8_egp_G11_bw128_equal_legacy", bool(torch.equal(ttnn.to_torch(legacy), ttnn.to_torch(egp)))
+        )
+        legacy.deallocate(True)
+        egp.deallocate(True)
+    bench.run("gu_m1_idx8_egp_G5_bw128", gate_up_idx_egp(x1, idx8, 8, G=5, cores=(10, 5)))
     if ok_gu_idx:
         # correctness of the compact output vs torch, and the compact down projection (A compact [1, 8, 32, Ip])
         gu_c = gate_up_idx(x1, idx8, 8)()
@@ -233,12 +286,30 @@ def test_expert_microbench(mesh_device, device_params, reset_seeds):
                 dtype=ttnn.bfloat8_b,
             )
 
+        def down_idx_egp(cores, pcn, osw, G):
+            return lambda: ttnn.sparse_matmul(
+                act_c,
+                w_down,
+                sparsity=sparsities[8],
+                indices=idx8,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                output_tile=TILE,
+                is_input_a_sparse=True,
+                is_input_b_sparse=True,
+                program_config=_pc(cores, 5, 1, pcn, osw),
+                dtype=ttnn.bfloat8_b,
+                expert_groups=G,
+            )
+
         ok_down_idx = bench.run("down_idx8_8x4_pcn4", down_idx((8, 4), 4))
         if not ok_down_idx:
             ok_down_idx = bench.run("down_idx8_8x4_pcn4_a_not_sparse", down_idx((8, 4), 4, a_sparse=False))
         if ok_down_idx:
             bench.run("down_idx8_8x8_pcn2", down_idx((8, 8), 2))
             bench.run("down_idx8_8x4_pcn4_osw4", down_idx((8, 4), 4, 4))
+            bench.run("down_idx8_8x8_pcn2_osw2", down_idx((8, 8), 2, 2))  # the measured best b1 indexed down (legacy)
+            bench.run("down_idx8_egp_pcn16_osw8_G11_11x8", down_idx_egp((11, 8), 16, 8, 11))  # no EGP gain at k = 8
+            bench.run("down_idx8_egp_pcn8_osw8_G5_8x10", down_idx_egp((8, 10), 8, 8, 5))
             d_c = down_idx((8, 4), 4)()
             logger.info(f"indexed down output shape {d_c.shape}")
             act_ref = ttnn.to_torch(act_c).float().reshape(8, IP)
@@ -263,10 +334,37 @@ def test_expert_microbench(mesh_device, device_params, reset_seeds):
             dtype=ttnn.bfloat8_b,
         )
 
+    def down_egp(nnz, cores, pcn, osw, G, bw=5):
+        return lambda: ttnn.sparse_matmul(
+            act_down,
+            w_down,
+            sparsity=sparsities[nnz],
+            nnz=None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=TILE,
+            is_input_a_sparse=True,
+            program_config=_pc(cores, bw, 1, pcn, osw),
+            dtype=ttnn.bfloat8_b,
+            expert_groups=G,
+        )
+
     for nnz in (8, 9, 64, 112, 113, 128):
         tag = f"down_nnz{nnz}"
-        bench.run(f"{tag}_8x4_pcn4", down(nnz, (8, 4), 4))  # production b1
-        bench.run(f"{tag}_8x8_pcn2", down(nnz, (8, 8), 2))  # production b32
+        bench.run(f"{tag}_8x4_pcn4", down(nnz, (8, 4), 4))  # production b1 (legacy)
+        bench.run(f"{tag}_8x8_pcn2", down(nnz, (8, 8), 2))  # phase-2 production b32 (legacy)
+        # phase 3b (expert groups): the shipped batched down pcn16 osw8 G 11 on 11x8 and the pcn8 osw8 G 4 / 5 fallbacks
+        if bench.run(f"{tag}_egp_pcn16_osw8_G11_11x8", down_egp(nnz, (11, 8), 16, 8, 11)) and nnz in (8, 112):
+            legacy = down(nnz, (8, 8), 2, 2)()
+            egp = down_egp(nnz, (11, 8), 16, 8, 11)()
+            bench.note(
+                f"{tag}_egp_pcn16_osw8_G11_11x8_equal_legacy",
+                bool(torch.equal(ttnn.to_torch(legacy), ttnn.to_torch(egp))),
+            )
+            legacy.deallocate(True)
+            egp.deallocate(True)
+        if nnz in (8, 112):
+            bench.run(f"{tag}_egp_pcn8_osw8_G4_8x8", down_egp(nnz, (8, 8), 8, 8, 4))
+            bench.run(f"{tag}_egp_pcn8_osw8_G5_8x10", down_egp(nnz, (8, 10), 8, 8, 5))
         if nnz in (8, 112):
             bench.run(f"{tag}_8x4_pcn4_osw2", down(nnz, (8, 4), 4, 2))
             bench.run(f"{tag}_8x4_pcn4_osw4", down(nnz, (8, 4), 4, 4))

@@ -189,6 +189,11 @@ def decode_forward(
 
     # Fused gate/up projection: [1, 1, 1, H] x [1, E, H, 2 * Ip] -> [1, 1, 1, E, 1, 2 * Ip]
     # (Ip = intermediate_padded_per_device; per device the columns are [gate | up], each zero-padded to Ip).
+    # Program config and expert groups travel together (SparseMatmulConfig): an expert-group grid is only legal
+    # with its `expert_groups` value and vice versa.
+    gate_up_cfg = program_config.get_decode_gate_up_config(
+        hidden_states.shape[2], weights.gate_up_proj.shape[3], k=hidden_states.shape[-1]
+    )
     gate_up = ttnn.sparse_matmul(
         hidden_states,
         weights.gate_up_proj,
@@ -203,9 +208,8 @@ def decode_forward(
         nnz=None,
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
-        program_config=program_config.get_decode_gate_up_config(
-            hidden_states.shape[2], weights.gate_up_proj.shape[3], k=hidden_states.shape[-1]
-        ),
+        program_config=gate_up_cfg.program_config,
+        expert_groups=gate_up_cfg.expert_groups,
         dtype=activation_dtype,
     )
     hidden_states.deallocate(True)
@@ -228,6 +232,9 @@ def decode_forward(
     down_input = ttnn.transpose(down_input, 1, 0)
     down_input = ttnn.reshape(down_input, (1, config.num_experts, seq_len, ip))
     # Down projection
+    down_cfg = program_config.get_decode_down_config(
+        down_input.shape[2], weights.down_proj.shape[-1], k=down_input.shape[-1]
+    )
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,
@@ -238,9 +245,8 @@ def decode_forward(
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
         is_input_a_sparse=True,
-        program_config=program_config.get_decode_down_config(
-            down_input.shape[2], weights.down_proj.shape[-1], k=down_input.shape[-1]
-        ),
+        program_config=down_cfg.program_config,
+        expert_groups=down_cfg.expert_groups,
         dtype=activation_dtype,
     )
 
@@ -351,6 +357,8 @@ def _decode_forward_indexed(
     shared = shared_expert(hidden_states) if shared_expert is not None else None
 
     # 1. Fused gate/up over the k selected experts only: [1, 1, 1, H] x [1, E, H, 2 Ip] -> [1, 1, 1, k, 1, 2 Ip]
+    #    (expert groups: group i % G computes entry i of the ids; the compact output layout is unchanged)
+    gate_up_cfg = program_config.get_decode_gate_up_config(1, weights.gate_up_proj.shape[3], k=hidden_size)
     gate_up = ttnn.sparse_matmul(
         hidden_states,
         weights.gate_up_proj,
@@ -358,7 +366,8 @@ def _decode_forward_indexed(
         indices=indexed_routing.indices,  # [1, 1, 1, k] uint16 ROW_MAJOR; nnz must stay unset
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
-        program_config=program_config.get_decode_gate_up_config(1, weights.gate_up_proj.shape[3], k=hidden_size),
+        program_config=gate_up_cfg.program_config,
+        expert_groups=gate_up_cfg.expert_groups,
         dtype=activation_dtype,
     )
     hidden_states.deallocate(True)
@@ -378,6 +387,7 @@ def _decode_forward_indexed(
         expert_scalars.deallocate(True)
 
     # 3. Down over the same k experts, compact A: [1, k, 1, Ip] x [1, E, Ip, H] -> [1, k, 1, H]
+    down_cfg = program_config.get_decode_down_config(1, weights.down_proj.shape[-1], k=ip)
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,
@@ -387,7 +397,8 @@ def _decode_forward_indexed(
         output_tile=output_tile,
         is_input_a_sparse=True,
         is_input_b_sparse=True,
-        program_config=program_config.get_decode_down_config(1, weights.down_proj.shape[-1], k=ip),
+        program_config=down_cfg.program_config,
+        expert_groups=down_cfg.expert_groups,
         dtype=activation_dtype,
     )
     down_input.deallocate(True)
@@ -492,7 +503,13 @@ def _decode_forward_batched(
     expert_hit.deallocate(True)
 
     # 2a. Fused gate/up projection: [1, 1, T, H] x [1, E, H, 2 * Ip] -> [1, 1, 1, E, T, 2 * Ip] -> [1, E, T, 2 * Ip]
+    #     With expert groups (ProgramConfig.decode_gate_up_expert_groups) the 32-row activation tile is multicast once
+    #     and stays resident while G groups of cores stream every G-th active expert concurrently (phase 3b; the union
+    #     of ~72 experts at 32 users: 669 -> 276 us per layer on P150, bit-identical output).
     ip = weights.intermediate_padded_per_device
+    gate_up_cfg = program_config.get_decode_gate_up_config(
+        num_tokens, weights.gate_up_proj.shape[3], k=hidden_states.shape[-1]
+    )
     gate_up = ttnn.sparse_matmul(
         hidden_states,
         weights.gate_up_proj,
@@ -500,9 +517,8 @@ def _decode_forward_batched(
         nnz=None,  # data-dependent union size: must be inferred on device (see decode_forward)
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
-        program_config=program_config.get_decode_gate_up_config(
-            num_tokens, weights.gate_up_proj.shape[3], k=hidden_states.shape[-1]
-        ),
+        program_config=gate_up_cfg.program_config,
+        expert_groups=gate_up_cfg.expert_groups,
         dtype=activation_dtype,
     )
     hidden_states.deallocate(True)
@@ -528,9 +544,12 @@ def _decode_forward_batched(
 
     # 2b. Down projection (input is expert-batched too): [1, E, T, Ip] x [1, E, I, H] -> [1, E, T, H]
     #     (padded K: Ip == padded I of the weight; the extra input columns are zero). The grid choice takes the REAL
-    #     user count (ProgramConfig.decode_down_batched_min_tokens: 8x4 x 4 tiles for few users -- their union of
-    #     experts is small and the wider per-core block wins, measured nnz 8: 152 vs 190 us -- 8x8 x 2 tiles for
-    #     >= 16 users); per_core_M is 1 tile either way, so the M padding does not enter the config.
+    #     user count (ProgramConfig.decode_down_batched_min_tokens selects the batched grid / expert groups: phase 3b
+    #     runs 11 groups x 8 blocks of 16 tiles from 2 users on -- 216 -> 144 us per layer at the 32-user union; the
+    #     legacy configs used 8x4 x 4 tiles below 16 users, whose small union favoured fewer multicast receivers per
+    #     validity round trip, and 8x8 x 2 tiles above); per_core_M is 1 tile either way, so the M padding does not
+    #     enter the config.
+    down_cfg = program_config.get_decode_down_config(real_tokens, weights.down_proj.shape[-1], k=down_input.shape[-1])
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,
@@ -539,9 +558,8 @@ def _decode_forward_batched(
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
         is_input_a_sparse=True,
-        program_config=program_config.get_decode_down_config(
-            real_tokens, weights.down_proj.shape[-1], k=down_input.shape[-1]
-        ),
+        program_config=down_cfg.program_config,
+        expert_groups=down_cfg.expert_groups,
         dtype=activation_dtype,
     )
     down_input.deallocate(True)
