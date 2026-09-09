@@ -46,4 +46,24 @@ struct SparseMatmulInputs {
     std::vector<std::optional<Tensor>> optional_output_tensors;
 };
 
+// EGP kernel zero-fill (the "v2" of the expert-group factory). With `expert_groups` set, the EGP kernels write
+// EVERY tile of the output in every run: an expanded scan output gets its non-computed slots (invalid mask
+// entries, and ranks >= a caller-supplied nnz) zero-filled by the cores of group `slot % G` with the same tile
+// walk as the computed slots, and indexed / compact outputs were already fully written. The device op
+// therefore skips the `ttnn::zeros_like` FILL pass it runs before every legacy-path launch (45.5 us on the
+// Solar b32 down output, 4.5 us on the gate|up output, per layer). Both the FILL skip (create_output_tensors)
+// and the kernel define (EGP factory) are derived from this ONE predicate so they cannot diverge; the factory
+// additionally TT_FATALs the coverage preconditions (Mt % per_core_M == 0, interleaved output).
+//
+// Placement: the zero writes are issued by the in0 EGP reader kernel by default (RISCV_0, the NoC the weight
+// stream does not use, idle during the scan apart from the owned slots' in0 pushes), or by the in1 writer
+// (the same tile walk, on the streaming RISC) with TT_SPARSE_MATMUL_EGP_ZERO_FILL=in1. A/B knob for
+// measurements only, read once per process: TT_SPARSE_MATMUL_EGP_ZERO_FILL=0 restores the phase-3b behaviour
+// (FILL kept, no kernel zero-fill), `in1` selects the writer placement, anything else (unset) the in0 reader.
+// Not part of the program hash -- fresh process per arm. The legacy factory (`expert_groups == nullopt`) is
+// untouched by all of this.
+bool sparse_matmul_egp_zero_fill_enabled();
+bool sparse_matmul_egp_zero_fill_in_in1_writer();
+bool sparse_matmul_egp_kernel_writes_whole_output(const SparseMatmulParams& operation_attributes);
+
 }  // namespace ttnn::prim

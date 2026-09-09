@@ -31,6 +31,9 @@ and, with ``SOLAR_OPEN_PERF_OUT=<json>``, written to that file.
     11x10, batched down 11 groups x 16 tiles on 11x8, the b1 indexed gate|up) vs the legacy configs of the same tree
     (``DECODE_EGP_LEGACY`` = ``SOLAR_OPEN_DECODE_EGP=off``) at union sizes 8 / 72 / 128: the results must be IDENTICAL
     (max abs diff 0, the kernels compute the same per-tile math) -- call sites ``experts/decode.py``.
+  * ``p3c_down_indexed``: the phase-3c grid of the b1 indexed compact-A down (``decode_down_indexed_cores`` 8x8 x 2
+    tiles, out_subblock_w 2) vs the phase-3b one (the single-user 8x4 x 4 tiles, ``SOLAR_OPEN_DECODE_EGP=p3b``) on the
+    same compact bfp8 GLU rows and top-8 ids: IDENTICAL required -- call site ``experts/decode.py::_decode_forward_indexed``.
 
     SOLAR_OPEN_PERF_OUT=/path/cand.json pytest models/demos/solar_open/tests/perf/test_config_candidates.py \
         -k 1x1 -x -p no:cacheprovider
@@ -49,7 +52,7 @@ import ttnn
 from models.common.utility_functions import comp_pcc
 from models.demos.solar_open.tests.test_factory import parametrize_mesh_with_fabric
 from models.demos.solar_open.tt.attention_configs import SolarOpenAttentionProgramConfig
-from models.demos.solar_open.tt.expert_configs import DECODE_EGP_LEGACY, SolarOpenProgramConfig
+from models.demos.solar_open.tt.expert_configs import DECODE_EGP_LEGACY, SolarOpenProgramConfig, decode_egp_overrides
 from models.demos.solar_open.tt.experts.prefill import _DENSE_COMPUTE_KERNEL_CONFIG, _dense_core_grid
 from models.demos.solar_open.tt.rms_norm import RMSNorm, decode_norm_applies, decode_norm_sharded_configs
 from models.demos.solar_open.tt.shared_expert import shared_expert_program_configs
@@ -522,7 +525,47 @@ def test_config_candidates(mesh_device, device_params, reset_seeds):
         ref_idx.reshape(1, 1, 1, 8, 1, 2 * IP),
     )
     assert results["egp_gate_up_indexed_k8"]["identical"]
-    for t in (w_gu, w_dn, x32, x1, indices, placeholder):
+
+    # ---------------- 9. phase 3c: the indexed compact-A down on 8x8 x 2 tiles vs the 8x4 x 4 tiles grid, identical ----------------
+    # The shipped b1 down: A = the k = 8 compact bfp8 GLU rows [1, 8, 1, Ip], both operands sparse, output [1, 8, 1, H].
+    pc_p3b = SolarOpenProgramConfig(**decode_egp_overrides("p3b"))
+    assert pc_p3b.decode_down_indexed_cores is None and pc_egp.decode_down_indexed_cores == (8, 8)
+    act_c = up(torch.randn(1, 8, 1, IP, generator=g), mem=ttnn.L1_MEMORY_CONFIG)
+
+    def indexed_down(cfg):
+        c = cfg.get_decode_down_config(1, H, k=IP, indexed=True)
+        return lambda: ttnn.sparse_matmul(
+            act_c,
+            w_dn,
+            sparsity=placeholder,
+            indices=indices,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_tile=tile,
+            is_input_a_sparse=True,
+            is_input_b_sparse=True,
+            program_config=c.program_config,
+            expert_groups=c.expert_groups,
+            dtype=ttnn.bfloat8_b,
+        )
+
+    p3b_key = pc_p3b.get_decode_down_config(1, H, k=IP, indexed=True).program_config
+    p3c_key = pc_egp.get_decode_down_config(1, H, k=IP, indexed=True).program_config
+    assert (p3b_key.compute_with_storage_grid_size.x, p3b_key.compute_with_storage_grid_size.y, p3b_key.per_core_N) == (
+        8,
+        4,
+        4,
+    )
+    assert (p3c_key.compute_with_storage_grid_size.x, p3c_key.compute_with_storage_grid_size.y, p3c_key.per_core_N) == (
+        8,
+        8,
+        2,
+    )
+    ref_dn_idx = torch.matmul(ttnn.to_torch(act_c).float(), w_dn_t[:, ids])  # [1, 8, 1, H]
+    _ab(device, "p3c_down_indexed_k8", indexed_down(pc_p3b), indexed_down(pc_egp), results, ref_dn_idx)
+    assert results["p3c_down_indexed_k8"][
+        "identical"
+    ], "the 8x8 x 2 tiles indexed down differs from the 8x4 x 4 tiles one"
+    for t in (w_gu, w_dn, x32, x1, indices, placeholder, act_c):
         t.deallocate(True)
 
     if PERF_OUT:

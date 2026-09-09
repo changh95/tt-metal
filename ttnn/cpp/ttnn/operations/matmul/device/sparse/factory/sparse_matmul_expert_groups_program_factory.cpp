@@ -160,6 +160,14 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     const uint32_t num_blocks_y = ((Mt - 1) / per_core_M) + 1;
     const uint32_t num_blocks_x = ((Nt - 1) / per_core_N) + 1;
     const uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
+    // The resident in0 is multicast once from the sender to the whole grid (and the own-read debug arm reads the
+    // same row block on every core), so a broadcast A must consist of a single row block.
+    TT_FATAL(
+        !bcast_A || num_blocks_y == 1,
+        "expert_groups with a broadcast A requires per_core_M == Mt ({} vs {}): the resident in0 is multicast once "
+        "to the whole grid",
+        per_core_M,
+        Mt);
 
     // Expert-group grid: G groups x num_blocks_total output blocks. Core i (row-major from start_core) is
     // group i / num_blocks_total and output block i % num_blocks_total.
@@ -220,10 +228,46 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     const uint32_t sparsity_cb_size = sparsity.buffer()->aligned_page_size();
     const uint32_t in1_sparsity_cb_size = in1_sparsity_buffer->aligned_page_size();
 
+    // Compact output ([1, nnz, M, N]) detection exactly as the legacy factory / device op.
+    const bool compact_output =
+        nnz.has_value() &&
+        output_tensor.logical_shape() == ttnn::Shape{1U, nnz.value(), a.logical_shape()[-2], b.logical_shape()[-1]};
+
+    // Writer zero-fill contract (see sparse_matmul_egp_kernel_writes_whole_output). The device op skipped its
+    // FILL pass iff `kernel_writes_whole_output`; the in1 writer zero-fills the non-computed slots iff the output
+    // is an EXPANDED scan output (`zero_fill` -> EGP_ZERO_FILL define + the one-tile zero CB c_8). Indexed and
+    // compact outputs are fully written by the existing writers, so they need no fill and get no define.
+    const bool kernel_writes_whole_output = sparse_matmul_egp_kernel_writes_whole_output(operation_attributes);
+    const bool zero_fill = kernel_writes_whole_output && !use_indices && !compact_output;
+    // Placement of the zero writes (same tile walk either way): the in0 reader (default; its NoC carries no
+    // weight stream and the RISC is idle during the ownership scan) or the in1 writer (knob `in1`).
+    const bool zero_fill_in1 = zero_fill && sparse_matmul_egp_zero_fill_in_in1_writer();
+    const bool zero_fill_in0 = zero_fill && !zero_fill_in1;
+    // Coverage preconditions of the skip (the device op validates them too; re-derived here because this is the
+    // factory whose writer geometry the proof is about). Every slot's Mt x Nt tiles are partitioned by the
+    // (per_core_M rows) x (per_core_N, last_per_core_N columns) blocks only when per_core_M divides Mt; the writer
+    // addresses interleaved pages (no OUT_SHARDED path in this factory).
+    TT_FATAL(
+        !kernel_writes_whole_output || Mt % per_core_M == 0,
+        "expert_groups: Mt ({}) must be a multiple of per_core_M ({}) (the writer covers whole per_core_M-row blocks)",
+        Mt,
+        per_core_M);
+    TT_FATAL(
+        !kernel_writes_whole_output ||
+            output_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
+        "expert_groups: the output must be INTERLEAVED, got {}",
+        output_tensor.memory_config().memory_layout());
+    // Skip / define agreement: whenever the device op skipped the FILL, this program must be in one of the three
+    // full-coverage modes (a tautology by construction -- kept as the guard against a future edit of either side).
+    TT_FATAL(
+        !kernel_writes_whole_output || zero_fill || use_indices || compact_output,
+        "expert_groups: the FILL pass was skipped but the program does not cover the whole output");
+    const uint32_t zero_CB_size = zero_fill ? output_single_tile_size : 0;
+
     // L1 budget: fail on the host with the numbers instead of at CB allocation.
     const uint32_t l1_cb_bytes = in0_CB_size + in1_CB_size + out_CB_size +
                                  (interm0_data_format != output_data_format ? interm0_CB_size : 0) + sparsity_cb_size +
-                                 in1_sparsity_cb_size;
+                                 in1_sparsity_cb_size + zero_CB_size;
     const uint32_t l1_budget = tt::tt_metal::hal::get_max_worker_l1_unreserved_size();
     TT_FATAL(
         l1_cb_bytes <= l1_budget,
@@ -276,10 +320,6 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     const uint32_t num_batch_compute = use_indices ? num_active : batchB;
     constexpr bool get_batch_from_reader = true;
     const uint32_t expected_nnz = use_indices ? 0 : nnz.value_or(0);
-    // Compact output ([1, nnz, M, N]) detection exactly as the legacy factory / device op.
-    const bool compact_output =
-        nnz.has_value() &&
-        output_tensor.logical_shape() == ttnn::Shape{1U, nnz.value(), a.logical_shape()[-2], b.logical_shape()[-1]};
 
     const uint32_t in0_num_subblocks = (out_block_h / out_subblock_h);
     const uint32_t in0_block_num_tiles = out_subblock_h * in0_block_w * in0_num_subblocks;
@@ -321,6 +361,21 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     };
     tt::tt_metal::TensorAccessorArgs(*in0_buffer).append_to(in0_compile_time_args);
     tt::tt_metal::TensorAccessorArgs(*sparsity_buffer).append_to(in0_compile_time_args);
+    // Zero-fill geometry of the in0 kernel (read only under EGP_ZERO_FILL; always appended for one arg layout):
+    // the output accessor, then the writer's output walk constants.
+    tt::tt_metal::TensorAccessorArgs(*out_buffer).append_to(in0_compile_time_args);
+    in0_compile_time_args.insert(
+        in0_compile_time_args.end(),
+        {
+            (std::uint32_t)Nt,                              // out_tensor_stride_h
+            (std::uint32_t)out_subblock_w,                  // out_subblock_w
+            (std::uint32_t)out_subblock_h,                  // out_subblock_h
+            (std::uint32_t)out_block_w,                     // out_tensor_next_w_dim_block_stride
+            (std::uint32_t)out_block_h * Nt,                // out_tensor_next_h_dim_block_stride
+            (std::uint32_t)Mt * Nt,                         // MtNt
+            (std::uint32_t)(out_block_h / out_subblock_h),  // out_num_nonzero_subblocks_h
+            (std::uint32_t)(out_block_w / out_subblock_w),  // out_num_nonzero_subblocks_w
+        });
 
     // in1 sender/writer compile-time args: identical to the legacy sparse factory (the shared kernel).
     std::vector<uint32_t> in1_sender_writer_compile_time_args = {
@@ -394,6 +449,14 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     mm_kernel_in1_defines["SKIP_MCAST"] = "1";
     mm_kernel_in1_defines["EXPERT_GROUPS"] = std::to_string(expert_groups);
     mm_kernel_in1_defines["EXPERT_GROUPS_NNZ"] = std::to_string(expected_nnz);
+    // Expanded scan output: the cores of group (slot % G) zero-fill every slot nobody computes, from the in0
+    // reader or the in1 writer (exactly one of the two).
+    if (zero_fill_in0) {
+        mm_kernel_in0_defines["EGP_ZERO_FILL"] = "1";
+    }
+    if (zero_fill_in1) {
+        mm_kernel_in1_defines["EGP_ZERO_FILL"] = "1";
+    }
 
     const tt_metal::NOC in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
     const tt_metal::NOC in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
@@ -410,6 +473,7 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
             .named_compile_args = {
                 {"cb_in0", tt::CBIndex::c_0},
                 {"cb_sparsity", tt::CBIndex::c_6},
+                {"cb_zero", tt::CBIndex::c_8},  // read only under EGP_ZERO_FILL (the CB exists only then)
                 {"num_active", num_active},
             }});
 
@@ -428,6 +492,7 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
                 {"cb_bias", tt::CBIndex::c_3},
                 {"cb_out", tt::CBIndex::c_4},
                 {"cb_sparsity", tt::CBIndex::c_7},
+                {"cb_zero", tt::CBIndex::c_8},  // read only under EGP_ZERO_FILL (the CB exists only then)
                 {"num_active", num_active},
             }});
 
@@ -535,6 +600,17 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     tt_metal::CreateCircularBuffer(program, all_cores, sparsity_cb_config0);
     tt_metal::CreateCircularBuffer(program, all_cores, sparsity_cb_config1);
 
+    if (zero_fill) {
+        // One output tile of zeros (written once by the in1 kernel, never pushed/popped): the NoC source of every
+        // zero-fill write. Same page size / tile dims as the output CB so get_tile_size(cb_zero) == the output tile.
+        const uint32_t zero_cb_index = tt::CBIndex::c_8;
+        tt_metal::CircularBufferConfig zero_cb_config =
+            tt_metal::CircularBufferConfig(zero_CB_size, {{zero_cb_index, output_data_format}})
+                .set_page_size(zero_cb_index, output_single_tile_size)
+                .set_tile_dims(zero_cb_index, output_tile);
+        tt_metal::CreateCircularBuffer(program, all_cores, zero_cb_config);
+    }
+
     // Last-column padding parameters (no split on height), as the legacy factory.
     const uint32_t last_per_core_N = Nt % per_core_N == 0 ? per_core_N : Nt % per_core_N;
     const uint32_t last_out_block_w = last_per_core_N % out_block_w == 0 ? out_block_w : last_per_core_N % out_block_w;
@@ -561,8 +637,14 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
         const uint32_t output_idx_x = block_id % num_blocks_x;
         const uint32_t output_idx_y = block_id / num_blocks_x;
 
+        const bool last_column = output_idx_x == num_blocks_x - 1;
+        const uint32_t out_tensor_start_tile_id = (output_idx_x * per_core_N) + (output_idx_y * per_core_M * Nt);
+
         // in0 EGP kernel runtime args: [0] in0 addr, [1] in0 start tile id, [2..5] mcast rectangle,
-        // [6..7] sender NoC x/y, [8] last_block_h, [9] sparsity addr, [10] group_id, [11] is_sender.
+        // [6..7] sender NoC x/y, [8] last_block_h, [9] sparsity addr, [10] group_id, [11] is_sender,
+        // zero-fill geometry (read under EGP_ZERO_FILL only): [12] out addr, [13] out start tile id,
+        // [14] last_num_blocks_w_dim, [15] out_last_num_nonzero_subblocks_w, [16] out_last_subblock_w -- the same
+        // values the in1 writer gets in its [7], [8], [20], [14], [15].
         std::vector<uint32_t> in0_args = {
             (std::uint32_t)in0_buffer->address(),
             (std::uint32_t)Kt * per_core_M * output_idx_y,  // in0_tensor_start_tile_id
@@ -576,6 +658,11 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
             (std::uint32_t)sparsity_buffer->address(),
             (std::uint32_t)group_id,
             (std::uint32_t)(core == start_core ? 1 : 0),
+            (std::uint32_t)out_buffer->address(),
+            (std::uint32_t)out_tensor_start_tile_id,
+            (std::uint32_t)(last_column ? last_out_num_blocks_w : out_num_blocks_x),
+            (std::uint32_t)(last_column ? last_block_num_nonzero_subblocks_w : out_block_w / out_subblock_w),
+            (std::uint32_t)(last_column ? last_subblock_of_last_block_w : out_subblock_w),
         };
         tt_metal::SetRuntimeArgs(program, in0_kernel_id, core, in0_args);
 
@@ -589,9 +676,9 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
             (std::uint32_t)0,
             (std::uint32_t)in1_sparsity_buffer->address(),  // sparsity_addr (id list in indexed mode)
             (std::uint32_t)out_buffer->address(),
-            ((std::uint32_t)output_idx_x * per_core_N) + (output_idx_y * per_core_M * Nt)  // out_tensor_start_tile_id
+            (std::uint32_t)out_tensor_start_tile_id,
         };
-        if (output_idx_x == num_blocks_x - 1) {
+        if (last_column) {
             in1_args.push_back(last_out_block_w);
             in1_args.push_back(out_block_h / out_subblock_h);
             in1_args.push_back(out_subblock_h);
@@ -614,7 +701,7 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
         }
         in1_args.push_back(0);  // [18] bias placeholder
         in1_args.push_back(0);  // [19] bias placeholder
-        in1_args.push_back(output_idx_x == num_blocks_x - 1 ? last_out_num_blocks_w : out_num_blocks_x);  // [20]
+        in1_args.push_back(last_column ? last_out_num_blocks_w : out_num_blocks_x);  // [20]
         in1_args.push_back(group_id);  // [21] expert group
         in1_args.push_back(0);
         in1_args.push_back(0);
@@ -626,7 +713,7 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
     log_debug(
         LogOp,
         "sparse_matmul EGP: G {} x {} blocks = {} cores ({}x{} grid), in0 {} ({} B), in1 CB {} B, batch {}, "
-        "expected_nnz {}, compact {}, indexed {}",
+        "expected_nnz {}, compact {}, indexed {}, zero_fill {} (kernel writes whole output {})",
         expert_groups,
         num_blocks_total,
         num_cores,
@@ -638,7 +725,9 @@ SparseMatmulExpertGroupsProgramFactory::cached_program_t SparseMatmulExpertGroup
         num_batch_compute,
         expected_nnz,
         compact_output,
-        use_indices);
+        use_indices,
+        zero_fill_in0 ? "in0" : (zero_fill_in1 ? "in1" : "none"),
+        kernel_writes_whole_output);
 
     auto shared_vars = SparseMatmulExpertGroupsProgramFactory::shared_variables_t{
         in0_kernel_id, in1_kernel_id, cores, num_cores, expert_groups};
@@ -669,6 +758,7 @@ void SparseMatmulExpertGroupsProgramFactory::override_runtime_arguments(
         auto& in0_runtime_args = in0_runtime_args_by_core[core.x][core.y];
         in0_runtime_args[0] = src_buffer_a->address();
         in0_runtime_args[9] = sparsity_buffer->address();
+        in0_runtime_args[12] = dst_buffer->address();  // zero-fill output address (in0 placement)
 
         auto& in1_runtime_args = in1_runtime_args_by_core[core.x][core.y];
         in1_runtime_args[0] = src_buffer_b->address();

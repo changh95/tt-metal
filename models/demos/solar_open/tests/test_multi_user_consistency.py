@@ -23,7 +23,17 @@ with the same tokens and the per-step *logits* of each prompt are compared acros
 A prompt's logits at every step must be as close across slots as they are across two identical runs
 (PCC ~1, top-1 agreement at the baseline rate). Requires real weights (HF_MODEL); runs on a 1x8 mesh.
 
+Packed-prefill arm (phase 3a/3c): with ``SOLAR_OPEN_BATCHED_PREFILL=1`` every ``_prefill`` below is ONE 32 x 128
+packed pass through the plain Generator's batched path (a 4096-token MoE chunk of four 1024-token splits) instead of
+32 sequential 128-token prefills, so this test is the slot-independence gate of the packed path. Phase 3a failed it
+(rotated slots PCC min 0.91-0.94, 34-38 / 768 top-1 flips; fillers of one prompt in different splits 24-33 / 720):
+the expert-sorted MoE planned its hot / cold experts per split from the 8 users of that split. Phase 3c plans a
+packed pass once per chunk (``experts/prefill.py: _sorted_moe_chunk_plan``, marked by ``Model.ttnn_prefill_forward``),
+so every slot of the pass sees the same hot / cold sets and the phase-2 floors below are expected to hold; the test
+asserts that the per-chunk plan really ran. With the flag off (default) the run is the phase-2 sequential form.
+
     pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8
+    SOLAR_OPEN_BATCHED_PREFILL=1 pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8
 """
 
 import time
@@ -36,6 +46,7 @@ import ttnn
 from models.common.sampling import SamplingParams
 from models.demos.solar_open.demo.text_demo import prepare_solar_open_generator_args
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
+from models.demos.solar_open.tt.experts import prefill as experts_prefill
 from models.tt_transformers.demo.simple_text_demo import load_inputs
 from models.tt_transformers.tt.common import preprocess_inputs_prefill
 from models.tt_transformers.tt.generator import Generator
@@ -193,10 +204,25 @@ def test_multi_user_isolation(mesh_device, device_params, batch_size, num_tokens
     prompts, _ = load_inputs(PROMPTS_FILE, batch_size, instruct=False)
     prompts = list(prompts)[:batch_size]
     args = (generator, models, model_args, tt_kv_cache, page_table, tokenizer)
+    packed_arm = model_args[0].batched_prefill.enabled and not model_args[0].disable_batched_prefill
+    logger.info(
+        f"prefill arm: {model_args[0].batched_prefill.describe()} -> "
+        f"{'ONE packed 32 x 128 pass per run' if packed_arm else 'sequential per-user prefills'}; "
+        f"sorted-MoE plan mode {experts_prefill.SORTED_MOE_PLAN}"
+    )
+    experts_prefill.LAST_SORTED_MOE_PLAN.clear()
 
     # 1. Greedy generation (the demo path): sanity-check outputs and get a natural continuation per prompt
     #    to teacher-force below.
     greedy, times = _generate_greedy(*args, prompts, num_tokens, sampling, max_seq_len)
+    last_plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
+    logger.info(f"sorted-MoE plan of the last prefill split: {last_plan or None}")
+    if packed_arm and experts_prefill.SORTED_MOE_PLAN in ("auto", "chunk"):
+        # the 32 x 128 pass is one 4096-token chunk of four sorted splits: it must have been planned per chunk (phase
+        # 3c), otherwise the slot floors below measure the phase-3a per-split dependence again
+        assert (
+            last_plan.get("per_chunk") is True and last_plan.get("n_splits") == 4
+        ), f"the packed pass was not planned per chunk: {last_plan}"
     steady = times[2:] if len(times) > 2 else times
     logger.info(
         f"greedy batch {batch_size}: decode {1000 * sum(steady) / max(1, len(steady)):.1f} ms/step steady-state "

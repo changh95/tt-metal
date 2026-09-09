@@ -34,8 +34,9 @@ INDEXED_WEIGHTS_LAYOUT = "transpose"
 # Indexed single-user path: WHERE the token's routing weights are applied. True multiplies the [1, k, 1, 1] scalars into
 # the compact bfp8 GLU rows (the down INPUT, 5 tiles per expert -- the order of the batched path); False multiplies
 # them into the compact down OUTPUT [1, k, 1, H] (128 tiles per expert) -- the order of the phase-1 single-user scan
-# path, whose per-expert down outputs the indexed path then reproduces bit for bit (same kernels, program configs and
-# unweighted bfp8 inputs). Neither order is bit-equivalent to the scan path: its 128-slot ttnn.sum and the compact
+# path, whose per-expert down outputs the indexed path then reproduces bit for bit (same kernels and unweighted bfp8
+# inputs; the per-output-tile math does not depend on the grid, so the indexed down's own grid -- phase 3c,
+# ProgramConfig.decode_down_indexed_cores -- keeps this). Neither order is bit-equivalent to the scan path: its 128-slot ttnn.sum and the compact
 # 8-slot fast_reduce_nc differ by half a bfp8 ulp on ~18 % of the output elements, so the model-level metrics move
 # inside the bfp8 rounding-noise band either way. Measured on P150 (2026-09-07, k = 8, tests/perf/test_indexed_candidates.py
 # and the b1 ladder in scratchpad/phase2/perf_log.md perf-p2): PCC vs torch fp32 (mean of 4 tokens) scan 0.998220,
@@ -329,12 +330,15 @@ def _decode_forward_indexed(
          into the k compact GLU rows (down INPUT, 5 tiles wide -- the down is linear, as in the batched path) when
          ``INDEXED_WEIGHTS_ON_DOWN_INPUT``, else into the k compact down OUTPUT rows (the scan path's order)
       3. down: ``[1, k, 1, Ip] x [1, E, Ip, H]`` (ids, ``is_input_a_sparse``: A slot i pairs with expert
-         ``indices[i]``) -> ``[1, k, 1, H]``; ``fast_reduce_nc`` over the k slots -> ``[1, 1, 1, H]``
+         ``indices[i]``) -> ``[1, k, 1, H]`` on the indexed down grid (``ProgramConfig.decode_down_indexed_cores``,
+         ``get_decode_down_config(indexed=True)``; phase 3c: 8x8 x 2 tiles); ``fast_reduce_nc`` over the k slots
+         -> ``[1, 1, 1, H]``
       4. shared partial added in place, one TP all_reduce (unchanged contract)
 
     Static k (``config.num_experts_per_tok``) makes every shape static: trace-safe. ``nnz`` must NOT be passed
     (the indexed loop count is k; the op rejects it) and ``sparsity`` is a required operand the kernels never read
-    (``sparsity_placeholder``). Numerics: same kernels and program configs as the scan path per expert; with
+    (``sparsity_placeholder``). Numerics: same kernels as the scan path per expert (the down grid differs, which
+    does not change the per-output-tile math: tests/perf/test_config_candidates.py asserts torch.equal); with
     ``INDEXED_WEIGHTS_ON_DOWN_INPUT`` the routing weights multiply the bfp8 GLU rows instead of the bfp8 down
     outputs, so the result is equal to the scan path up to bfp8 rounding order; with it off the per-expert down
     outputs and their weighting are the scan path's, only the k-slot reduction order differs (both validated vs
@@ -386,8 +390,10 @@ def _decode_forward_indexed(
         down_input = ttnn.mul(down_input, expert_scalars, output_tensor=down_input)
         expert_scalars.deallocate(True)
 
-    # 3. Down over the same k experts, compact A: [1, k, 1, Ip] x [1, E, Ip, H] -> [1, k, 1, H]
-    down_cfg = program_config.get_decode_down_config(1, weights.down_proj.shape[-1], k=ip)
+    # 3. Down over the same k experts, compact A: [1, k, 1, Ip] x [1, E, Ip, H] -> [1, k, 1, H], on the indexed down
+    #    grid (ProgramConfig.decode_down_indexed_cores when set: k small reads per core and no validity scan make a
+    #    different grid the best one than for the scan path's expanded A; the per-output-tile math is grid-independent)
+    down_cfg = program_config.get_decode_down_config(1, weights.down_proj.shape[-1], k=ip, indexed=True)
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,

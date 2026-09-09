@@ -78,6 +78,16 @@ _SOLAR_NUM_EXPERTS = 128
 #   SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN=<n> largest PADDED per-user prefill length that is packed (default 128:
 #                                             the 1K+ buckets already run the sorted MoE per user at a flat per-token
 #                                             cost, so packing them buys little TTFT-last and costs TTFT-mean)
+#   SOLAR_OPEN_BATCHED_PREFILL_HEAD=full|gather  head of a packed pass (phase 3c): "full" (default) = the
+#                                             tt_transformers batched path (norm + lm_head over every row, one 32-row
+#                                             tile read back per user); "gather" = Model.packed_prefill_pass (the
+#                                             B last-token rows gathered into one tile row, norm + lm_head on 32
+#                                             rows, ONE readback per pass; design_packed_prefill.md 2.6 item 1)
+#
+# Slot independence (phase 3c): the expert-sorted MoE plans a packed pass once per 4096-token chunk
+# (experts/prefill.py, SOLAR_OPEN_SORTED_MOE_PLAN), so every user of a pass that fits ONE chunk (tokens_per_pass <=
+# SolarOpenProgramConfig.sequence_chunk_size = 4096) sees the same hot / cold sets whatever its slot; a longer pass
+# spans several chunks (users in different chunks get different plans) and from_env warns.
 BATCHED_PREFILL_MIN_TOKENS = 256
 # v1 runs the tt_transformers batched path, whose head applies norm + lm_head to ALL B*S rows ([T, 24576] bf16 per
 # device = 50 MiB at 1K, 201 MiB at 4K, 400 MiB at 8K) and reads one 32-row tile per user back; 8K tokens per pass
@@ -85,6 +95,8 @@ BATCHED_PREFILL_MIN_TOKENS = 256
 BATCHED_PREFILL_MAX_TOKENS = 8 * 1024
 BATCHED_PREFILL_DEFAULT_TOKENS = 1024
 BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN = 128
+BATCHED_PREFILL_HEADS = ("full", "gather")
+BATCHED_PREFILL_DEFAULT_HEAD = "full"
 # Device batch sizes the tt_transformers batched-prefill path pads a pass to (generator.SUPPORTED_PREFILL_BATCH_SIZES).
 BATCHED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 
@@ -120,8 +132,11 @@ class BatchedPrefillOptions:
     enabled: bool = False
     tokens_per_pass: int = BATCHED_PREFILL_DEFAULT_TOKENS
     max_seq_len: int = BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN
+    head: str = BATCHED_PREFILL_DEFAULT_HEAD
 
     def __post_init__(self):
+        if self.head not in BATCHED_PREFILL_HEADS:
+            raise ValueError(f"head must be one of {BATCHED_PREFILL_HEADS}, got {self.head!r}")
         if self.tokens_per_pass % 32 != 0 or not (
             BATCHED_PREFILL_MIN_TOKENS <= self.tokens_per_pass <= BATCHED_PREFILL_MAX_TOKENS
         ):
@@ -143,7 +158,17 @@ class BatchedPrefillOptions:
                 f"every token of a pass; {BATCHED_PREFILL_MAX_TOKENS} tokens is its DRAM-safe cap)"
             )
         max_seq_len = _env_int("SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN", BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN)
-        return cls(enabled=enabled, tokens_per_pass=clamped, max_seq_len=max_seq_len)
+        head = (os.getenv("SOLAR_OPEN_BATCHED_PREFILL_HEAD") or BATCHED_PREFILL_DEFAULT_HEAD).strip().lower()
+        if head not in BATCHED_PREFILL_HEADS:
+            raise ValueError(f"SOLAR_OPEN_BATCHED_PREFILL_HEAD={head!r} is not one of {BATCHED_PREFILL_HEADS}")
+        chunk = SolarOpenProgramConfig().sequence_chunk_size
+        if enabled and clamped > chunk:
+            logger.warning(
+                f"SOLAR_OPEN_BATCHED_PREFILL_TOKENS={clamped} exceeds the MoE chunk of {chunk} tokens: the expert-sorted "
+                "MoE plans per chunk, so users in different chunks of one pass get different hot / cold sets (a pass of "
+                f"at most {chunk} tokens is slot independent)"
+            )
+        return cls(enabled=enabled, tokens_per_pass=clamped, max_seq_len=max_seq_len, head=head)
 
     def users_per_pass(self, seq_len):
         """Users of padded length ``seq_len`` that fit one pass (0 when the length is not packed at all)."""
@@ -155,7 +180,7 @@ class BatchedPrefillOptions:
     def describe(self):
         return (
             f"batched prefill {'ON' if self.enabled else 'OFF'} (tokens_per_pass={self.tokens_per_pass}, "
-            f"max_seq_len={self.max_seq_len})"
+            f"max_seq_len={self.max_seq_len}, head={self.head})"
         )
 
 

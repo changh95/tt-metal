@@ -13,8 +13,16 @@ placeholder until a trace-safe sorted plan exists). ``is_trace_safe_prefill_len`
 may be traced. The path's persistent device helpers (``down_proj_padded``, the one-hot identities of the sorted split
 lengths) are built on the FIRST prefill call of any length (``_ensure_prefill_helpers``), so no persistent allocation
 happens after a trace was captured.
+
+Phase 3c (design_traced_prefill.md G1, measurements.md "Mechanism of the model-level slot dependence"): the
+host-planned path plans a PACKED multi-user pass once per chunk (``_sorted_moe_chunk_plan``: one count readback for
+all splits of the chunk, one (cap, hot set, cold mask) shared by them; planner arithmetic in ``sorted_plan.py``) so
+that a user's numerics no longer depend on the 1024-token split its slot falls into; single-user prefills keep the
+per-split plan (``SOLAR_OPEN_SORTED_MOE_PLAN``, default ``auto``). ``Model.ttnn_prefill_forward`` marks a packed pass
+with ``packed_prefill_pass``.
 """
 
+import contextlib
 import os
 
 import torch
@@ -31,6 +39,23 @@ from .operations import (
     apply_sequence_parallel_allgather,
     apply_tensor_parallel_allreduce,
     reduce_experts,
+)
+from .sorted_plan import (  # noqa: F401 -- the constants and _plan_from_counts stay importable from this module
+    _DENSE_PER_EXPERT_MS,
+    _HOT_FIXED_MS,
+    _HOT_PER_EXPERT_MS,
+    _SORTED_FIXED_MS,
+    _SORTED_MOE_MAX_HOT,
+    _SORTED_MOE_MIN_EXPERTS,
+    _SORTED_PER_KROW_MS,
+    SORTED_MOE_CHUNK_HOT_RULES,
+    SORTED_MOE_PLAN_MODES,
+    _plan_from_counts,
+    plan_chunk_from_counts,
+    plan_per_chunk,
+    sorted_moe_chunk_hot_rule_from_env,
+    sorted_moe_plan_mode_from_env,
+    split_pieces,
 )
 from .weights import ExpertWeights
 
@@ -157,6 +182,35 @@ def _process_prefill_chunk(
         hidden_list = [hidden_states]
         routing_list = [None] if lazy_routing else [routing_weights]
 
+    # Phase 3c: plan granularity of the host-planned splits of this chunk (sorted_plan.plan_per_chunk). Per chunk
+    # (a packed multi-user pass under the default ``auto`` mode, or every prefill under ``chunk``): ONE count readback
+    # and ONE hot/cold plan for all of them, so a token's path does not depend on the split -- the slot -- it sits
+    # in. Otherwise (single-user prefills under ``auto``, everything under ``split``, chunks with one planned split)
+    # the phase-3b per-split planner runs unchanged inside the loop.
+    chunk_plan = None
+    chunk_planned = False
+    if dense_moe:
+        planned_splits = []
+        offset = 0
+        for hidden_split in hidden_list:
+            n = hidden_split.shape[2]
+            if moe_prefill_path(n, program_config, config.num_experts, weights.num_always_on_experts) == (
+                MOE_PATH_HOST_PLANNED
+            ):
+                planned_splits.append((offset, n))
+            offset += n
+        chunk_planned = plan_per_chunk(SORTED_MOE_PLAN, packed_prefill_pass_active(), len(planned_splits))
+        if chunk_planned:
+            chunk_plan = _sorted_moe_chunk_plan(
+                routing_tokens_all,
+                planned_splits,
+                config,
+                program_config.dense_bmm_max_tokens,
+                device=weights.gate_up_proj.device(),
+                always_on=weights.num_always_on_experts,
+                trace_safe_split_lens=program_config.trace_safe_split_lens,
+            )  # None: every planned split of the chunk takes the dense per-expert loop
+
     # Process each split and stream-concatenate to avoid holding all split outputs.
     next_states_reduced_acc = None
     group_offset = 0
@@ -178,15 +232,18 @@ def _process_prefill_chunk(
             )
             plan = None
             if path == MOE_PATH_HOST_PLANNED:
-                plan = _sorted_moe_plan(
-                    routing_tokens_all,
-                    token_offset,
-                    split_len,
-                    config,
-                    program_config.dense_bmm_max_tokens,
-                    always_on=weights.num_always_on_experts,
-                    trace_safe_split_lens=program_config.trace_safe_split_lens,
-                )
+                if chunk_planned:
+                    plan = chunk_plan.split_plan() if chunk_plan is not None else None
+                else:
+                    plan = _sorted_moe_plan(
+                        routing_tokens_all,
+                        token_offset,
+                        split_len,
+                        config,
+                        program_config.dense_bmm_max_tokens,
+                        always_on=weights.num_always_on_experts,
+                        trace_safe_split_lens=program_config.trace_safe_split_lens,
+                    )
             LAST_PREFILL_MOE_PATH.update(split=split_len, path=path, sorted=plan is not None)
             if plan is not None:
                 next_states_reduced = _sorted_moe_forward(
@@ -198,6 +255,7 @@ def _process_prefill_chunk(
                     activation_dtype,
                     dense_core_grid,
                     program_config=program_config,
+                    deallocate_cold_mask=chunk_plan is None,
                 )
             else:
                 if routing_split is None:  # lazy_routing: this split multiplies per-expert outputs by the weights
@@ -295,6 +353,8 @@ def _process_prefill_chunk(
         if routing_split is not None:
             routing_split.deallocate(True)
         token_offset += split_len
+    if chunk_plan is not None:
+        chunk_plan.release()  # the cold mask shared by the chunk's splits
     if group_mask is not None:
         group_mask.deallocate(True)
     if routing_tokens_all is not None:
@@ -481,26 +541,38 @@ def _dense_tail(
 _SORTED_MOE_DEBUG = os.getenv("SOLAR_OPEN_SORTED_MOE_DEBUG", "0") == "1"
 # Last plan chosen by _sorted_moe_plan ({"split", "cap", "hot"}); read by tests to assert which path ran.
 LAST_SORTED_MOE_PLAN = {}
-_SORTED_MOE_MAX_HOT = 16  # more hot experts than this -> dense per-expert loop for the split
-# Cost model (ms per 1024-token split, P150) used to pick the hot/cold threshold on the host. Re-measured for the
-# Solar-Open shapes (H=4096 / Ip=160, bfp8) from the tracy device profile of the real-weight layer 0 at 1024 tokens
-# (2026-09-07; the shipped values were the H=2880 / Ip=384 numbers of tt-metal PR #55589: 2.5, 0.27, 1.0, 0.25 and
-# 0.125): fixed sorted cost ~0.5 ms (planner ops, topk, index/slot glue, untilizes), 0.23 ms per 1024 gathered rows
-# (embedding gather 46 + gate/up bmm 49 + down bmm 72 + one-hot scatter matmul 49 + slices/GLU/mul 9 us), hot group
-# fixed ~0.3 ms (concats, reduce, adds) + 0.25 ms per hot expert (repeat + bmm + slices), dense per-expert loop
-# 0.15 ms (gate/up linear 77 + down 33 + 2 weight slices 18 + GLU/mul/concat share ~20 us). The constants only
-# steer the hot/cold split and the sorted-vs-dense choice, never correctness. perf-p1 (2026-09-07): with the hot
-# group as per-expert linears (HOT_EXPERTS_PER_EXPERT_LINEAR) its wall time at 1024 tokens fits 0.39 + 0.136 ms x
-# n_hot (measured 0.93 / 1.48 / 2.42 ms at 4 / 8 / 15 hot experts vs 1.25 / 2.26 / 4.06 for repeat + bmm, i.e.
-# 0.23 + 0.255 x n_hot) -> _HOT_FIXED_MS, _HOT_PER_EXPERT_MS = 0.4, 0.135. Phase 3 (the minimal_matmul gate|up and
-# the K-concatenated hot down of SolarOpenProgramConfig) makes the hot group cheaper (~-35 us per expert, ~-0.3 ms at
-# 15 hot); the constants are conservative until re-derived from a layer-0 tracy (pinned by tests/unit/test_p1_layout).
-_SORTED_FIXED_MS, _SORTED_PER_KROW_MS, _HOT_FIXED_MS, _HOT_PER_EXPERT_MS = 0.5, 0.23, 0.4, 0.135
-_DENSE_PER_EXPERT_MS = 0.15  # per-expert cost of the dense loop over a 1024-token split (gate/up + down + slices)
-# Measured on P150x8 (PR #55589): the sorted path halves E=128 prefill at ISL >= 1024 but is slower than the dense
-# loop for E=32 (~128 routed tokens per expert per 1024, so the gathered rows are not much fewer and the fixed
-# cost + host round-trip dominate).
-_SORTED_MOE_MIN_EXPERTS = 64
+# The cost-model constants (_SORTED_MOE_MAX_HOT, _SORTED_FIXED_MS, ..., _SORTED_MOE_MIN_EXPERTS) and _plan_from_counts
+# live in sorted_plan.py (pure, no ttnn) and are re-exported above.
+
+# Phase 3c plan granularity of the host-planned sorted path (sorted_plan.SORTED_MOE_PLAN_MODES): auto (default) =
+# one plan per chunk for a packed multi-user pass, per split otherwise; chunk = per chunk for every prefill; split =
+# the phase-3b per-split plan everywhere (the A/B arm). Read once at import from SOLAR_OPEN_SORTED_MOE_PLAN.
+SORTED_MOE_PLAN = sorted_moe_plan_mode_from_env()
+# Hot-set rule of the per-chunk plan (sorted_plan.SORTED_MOE_CHUNK_HOT_RULES): average (default, layout invariant) or
+# max (the union of the per-split plans' hot sets: cheaper caps, layout dependent). SOLAR_OPEN_SORTED_MOE_CHUNK_HOT.
+SORTED_MOE_CHUNK_HOT = sorted_moe_chunk_hot_rule_from_env()
+# Set by Model.ttnn_prefill_forward for the duration of a packed pass (batch_size > 1): the MoE sees a token-major
+# [1, 1, B*S, H] tensor and cannot tell a packed pass from a long single-user prompt on its own.
+_PACKED_PREFILL_PASS = False
+
+
+@contextlib.contextmanager
+def packed_prefill_pass(active=True):
+    """Mark the enclosed prefill forward as a packed multi-user pass (``active`` True) for the plan-mode decision
+    (``plan_per_chunk``); restores the previous mark on exit. Host state only (no device op)."""
+    global _PACKED_PREFILL_PASS
+    previous = _PACKED_PREFILL_PASS
+    _PACKED_PREFILL_PASS = bool(active)
+    try:
+        yield
+    finally:
+        _PACKED_PREFILL_PASS = previous
+
+
+def packed_prefill_pass_active():
+    """True inside ``packed_prefill_pass(True)``."""
+    return _PACKED_PREFILL_PASS
+
 
 # perf-p1 layout switches (2026-09-07; module constants so an A/B run can flip them, all default ON):
 # - HOT_EXPERTS_PER_EXPERT_LINEAR: the hot group's gate/up runs as one ttnn.linear per hot expert over the whole
@@ -546,9 +618,7 @@ TRACE_SAFE_MOE_PATHS = frozenset({MOE_PATH_DENSE_BMM, MOE_PATH_STATIC_LOOP, MOE_
 LAST_PREFILL_MOE_PATH = {}
 
 
-def _pieces(length, size):
-    """Piece lengths ``ttnn.split(x, size)`` cuts a ``length``-long axis into: full pieces, then the remainder."""
-    return [size] * (length // size) + ([length % size] if length % size else [])
+_pieces = split_pieces  # piece lengths ttnn.split cuts an axis into (sorted_plan.split_pieces)
 
 
 def prefill_split_lens(seq_len, program_config):
@@ -585,38 +655,6 @@ def is_trace_safe_prefill_len(seq_len, program_config, num_experts, always_on=0,
         moe_prefill_path(split_len, program_config, num_experts, always_on, dense_moe) in TRACE_SAFE_MOE_PATHS
         for split_len in prefill_split_lens(seq_len, program_config)
     )
-
-
-def _plan_from_counts(routed_counts, split_len, num_experts, always_on=0):
-    """Cost-model core of _sorted_moe_plan on the host-side per-expert routed-token counts (torch int64 [E_routed]).
-
-    Returns ``(cost_ms, cap, n_hot)`` for the cheapest cap of (32, 64, 96, 128, 160, 192, 256) below ``split_len``
-    with at most _SORTED_MOE_MAX_HOT routed hot experts (count > cap), or None when every cap is over the hot limit
-    or none beats the dense per-expert loop (``_DENSE_PER_EXPERT_MS`` x E x split / 1024). Pure function (unit-tested
-    on synthetic count distributions)."""
-    best = None
-    for cap in (32, 64, 96, 128, 160, 192, 256):
-        if cap >= split_len:
-            # strict: an always-on slot has count == split_len and must stay OUT of the cold mask le(counts, cap)
-            break
-        hot = int((routed_counts > cap).sum().item())
-        if hot > _SORTED_MOE_MAX_HOT:
-            continue
-        n_hot_group = hot + always_on
-        cost = (
-            _SORTED_FIXED_MS
-            + _SORTED_PER_KROW_MS * (num_experts * cap / 1024)
-            + (_HOT_FIXED_MS + _HOT_PER_EXPERT_MS * n_hot_group if n_hot_group else 0.0)
-        )
-        if best is None or cost < best[0]:
-            best = (cost, cap, hot)
-    # The sorted path only pays off when the routed rows are few relative to E x split (E=128, top-8: ~64 routed
-    # tokens per expert per 1024); when it is not cheaper than the dense per-expert loop (which has no host
-    # round-trip) the loop is kept.
-    dense_cost = _DENSE_PER_EXPERT_MS * num_experts * split_len / 1024
-    if best is None or best[0] >= dense_cost:
-        return None
-    return best
 
 
 def _sorted_moe_plan(
@@ -664,7 +702,7 @@ def _sorted_moe_plan(
     _, cap, n_hot = best
     assert cap < split_len, (cap, split_len)  # the cold mask relies on count(always-on) == split_len > cap
     hot_ids = [int(e) for e in torch.nonzero(routed_counts > cap).reshape(-1).tolist()] + list(range(E_routed, E))
-    LAST_SORTED_MOE_PLAN.update(split=split_len, cap=cap, hot=n_hot, always_on=always_on)
+    LAST_SORTED_MOE_PLAN.update(split=split_len, cap=cap, hot=n_hot, always_on=always_on, per_chunk=False, n_splits=1)
     if _SORTED_MOE_DEBUG:
         top = routed_counts.topk(min(4, E_routed)).values.tolist()
         logger.info(
@@ -678,8 +716,127 @@ def _sorted_moe_plan(
     return routing_t, cap, hot_ids, cold_mask_t
 
 
+class _SortedMoeChunkPlanTensors:
+    """Device side of a per-chunk plan (``_sorted_moe_chunk_plan``): the routing^T slice of every host-planned split
+    ``[1, 1, E, split]`` (each consumed by its ``_sorted_moe_forward`` call), the shared ``cap`` / ``hot_ids`` and ONE
+    cold mask ``[1, 1, E, 1]`` all splits multiply into their slot weights (freed by ``release`` after the last
+    split)."""
+
+    def __init__(self, routing_t_splits, cap, hot_ids, cold_mask_t, host_plan):
+        self.routing_t_splits = list(routing_t_splits)
+        self.cap = cap
+        self.hot_ids = list(hot_ids)
+        self.cold_mask_t = cold_mask_t
+        self.host_plan = host_plan
+        self._next = 0
+
+    def split_plan(self):
+        """The next planned split's ``(routing_t, cap, hot_ids, cold_mask_t)`` in chunk order."""
+        routing_t = self.routing_t_splits[self._next]
+        self._next += 1
+        return routing_t, self.cap, self.hot_ids, self.cold_mask_t
+
+    def release(self):
+        assert self._next == len(self.routing_t_splits), (self._next, len(self.routing_t_splits))
+        self.cold_mask_t.deallocate(True)
+
+
+def _sorted_moe_chunk_plan(
+    routing_tokens_all,
+    planned_splits,
+    config,
+    dense_bmm_max_tokens,
+    device,
+    always_on=0,
+    trace_safe_split_lens=(),
+):
+    """Per-CHUNK plan of the host-planned splits ``planned_splits`` = [(token_offset, split_len), ...] of one chunk
+    (phase 3c, design G1): ONE device->host read of the per-expert counts of every planned split and ONE (cap, hot set,
+    cold mask) for all of them (``sorted_plan.plan_chunk_from_counts``: hot set from the chunk-average per-split
+    counts -- a function of the set of users, not of their slot layout -- and the cap raised to fit every cold
+    expert in every split), so a token's hot/cold treatment does not depend on the split -- i.e. on the slot -- it
+    sits in. Returns a ``_SortedMoeChunkPlanTensors`` or None (every planned
+    split takes the dense per-expert loop). The same trace-safety contract as ``_sorted_moe_plan`` (never under a
+    capture). With one planned split the caller uses ``_sorted_moe_plan`` (identical plan, same ops)."""
+    E = config.num_experts
+    E_routed = E - always_on
+    if E_routed < _SORTED_MOE_MIN_EXPERTS or len(planned_splits) < 2:
+        return None
+    for _, split_len in planned_splits:
+        assert split_len > dense_bmm_max_tokens, "the sorted MoE path is for eager (untraced) long splits only"
+        assert split_len not in trace_safe_split_lens, f"split {split_len} is trace-safe only (trace_safe_split_lens)"
+    split_lens = tuple(split_len for _, split_len in planned_splits)
+    # Counts of every planned split from ONE transpose + gt of the chunk's token-major routing weights. The 0/1 mask
+    # is summed in fp32 (typecast) so the counts are exact integers -- a bf16 sum (the per-split planner's form) rounds
+    # counts above 256 to even -- which the layout-invariant "average" rule needs (a rounded total could straddle a
+    # cap). No concat of the [1, 1, E, 1] parts (tile padding along the concatenated dim): the parts are read one by
+    # one after the first read drained the queue, i.e. ONE device idle per chunk instead of one per split.
+    routing_t_chunk = ttnn.transpose(routing_tokens_all, 2, 3)  # [1, 1, E, chunk]
+    active = ttnn.gt(routing_t_chunk, 0.0)
+    active32 = ttnn.typecast(active, ttnn.float32)
+    active.deallocate(True)
+    counts_parts = []
+    for token_offset, split_len in planned_splits:
+        active_split = ttnn.slice(active32, [0, 0, 0, token_offset], [1, 1, E, token_offset + split_len])
+        counts_parts.append(ttnn.sum(active_split, dim=3, keepdim=True))  # [1, 1, E, 1] fp32
+        active_split.deallocate(True)
+    active32.deallocate(True)
+    # routing weights are replicated across the TP devices, so one device's counts suffice
+    counts_host = torch.stack(
+        [ttnn.to_torch(ttnn.get_device_tensors(part)[0]).reshape(E).float() for part in counts_parts], dim=1
+    )  # [E, n_splits]
+    for part in counts_parts:
+        part.deallocate(True)
+    counts_host = counts_host.round().to(torch.int64)
+    plan = plan_chunk_from_counts(counts_host, split_lens, E, always_on, hot_rule=SORTED_MOE_CHUNK_HOT)
+    if plan is None:
+        routing_t_chunk.deallocate(True)
+        return None
+    LAST_SORTED_MOE_PLAN.update(
+        split=split_lens[0],
+        cap=plan.cap,
+        hot=plan.n_hot,
+        always_on=always_on,
+        per_chunk=True,
+        n_splits=len(planned_splits),
+        cap_cost=plan.cap_cost,
+        promoted=plan.n_promoted,
+        hot_rule=plan.hot_rule,
+        per_split_hot=plan.per_split_hot,
+    )
+    if _SORTED_MOE_DEBUG:
+        routed = counts_host[:E_routed]
+        top_avg = (routed.sum(dim=1).double() / len(planned_splits)).topk(min(4, E_routed)).values.tolist()
+        top_max = routed.max(dim=1).values.topk(min(4, E_routed)).values.tolist()
+        logger.info(
+            f"SORTED-MOE chunk ({plan.hot_rule}): splits={split_lens} cap={plan.cap} (cost-model cap {plan.cap_cost}) hot={plan.n_hot} "
+            f"(promoted {plan.n_promoted}; per split alone at this cap {plan.per_split_hot}) always_on={always_on} "
+            f"top4(avg)={[round(v, 1) for v in top_avg]} top4(max over splits)={top_max} "
+            f"zero={(routed.sum(dim=1) == 0).sum().item()}"
+        )
+    # ONE cold mask for the chunk (1.0 = cold in every split), uploaded like the sorted path's identities: the same
+    # host counts that chose cap / hot_ids build it, so mask and hot set agree by construction.
+    cold_mask_t = ttnn.from_torch(
+        plan.cold_mask.reshape(1, 1, E, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    routing_t_splits = [
+        ttnn.slice(routing_t_chunk, [0, 0, 0, token_offset], [1, 1, E, token_offset + split_len])
+        for token_offset, split_len in planned_splits
+    ]
+    routing_t_chunk.deallocate(True)
+    return _SortedMoeChunkPlanTensors(routing_t_splits, plan.cap, plan.hot_ids, cold_mask_t, plan)
+
+
 def _sorted_moe_forward(
-    hidden_4D, plan, split_len, weights, config, activation_dtype, dense_core_grid, program_config=None
+    hidden_4D,
+    plan,
+    split_len,
+    weights,
+    config,
+    activation_dtype,
+    dense_core_grid,
+    program_config=None,
+    deallocate_cold_mask=True,
 ):
     """Hot/cold expert-sorted MoE for one split ([1, 1, split, H] -> [1, 1, split, H]); consumes hidden_4D.
 
@@ -694,7 +851,8 @@ def _sorted_moe_forward(
     K-concatenated minimal_matmul over bf16 GLU pieces (``program_config.hot_down_kconcat_minimal``; without it the
     perf-p1 forms: one batched matmul reduced with fast_reduce_nc, or HOT_DOWN_KCONCAT's 2D K-concat). The math
     equals the dense path. ``program_config`` also supplies the 1D config of the cold down bmm (rows = cap, see
-    ``_dense_down_program_config``)."""
+    ``_dense_down_program_config``). ``deallocate_cold_mask`` False leaves the cold mask alive: a per-chunk plan
+    (``_sorted_moe_chunk_plan``) shares one mask between its splits and frees it itself."""
     routing_t, cap, hot_ids, cold_mask_t = plan
     E, H, ip = config.num_experts, config.hidden_size, weights.intermediate_padded_per_device
     device = weights.gate_up_proj.device()
@@ -715,7 +873,8 @@ def _sorted_moe_forward(
         routing_t_table = ttnn.reshape(routing_t, (E, split_len))  # gather table for the hot routing rows
     else:
         routing_t.deallocate(True)
-    cold_mask_t.deallocate(True)
+    if deallocate_cold_mask:
+        cold_mask_t.deallocate(True)
     idx_rm = ttnn.to_layout(ttnn.typecast(idx, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT)  # [1, 1, E, cap] uint32
     idx.deallocate(True)
     # ttnn.embedding reads [batch, tokens] indices and returns [batch, 1, tokens, width]: [E, cap] is a 0-cost view of

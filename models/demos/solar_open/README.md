@@ -9,9 +9,13 @@ traced prefill at 128 tokens and the Blackhole user-grid placement are kept; the
 (attention-sink logits and biases, clamped SwiGLU, sliding windows, channel-token shortcuts) is gone and Solar's
 sigmoid router with selection bias plus the shared expert are added.
 
-Status: phase 2 complete (2026-09-07): perf levers, streaming loader, KV budgets / long-context cases, vLLM wrapper
-(untested), all default-on changes re-validated on the final tree. See "Recorded baselines" at the end: the phase-1 vs
-phase-2 summary table first, then the per-test rows with the measured PCC / step-time values.
+Status: phase 3c complete (2026-09-09): batch-32 decode 37.8-38.0 ms/step (~840-850 tok/s aggregate; phase 1 92.1, phase 2 62.5,
+phase 3b 40.3), batch-1 decode 15.9-16.1 ms/step (phase 1 54.4, phase 2 18.0, phase 3b 16.0), TTFT@128 ~150-160 ms per user, every
+accuracy metric of the decode paths bit-identical to phase 2 / 3b (the phase-3 decode levers -- expert-group parallelism, the kernel
+zero-fill and the b1 down grid of `ttnn.sparse_matmul` -- redistribute the same per-tile math). Phase 3a's packed multi-user prefill
+(`SOLAR_OPEN_BATCHED_PREFILL=1`, batch-32 TTFT-last 4.7 -> ~1.8-2.4 s) is now slot independent within one pass but stays opt-in (see
+"Known limitations"). See "Recorded baselines" at the end: the phase-1 vs phase-2 summary table first, then the per-test rows, then
+the phase 3a / 3b / 3c rows (each with its own before / after table) and the ISL/OSL x batch sweeps (`_p3c` subset, `_p3b`, `_p2`).
 
 Numerics (relative to the bf16 HF model): weights are bfp8 (experts, attention, lm_head, KV cache) / bf16 (embeddings,
 norms, router gate, fp32 router bias); the residual stream is bf16 (`DecoderLayer._residual_add` writes each residual
@@ -126,12 +130,16 @@ without any checkpoint.
 | `SOLAR_OPEN_TF_REFERENCE` | `$TT_CACHE_PATH/teacher_forced_reference.pt` | reference file written by `tests/accuracy/gen_reference.py` and read by `tests/accuracy/test_teacher_forced.py` |
 | `SOLAR_OPEN_TF_REPORT_DIR` | unset | `test_teacher_forced.py` writes a markdown report (`teacher_forced_<case>.md`: per-prompt metrics, HF vs TT greedy continuations) into this directory |
 | `SOLAR_OPEN_NUM_DEVICES` | unset | test collection only: replaces `ttnn.get_num_devices()` in the mesh parametrizations so `pytest --collect-only` / `python -c "import ..."` never touch the devices (e.g. `SOLAR_OPEN_NUM_DEVICES=8`) |
-| `SOLAR_OPEN_BATCHED_PREFILL` | `0` | `1` turns on the phase-3a packed multi-user prefill (design_packed_prefill.md): equal-length short prompts of one `prefill_forward_text` call run as ONE `[1, 1, B*S, H]` forward (per-user causal attention and paged KV fill; MoE / router / norms row-wise over `T = B*S`) instead of B sequential per-user prefills. Policy in `tt/model_config.py::plan_batched_prefill` + `tt/model.py::prefill_forward_text_batched` (the demo and the tests call the driver; a plain `Generator` with the flag on batches every equal-length multi-user call in one pass, host sampling only, and refuses to TRACE such a pass -- `Model.prepare_prefill_inputs_trace`). HF-equivalent but not sequential-identical and not slot-independent (see "Known limitations" and the phase-3a baselines); the regression harness (`enable_trace=True` at 128) and vLLM (on-device `sampling_params`) keep it off. Measured: batch-32 TTFT-last 4.73 s -> 1.8-2.6 s |
+| `SOLAR_OPEN_BATCHED_PREFILL` | `0` | `1` turns on the phase-3a packed multi-user prefill (design_packed_prefill.md): equal-length short prompts of one `prefill_forward_text` call run as ONE `[1, 1, B*S, H]` forward (per-user causal attention and paged KV fill; MoE / router / norms row-wise over `T = B*S`) instead of B sequential per-user prefills. Policy in `tt/model_config.py::plan_batched_prefill` + `tt/model.py::prefill_forward_text_batched` (the demo and the tests call the driver; a plain `Generator` with the flag on batches every equal-length multi-user call in one pass, host sampling only, and refuses to TRACE such a pass -- `Model.prepare_prefill_inputs_trace`). HF-equivalent but not sequential-identical and not slot-independent (see "Known limitations" and the phase-3a baselines); the regression harness (`enable_trace=True` at 128) and vLLM (on-device `sampling_params`) keep it off. Measured: batch-32 TTFT-last 4.73 s -> 1.8-2.6 s. Phase 3c: a pass of at most `SOLAR_OPEN_BATCHED_PREFILL_TOKENS <= 4096` tokens is planned once per MoE chunk (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`), so identical users in different slots of ONE pass are bit-identical (fillers 0 of 720 flips, was 24-33) and rotating the 32 users over the slots costs 9 of 768 flips (was 34-38); a user's logits still depend on the SET of users in its pass (hot / cold experts are decided on all of them), which is why the default stays `0` (see "Known limitations" and the P2 rows) |
 | `SOLAR_OPEN_BATCHED_PREFILL_TOKENS` | `1024` | token budget of one packed pass (`B_mb x S <= n`; 1024 = 8 x 128-token users -> 4 passes for batch 32, 4096 = the whole batch-32 demo in one pass; clamped to 256..8192: the v1 head runs norm + lm_head on every row of the pass and reads one 32-row tile per user back) |
 | `SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN` | `128` | largest PADDED per-user prefill length that is packed (1024 opts the 1K bucket in; the >= 1K buckets already run the expert-sorted MoE at a flat per-token cost, so packing them buys little TTFT-last and costs TTFT-mean) |
 | `SOLAR_OPEN_PREFILL_EXPERT_MM` | `tuned` | A/B preset of the phase-3a prefill expert matmul configs (`tt/expert_configs.py::PREFILL_EXPERT_MM_PRESETS`): `tuned` = the shipped `SolarOpenProgramConfig` values (per-expert gate\|up of the sorted hot group / per-expert loop as `ttnn.experimental.minimal_matmul` (11,5) K16 sub 3x2 -- 46 vs 81 us per expert at 1024 tokens; the hot group's down + sum over the hot experts as ONE K-concatenated minimal_matmul (11,10) K5 N12 sub 4x2 over bf16 GLU pieces -- 117 + 36 vs 394 + 205 us at 15 hot; dense down `out_subblock_h = Mt`, bit-identical), `phase2` = the phase-2 forms, `gate_up_alt` = the better-numerics (11,10) K8 gate\|up blocking, `bfp8_act` = tuned + bfp8 activation broadcast on the dense 128-token path (numerics switch, off). Cache-neutral. Measured (see the phase-3a baselines): per-layer prefill_1024 10.64 -> 8.20 ms, TTFT 1K 415 -> 388, 2K 1066 -> 721, 4K 1575 -> 1401, 8K 3191 -> 2907 ms; 128-token prefill and decode unchanged |
 | `SOLAR_OPEN_SORTED_SCATTER_FP32` | `1` | `0` restores the phase-2 bf16-destination accumulation of the expert-sorted prefill MoE's one-hot scatter matmul (`tt/experts/prefill.py::_sorted_moe_forward`). With `1` (phase 3a) a token's expert contributions are summed in fp32 and rounded once: teacher-forced b32 through a 32 x 128 packed pass 0.9219 -> 0.9336 top-1 / KL 0.038 -> 0.030, slot copies bit-identical again, real layer-0 PCC unchanged, TTFT neutral (1K 416 vs 388-401 ms, 8K 2920 vs 2907-2927). Cache-neutral |
-| `SOLAR_OPEN_DECODE_EGP` | `on` | `off` restores the phase-2 decode expert configs (`tt/expert_configs.py::DECODE_EGP_LEGACY`: legacy sparse_matmul kernels, gate\|up 5x2, batched down 8x8 x 2 tiles from 16 users). With `on` (phase 3b) the decode `ttnn.sparse_matmul`s run with EXPERT GROUPS (`expert_groups=11`, the new op keyword; `None` = the legacy kernels byte for byte): the fused gate\|up on 11x10 = 11 groups x 10 output blocks (every decode path incl. the b1 indexed one), the batched down on 11x8 = 11 groups x 8 blocks of 16 tiles from 2 users on; each group streams every 11th active expert concurrently, the activation tile is multicast once and kept resident in L1, every core decides each expert's validity locally. Bit-identical per output tile (same math): the component PCCs and the teacher-forced metrics reproduce to the digit. `solar_open_program_config()` applies the `off` values itself on compute grids narrower than 11x10. Cache-neutral. Measured (see "Recorded baselines", phase-3b rows): per layer at the 32-user union gate\|up 669 -> 276 us, down 216 -> 144 us kernel |
+| `SOLAR_OPEN_SORTED_MOE_PLAN` | `auto` | Plan granularity of the expert-sorted prefill MoE's hot / cold sets (`tt/experts/prefill.py`, arithmetic in `tt/experts/sorted_plan.py`; phase 3c). `auto`: a PACKED multi-user pass (`Model.ttnn_prefill_forward` with `batch_size > 1`, marked through `experts.prefill.packed_prefill_pass`) is planned ONCE per 4096-token chunk -- one count readback (exact fp32 counts) and one (cap, hot set, cold mask) shared by all its 1024-token splits, so a token's path does not depend on the split its slot falls into -- while single-user prefills keep the phase-3b per-split plan (byte-identical ops: the flag-off gates of P2 reproduce every recorded digit). `chunk`: per chunk for every prefill (one sync per chunk instead of four, design_traced_prefill.md G1; single-user 2K+ outputs move at the bfp8 floor; TTFT effect not measured -- opt-in study). `split`: the phase-3b per-split plan everywhere (packed passes are then slot dependent again: the A/B arm). A chunk with ONE planned split always takes the legacy code. Cache-neutral |
+| `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT` | `average` | Hot-set rule of the per-chunk plan. `average`: an expert is hot when its chunk-AVERAGE per-split count exceeds the cost model's cap -- a function of the SET of users in the pass, not of their slot layout -- and the gather cap is raised to the smallest listed cap (32..256) that fits every cold expert in every split (a cold expert above 256 tokens in some split is promoted to hot and logged as `promoted`). `max`: the cost model on the per-expert maxima over the splits (= the union of the per-split plans' hot sets, cheaper caps) -- layout dependent, the A/B arm. `SOLAR_OPEN_SORTED_MOE_DEBUG=1` prints one line per chunk and layer: cap vs cost-model cap, hot, promoted, per-split hot counts |
+| `SOLAR_OPEN_BATCHED_PREFILL_HEAD` | `full` | Head of a packed pass (phase 3c, opt-in). `full`: the tt_transformers batched path (norm + lm_head over every row of the pass, one 32-row tile read back per user). `gather`: `Model.packed_prefill_pass` gathers the B last-token rows into ONE `[1, 1, 32, H]` tile row (`ttnn.embedding`, the row gather of the sorted MoE), runs norm + lm_head on 32 rows -- the single-user head's programs -- and reads `32 x vocab` back once per pass (design_packed_prefill.md 2.6 item 1). Eager only, host sampling; per-user logits are not bit-identical to `full` (another lm_head program config). Measured in P2: see the phase-3c rows |
+| `SOLAR_OPEN_DECODE_EGP` | `on` | `off` restores the phase-2 decode expert configs (`tt/expert_configs.py::DECODE_EGP_LEGACY`: legacy sparse_matmul kernels, gate\|up 5x2, batched down 8x8 x 2 tiles from 16 users, the b1 indexed down on the single-user 8x4 x 4 tiles grid); `p3b` restores the phase-3b ones (EGP on, only the b1 indexed compact-A down back on the 8x4 x 4 tiles grid: the A/B arm of the phase-3c lever, `decode_down_indexed_cores` 8x8 x 2 tiles, 20.6 -> 15.7 us kernel per layer, see "Recorded baselines", phase-3c rows). With `on` (phase 3b) the decode `ttnn.sparse_matmul`s run with EXPERT GROUPS (`expert_groups=11`, the new op keyword; `None` = the legacy kernels byte for byte): the fused gate\|up on 11x10 = 11 groups x 10 output blocks (every decode path incl. the b1 indexed one), the batched down on 11x8 = 11 groups x 8 blocks of 16 tiles from 2 users on; each group streams every 11th active expert concurrently, the activation tile is multicast once and kept resident in L1, every core decides each expert's validity locally. Bit-identical per output tile (same math): the component PCCs and the teacher-forced metrics reproduce to the digit. `solar_open_program_config()` applies the `off` values itself on compute grids narrower than 11x10. Cache-neutral. Measured (see "Recorded baselines", phase-3b rows): per layer at the 32-user union gate\|up 669 -> 276 us, down 216 -> 144 us kernel |
+| `TT_SPARSE_MATMUL_EGP_ZERO_FILL` | unset (= on) | `0` restores the phase-3b host zero-fill of the EGP `ttnn.sparse_matmul` outputs: the `ttnn.zeros_like` FILL pass the op ran before every launch (45.5 us on the 16 MB batched down output, 4.5 us on the gate\|up output, per layer). With the knob unset (phase-3c lever A3, "writer zero-fill") the EGP kernels of group `slot % G` zero-fill every expert slot nobody computes with the same tile walk as a computed slot (from the in0 reader by default, `in1` = from the in1 writer: the two placements of the A/B; indexed / compact outputs are fully written by construction), so the op skips the FILL; bit-identical (`torch.equal` on pre-poisoned outputs, `tests/ttnn/unit_tests/operations/matmul/test_sparse_matmul_expert_groups.py`). Read once per process, not part of the program hash: fresh process per arm. `SOLAR_OPEN_DECODE_EGP=off` (legacy kernels) keeps the FILL by construction. Op-level numbers in "Recorded baselines", phase-3c rows (A3); the 1x8 gates and the demo / teacher-forced / traced numbers in the A4 rows there (b32 40.3 -> 37.9 ms/step, b1 unchanged). |
 | `SOLAR_OPEN_PERF_FLUSH_EVERY` | `5` | `tests/perf/test_full_model_device_perf.py`: device-profiler flush cadence in decode steps / prefill users; use `2` for the b32 case (a marker-buffer wrap aborted the b32 run at cadence 5 in the profiler teardown) |
 
 The phase-2 program-config levers (perf-p0, all default ON and cache-neutral) have no environment variable; each one is
@@ -199,7 +207,10 @@ SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_batched_prefill.py -k host      # h
 SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_traced_prefill.py -k Host       # host: MoE path selection, trace table validation, router helper persistence
 pytest $T/unit/test_traced_prefill.py -k "1x8 and prefill_128"                # real weights: traced prefill == eager (logits, KV pages, stale-trace, MoE path, router helpers); 1K/2K/4K skip until the table lists them
 pytest $T/unit/test_batched_prefill.py -k "1x8 and b8_s128"                   # real weights: packed 8 x 128 pass vs sequential per user (no-garbage floors; 4 teacher-forced decode steps over the packed KV; cross-user distinctness); also b2_s128, b32_s128, b4_s1024, b8_s128_x2
-pytest $T/test_layer0_batched_prefill.py -k 1x8                               # real layer 0: packed (batch_size=4) vs per-user attention / MoE / layer, KV blocks, both vs HF; the `dup` case: identical users in different slots are bit-identical
+pytest $T/test_layer0_batched_prefill.py -k 1x8                               # real layer 0: packed (batch_size=4) vs per-user attention / MoE / layer, KV blocks, both vs HF; the `dup` cases: identical users in different slots are bit-identical (b16_s128_dup: copies in the OTHER 1024-token split, the per-chunk plan of phase 3c)
+pytest $T/unit/test_sorted_moe_chunk_plan.py                                  # host: phase-3c per-chunk planner (average / max rules, layout invariance over slot permutations, promotion), gather-head rows
+SOLAR_OPEN_BATCHED_PREFILL=1 pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8   # slot-independence gate of the packed path (one 32 x 128 pass per prefill; fails its lone-prompt floor by construction, see "Known limitations")
+pytest $T/unit/test_batched_prefill.py -k "1x8 and b32_s128_gather"           # the opt-in gather head (SOLAR_OPEN_BATCHED_PREFILL_HEAD=gather) vs the sequential arm
 pytest $T/perf/test_prefill_matmul_candidates.py -k 1x1                       # one device: phase-3a prefill expert matmul candidates + the wired forms (PCC parity, dense-down bit-identity, per-op burst times)
 SOLAR_OPEN_PERF_PROFILE=1 pytest $T/perf/test_attention_prefill_microbench.py -k "sdpa or allreduce"   # under tracy: SDPA chunk/grid sweep (1x1), all_reduce dtype/links (1x8)
 SOLAR_OPEN_BATCHED_PREFILL=1 pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "b32 and 1x8"   # the packed 32 x 128 pass against the HF reference (the accuracy gate of the packed path)
@@ -211,7 +222,8 @@ Perf tests (phase 2; not correctness tests, `tests/perf/`). The first two are th
 `SOLAR_OPEN_PERF_PROFILE=1` and are meant to run under the tracy device profiler:
 
 ```bash
-pytest $T/perf/test_layer0_device_perf.py -k 1x8         # real layer 0 (needs the layer-0 shards): traced replay ms per layer for decode b1 / b32, eager prefill 128 / 1024; x48 = the demo step within ~2 %; SOLAR_OPEN_PERF_OUT=<json> records it. Final phase-2 tree: b1 0.376-0.379 / b32 1.30-1.33 ms traced (phase 1 1.152 / 1.911), prefill_128 eager 3.94-3.97 (4.5)
+pytest $T/perf/test_layer0_device_perf.py -k 1x8         # real layer 0 (needs the layer-0 shards): traced replay ms per layer for decode b1 / b32, eager prefill 128 / 1024; x48 = the demo step within ~2 %; SOLAR_OPEN_PERF_OUT=<json> records it. Final phase-2 tree: b1 0.376-0.379 / b32 1.30-1.33 ms traced (phase 1 1.152 / 1.911), prefill_128 eager 3.94-3.97 (4.5); phase 3c final tree (2026-09-09, R1): b1 0.335 / b32 0.792 ms traced, prefill_128 / 1024 / 8192 eager 3.92 / 8.14 / 80.7 (the 8192 value is host noise: the `_p3c` sweep prefills 8K in 3.7 s per user vs 4.2 in `_p3b`) ms
+pytest $T/perf/test_layer0_eager_host.py -k "1x8 and decode_b32"  # real layer 0: EAGER host-time probe, both decode config arms (SOLAR_OPEN_E1_ARMS, default on,off,on,off) in ONE process: wall = enqueue + sync per step, main-thread CPU / MHz, per-thread CPU, cProfile per arm; SOLAR_OPEN_PERF_OUT=<json> records it (phase 3c E1: the arms are equal, eager walls from different processes are not comparable below ~1 ms)
 pytest $T/perf/test_config_candidates.py -k 1x1          # one device, random weights at the TP=8 shapes: candidate matmul configs vs the auto config and a torch fp32 reference (PCC, max abs diff, wall)
 pytest $T/perf/test_layout_candidates.py -k 1x1          # one device: perf-p1 layout levers (routing mul placement, hot-group forms, copy elision) vs torch fp32
 pytest $T/perf/test_indexed_candidates.py -k 1x1         # one device: perf-p2 scan vs indexed expert block vs torch fp32, traced timing
@@ -501,21 +513,36 @@ Treat every statement about the vLLM side as a hypothesis to verify on a machine
 
 ## Known limitations
 
-- Packed multi-user prefill (`SOLAR_OPEN_BATCHED_PREFILL=1`, phase 3a) is HF-equivalent but neither sequential-identical
-  nor slot-independent: the row-wise matmuls of a `T = B x S` pass take other auto program configs than the `S`-row
-  per-user pass (another bf16 partial-sum order) and a 32 x 128 pass is four 1024-token MoE splits, each planned (hot /
-  cold experts, cap) from the 8 users it holds, so a user's numerics depend on its split and on the co-batched users.
-  Measured 2026-09-08: first-token logits PCC 0.97-0.99 / KL 0.01-0.14 against the sequential prefill, teacher-forced vs HF
-  0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 / KL 0.030 (sequential 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 /
-  0.031, every floor holds), but `tests/test_multi_user_consistency.py` with the flag fails its slot-independence floors
-  (rotated slots PCC min 0.91-0.94 / 34-38 of 768 top-1 flips; fillers of one prompt in different splits 24-33 of 720),
-  while a 512-token pass (one split) is bit-identical across slots (`test_layer0_batched_prefill.py -k dup`). Planning
-  the hot / cold sets once per 4096-token chunk (design_traced_prefill.md G1) would make a pass slot independent; the
-  dependence on the set of co-batched users is inherent to hot / cold. Also: a plain `Generator` with the flag on packs
-  every equal-length multi-user call in ONE pass (no microbatching, host sampling only) and refuses to trace it, so the
-  regression harness (`enable_trace=True` at 128) and vLLM (on-device `sampling_params`) keep the flag off, and the
-  phase-3a 1K / 2K / 4K traced-prefill study is a NO-GO (design_traced_prefill.md: every trace-safe MoE formulation costs
-  more per 1024-token split than the 55-65 ms of host time a trace could remove).
+- Packed multi-user prefill (`SOLAR_OPEN_BATCHED_PREFILL=1`, phase 3a / 3c) is HF-equivalent and, since phase 3c, slot
+  independent within one MoE chunk: the expert-sorted MoE plans a packed pass ONCE per 4096-token chunk on the chunk-average
+  per-expert counts (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`, `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT=average`,
+  `tt/experts/sorted_plan.py`), so every slot of a pass sees the same hot / cold sets and the same gather cap. Measured
+  2026-09-09 (P2, `tests/test_multi_user_consistency.py` with the flag = one 32 x 128 pass per prefill): fillers of one
+  prompt in different slots 0 of 720 top-1 flips, logit PCC min 0.99999 (phase 3a: 24-33 of 720); identical users in the
+  OTHER 1024-token split bit-identical in attention / MoE / layer (`test_layer0_batched_prefill.py -k b16_s128_dup`);
+  rotating the 32 users over the slots 9 of 768 flips, per-step PCC min 0.979 (phase 3a: 34-38, 0.91-0.94; floors 15 /
+  0.97 hold). What remains, by construction: a user's numerics depend on the SET of users in its pass -- hot / cold is
+  decided on all of them, so a token takes the per-expert-linear (hot) or the gathered-bmm (cold) accumulation depending on
+  its pass mates -- which the lone-prompt check exposes (prompt 0 alone among 31 copies of a filler: 2 of 24 flips at
+  margins <= 0.875, PCC min 0.973, vs the allowed 1 extra flip of the sequential path) and the gather cap / promotions,
+  which follow the per-split maxima; with the default `SOLAR_OPEN_BATCHED_PREFILL_TOKENS=1024` the 32 users run as four
+  8-user passes, so a user's logits depend on its 7 pass mates, and a pass longer than 4096 tokens spans two chunks with two
+  plans. The packed pass is also not sequential-identical (row-wise matmuls at `T = B x S` rows take other auto program
+  configs than the `S`-row per-user pass: first-token logits PCC 0.97-0.99 / KL 0.01-0.27 against the sequential prefill;
+  teacher-forced vs HF 0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 / KL 0.030 for the 32 x 128 pass, sequential 0.9297 /
+  0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.031, every floor holds). Because the consistency gate's lone-prompt floor is red
+  for the packed path, the flag stays default OFF (P2 decision; the phase-3c rows record both arms). Also: a plain
+  `Generator` with the flag on packs every equal-length multi-user call in ONE pass (no microbatching, host sampling only)
+  and refuses to trace it, so the regression harness (`enable_trace=True` at 128) and vLLM (on-device `sampling_params`)
+  keep the flag off, and the phase-3a 1K / 2K / 4K traced-prefill study is a NO-GO (design_traced_prefill.md: every
+  trace-safe MoE formulation costs more per 1024-token split than the 55-65 ms of host time a trace could remove).
+- Tests that tokenize prompts through the chat template (`tests/test_layer0_real_weights.py`,
+  `tests/test_layer0_batched_prefill.py`, `tests/unit/test_batched_prefill.py`, the demo) get different token ids every
+  day: the Solar template injects the current date (`strftime_now("%Y-%m-%d")`), so their PCC / KL digits are reproducible
+  only within a day (the teacher-forced test pins the date and is bit-identical across days). Two of their edge floors fail
+  on 2026-09-09's tokens on the clean phase-3b HEAD as well as on the phase-3c tree (`test_layer0_batched_prefill.py`
+  decoder row PCC min 0.987 on one row of one user vs the 0.99 floor; `test_batched_prefill.py -k b2_s128` KL mean 0.256
+  vs 0.25 on two near-tie users) -- input dependent, not a regression; not re-baselined in phase 3c.
 - Board 1 of this box at 80 C: two hot runs of `tests/test_multi_user_consistency.py` produced NON-FINITE logits in their
   sixth prefill + decode pass (slot 20; the first five passes exact), a cool-box run (46-58 C) is exact (744/744) -- the
   test now asserts finite logits; treat >= 78 C on board 1 as a correctness hazard, not only a throttling one.
@@ -816,7 +843,7 @@ trace replays with in-place mask updates. Same box, warm cache, bfp8 experts, gr
 | b32 decode ms/step avg / plateau (tok/s aggregate) | 62.24 / 62.4 (514) | **40.27 / 40.0, 39.79 / 39.4 (800-812)** | **-35 %**; iterations 2-22 51.7 -> 33.2 / 32.6, last-50 62.3 -> 40.4 / 40.0; design 4.2 projected ~40-44 |
 | b32 TTFT first / mean / last ms, sequential | 148.5 / 2449.7 / 4751.0 | 150.5 / 2483.5 / 4816.4, 150.0 / 2475.5 / 4800.9 | unchanged (32 sequential traced 128-token prefills) |
 | per-layer traced replay ms (real layer 0) decode b1 / b32 (union 8 / 72), blocking (non-blocking) | 0.376 (0.355) / 1.306 (1.271) | **0.338 (0.319) / 0.844 (0.814)** | -10 % / **-35 %** (`tests/perf/test_layer0_device_perf.py -k "1x8 and decode"`, back to back) |
-| per-layer EAGER ms (real layer 0) decode b1 / b32 | 2.69 / 3.21 | 2.64 / 4.10 | eager decode is not a production path (the demos, the teacher-forced test and vLLM replay traces); the b32 eager wall grows by ~0.9 ms per layer with the wide grids -- see the phase-3b notes in `scratchpad/phase3/egp_results.md` section 11 for the attribution |
+| per-layer EAGER ms (real layer 0) decode b1 / b32 | 2.69 / 3.21 | 2.64 / 4.10 | eager decode is not a production path (the demos, the teacher-forced test and vLLM replay traces); the b32 eager wall grows by ~0.9 ms per layer with the wide grids -- see the phase-3b notes in `scratchpad/phase3/egp_results.md` section 11; attributed in phase 3c E1 (section 11.1 and the E1 rows below): cross-process host variance, NOT an EGP cost -- in one process the arms are equal (3.06-3.18 vs 3.06-3.20 ms) |
 | teacher-forced b1 (top-1 / decisive / top-5 / top-64 PCC / full PCC / KL) | 0.9258 / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.0300 | **BIT-IDENTICAL** (0.9258 (237/256) / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996) | teacher-forced decode 27.3 -> **25.7** ms/step (full-logit readback) |
 | teacher-forced b32 | 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.0312 | **BIT-IDENTICAL** (0.9297 (238/256) / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.03119) | 51.1 -> **41.0** ms/step |
 | component / real-weight ladder (1x8, all cases paged + unpaged, pos0 + pos70000) | phase-3a values | **all identical to the digit**: experts decode b1 / b32 / b16 0.99800 / 0.99818 / 0.99809 (also with `off` in the same session), mlp 0.99902 / 0.99897 / 0.99892, decoder 0.99349 / 0.99729 / 0.99713 (pos70000 0.99352 / 0.99731 / 0.99663); prefill experts 0.99937 x3, mlp 0.99871 / 0.99903 / 0.99916, decoder 0.99603 / 0.99561 / 0.99658; hook zeros exact / shifts 8.1028 / 8.1039 / 8.1456 / 8.1452; fused (129 slots, the batched EGP path at b1 / b8 / b32) vs HF unfused 0.99896 / 0.99898 / 0.99857 / 0.99863 / 0.99916 / 0.99931, fused 0.99827 / 0.99825 / 0.99780 / 0.99894 / 0.99922 / 0.99928, launches 4 -> 1, 4 -> 2, 5 -> 6; test_model 0.99052 / 0.99902 / 0.99935; real layer 0 mlp 0.99973 / 0.99957 / 0.99985 / 0.99991, decoder 0.99860 / 0.99886 / 0.99997 / 0.99985; skewed 0.99937 / 0.99942 | `scratchpad/phase3/integrate/runs.txt` (i0-i7b, i1b) |
@@ -825,9 +852,333 @@ trace replays with in-place mask updates. Same box, warm cache, bfp8 experts, gr
 
 Not changed by phase 3b: prefill (all paths), the b1 indexed compact-A down (EGP measured slower at k = 8: 19.4-20.6 vs
 15.9 us legacy 8x8 pcn2 osw2 / 24.6 us the shipped 8x4 pcn4 osw4 -- the legacy 8x8 pcn2 osw2 is a ~0.4 ms/step
-follow-up for b1, a config change only), the 45.5 us zero-FILL of the 16 MB down output (the kernel-side follow-up "v2
+follow-up for b1, a config change only: DONE in phase 3c, see the rows below), the 45.5 us zero-FILL of the 16 MB down output (the kernel-side follow-up "v2
 writer zero-fill", ~2.2 ms per b32 step), the K-block size of the gate\|up (bw32 is a further -14 us/layer at G 11 but
 changes the accumulation order: a numerics-moving step for a later gate).
+
+### Phase 3c rows (2026-09-09, HEAD de5c31bb3dc + the uncommitted phase-3c tree; ledgers `scratchpad/phase3c/<stage>/runs.txt`, copies under `results/phase3/`)
+
+Phase 3c = four levers on top of phase 3b, each gated the same way (op exactness, `test_config_candidates.py`, the traced real layer 0,
+the component / real-weight ladder, the teacher-forced floors) and a final regression of the whole tree (stage R1, the table
+below): **A1** the b1 indexed compact-A down on the legacy 8x8 x 2 tiles grid (its own knob `decode_down_indexed_cores`; -4.9 us
+kernel per layer, bit-identical); **A3 / A4** kernel zero-fill of the EGP `ttnn.sparse_matmul` outputs (the op no longer runs a
+`ttnn.zeros_like` FILL pass before every launch: -45.5 us on the 16 MB batched down output and -4.5 us on the gate\|up output per
+layer, -50 us at the b32 union; `TT_SPARSE_MATMUL_EGP_ZERO_FILL=0` = the phase-3b FILL); **B1 / P2** the packed multi-user prefill
+planned once per 4096-token chunk (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`: slot independence within one pass is now exact, the flag
+stays default OFF because the co-batch dependence of hot / cold is inherent); **E1** the phase-3b eager per-layer host-time item
+attributed to cross-process host variance (no lever). Same box, warm cache, bfp8 experts, greedy, `reasoning_effort=low`, cool
+box (< 60 C) before every correctness gate and demo; "phase 3b" = the phase-3b rows above (same box, 2026-09-08) unless a
+same-session A/B arm is named. One table (R1, the final uncommitted tree with the shipped defaults, no env overrides):
+
+| metric | phase 3b | phase 3c (final tree) | note |
+|---|---:|---:|---|
+| b1 decode ms/step avg (it2-22 / plateau 25-60 / last-50); tok/s/user | 15.92 / 16.3 (16.0 / 16.0 / 16.0); 62.5 | **16.11** (16.0 / 16.1 / 16.2); 62.1 (R1 r13; A1: 15.62-16.11 over 5 runs, mean 15.92, plateau 15.90) | A1 (-4.9 us kernel x 48 = -0.24 ms/step expected) + the b1 indexed gate\|up FILL (-0.05): at the edge of the +-0.3 ms run-to-run spread (A1 measured -0.20 paired over 4 vs 5 alternating runs) |
+| b1 TTFT@128 ms | 158.9 / 152.1 (phase 2: 153.6-155.0) | 159.1 (R1); 150-159 (A1, 9 runs) | the traced prefill@128 has no phase-3c lever |
+| b32 decode ms/step avg (it2-22 / plateau 25-60 / last-50); tok/s aggregate | 40.27 / 39.79 (33.2 / 40.0 / 40.4, 32.6 / 39.4 / 40.0); 795-804 | **37.81** (32.3 / 37.7 / 37.5); 846 (R1 r14; A4: 38.12 / 37.57 / 38.03, plateau 38.0, 839-852) | **A3 / A4**: -50 us of op time per layer at the b32 union (48 x -50 us = -2.4 ms of kernel, -2.0..-2.1 ms/step measured in A4 over 3 vs 2 alternating runs) |
+| b32 TTFT first / mean / last ms, sequential 32 x 128 traced prefills (the default) | 150.5 / 2483.5 / 4816.4; 150.0 / 2475.5 / 4800.9 | 148.1 / 2443.0 / 4737.9 (R1); 148 / 2440 / 4735 (A4) | unchanged (32 sequential traced prefills; no phase-3c lever on the default path) |
+| b32 TTFT first / mean / last ms, PACKED prefill (opt-in `packed_b32_128`: four 8 x 128 passes at `SOLAR_OPEN_BATCHED_PREFILL_TOKENS=1024`; one 32 x 128 pass at 4096) | phase 3a, cool box: 783 / 1623 / 2362 and 461 / 1131 / 1805 (1024); 2825 / 2825 / 2825 (4096; 2376-2825 across runs) | **824.6 / 1535.2 / 2228.4 (1024); 1760.0 / 1760.0 / 1760.0 (4096)**, decode plateau 37.97 / 37.54 (= the sequential demo); the first decode iteration after a packed prefill costs 1.21-1.23 s once (the decode trace is captured there instead of in the sequential path's warm-up), so the second token of every user lands ~1.2 s after the first | the per-chunk plan (`auto`) is used only by the packed pass; with 1024-token passes (one split each) the plan equals the legacy per-split plan, so its TTFT is the phase-3a number; the 4096-token pass (four splits) runs the chunk plan |
+| per-layer traced replay ms (real layer 0) decode b1 / b32 (union 8 / 72), blocking (non-blocking) | 0.338 (0.319) / 0.844 (0.814) | **0.335 (0.313) / 0.792 (0.758)** (R1 r15; A4 l4 0.336 (0.313) / 0.788 (0.762)) | b1 -5 us (A1), b32 -57 us (A3 / A4); `test_layer0_device_perf.py -k 1x8` |
+| per-layer EAGER ms (real layer 0) decode b1 / b32; prefill 128 / 1024 / 8192 | 2.64 / 4.10 (one run each); prefill 3.896 / 8.204 / 56.327 (phase 3a) | 2.78 / 4.23 (one run each, R1); prefill 3.916 / 8.143 / 80.72 -- the 8192 reading is host noise of the eager probe (the `_p3c` sweep prefills 8K tokens in 3745 ms per user vs 4191 in `_p3b`, see the sweep section) | eager walls from different processes are not comparable below ~1 ms at b32 (E1: the phase-3b +0.9 ms was host variance; in one process the arms are equal); prefill eager = the TTFT path, host-load sensitive |
+| teacher-forced b1 (top-1 / decisive / top-5 / top-64 PCC / full PCC / KL); decode ms/step | 0.9258 (237/256) / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996; 25.7 | **0.9258 (237/256) / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996** (bit-identical); **25.5** (A1: 24.9) | floors 0.90 / 0.94 / 0.90 / 0.96 / 0.97 / 0.06 |
+| teacher-forced b32 (32 slots, sequential prefill); decode ms/step | 0.9297 (238/256) / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.03119; 41.0 | **0.9297 (238/256) / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.03119** (bit-identical); **37.5** (A4: 38.6) | slot copies identical 1792 / 1792 |
+| teacher-forced b32 through ONE packed 32 x 128 pass (opt-in, P2) | phase 3a: 0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 / 0.0304 | **0.9336 (239/256) / 0.9690 / 0.9180 / 0.98195 / 0.99266 / 0.03039**, slot copies 1792 / 1792; decode 36.0 ms/step | to the digit (identical splits -> identical plan) |
+| op level (one device, tracy kernel us) at the b32 union nnz 72: batched down pcn16 osw8 G11 (11,8); gate\|up G11 bw128 (11,10) | down 143.9 + 45.5 FILL = **189.4**; gate\|up 275.8 + 4.5 = **280.3** | down **143.7** (kernel = op total, one program; -45.7); gate\|up **274.8** (-5.5) | A3 / A4 (`scratchpad/phase3c/A4/zf_mb.py`; the before arm reproduces 189.4 to the digit); nnz 8 / 32 / 112 / 128 down 65.0 / 111.8 / 266.8 / 295.3 -> 28.5 / 68.2 / 220.1 / 248.9 |
+| op level, b1 indexed compact paths (k = 8): gate\|up EGP G11; down | gate\|up 33.0 + 1.1 FILL = 34.2; down 8x4 pcn4 osw4 20.6 + 3.8 FILL = **24.5** | gate\|up **33.2** (FILL gone); down 8x8 pcn2 osw2 15.7 + 3.8 = **19.6** | A1 (-4.9 us kernel) + A3 (-1.1 us FILL); the legacy indexed down keeps its 3.8 us compact FILL (spec 3.8, backlog) |
+| component ladder, random weights (`test_router` 26, `test_shared_expert` 8, `test_decoder` x 7 components decode b1 / b32 / b16 + prefill 128 / 1024 / 4096, paged + unpaged, pos0 + pos70000, hook 4, skewed 2, `test_model` 3, fused 6) | phase-3b digits (experts / mlp / decoder: integrate i1 / i6, hook i2, model i4, skewed i7, fused i3 = A4 f1) and phase-2 digits (router / shared expert / attention / rms_norm: gate-p0 u_*) | **identical to the digit wherever a same-module-set reference exists**: router 26, shared expert 8, hook 4, model 3, fused 6, real-weight layer 0 8 cases, the decoder in all 24 `test_decoder` cases, 91 / 108 `test_decoder` (case, component) cells; the 8 experts / mlp prefill 1024 / 4096 cells are attributed to the two phase-3a prefill levers (r17: phase-2 arms reproduce the phase-2 all-7 digits 18 / 18), the 9 attention decode cells are first recorded with this module set; skewed routing 0.99930 / 0.99944 is inside its run-to-run band (unseeded input; 0.99930-0.99937 / 0.99942-0.99955 over five runs of three trees) | `scratchpad/phase3c/R1/compare_ladder.py`: order-independent multiset comparison of every measured line |
+| real-weight layer 0 (`test_layer0_real_weights.py -k 1x8`: decode b1 / b32, prefill 128 / 1024, paged + unpaged) | 2026-09-09 (A4 r1, same date = same token ids): mlp 0.999701995998598 / 0.99963109702278 / 0.9998468904413703 / 0.999900783306261, decoder 0.9986528843052397 / 0.9988627670526441 / 0.999965545788691 / 0.9998534573128649 | identical to the digit (R1 r07: mlp 0.999701995998598 / 0.99963109702278 / 0.9998468904413703 / 0.999900783306261, decoder 0.9986528843052397 / 0.9988627670526441 / 0.999965545788691 / 0.9998534573128649; router set agreement 1.0 / 1.0 / 0.9922 (1/128) / 0.9932 (7/1024), 0 decisive; paged == unpaged) | the 09-08 digits differ because the chat template stamps the date into the prompt (P2 attribution) |
+| `test_multi_user_consistency.py -k 1x8`, default env (sequential per-user prefill) | phase 3a cool box: same slots 0 / 768, rotated 0 / 768, lone prompt 0 / 24, fillers 0 / 744 and 0 / 720; PCC min 0.99993-0.99999; decode 51.9 ms/step | **0 / 768, 0 / 768, 0 / 24, 0 / 744, 0 / 720; PCC min 0.99994-0.99999**; decode 33.2 ms/step (965 tok/s aggregate; the test's 32 shared-prompt users) | the packed arm (`SOLAR_OPEN_BATCHED_PREFILL=1`) is the P2 row below |
+| subset sweep (`run_sweep.sh`, tag `_p3c`: B 1 / 32 x 128/128, 128/1024, 8192/1024), decode ms/step mean (p99) | B1 15.74 (16.20) / 16.12 (16.54) / 17.23 (17.64); B32 38.31 (40.98) / 39.03 (41.60) / 32.20 (32.71) | **B1 16.12 (16.79) / 16.12 (16.42) / 17.23 (17.51); B32 36.90 (39.36) / 37.68 (39.94) / 30.50 (30.98)** | the phase-3c tables (tok/s, TTFT, status) are the `_p3c` sweep section below |
+| subset sweep, aggregate tok/s; TTFT mean over users ms | B1 63.5 / 62.0 / 58.0; B32 835 / 820 / 994; TTFT B1 161 / 168 / 4191, B32 2443 / 2449 / 60965 | **B1 62.0 / 62.0 / 58.0; B32 867 / 849 / 1048**; TTFT B1 165 / 159 / 3745, B32 2440 / 2450 / 51798 | TTFT = a single eager prefill per cell (host-load and temperature sensitive), not a phase-3c lever |
+| host-only tests / pre-commit / tree | phase 3b: 190 passed | **246 passed** (`test_p0_program_configs`, `test_expert_parallel_config`, `test_p1_layout`, `test_p2_indexed`, `test_model_config`, `test_sorted_moe_chunk_plan`, `test_batched_prefill -k host`, fused host, `test_traced_prefill` host, `test_expert_weights`); py_compile 17 files; pre-commit clean on all 24 changed / new files; no scratch path or debug print left in a tree file | `git status --short`: 20 modified + 4 new files, `git diff --stat` 20 files, +1812 / -209 (before the R1 README / design-doc edits) |
+
+Defaults after phase 3c: `SOLAR_OPEN_DECODE_EGP=on` (A1 grid included; `p3b` / `off` = the two earlier trees), `TT_SPARSE_MATMUL_EGP_ZERO_FILL`
+unset (= kernel zero-fill from the in0 reader; `0` = the phase-3b FILL), `SOLAR_OPEN_SORTED_MOE_PLAN=auto` + `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT=average`
+(reach only packed passes), `SOLAR_OPEN_BATCHED_PREFILL=0` (unchanged), `SOLAR_OPEN_BATCHED_PREFILL_HEAD=full` (unchanged). Nothing else moved.
+The stage-by-stage detail follows (A1, A3, A4, E1, P2, R1), then the `_p3c` sweep tables.
+
+#### Phase 3c lever A1: the b1 indexed compact-A down on the 8x8 x 2 tiles grid (`scratchpad/phase3c/A1/runs.txt`, copy under `results/phase3/a1_b1_down/`)
+
+Phase 3c lever A1 = the b1 indexed compact-A down on the legacy 8x8 x 2 tiles grid. The single-user down of the shipped
+b1 path (`experts/decode.py::_decode_forward_indexed`: A = the k = 8 compact bfp8 GLU rows `[1, 8, 1, 160]`, both operands
+sparse, output `[1, 8, 1, 4096]`) ran on the phase-2 single-user grid 8x4 x per_core_N 4 (out_subblock_w 4). It now has its
+own knob, `ProgramConfig.decode_down_indexed_cores` / `_subblock_w` / `_expert_groups` (`SolarOpenProgramConfig`: (8, 8) /
+2 / None; `get_decode_down_config(..., indexed=True)`; None = the single-user values as before), because the best grid of
+the compact-A indexed down differs from the scan path's: on the expanded `[1, E, 32, 160]` A of the scan path
+(`SOLAR_OPEN_INDEXED_DECODE=0`, the fused shared expert at one user) the 8x4 x 4 tiles grid stays faster (kernel 106.4 vs
+144.4 us at nnz 8, one device), so `decode_down_cores` (8, 4) is unchanged there, as are the batched EGP down (>= 2 users)
+and the gate\|up. Same per-output-tile math on every legal grid -> bit-identical results. Presets of `SOLAR_OPEN_DECODE_EGP`:
+`on` (default) = phase 3c, `p3b` = phase 3b (EGP on, the indexed down back on 8x4 x 4 tiles: the A/B arm of this row), `off`
+= phase 2 (legacy kernels everywhere, the indexed down on 8x4); `solar_open_program_config()` applies `off` on grids
+narrower than 11x10 (the 8x8 x 2 tiles indexed grid is measured on Blackhole only). Same box, warm cache, bfp8 experts,
+greedy, `reasoning_effort=low`; `p3b` = `SOLAR_OPEN_DECODE_EGP=p3b` on the same tree, alternating with `on` in one session.
+
+| metric | phase 3b (`p3b` arm, same tree, same session) | phase 3c (A1) | note |
+|---|---:|---:|---|
+| op level (one device, tracy kernel us, `tests/perf/test_expert_microbench.py -k 1x1` under tracy): indexed compact-A down k = 8 `[1,8,1,160] x [1,128,160,4096]` | 8x4 pcn4 osw4 **20.6** (+3.8 compact-output FILL = 24.5, the recorded 24.6) | 8x8 pcn2 osw2 **15.7** (19.6) | -24 % kernel, -4.9 us/layer; 8x4 pcn4 osw1 40.9, 8x8 pcn2 osw1 22.4; EGP pcn16 osw8 G 11 11x8 17.7, pcn8 osw8 G 5 8x10 19.8 (no EGP gain at k = 8, as in phase 3b); scan-path expanded down nnz 8: 8x4 pcn4 osw4 106.4 vs 8x8 pcn2 osw2 144.4 (+45.5 FILL) -> the scan-path grid stays 8x4 |
+| exactness (`tests/perf/test_config_candidates.py -k 1x1`, case `p3c_down_indexed_k8`) | - | **identical** (`torch.equal`, max abs diff 0.0; PCC vs the fp32 matmul of the device-rounded operands 0.99987 for both grids) | 1 passed; host wall 0.077 -> 0.073 ms (launch-bound at this size) |
+| per-layer traced replay ms (real layer 0) decode b1 / b32 (union 8 / 72), blocking (non-blocking) | 0.342 (0.319) / 0.839 (0.809) | **0.337 (0.314)** x2 / 0.849 (0.813), 0.842 (0.810) | b1 -5 us = the kernel delta; b32 does not use this config (0.839-0.849 around the recorded 0.844 = the ~1 % traced noise); eager b1 2.81 vs 3.71 / 2.84 ms (host-noisy, not a production path) |
+| component ladder b1 (`test_decoder --test-modules=experts,mlp`, pos0 + pos70000 unpaged) | experts 0.99800 / mlp 0.99902 | **identical to the digit**: experts 0.9980011563664809, mlp 0.9990183053495475 (the b16 cases matched by `-k decode_b1`: 0.9980947868553347 / 0.9989236003313575, also identical) | 4 passed |
+| demo b1 `prefill_128` ms/step avg, 4 vs 5 alternating runs | 16.09 / 16.31 / 15.68 / 16.30 (mean **16.09**); it2-22 mean 15.93, plateau 25-60 mean 16.09, last-50 mean 16.20 | 15.98 / 16.02 / 16.11 / 15.62 / 15.88 (mean **15.92**); it2-22 mean 15.81, plateau mean 15.90, last-50 mean 16.01 | paired mean -0.20 ms/step (48 x -4.9 us = -0.24 expected; the run-to-run spread is +-0.3 ms: both arms had one 15.6-15.7 run); TTFT@128 152-159 vs 150-159 ms unchanged; generated text identical (78-token prompt, 93 generated tokens, stop token) |
+| teacher-forced b1 (top-1 / decisive / top-5 / top-64 PCC / full PCC / KL) | 0.9258 / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996 | **BIT-IDENTICAL** (0.9258 (237/256) / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996) | teacher-forced decode 25.7 -> **24.9** ms/step (full-logit readback) |
+| host-only tests | - | `test_p0_program_configs.py` (+ `test_indexed_down_grid`, the `p3b` preset), `test_expert_parallel_config.py` (+ `decode_down_1_user_indexed`), `test_model_config.py`, `test_p2_indexed.py`: 176 passed | pre-commit clean |
+
+Not changed by phase 3c A1: prefill (all paths), the b32 / batched decode configs, the scan-path single-user down, the
+eager per-layer host time (open item from phase 3b; attributed by stage E1 below: not an EGP cost). The 45.5 us zero-FILL of the 16 MB batched down output is removed by
+lever A3 below.
+
+#### Phase 3c lever A3: kernel zero-fill of the EGP `ttnn.sparse_matmul` outputs (op level, device 0; the 1x8 gates are the A4 rows below)
+
+Before A3 every `ttnn.sparse_matmul` call ran a `ttnn.zeros_like` FILL pass over its expanded output before the program
+(`create_output_tensors`): 45.5 us on the 16 MB batched down output `[1,128,32,4096]` bfp8 in L1 and 4.5 us on the
+gate\|up output `[1,128,32,320]`, per layer, whatever the union (`design/phase3/zerofill_spec.md`, A2). With `expert_groups`
+set the op now skips the FILL: the EGP kernels write every tile of the output in every run -- the cores of group
+`slot % G` zero-fill each expert slot nobody computes (invalid mask entry, or rank >= a caller-supplied nnz) with the same
+(bh, bw, sbh, sbw, h, w) tile walk as a computed slot, from a one-tile zero page in CB c_8; indexed and compact outputs
+were already fully written. The zero writes are issued by the in0 EGP reader kernel by default (RISCV_0, the NoC the
+weight stream does not use, idle during the ownership scan); `TT_SPARSE_MATMUL_EGP_ZERO_FILL=in1` issues them from the in1
+writer instead, `=0` restores the phase-3b FILL (fresh process per arm; the legacy kernels, `SOLAR_OPEN_DECODE_EGP=off`,
+keep the FILL by construction). Host guards: `Mt % per_core_M == 0`, an INTERLEAVED output, and (found by the A3 M = 128
+diagnostic) a broadcast A must be a single row block (`per_core_M == Mt`: the resident in0 is multicast once to the whole
+grid; the phase-3b factory computed rows >= 1 on row block 0's activations). Zeros are zeros: the computed slots use the
+unchanged path, so every recorded metric must reproduce to the digit (verified on the 1x8 mesh in A4 below: traced layer 0 b32
+0.845 -> 0.788 ms, demo b32 40.3 -> 37.9 ms/step, b1 unchanged, every decode accuracy metric bit-identical).
+
+| op (tracy kernel us, device 0, `scratchpad/phase3c/A3/zf_probe.py`, 8 reps) | phase 3b: kernel + FILL = op total | A3 `in1` arm | **A3 default (in0)** | delta vs the phase-3b op total |
+|---|---:|---:|---:|---:|
+| batched down EGP pcn16 osw8 G11 (11,8), nnz 72 (b32 union) | 143.2 + 45.4 = 188.6 | 146.8 | **143.4** | **-45.2** |
+| same, nnz 128 / 8 / 0 | 249.8 + 45.5 = 295.3 / 20.0 + 45.5 = 65.5 / 3.4 + 45.5 = 48.9 | 250.6 / 42.3 / 30.6 | **249.2 / 26.4 / 25.7** | -46.1 / -39.1 / -23.2 |
+| gate\|up EGP G11 bw128 (11,10), nnz 72 | 274.3 + 4.5 = 278.8 | 277.3 | **273.3** | **-5.5** |
+| same, nnz 128 / 8 / 0 | 493.0 + 4.5 (phase 3b) / - / - | 493.8 / 37.5 / 10.9 | **494.3 / 35.8 / 14.0** | -3.2 at nnz 128 |
+| write-cost proxy downK1 (K = 1 tile) nnz 8 / 72 / 128 | 7.2 / 34.2 / 56.2 + 45.5 | 34.8 / 50.8 / 57.4 | 24.8 / 34.5 / 57.0 | the zero writes hide under the weight stream from the in0 RISC |
+| down EGP nnz 72 with a DRAM output (not a Solar config) | 173.5 + 87.3 = 260.8 | 204.9 | 188.9 | -71.9; DRAM zero writes do compete with the weight reads (+45 vs the L1 output) |
+| legacy controls: down 8x8 pcn2 osw2 nnz 72, gate\|up 5x2 nnz 72 | 216.0 + 45.5, 664.6 + 4.5 | unchanged | unchanged | the legacy path keeps its FILL (byte for byte) |
+
+Per layer at the b32 union: -45.2 (down) - 5.5 (gate\|up) = **-50.7 us of op time** (spec estimate -49.5 for the in0
+placement; 48 layers -> -2.4 ms of kernel per b32 step). The `in1` placement pays ~150 ns of NoC-command issue per zero
+tile on the streaming RISC (+22 us at nnz 8, +3.6 at nnz 72), which is why the spec's 3.1 rule moved the default to the
+in0 reader. Exactness: `tests/ttnn/unit_tests/operations/matmul/test_sparse_matmul_expert_groups.py` hands the EGP op
+PRE-POISONED outputs (bfp8 12345.0 / bf16 NaN) and requires `torch.equal` with the legacy result: gate\|up and down at
+nnz 0 / 1 / 8 / 72 / 128 x random / first / last, static nnz expanded, M = 128 (per_core_M 4), ragged last column blocks
+(pcn 12 osw 6, pcn 24 osw 8), one poisoned output reused across masks (A -> B disjoint -> nnz 0 -> A), 40 trace replays
+with in-place mask updates (EGP vs in-trace legacy vs fresh legacy), program-cache entry counts (the EGP call launches
+ONE program), indexed / gpt-oss / gemma4 shapes; all in three arms (default, `in1`, `0`) and under `TT_METAL_WATCHER=1`
+(0 asserts); `tests/perf/test_config_candidates.py -k 1x1` all EGP cases identical. Final counts on the shipped binary
+(`scratchpad/phase3c/A3/runs.txt`, copy under `results/phase3/a3_zerofill/`): the EGP file 37 passed x 3 arms (+ 37 passed
+under watcher, 0 asserts), the legacy sparse + indexed + docs tests 52 passed (also under watcher, 0 asserts), the dense 1D
+matmul subset 38 passed, `test_config_candidates.py -k 1x1` 1 passed (all EGP cases identical). The 1x8 Solar gates and the gpt-oss /
+gemma4 model regressions (legacy path, byte for byte) are the A4 rows below.
+
+#### Phase 3c lever A3 on the 1x8 mesh (A4, 2026-09-09; `scratchpad/phase3c/A4/runs.txt`, copy under `results/phase3/a4_zerofill/`)
+
+Mechanism in one paragraph: with `expert_groups` set, `ttnn.sparse_matmul` no longer runs the `ttnn.zeros_like` FILL
+pass over its expanded output before the program; instead the EGP kernels write every output tile in every run -- the
+cores of group `slot % G` zero-fill each expert slot nobody computes with the same tile walk as a computed slot (one-tile
+zero page in CB c_8; issued by the in0 reader RISC, which is idle during the ownership scan), so the host skips the FILL
+(45.5 us on the 16 MB batched down output, 4.5 us on the gate\|up output, per layer). The computed slots use the unchanged
+path, hence every recorded accuracy metric must reproduce to the digit. A/B arm = `TT_SPARSE_MATMUL_EGP_ZERO_FILL=0`
+(the phase-3b FILL) in a fresh process on the same binary; `in1` = the alternative placement. Same box, warm cache, bfp8
+experts, greedy, `reasoning_effort=low`, cool box (< 60 C) before every correctness gate and demo.
+
+| metric | before (`TT_SPARSE_MATMUL_EGP_ZERO_FILL=0`, same binary / phase 3b record) | after (zero-fill, default) | note |
+|---|---:|---:|---|
+| op level, shipped batched down EGP pcn16 osw8 G11 (11,8): op total us (kernel + FILL) at nnz 8 / 32 / 72 / 112 / 128 (`scratchpad/phase3c/A4/zf_mb.py`, device 0, tracy, 8 reps) | 65.0 (19.5 + 45.5) / 111.8 (66.3 + 45.4) / **189.4 (143.9 + 45.4)** / 266.8 (221.4 + 45.4) / 295.3 (249.9 + 45.4) | 28.5 / 68.2 / **143.7** / 220.1 / 248.9 (kernel = op total, one program) | -36.5 / -43.6 / **-45.7** / -46.7 / -46.4 us; the before arm reproduces the phase-3b record (189.4 = 143.9 + 45.5) to the digit; nnz 0: 48.9 -> 25.9. DRAM read bandwidth of the expert weights (0.696 MB per expert; + the group's 8 reads of the 5.4 KB A slot in parentheses) after: 195 (208) / 327 (347) / 349 (371) / 354 (376) / 358 (380) GB/s -- the down stays DRAM-read-bound from nnz 32 on; at nnz 8 the +9 us of kernel is the 120 zero slots issued by 11 groups (the FILL was 45.5) |
+| op level, shipped gate\|up EGP G11 bw128 (11,10), nnz 8 / 32 / 72 / 112 / 128 | 38.8 (34.3 + 4.5) / 127.0 / **279.5 (275.0 + 4.5)** / 435.6 / 499.4 | 35.2 / 123.3 / **274.8** / 431.3 / 494.2 | -3.6 / -3.7 / **-4.7** / -4.3 / -5.2 us (the 4.5 us FILL gone, +0.2-0.9 kernel); 317 / 361 / 365 / 362 / 361 GB/s of 1.39 MB per expert |
+| op level, b1 indexed compact paths (k = 8) | gate\|up idx8 EGP G11 33.1 + 1.1 = 34.2; down idx8 legacy 8x8 pcn2 osw2 15.8 + 3.9 = 19.7 (A1), 8x4 pcn4 osw4 20.8 + 3.9 = 24.7 | gate\|up idx8 33.2 (the 1.1 us FILL gone); down idx8 legacy **19.6 / 24.5 unchanged** (legacy path keeps its FILL by construction); EGP idx8 down control 22.3 -> 18.3 | -1.0 us/layer on the b1 gate\|up = -0.05 ms per b1 step, below the demo spread; legacy controls (down 8x8 nnz 72 262.5, gate\|up 5x2 nnz 72 669.6 / 669.1, idx8 gate\|up 5x2 69.3) unchanged |
+| exactness inside the probe (both arms) | - | `torch.equal` EGP vs legacy on the same operands: down nnz 8 / 72 / 128, gate\|up nnz 8 / 72 / 128, indexed gate\|up k 8, indexed down 8x4 vs 8x8 and EGP vs 8x8 -- all **true**, max abs diff 0.0, finite | plus the 37-test EGP op file x 3 arms + watcher of A3 |
+| real legacy-path callers, 1x1 (device 0) | gemma4 `test_experts -k 1x1` 4 passed: PCC 0.999466015072982 / 0.9985605482924447 / 0.9985784988534954 / 0.998580409311318 (phase-3 validate run 5); gpt-oss `test_decoder[1x1 decode_low_latency layer_0 unpaged] --test-modules=experts,mlp` 1 passed: experts 0.9821427742468591, mlp 0.9827003730356556 (phase-3 validate run 11) | **identical to the digit**: gemma4 4 passed (9.6 s) with the same four PCCs; gpt-oss 1 passed (34 s) with the same two | `expert_groups=None` callers: legacy factory + kernels byte for byte (the shared in1 kernel's edits are all under `#ifdef EXPERT_GROUPS`) |
+| per-layer traced replay ms (real layer 0, `test_layer0_device_perf.py -k "1x8 and decode"`), b1 / b32 (union 8 / 72), blocking (non-blocking) | env-0 arm: b1 0.335 (0.314) / b32 **0.845 (0.814)**; phase-3b record 0.338 (0.319) / 0.844 (0.814); A1 record b1 0.337 (0.314) | **b1 0.336 (0.313) / b32 **0.788 (0.762)**** (second run b1 0.337 (0.313) / b32 blocking mean 0.828 with min 0.788 and non-blocking 0.763 -- host jitter in 20 blocking replays, its eager step was also 4.99 vs 3.1-3.6 ms); `in1` placement b1 0.335 (0.312) / b32 0.791 (0.762) | b32 **-57 us blocking / -52 us non-blocking per layer** (op level -50.4; x 48 layers = -2.5 ms per b32 step); b1 unchanged (+-2 us); the `in1` placement is equal within noise at the model level (in0 stays the default); eager per-layer walls 3.1-5.0 ms are host-noisy and not a production path |
+| component ladder (`test_decoder --test-modules=experts,mlp`, decode b1 / b32 / b16, pos0 + pos70000, paged + unpaged) | experts 0.9980011563664809 / 0.9981790165289273 / 0.9980947868553347, mlp 0.9990183053495475 / 0.9989727380294698 / 0.9989236003313575 (phase-3 integrate i1, A1 m1) | 6 passed (paged variants and b128 skipped by the test): experts 0.9980011563664809 / 0.9981790165289273 / 0.9980947868553347, mlp 0.9990183053495475 / 0.9989727380294698 / 0.9989236003313575 at pos0 AND pos70000 | **identical to the digit** (zeros are zeros; the computed slots use the unchanged path) |
+| `test_fused_shared_expert.py -k 1x8` (129-slot always-on path = batched EGP at b1 / b8 / b32, prefill 128 / 1024 / 4096) | vs HF unfused 0.9989568873533895 / 0.9989831037970425 / 0.9985680471997799 / 0.9986282726899116 / 0.9991554570239713 / 0.9993088197635935, fused 0.9982657901437767 / 0.9982466751420142 / 0.9977978850330302 / 0.9989392602842626 / 0.9992169043876216 / 0.9992761972703403 (phase-3 integrate i3) | 6 passed: vs HF unfused 0.9989568873533895 / 0.9989831037970425 / 0.9985680471997799 / 0.9986282726899116 / 0.9991554570239713 / 0.9993088197635935, fused 0.9982657901437767 / 0.9982466751420142 / 0.9977978850330302 / 0.9989392602842626 / 0.9992169043876216 / 0.9992761972703403; fused vs unfused 0.9989015307928019 / 0.9988726198515777 / 0.9988870661881794 / 0.9990306494338195 / 0.9992924065964357 / 0.9993907751548204; linears 4 -> 1, 4 -> 2, 5 -> 6 | **identical to the digit** (the 129-slot always-on path is the batched EGP down + gate\|up with zero-filled slots at every batch) |
+| `tests/test_layer0_real_weights.py -k 1x8` (decode b1 / b32, prefill 128 / 1024; paged + unpaged) | mlp 0.9997264621580534 / 0.9995740318411692 / 0.9998537568364068 / 0.9999126315854807, decoder 0.9986027877653817 / 0.9988577506417139 / 0.9999655778825997 / 0.9998533351208578 (phase-3 integrate i5) | 8 passed: mlp 0.999701995998598 / 0.99963109702278 / 0.9998468904413703 / 0.999900783306261, decoder 0.9986528843052397 / 0.9988627670526441 / 0.999965545788691 / 0.9998534573128649; router set agreement 1.0 / 1.0 / 0.9922 (1/128) / 0.9932 (7/1024), 0 decisive flips | 8 passed, paged == unpaged, all floors hold -- but NOT the 2026-09-08 digits (mlp 0.9997264621580534 / 0.9995740318411692 / 0.9998537568364068 / 0.9999126315854807, decoder 0.9986027877653817 / 0.9988577506417139 / 0.9999655778825997 / 0.9998533351208578). Attributed (chain 4): the env-0 arm (r2, phase-3b FILL) and the `SOLAR_OPEN_DECODE_EGP=off` + env-0 arm (r3, phase-2 legacy kernels) reproduce TODAY's digits exactly, so the shift is arm-independent and not the zero-fill (nor EGP / A1); the prefill cases (128 / 1024, no decode expert config at all) shifted too, and the router line's near-tie fraction -- a REFERENCE-only quantity (1 - mean(reference 8th-vs-9th margin >= 1e-3) from the CPU HF attention -> post-attention norm -> bf16 -> router) -- moved 0.156 -> 0.062 (b32) and 0.117 -> 0.102 (s128), the b32 union 78 -> 80 with 0/32 flips (was 2/32): the CPU reference itself moved between the two sessions. Token ids unchanged (unions 8 / 108 / 120, the 78-token demo prompt), weights / tokenizer / cache files unchanged (mtimes 2026-09-07), code identical (git), device bring-up logs identical, torch 2.11.0+cpu fp32 GEMM / SDPA bitwise thread-count-invariant on this box (`cpu_thread_probe.py`). Open item for the next stage (see notes) |
+| teacher-forced b32 (top-1 / decisive / top-5 / top-64 PCC / full PCC / KL) | 0.9297 (238/256) / 0.9690 (of 226) / 0.9211 / 0.97969 (min 0.67957) / 0.99064 (min 0.83893) / 0.03119 (max 0.54497); decode 41.0 ms/step | **BIT-IDENTICAL**: 0.9297 (238/256) / 0.9690 (of 226) / 0.9211 / 0.97969 (min 0.67957) / 0.99064 (min 0.83893) / 0.03119 (max 0.54497); slot copies identical 1792 / 1792; per prompt 0.9062 / 0.8906 / 0.9844 / 0.9375 | teacher-forced decode (full-logit readback) 41.0 -> **38.6 ms/step** over 61 steps |
+| teacher-forced b1 | 0.9258 (237/256) / 0.9558 (of 226) / 0.9234 / 0.98089 (min 0.78517) / 0.99162 (min 0.86808) / 0.02996 (max 0.66345); decode 24.9 ms/step (A1) | **BIT-IDENTICAL**: 0.9258 (237/256) / 0.9558 (of 226) / 0.9234 / 0.98089 (min 0.78517) / 0.99162 (min 0.86808) / 0.02996 (max 0.66345) | decode 25.3 ms/step over 250 steps (A1 24.9: within noise, b1 does not run the batched down; the indexed gate\|up FILL is 1.1 us) |
+| demo `batch32` (32 KO/EN prompts, 8K paged context, 512 steps) ms/step: avg / it2-22 / plateau 25-60 / last-50; tok/s aggregate; TTFT per user first / mean / last | env-0 arm, alternating with the after arm: 39.94 / 35.10 / 40.28 / 39.35 (801.2 tok/s; TTFT 147.6 / 2434.6 / 4721.6) and 39.82 / 34.65 / 39.98 / 39.31 (803.7 tok/s; TTFT 149.1 / 2460.9 / 4772.7) -> mean avg **39.88**, plateau **40.13**; phase-3b record 40.27 / 33.2 / 40.0 / 40.4 (794.6 tok/s) and 39.79 / 32.6 / 39.4 / 40.0 (804.3 tok/s), TTFT 150.5 / 2483.5 / 4816.4 | **38.12 / 32.85 / 38.16 / 37.57 (839.4 tok/s; TTFT 147.9 / 2441.1 / 4734.3), 37.57 / 32.29 / 37.65 / 37.09 (851.8 tok/s; TTFT 147.8 / 2439.3 / 4730.8), 38.03 / 32.78 / 38.16 / 37.50 (841.4 tok/s; TTFT 148.4 / 2448.7 / 4749.0) -> mean avg **37.91**, plateau **37.99**** | **-1.97 ms/step avg, -2.14 plateau** (predicted -2.2 .. -2.4 from 48 x -50 us at the 96 % kernel share); aggregate 802 -> 844 tok/s (+5 %); min step 25-26 -> 23.5-25; TTFT per user unchanged (sequential prefill untouched, first 147.6-149.1 ms, last 4.72-4.77 s); generated text identical in all 5 runs (only the compile-time lines differ); 512-step budget hit by every user as before |
+| demo `prefill_128` (b1) ms/step avg / it2-22 / plateau / last-50, TTFT | env-0 arm 15.75 / 15.71 / 15.72 / 15.78, TTFT 157.9 ms; A1 record 15.92 mean of 5 (plateau 15.90), TTFT 150-159 ms | 15.87 / 16.01 / 15.79 / 15.88, TTFT 153.3 ms | unchanged within the +-0.3 ms run-to-run spread (expected -0.05 ms/step: the 1.1 us indexed gate\|up FILL); 78-token prompt, 93 generated tokens, text identical across arms |
+
+Net for lever A3 on the 1x8 mesh: demo b32 40.3 -> **37.9 ms/step** (plateau 40.0-40.1 -> 38.0; 800 -> 844 tok/s aggregate), traced real layer 0 b32 0.845 -> **0.788 ms**, teacher-forced decode b32 41.0 -> **38.6 ms/step**; b1 unchanged (15.8-15.9 ms/step, traced 0.336); every decode accuracy metric (component ladder, fused shared expert, teacher-forced b1 / b32) bit-identical; the legacy path (gemma4 / gpt-oss callers, `SOLAR_OPEN_DECODE_EGP=off`) untouched to the digit. Kept as the default (zero-fill on, in0 placement); `TT_SPARSE_MATMUL_EGP_ZERO_FILL=0` remains the A/B arm. 22 device runs in A4, all rc 0, none timed out (`scratchpad/phase3c/A4/runs.txt`). Remaining b32 items after this lever, in order: the packed prefill (lane B: TTFT-last 4.7 s = 32 sequential prefills) and the eager per-layer host time (closed by E1 below: host variance, no Solar-side lever); the legacy indexed down still runs its 3.8 us compact FILL (spec 3.8, host-only, -0.18 ms per b1 step).
+
+#### Phase 3c stage E1: the eager per-layer host time attributed (2026-09-09; `scratchpad/phase3c/E1/runs.txt`, copy under `results/phase3/e1_eager_host/`; `scratchpad/phase3/egp_results.md` section 11.1)
+
+Open item from phase 3b: the EAGER (non-traced) per-layer decode wall at b32 rose 3.21 -> 4.10 ms with EGP (one run per
+arm, 09-08) while the device kernels fell 1255 -> 798 us per step. Eager decode is not a production path (the demos, the
+teacher-forced test and vLLM replay traces), so E1 was an attribution task: NEW `tests/perf/test_layer0_eager_host.py`
+builds the real layer 0 once and swaps the decode config arm on the built layer (`on` = phase 3c EGP tree, `off` = the
+phase-2 configs) between blocks of 20 eager steps in ONE process (shared CPU placement / frequency), splitting each step
+into host enqueue + device tail, recording the main thread's CPU and MHz, every thread's CPU time and a cProfile per arm;
+plus the host zones (`tracy-csvexport -u`) and per-op host gaps of the two 09-08 tracy captures, and a host-load
+reproduction. **Verdict: no EGP cost; the +0.9 ms was cross-process host variance.** No code lever (the Solar-side Python is
+0.43-0.48 ms of the ~3 ms wall with no item above 0.08 ms; the rest is the ttnn eager mesh dispatch, 47-51 us per op x 49
+ops x 8 devices). No Solar code or op file changed; the probe test is kept as a tool.
+
+| metric | `off` (phase-2 configs) | `on` (phase 3c) | note |
+|---|---:|---:|---|
+| in-process A/B, eager b32 ms/step (mean of 20; blocks on / off / on / off), 4 processes: unpinned; `taskset` NUMA node 0; node 1; `TT_METAL_NUMA_BASED_AFFINITY=1` | 3.134 / 3.064; 3.196 / 2.963; 3.120 / 2.987; 2.951 / 2.958 | **3.100 / 3.062; 3.110 / 2.949; 3.182 / 2.935; 2.891 / 2.832** | on - off per process -0.018 / -0.050 / +0.005 / -0.093 ms: **equal within the +-0.15 per-block spread**, `on` slightly faster (47 vs 49 ops per step since the A3 zero-fill removed the two FILL dispatches); NUMA placement of the main thread irrelevant (devices 0-3 on node 0, 4-7 on node 1) |
+| in-process A/B, eager b1 ms/step (indexed EGP gate\|up + 8x8 down vs legacy) | 2.705 / 2.604 | 2.787 / 2.547 | +0.012: equal |
+| where the eager wall is (b32, quiet box, either arm) | enqueue 2.72-2.99 + tail 0.21-0.23 | enqueue 2.61-2.90 + tail 0.21-0.31 | host-bound: the device (traced 0.788 ms) idles ~75 % of an eager step; cProfile: 49 `ttnn` op calls 2.28-2.50 ms (**47-51 us per op** on the 1x8 mesh, the nanobind dispatch to 8 CQs), Python outside the op calls 0.43-0.48 ms (attention `decode_forward` 0.08, `_decode_forward_batched` 0.07, the 2 `_build_matmul_config` getters 0.03, `decode_norm_applies` 0.03, ...) |
+| host zones of the 09-08 tracy captures (integrate i10 / i11), per call | `EnqueueProgram` 13.6 us x 49, op zone 1.50 us x 392, program hash 0.34 | 20.9 / 2.06 / 0.46 | uniformly 1.4-1.5x slower in the EGP capture for EVERY op incl. the attention ops (per-op host gaps: input-norm reshard 79.4 -> 155.6 us, `LayerNorm` 54.3 -> 96.2, sdpa 68.0 -> 90.6): a per-process host slowdown, not two ops |
+| host-load reproduction: the same probe with a concurrent 24-thread torch fp32 GEMM loop (no ttnn; the shape of a lane-B CPU reference next to a device lane, as during A4) | 5.227 / 5.817 (mins 3.31 / 5.09) | 3.364 / 4.385 (mins 3.15 / 3.18) | walls 3.4 -> 5.8 ms, single steps to 13.5 ms, main thread migrating CPUs 19 -> 44 -> 20 -> 16 at 0.9-3.8 GHz (`scaling_governor=powersave`), 5-6 ms of CPU per step instead of 3, cProfile 102-105 us per op (2x); the arm order decides which arm looks slow |
+| `test_layer0_device_perf.py -k "1x8 and decode"`, 4 processes alternating on / off / on / off, quiet box: eager ms/step (mean of 5) b1 / b32 | 2.786 / **3.234** then 2.788 / **4.337** | 2.544 / **2.932** then 2.681 / **3.110** | the SAME `off` arm moved 3.23 -> 4.34 ms in two consecutive processes 90 s apart (steps 3.20-3.28 vs 4.21-4.42) while its traced replay stayed 1.309 / 1.308 -> the 09-08 pair (3.21 vs 4.10) is one sample of this swing; `on` eager 2.93-3.11 is below the recorded 3.21 `off` value |
+| traced replay ms (same 4 runs), b1 / b32 blocking (non-blocking) | 0.376 (0.355) / 1.309 (1.273); 0.378 (0.355) / 1.308 (1.277) | 0.334 (0.313) / 0.789 (0.759); 0.339 (0.313) / 0.781 (0.759) | unchanged: `off` reproduces the phase-2 records (0.376-0.379 / 1.30-1.33) and `on` the A4 records (0.336 / 0.788) to the digit while the eager walls swing by 1.1 ms |
+| host-only | - | pre-commit clean on the new test | 10 device runs in E1, all rc 0, none timed out; every run started 42-60 C |
+
+Rule for eager walls on this box: compare arms only inside one process (`test_layer0_eager_host.py` or alternating blocks
+in one session) on a quiet host, and read the traced replay for anything below +-1 ms -- single eager runs from different
+processes are not comparable to better than ~+-1 ms at b32.
+
+#### Phase 3c stage P2: the packed multi-user prefill planned once per chunk (B1 / P2, 2026-09-09; `scratchpad/phase3c/P2/runs.txt`, copy under `results/phase3/p2_packed_prefill/`)
+
+Phase 3a's packed prefill (`SOLAR_OPEN_BATCHED_PREFILL=1`) was not slot independent because `_process_prefill_chunk` planned
+the expert-sorted MoE per 1024-token split from that split's own counts: in a 32 x 128 pass an expert could be hot (per-expert
+linear + K-concat down) in one split and cold (gathered bmm + scatter) in another, so a user's numerics depended on the split
+its slot fell into (`design/phase3/measurements.md` 2.1). Phase 3c (lane B, host-only worktree, python-only patch: `tt/experts/
+sorted_plan.py` NEW, `tt/packed_prefill.py` NEW, `tt/experts/prefill.py`, `tt/model.py`, `tt/model_config.py`, three tests + a new
+host test) marks a packed pass (`experts.prefill.packed_prefill_pass`, `batch_size > 1`) and plans its MoE ONCE per 4096-token
+chunk (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`): one transpose / gt / fp32 typecast of the chunk's routing, the per-split counts read
+after one queue drain, one host plan whose hot set is decided on the chunk-AVERAGE per-split counts (a function of the SET of
+users, not of their slots: `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT=average`; `max` = the union rule, layout dependent, the A/B arm) with
+the gather cap raised to fit every cold expert in every split, and ONE cold mask shared by the splits. Single-user prefills
+(`batch_size == 1`) never set the mark and run the phase-3b per-split ops byte for byte. Also delivered, default off: the design's
+v2 gather head (`SOLAR_OPEN_BATCHED_PREFILL_HEAD=gather`: norm + lm_head on the 32 gathered last-token rows, one readback per
+pass). Flag-off gates and the fix on the 1x8 mesh (cool box before every gate):
+
+| gate | phase 3a / 3b | phase 3c (P2) | verdict |
+|---|---:|---:|---|
+| host: `test_sorted_moe_chunk_plan.py` (16), `test_batched_prefill.py -k host` (12), the other host suites | - | 205 passed; pre-commit clean; `git apply --check` of the lane-B patch clean | - |
+| flag OFF: prefill component ladder (`test_decoder --test-modules=experts,mlp,decoder`, 128 / 1024 / 4096, paged + unpaged) | experts 0.9993737365593212 / 0.999370776079843 / 0.9993715743556028, mlp 0.9987083193438778 / 0.9990254164486191 / 0.9991570124846377, decoder unpaged 0.9960324299423666 / 0.9956107127084289 / 0.9965821120569854, paged 0.9961091675204277 / 0.9956797074744249 / 0.9965734437588849 (09-08 i6) | 12 passed, **identical to the digit** | the untouched single-user path |
+| flag OFF and flag ON: teacher-forced b1 | 0.9258 (237/256) / 0.9558 / 0.9234 / 0.98089 / 0.99162 / KL 0.02996 | **BIT-IDENTICAL in both arms** (batch 1 never packs); decode 26.2 / 25.1 ms/step | - |
+| flag ON: teacher-forced b32 = ONE 32 x 128 pass with the per-chunk plan | phase-3a packed row 0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 / 0.0304, slot copies 1792 / 1792 | **0.9336 (239/256) / 0.9690 (of 226) / 0.9180 / 0.98195 (min 0.77667) / 0.99266 (min 0.87379) / KL 0.03039 (max 0.78609)**, slot copies 1792 / 1792 (logit PCC min 0.99998); decode 36.0 ms/step | reproduces the phase-3a packed row to the digit (four identical splits -> the chunk-average plan equals the per-split plan); every floor holds |
+| flag ON: `test_layer0_batched_prefill.py -k b16_s128_dup` (T = 2048 = two 1024-token splits, users 8..15 = copies of 0..7 in the OTHER split) | phase 3a: copies in different splits differ (an expert hot in one split, cold in the other) | plan `per_chunk True, n_splits 2, cap 128 (= cost cap), hot 14, promoted 0, per_split_hot (14, 14)`: **all 8 copies bit-identical** in attention (row PCC min 1.000000 / 0.999998), MoE (0.999998-0.999999) and the whole layer (0.999999-1.000000); packed vs per-user attention row min 0.996877, MoE 0.999275, decoder 0.987171 (user 1's row, the date-edge floor below), vs HF decoder packed 0.99923 / per-user 0.99936, K/V 0.999918 / 0.999843 | the layer-level proof of the per-chunk plan |
+| flag ON: `test_multi_user_consistency.py -k 1x8` (one 32 x 128 pass per prefill; the per-chunk assertion `n_splits 4` passed) | phase 3a: rotated slots PCC min 0.91-0.94, 34-38 / 768 top-1 flips; fillers of one prompt in different splits 24-33 / 720 | A1 vs A2 same slots 0 / 768 (PCC min 0.99996); **rotated slots PCC min 0.97903 mean 0.99923, 9 / 768 flips** (margins <= 0.375; floors 0.97 / <= 15 hold); C1 vs C2 fillers same slots 0 / 744; **fillers of one prompt in DIFFERENT slots PCC min 0.99999, 0 / 720 flips**; lone prompt (prompt 0 alone in slot 7 among 31 fillers) PCC min 0.97326 mean 0.99457, **2 / 24 flips (allowed 1) -> the gate is RED** | slot independence within one pass is exact; what remains is the co-batch dependence of hot / cold (the SET of users decides which accumulation a token takes), inherent to the sorted MoE and not removable by any per-chunk plan -> **`SOLAR_OPEN_BATCHED_PREFILL` stays default 0** |
+| flag ON: `test_batched_prefill.py -k "1x8 and b8_s128 and not x2"` (one split, legacy plan cap 128 hot 15) | phase 3a floors PCC >= 0.9 / KL <= 1.0 / mean <= 0.25 | PASSED: prefill PCC min 0.96946 mean 0.98035, KL max 0.6781 mean 0.1703, top-1 4/8 (0 decisive), decode step 4 PCC min 0.99244 | today's tokens (see the date note) |
+| flag ON: `-k b32_s128` (per-chunk plan cap 160 = cost cap, hot 14, promoted 0, per_split_hot (12, 12, 13, 13)) | phase 3a: 0.97289 / 0.98195, KL max 0.5234 mean 0.1017, 25/32, 14/14 decisive | logged prefill PCC min 0.97184 mean 0.98198, KL max 1.2967 (floor 1.0) mean 0.1801, top-1 24/32, decisive 16 of which 15 equal, then the P2 chain was stopped (the orchestrator's cut-off) -> likely red on 2026-09-09's tokens; not separable from the date effect without a same-day `SOLAR_OPEN_SORTED_MOE_PLAN=split` run | open (backlog) |
+| two edge floors of the chat-templated tests | 09-08: `test_layer0_batched_prefill.py` b4_s128 decoder row PCC min 0.996069; `test_batched_prefill.py -k b2_s128` KL mean 0.0954 | 09-09: 0.987211 (floor 0.99) and 0.2561 (floor 0.25), **reproduced EXACTLY on a clean de5c31bb3dc worktree** (no lane A, no lane B) | not a regression: the Solar chat template injects `strftime_now('%Y-%m-%d')`, so every templated-prompt test gets other token ids each day (this also explains A4's real-weight digit shift and A1's 93-vs-81 demo tokens; the teacher-forced test pins the date). The floors are not re-baselined in phase 3c (tech-lead decision), see "Known limitations" |
+
+Not measured in P2 (the chain was cut): the packed demo TTFT (`packed_b32_128` at 1024 / 4096 tokens per pass), the
+`SOLAR_OPEN_SORTED_MOE_DEBUG=1` / `CHUNK_HOT=max` / `PLAN=split` consistency arms, the gather head, `b4_s1024` /
+`b8_s128_x2`. The packed demo TTFT was measured by the R1 regression below.
+
+#### Phase 3c stage R1: regression of the final uncommitted tree (2026-09-09; `scratchpad/phase3c/R1/runs.txt`, copy under `results/phase3/r1_regression/`)
+
+Everything with the shipped defaults (no env overrides), one device process at a time, cool box (< 60 C) before every
+correctness gate and demo, `timeout` on every run. Comparison rule: a metric of an untouched path must reproduce its recorded
+digits exactly; the moved metrics must move by what the lever's op-level numbers predict.
+
+| gate | reference | R1 | verdict |
+|---|---:|---:|---|
+| host: py_compile 17 files; host suites; pre-commit; identifier sweep | phase 3b: 190 passed | **py_compile 17 OK; 246 passed; pre-commit rc 0 on 24 files; 2 stray scratch-path comments removed** | - |
+| `test_router.py -k 1x8` (26 cases: fused / ops x fp32 / bf16 logits, T 1..4096, strong bias, trace replay, route_indexed) | phase 3a a8 (= phase 2) | **26 passed, IDENTICAL** (80 measured lines) | - |
+| `test_shared_expert.py -k 1x8` (bfp8 / bf16 x T 1 / 32 / 128 / 1024) | phase 2 u_shared | **8 passed, IDENTICAL** (17 lines) | - |
+| `test_decoder -k "1x8"` x 7 components (rms_norm, attention, router, experts, shared_expert, mlp, decoder), decode b1 / b32 / b16 + prefill 128 / 1024 / 4096, paged + unpaged, pos0 + pos70000 | phase 3b i1 / i6 (experts, mlp, decoder), phase 2 u_decoder_pos0 / pos70000 (the other four) | **24 passed (12 decode + 12 prefill, 108 (case, component) cells)**: 91 cells identical to their module-set-matched reference (router / shared_expert / rms_norm / experts / mlp of every decode case and of prefill 128 = the phase-2 all-7 digits; attention of the paged pos0 cases = the final phase-2 attention digits; the decoder in all 24 cases = the phase-3b digits, e.g. decode 0.9934919793524272 / 0.9972899827245919 / 0.9971322602161867, prefill 0.9960324299423666 / 0.9956107127084289 / 0.9965821120569854); the 8 experts / mlp prefill 1024 / 4096 cells had no all-7 reference after the phase-3a prefill levers and are ATTRIBUTED by r17: with the two levers set to their phase-2 forms (`SOLAR_OPEN_PREFILL_EXPERT_MM=phase2 SOLAR_OPEN_SORTED_SCATTER_FP32=0`) the phase-3c tree reproduces every phase-2 all-7 prefill digit exactly (18 / 18 cells: experts 0.9993694515998423 / 0.9993692925331771, mlp 0.9990906861182238 / 0.9993000991331664, decoder 0.9956096168159887 / 0.9965809089774845 at 1024 / 4096, pos0 and pos70000), so nothing but those two documented levers moved them; the 9 attention decode cells (6 unpaged + 3 paged pos70000) have no post-flip all-7 reference and are recorded here as the first ones (indirect proof: the decoder, which contains the attention math, is identical in all 24 cases). See the note on `--test-modules` sets below the table | - |
+| `test_experts_shared_expert_hook -k 1x8` (decode b1 / b32, prefill 128 / 1024) | zeros hook exact, constant hook shift 8.1028 / 8.1039 / 8.1456 / 8.1452 (expected 8.0) | **4 passed, IDENTICAL**: zeros exact (max diff 0.0), shifts 8.1028 / 8.1039 / 8.1456 / 8.1452 | - |
+| `test_experts_skewed_routing.py -k 1x8` (prefill 1024 / 4096) | 0.99937 / 0.99942 | **2 passed: 0.99930 / 0.99944** (r06); 0.99935 / 0.99942 on the same tree again (x02) and 0.99935 / 0.99955 with the clean-HEAD python on the same binary (x01): the test's `hidden = torch.randn(...)` is unseeded, so its digits scatter ~1e-4 run to run (phase 2 0.99935 / 0.99944, phase 3b 0.99937 / 0.99942) -- a band, not a to-the-digit reference; plan cap 96 / hot 3 identical in every run | - |
+| `test_layer0_real_weights.py -k 1x8` (8 cases) | A4 r1 (same date) | **8 passed, IDENTICAL** to A4 r1 (mlp 0.999701995998598 / 0.99963109702278 / 0.9998468904413703 / 0.999900783306261; decoder 0.9986528843052397 / 0.9988627670526441 / 0.999965545788691 / 0.9998534573128649) | - |
+| `test_model -k 1x8` (prefill_b1_s128, decode_b32_s1, decode_b1_s1) | 0.9905245287653718 / 0.9990152033091141 / 0.9993492912939659 (i4) | **3 passed, IDENTICAL** (0.9905245287653718 / 0.9990152033091141 / 0.9993492912939659) | - |
+| `test_fused_shared_expert.py -k 1x8` (decode b1 / b8 / b32, prefill 128 / 1024 / 4096) | A4 f1 (= i3) | **6 passed, IDENTICAL** (vs HF unfused 0.9989568873533895 / 0.9989831037970425 / 0.9985680471997799 / 0.9986282726899116 / 0.9991554570239713 / 0.9993088197635935; fused 0.9982657901437767 / 0.9982466751420142 / 0.9977978850330302 / 0.9989392602842626 / 0.9992169043876216 / 0.9992761972703403) | - |
+| `test_multi_user_consistency.py -k 1x8`, default env | phase 3a cool box: 0 / 768, 0 / 768, 0 / 24, 0 / 744, 0 / 720; PCC min >= 0.99993 | **1 passed: 0 / 768, 0 / 768, 0 / 24, 0 / 744, 0 / 720, PCC min 0.99994**; decode 33.2 ms/step (phase 3a 51.9) | - |
+| teacher-forced b1 / b32 | A4 t2 / t1 (bit-identical since phase 2) | **bit-identical**: b1 0.9258 / 0.9558 / 0.9234 / 0.98089 / 0.99162 / 0.02996 (decode 25.5 ms/step); b32 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.03119 (decode 37.5 ms/step; phase 3b 41.0) | - |
+| demo `prefill_128` (b1) / `batch32` | A4 d4 / d1b-d3 | b1 **16.11** ms/step avg (it2-22 16.0, plateau 16.1, last-50 16.2; TTFT 159.1); b32 **37.81** (32.3 / 37.7 / 37.5; **846 tok/s**; TTFT 148.1 / 2443.0 / 4737.9 first / mean / last) | - |
+| `test_layer0_device_perf.py -k 1x8` (decode b1 / b32 traced + eager, prefill 128 / 1024 / 8192 eager) | A4 l4 (decode), phase 3a b0 (prefill) | traced b1 **0.335 (0.313)** / b32 **0.792 (0.758)** ms blocking (non-blocking); eager b1 2.78 / b32 4.23; prefill eager 3.92 / 8.14 / 80.7 ms (8192: host noise, see the sweep reading) | - |
+| packed prefill demo `packed_b32_128` at 1024 / 4096 tokens per pass (opt-in) | phase 3a cool box (see the table above) | 1024 (four 8 x 128 passes): TTFT **824.6 / 1535.2 / 2228.4** ms first / mean / last, decode avg 37.32, plateau 37.97, 857 tok/s; 4096 (one 32 x 128 pass): TTFT **1760** ms for every user, decode avg 36.88, plateau 37.54, 868 tok/s; vs the sequential default 147.7 / 2436 / 4725 (r16: 37.67 avg, plateau 37.79, 850 tok/s). Iteration 0 after a packed prefill is 1.21-1.23 s (decode trace capture; 24-28 ms in the sequential path where the warm-up captures it) | - |
+| subset sweep `_p3c` (6 cells) | `_p3b` cells | see the `_p3c` sweep section below | - |
+
+Verdict: **green**. 15 ladder runs, 6 sweep cells, 2 packed demos and 3 attribution runs, all on the first attempt, 0 timeouts, 0 board resets. Every metric of an untouched path reproduces its recorded digits exactly (the one apparent move, the skewed-routing PCC, is the test's unseeded input, see the row), and the moved metrics move by what the levers' op-level numbers predict: b32 -2.4 ms/step (40.3 -> 37.8; -50 us of op time per layer at the b32 union) from the kernel zero-fill, b1 -0.2 ms/step (16.1 -> 15.9, at the edge of the run-to-run spread) from the down grid, TTFT unchanged on the default path and 4.7 s -> 2.2 s / 1.8 s last-user on the opt-in packed path. Not in this tree's defaults: the packed prefill (P2: the lone-prompt consistency floor is a co-batch property of the hot / cold split), the 3.8 us compact FILL of the b1 indexed down (spec 3.8). Test digits that embed the date (chat template `strftime_now`) are reproducible only within a day; the two edge floors that fail on 2026-09-09's token ids on the clean HEAD too are listed in the P2 subsection.
+
+### ISL/OSL x batch sweep, phase 3c tree, full (2026-09-09, de5c31bb3dc + the uncommitted phase-3c tree, tag `_p3cfull`)
+
+The full 54-cell sweep on the final phase-3c tree with the shipped defaults (same harness and settings as the `_p3b` sweep below:
+`tests/sweep/run_sweep.sh`, TMO 4000 s, cooldown gate 78 C / 120 s, cool start < 60 C per batch, KV pool `min(64K, 512K // B)` tokens
+per user, page-table seed 1234, `reasoning_effort=low`, greedy, exactly OSL steps, traced decode). **54 / 54 cells ok** on the first
+attempt of every batch: 51 cells in the main pass (95 min of pytest, 07:19-08:59 UTC), the three cells the 512K rule skips (B16 32768/128,
+B32 16384/128 and 32768/128) filled with `SOLAR_OPEN_REGRESSION_KV_TOKENS=1056000 SOLAR_OPEN_KV_BUDGET_GIB=13.5
+SOLAR_OPEN_REGRESSION_POW2_CONTEXT=0` (47 min). 0 first-token failures, 0 degenerate users, QA keyword accuracy 1.00 in the 12 ISL-128
+cells; the AI clock read 1350 MHz after every prefill. Three cells of the main pass ran with board 1 at 83-89 C (the in-batch cooldown gate
+plateaus at ~83 C on this open-mesh box) and showed the thermal signature -- a wider step distribution (p99 - p50 of 2-4 ms) and a step
+6-9 % SLOWER than `_p3b` although every other cell of their rows was 3-12 % faster: B16 16384/128 (34.3 ms), B32 8192/128 (33.0) and
+B32 8192/1024 (35.3). They were re-measured after a cool start (the driver's < 60 C gate) and the tables carry the re-measurements: 30.4
+(p99 30.8; 1.07x), 29.3 (p99 29.5; 1.07x) and 33.7 (p99 35.5; 0.96x -- this cell measured 30.5 / 33.7 / 35.3 ms in three runs today at
+82-83 C before decode vs 32.2 in `_p3b`: it sits at the thermal edge, and its spread, not the tree, decides its digit). Versus `_p3b`:
+B1 1.00-1.05x (the A1 down grid is -0.24 ms/step, inside the cell-to-cell scatter), B2-B16 1.05-1.12x and B32 1.02-1.08x from the
+kernel zero-fill (-50 us of op time per layer at the b32 union; the batched down runs from 2 users on, hence the step from B1 to B2).
+TTFT is one eager prefill per cell (host-load and temperature sensitive, +-15 %) and no phase-3c lever touches the default sequential
+path. Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p3cfull.jsonl` (57 rows incl. the 3 re-measurements;
+`report.py` and the tables take the latest row per cell; `logs_p3cfull/REPORT_p3cfull.md`); copies with the driver ledgers under
+`/home/eslim/experiments/solar/results/sweep_p3c/`.
+
+Decode step ms (mean, steady state):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 15.8 | 15.8 | 16.0 | 16.0 | 16.5 | 17.3 | 17.3 | 17.6 | 19.6 |
+| 2 | 20.5 | 20.6 | 19.5 | 19.6 | 20.0 | 20.5 | 20.6 | 21.6 | 23.6 |
+| 4 | 23.2 | 23.1 | 19.7 | 20.3 | 20.5 | 21.6 | 21.6 | 22.8 | 26.4 |
+| 8 | 26.4 | 26.4 | 20.8 | 20.7 | 21.1 | 22.3 | 22.5 | 24.9 | 34.0 |
+| 16 | 31.3 | 30.7 | 20.8 | 21.4 | 23.0 | 24.6 | 25.0 | 30.4 | 46.8 |
+| 32 | 37.3 | 37.6 | 21.7 | 22.6 | 25.3 | 29.3 | 33.7 | 51.4 | 70.5 |
+
+TTFT mean over users, ms (= per-user prefill x (B+1)/2):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 152 | 157 | 402 | 1205 | 1559 | 4417 | 3026 | 6234 | 13174 |
+| 2 | 229 | 234 | 616 | 1110 | 2158 | 4471 | 4376 | 11675 | 19605 |
+| 4 | 373 | 376 | 1352 | 1845 | 3778 | 8231 | 10046 | 21250 | 33287 |
+| 8 | 670 | 676 | 1872 | 3382 | 6663 | 12966 | 12703 | 28154 | 73438 |
+| 16 | 1261 | 1263 | 3416 | 6385 | 12287 | 30479 | 27691 | 60976 | 165532 |
+| 32 | 2435 | 2464 | 6676 | 11984 | 23535 | 53184 | 54692 | 149666 | 332413 |
+
+TTFT last user, ms (whole batch admitted = B x per-user prefill):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 152 | 157 | 402 | 1205 | 1559 | 4417 | 3026 | 6234 | 13174 |
+| 2 | 305 | 312 | 821 | 1480 | 2877 | 5961 | 5835 | 15566 | 26140 |
+| 4 | 597 | 602 | 2163 | 2952 | 6045 | 13169 | 16074 | 34000 | 53259 |
+| 8 | 1190 | 1203 | 3328 | 6012 | 11846 | 23050 | 22582 | 50051 | 130556 |
+| 16 | 2374 | 2377 | 6431 | 12018 | 23129 | 57372 | 52125 | 114777 | 311590 |
+| 32 | 4723 | 4780 | 12947 | 23242 | 45643 | 103144 | 106070 | 290261 | 644680 |
+
+Aggregate decode tok/s:
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 63 | 63 | 62 | 63 | 61 | 58 | 58 | 57 | 51 |
+| 2 | 97 | 97 | 102 | 102 | 100 | 98 | 97 | 93 | 85 |
+| 4 | 172 | 173 | 203 | 197 | 195 | 185 | 185 | 176 | 152 |
+| 8 | 303 | 303 | 386 | 387 | 380 | 359 | 356 | 321 | 235 |
+| 16 | 511 | 522 | 771 | 748 | 696 | 650 | 640 | 526 | 342 |
+| 32 | 858 | 850 | 1476 | 1414 | 1267 | 1093 | 950 | 623 | 454 |
+
+Decode speed-up vs the phase-3b sweep (`_p3b` ms / `_p3cfull` ms):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1.00x | 1.02x | 1.01x | 1.02x | 1.02x | 1.00x | 1.00x | 1.05x | 1.03x |
+| 2 | 1.12x | 1.11x | 1.09x | 1.11x | 1.11x | 1.11x | 1.11x | 1.10x | 1.08x |
+| 4 | 1.09x | 1.10x | 1.12x | 1.07x | 1.11x | 1.09x | 1.09x | 1.09x | 1.03x |
+| 8 | 1.08x | 1.07x | 1.08x | 1.10x | 1.11x | 1.11x | 1.11x | 1.09x | 1.03x |
+| 16 | 1.05x | 1.07x | 1.12x | 1.12x | 1.08x | 1.09x | 1.07x | 1.06x | 1.06x |
+| 32 | 1.03x | 1.04x | 1.08x | 1.07x | 1.06x | 1.07x | 0.96x | 1.02x | 1.06x |
+
+### ISL/OSL x batch sweep, phase 3c tree, subset (2026-09-09, de5c31bb3dc + the uncommitted phase-3c tree, tag `_p3c`)
+
+The R1 regression re-ran six cells of the sweep on the final phase-3c tree with the shipped defaults (`LOG_DIR=generated/
+solar_open_multi_user_regression/logs_p3c TAG=_p3c TMO=4000 BATCHES="1 32" PAIRS="128:128,128:1024,8192:1024"
+tests/sweep/run_sweep.sh`; same harness and settings as the `_p3b` sweep below: cooldown gate 78 C / 120 s, cool start < 60 C,
+KV pool `min(64K, 512K // B)` tokens per user, page-table seed 1234, `reasoning_effort=low`, greedy, exactly OSL steps, traced
+decode). All 6 cells ok on the first attempt (8 min of pytest, 06:54-07:02 UTC; boards 67-78 C before prefill, 67-83 C before decode, no cell below 1350 MHz after its prefill; QA keyword accuracy 1.00 in the four ISL-128 cells, 0 first-token failures, 0 degenerate users). Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p3c.jsonl` (6 rows;
+`logs_p3c/REPORT_p3c.md`), copies under `/home/eslim/experiments/solar/results/phase3/r1_regression/`; comparison script
+`scratchpad/phase3c/R1/sweep_cells.py` (every recorded column, `_p3b` -> `_p3c`).
+
+| B | ISL/OSL | decode ms/step mean (p99), `_p3b` | `_p3c` | speed-up | tok/s aggregate | prefill per user ms | TTFT mean / last user ms | aiclk MHz / board C before decode (`_p3c`) | status |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 128/128 | 15.74 (16.20) | **16.12** (16.79) | 0.98x | 64 -> **62** | 161 -> 165 | 161 / 161 -> 165 / 165 | 1350 / 67 | ok |
+| 1 | 128/1024 | 16.12 (16.54) | **16.07** (16.39) | 1.00x | 62 -> **62** | 168 -> 159 | 168 / 168 -> 159 / 159 | 1350 / 67 | ok |
+| 1 | 8192/1024 | 17.23 (17.64) | **17.17** (17.51) | 1.00x | 58 -> **58** | 4191 -> 3745 | 4191 / 4191 -> 3745 / 3745 | 1350 / 71 | ok |
+| 32 | 128/128 | 38.31 (40.98) | **36.90** (39.41) | 1.04x | 835 -> **867** | 148 -> 148 | 2443 / 4738 -> 2440 / 4732 | 1350 / 71 | ok |
+| 32 | 128/1024 | 39.03 (41.60) | **37.68** (39.88) | 1.04x | 820 -> **849** | 148 -> 148 | 2449 / 4749 -> 2450 / 4752 | 1350 / 72 | ok |
+| 32 | 8192/1024 | 32.20 (32.71) | **30.53** (30.98) | 1.05x | 994 -> **1048** | 3695 -> 3139 | 60965 / 118235 -> 51798 / 100457 | 1350 / 83 | ok |
+
+Reading the six cells: the batch-32 decode step is 1.04-1.05x faster than `_p3b` in every cell (128/128 38.31 -> 36.90 ms, 128/1024 39.03 -> 37.68, 8192/1024 32.20 -> 30.50: the kernel zero-fill, -50 us of op time per layer at the b32 union, x48 = -2.4 ms of kernel per step; the sweep's 32 distinct prompts widen the union beyond the demo's, so the absolute gain per step is ~1.4-1.7 ms here vs 2.4 in the demo's plateau). Batch 1 is unchanged within the traced-decode noise (15.74 -> 16.12, 16.12 -> 16.12, 17.23 -> 17.23 ms: the A1 lever is -4.9 us of kernel per layer = -0.24 ms/step, below the +-0.3 ms cell-to-cell scatter of a single 128-step cell). TTFT is one eager prefill per cell and not a phase-3c lever: the 8192/1024 prefill measured 4191 -> 3745 ms per user at batch 1 and 3139 ms per user at batch 32 (host-load and temperature scatter, +-15 %), which also settles the 80.7 ms eager per-layer prefill_8192 reading of `test_layer0_device_perf.py` in R1 (phase 3a 56.3): host noise of that eager probe, not a prefill regression (the same tree prefills 8K tokens 11 % faster than `_p3b` in the sweep). Full matrices for every ISL/OSL pair are the `_p3b` sweep below.
 
 ### ISL/OSL x batch sweep, phase 3b tree (2026-09-08, 993ccc02c22 + the EGP tree, tag `_p3b`)
 

@@ -184,15 +184,24 @@ class ProgramConfig:
     # been measured; the threshold below is conservative.
     decode_down_cores_batched: tuple[int, int] | None = None
     decode_down_batched_min_tokens: int = 16
+    # Optional grid of the INDEXED single-user down (``MoEOptions.indexed_decode``, decode._decode_forward_indexed,
+    # ``get_decode_down_config(..., indexed=True)``): its A is the compact ``[1, k, 1, Ip]`` gathered by the top-k ids
+    # and both operands are sparse (k small reads per core, no 128-slot validity scan) -- a different kernel regime
+    # from the expanded ``[1, E, 32, Ip]`` A of the single-user scan path, so the best grid differs (Solar-Open on
+    # P150, k = 8: 8x8 x 2 tiles 15.9 us vs 8x4 x 4 tiles 24.6 us for the indexed down, while the scan path at nnz 8
+    # is faster on 8x4 x 4 tiles). None = the single-user ``decode_down_cores`` values.
+    decode_down_indexed_cores: tuple[int, int] | None = None
     # Expert-group parallelism (EGP, phase 3b) of the decode sparse_matmuls: ``ttnn.sparse_matmul(expert_groups=G)``
     # splits the grid into G core groups that each take every G-th active expert concurrently (the activation tile is
     # multicast once and kept resident in L1, every core decides each expert's validity locally, per-output-tile math
     # unchanged -> bit-identical to the legacy kernels for the same inputs). None = the legacy kernels. With G the
     # grid rule of _build_matmul_config becomes ``G x ceil(Nt / per_core_N) == cores`` (the first cores of the grid in
     # row-major order must fill an exact rectangle, still >= 2 cores). One value per decode sparse_matmul family:
-    # the fused gate|up (every decode path), the single-user down (the b1 indexed / scan paths) and the batched down.
+    # the fused gate|up (every decode path), the single-user down (the scan path at one user; also the indexed down
+    # unless decode_down_indexed_cores is set), the indexed compact-A down and the batched down.
     decode_gate_up_expert_groups: int | None = None
     decode_down_expert_groups: int | None = None
+    decode_down_indexed_expert_groups: int | None = None
     decode_down_batched_expert_groups: int | None = None
 
     # Core grid sizes for prefill
@@ -204,6 +213,7 @@ class ProgramConfig:
     # (8x4) it is 4.
     decode_gate_up_subblock_w: int = 1
     decode_down_subblock_w: int = 1
+    decode_down_indexed_subblock_w: int = 1
     decode_down_batched_subblock_w: int = 1
     prefill_gate_up_subblock_w: int = 1
     prefill_down_subblock_w: int = 1
@@ -266,12 +276,19 @@ class ProgramConfig:
         self._validate_cores("decode_down_cores", self.decode_down_cores)
         if self.decode_down_cores_batched is not None:
             self._validate_cores("decode_down_cores_batched", self.decode_down_cores_batched)
+        if self.decode_down_indexed_cores is not None:
+            self._validate_cores("decode_down_indexed_cores", self.decode_down_indexed_cores)
         if self.dense_down_cores is not None:
             self._validate_cores("dense_down_cores", self.dense_down_cores)
         self._validate_cores("prefill_gate_up_cores", self.prefill_gate_up_cores)
         self._validate_cores("prefill_down_cores", self.prefill_down_cores)
 
-        for name in ("decode_gate_up_expert_groups", "decode_down_expert_groups", "decode_down_batched_expert_groups"):
+        for name in (
+            "decode_gate_up_expert_groups",
+            "decode_down_expert_groups",
+            "decode_down_indexed_expert_groups",
+            "decode_down_batched_expert_groups",
+        ):
             groups = getattr(self, name)
             if groups is not None and (isinstance(groups, bool) or not isinstance(groups, int) or groups < 1):
                 raise ValueError(f"{name} must be None or a positive int (expert groups), got {groups!r}")
@@ -464,11 +481,22 @@ class ProgramConfig:
             groups,
         )
 
-    def get_decode_down_config(self, m: int, n: int, k: int = None) -> SparseMatmulConfig:
+    def get_decode_down_config(self, m: int, n: int, k: int = None, indexed: bool = False) -> SparseMatmulConfig:
         """Program config + expert groups of the decode down sparse_matmul (m = REAL tokens in the step: the batched
-        grid / groups from decode_down_batched_min_tokens tokens on, the single-user ones below)."""
+        grid / groups from decode_down_batched_min_tokens tokens on, the single-user ones below). ``indexed`` = the
+        compact-A indexed single-user down (m must be 1): the ``decode_down_indexed_*`` values when
+        ``decode_down_indexed_cores`` is set, else the single-user ones."""
         cores, subblock_w, groups = self.decode_down_cores, self.decode_down_subblock_w, self.decode_down_expert_groups
-        if self.decode_down_cores_batched is not None and m >= self.decode_down_batched_min_tokens:
+        if indexed:
+            if m != 1:
+                raise ValueError(f"the indexed decode down serves exactly one token per step, got m={m}")
+            if self.decode_down_indexed_cores is not None:
+                cores, subblock_w, groups = (
+                    self.decode_down_indexed_cores,
+                    self.decode_down_indexed_subblock_w,
+                    self.decode_down_indexed_expert_groups,
+                )
+        elif self.decode_down_cores_batched is not None and m >= self.decode_down_batched_min_tokens:
             cores, subblock_w, groups = (
                 self.decode_down_cores_batched,
                 self.decode_down_batched_subblock_w,

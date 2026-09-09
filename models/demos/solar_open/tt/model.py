@@ -15,11 +15,14 @@ from models.common.utility_functions import nearest_32
 from models.demos.solar_open.config import MeshConfig, Mode, ModeConfig
 from models.demos.solar_open.utils.general_utils import get_cache_file_name, get_default_num_links, resolve_rope_theta
 from models.demos.solar_open.utils.substate import substate
+from models.tt_transformers.tt.common import Mode as GeneratorMode
 from models.tt_transformers.tt.common import copy_host_to_device, rope_scaling_model_factory
 from models.tt_transformers.tt.rope import RotarySetup
 
+from .experts import prefill as experts_prefill
 from .layer import DecoderLayer
-from .model_config import BatchedPrefillOptions, plan_batched_prefill
+from .model_config import BATCHED_PREFILL_BATCH_SIZES, BatchedPrefillOptions, plan_batched_prefill
+from .packed_prefill import GATHER_HEAD_ROWS, gather_head_rows
 from .rms_norm import RMSNorm
 
 
@@ -667,22 +670,135 @@ class Model:
                 self.rope_setup.sin_matrix_prefill[:, :, :seq_len, :],
             ]
 
-        # Forward through layers and head (shared with decode)
-        logits = self._forward_layers_and_head(
-            hidden_states=x,
-            rope_mats=rope_mats,
-            current_pos=None,  # No current_pos for prefill
-            page_table=page_table,
-            kv_cache=kv_cache,
-            get_last_token=get_last_token,
-            is_decode=False,
-            user_id=user_id,
-            batch_size=batch_size,
-            skip_lm_head=skip_lm_head,
-            page_tables_per_layer=page_tables_per_layer,
-        )
+        # Forward through layers and head (shared with decode). A packed multi-user pass (batch_size > 1, tokens of B
+        # users concatenated along the sequence) is marked for the expert-sorted MoE planner, which then plans its
+        # hot / cold sets once per 4096-token chunk instead of per 1024-token split (phase 3c: a user's numerics must
+        # not depend on the split its slot falls into; experts/prefill.py packed_prefill_pass, SOLAR_OPEN_SORTED_MOE_PLAN).
+        # Host state only: a single-user prefill (batch_size 1) runs exactly the phase-3b ops.
+        with experts_prefill.packed_prefill_pass(batch_size > 1):
+            logits = self._forward_layers_and_head(
+                hidden_states=x,
+                rope_mats=rope_mats,
+                current_pos=None,  # No current_pos for prefill
+                page_table=page_table,
+                kv_cache=kv_cache,
+                get_last_token=get_last_token,
+                is_decode=False,
+                user_id=user_id,
+                batch_size=batch_size,
+                skip_lm_head=skip_lm_head,
+                page_tables_per_layer=page_tables_per_layer,
+            )
 
         return logits
+
+    # -----------------------------------------------------------------------------------------------------------------
+    # Phase 3c: packed multi-user prefill pass with the GATHER head (design_packed_prefill.md 2.6 item 1). Opt-in through
+    # BatchedPrefillOptions.head == "gather" (SOLAR_OPEN_BATCHED_PREFILL_HEAD); the default "full" head is the
+    # tt_transformers batched path (norm + lm_head over every row of the pass, one 32-row tile read back per user).
+
+    def packed_prefill_pass(self, tokens, prompt_lens, page_table, kv_cache, seq_len, padded_batch):
+        """One packed prefill pass of ``B = tokens.shape[0]`` users re-slotted to device rows ``0..B-1`` with the gather
+        head; returns their last-token logits ``[B, 1, vocab]`` (fp32, host).
+
+        Mirrors the tt_transformers batched path up to the head (``Generator._prefill_forward_text_impl`` /
+        ``prefill_forward_single_user_text``): ``tokens [B, L]`` are right-padded with 0 to ``seq_len`` (the users'
+        shared padded length) into ``[padded_batch, seq_len]`` rows (pad users: zero tokens), ``page_table [B, blocks]``
+        (the users' OWN rows) is cut to the blocks of ``seq_len`` and padded with -1 rows to ``padded_batch`` (the
+        kernel's inert sentinel), ``prepare_inputs_prefill`` embeds the flattened ``[1, 1, 1, T]`` tokens and hands
+        over the S-row RoPE slice, and ``ttnn_prefill_forward(batch_size=padded_batch, skip_lm_head=True)`` runs the
+        layers (per-user causal attention and paged KV fill, token-major MoE planned once per chunk). Then, instead of
+        norm + lm_head over all ``T = padded_batch x seq_len`` rows and one 12.6 MB tile readback per user, the
+        ``B`` last-token rows ``u * seq_len + len_u - 1`` are gathered (``ttnn.embedding``, the row gather the sorted
+        MoE uses) into ONE ``[1, 1, 32, H]`` tile row -- the shapes of the single-user head, so norm + lm_head run
+        the single-user programs -- and the host reads ``32 x vocab`` once (``packed_prefill.gather_head_rows``).
+        Eager only (the T-token MoE is host planned); on-device sampling is not part of this contract (host argmax).
+        """
+        B = int(tokens.shape[0])
+        lens = [int(n) for n in prompt_lens]
+        seq_len, padded_batch = int(seq_len), int(padded_batch)
+        if len(lens) != B:
+            raise ValueError(f"prompt_lens has {len(lens)} entries for {B} users")
+        if not 1 <= B <= padded_batch or padded_batch not in BATCHED_PREFILL_BATCH_SIZES:
+            raise ValueError(
+                f"{B} users do not fit a device batch of {padded_batch} (supported {BATCHED_PREFILL_BATCH_SIZES})"
+            )
+        if padded_batch > GATHER_HEAD_ROWS:
+            raise ValueError(f"the gather head serves at most {GATHER_HEAD_ROWS} users per pass, got {padded_batch}")
+        if kv_cache is None or page_table is None:
+            raise ValueError("the packed prefill pass needs the paged KV cache and the users' page-table rows")
+        if tokens.shape[1] < max(lens):
+            raise ValueError(f"tokens has {tokens.shape[1]} columns for prompt lengths up to {max(lens)}")
+        rows = gather_head_rows(lens, seq_len)  # validates 0 < len_u <= seq_len
+        block_size = int(kv_cache[0][0].shape[2])  # [blocks, kv_heads, block_size, head_dim] per layer
+        num_blocks = -(-seq_len // block_size)
+        if int(page_table.shape[1]) < num_blocks:
+            raise ValueError(
+                f"page_table has {page_table.shape[1]} blocks per user, a {seq_len}-token pass needs {num_blocks}"
+            )
+        prefill_ids = torch.zeros(padded_batch, seq_len, dtype=torch.long)
+        for user, length in enumerate(lens):
+            prefill_ids[user, :length] = tokens[user, :length].to(torch.long)
+        pass_page_table = torch.full((padded_batch, num_blocks), -1, dtype=torch.int32)
+        pass_page_table[:B] = page_table[:, :num_blocks].to(torch.int32)
+        slots = list(range(padded_batch))
+        prefill_input, rot_mats_global, rot_mats_local, tt_page_table, *_ = self.prepare_inputs_prefill(
+            prefill_ids, page_table=pass_page_table, batch_size=padded_batch, user_id=slots
+        )
+        hidden = self.ttnn_prefill_forward(
+            prefill_input,
+            rot_mats_global=rot_mats_global,
+            rot_mats_local=rot_mats_local,
+            user_id=slots,
+            page_table=tt_page_table,
+            get_last_token=-1,
+            kv_cache=kv_cache,
+            batch_size=padded_batch,
+            skip_lm_head=True,
+        )  # [1, 1, T, H] bf16 residual after the last layer
+        tt_logits = self._gather_head(hidden, rows)  # [1, 1, 32, V / TP] bf16
+        host_logits = self._prefill_head_logits_to_host(tt_logits)  # [32, vocab] fp32
+        output = torch.zeros(B, 1, self.vocab_size)
+        output[:, 0] = host_logits[:B]
+        return output
+
+    def _gather_head(self, hidden, rows):
+        """``hidden`` ``[1, 1, T, H]`` bf16 (consumed) -> logits ``[1, 1, 32, V / TP]`` bf16 of the rows ``rows`` (32
+        indices into the T rows, ``gather_head_rows``): gather, final norm, lm_head -- the single-user head's ops."""
+        T, H = int(hidden.shape[-2]), int(hidden.shape[-1])
+        if len(rows) != GATHER_HEAD_ROWS or max(rows) >= T or min(rows) < 0:
+            raise ValueError(f"gather rows must be {GATHER_HEAD_ROWS} indices below T={T}, got {rows}")
+        # [1, 32] uint32 index row on device (the sorted MoE uploads its hot ids the same way)
+        idx = ttnn.from_torch(
+            torch.tensor([rows], dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh_device,
+        )
+        table = ttnn.reshape(hidden, (T, H))  # tile-aligned view: the embedding gathers rows of a [rows, H] table
+        gathered = ttnn.embedding(idx, table, layout=ttnn.TILE_LAYOUT)  # [1, 32, H] bf16
+        idx.deallocate(True)
+        table.deallocate(True)  # releases the residual (view)
+        x = ttnn.reshape(gathered, (1, 1, GATHER_HEAD_ROWS, H))
+        # Final norm and lm_head exactly as _forward_layers_and_head runs them on the single-user 32-row tile.
+        normed = self.norm(x)
+        x.deallocate(True)
+        logits = ttnn.matmul(normed, self.lm_head_weight, dtype=ttnn.bfloat16)
+        normed.deallocate(True)
+        self._prefill_sampling_active = False
+        return logits
+
+    def _prefill_head_logits_to_host(self, tt_logits):
+        """``[1, 1, 32, V / TP]`` device logits (consumed) -> ``[32, vocab]`` fp32 on the host: device untilize, one
+        readback, TP concat of the per-device shards (the tt_transformers batched path does this per user)."""
+        rm = ttnn.to_layout(tt_logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        tt_logits.deallocate(True)
+        host = rm.cpu()
+        rm.deallocate(True)
+        tp = self.mesh_config.get_config(Mode.PREFILL).tp
+        shards = ttnn.get_device_tensors(host)
+        torch_out = torch.cat([ttnn.to_torch(shards[i]) for i in range(tp)], dim=-1)  # [1, 1, 32, V_padded]
+        return torch_out.reshape(GATHER_HEAD_ROWS, -1)[:, : self.vocab_size].float()
 
     def process_logits_after_prefill_trace(self, logits, last_token_idx):
         """
@@ -1438,6 +1554,7 @@ class BatchedPrefillPassRecord:
     traced: bool
     duration_s: float
     ttft_s: float
+    head: str = "full"  # packed passes: "full" (tt_transformers head) or "gather" (Model.packed_prefill_pass)
 
 
 @contextlib.contextmanager
@@ -1490,6 +1607,13 @@ def prefill_forward_text_batched(
       blocks are the user's whatever row it occupies in the pass; ``page_table`` is therefore required;
     * a packed pass is traced only when ``ModelArgs.can_enable_batched_prefill_trace(padded_batch, S)`` allows it
       (no shape today: the T = B x S MoE is not trace-safe, see ``Model.prepare_prefill_inputs_trace``);
+    * with ``options.head == "gather"`` (phase 3c, SOLAR_OPEN_BATCHED_PREFILL_HEAD) a packed pass runs Solar's own
+      ``Model.packed_prefill_pass`` (same layers, gather head: norm + lm_head on the 32 gathered last-token rows and
+      one readback per pass instead of one per user) -- always eager; ``"full"`` (default) is the tt_transformers
+      batched path;
+    * the expert-sorted MoE plans a packed pass once per 4096-token chunk (phase 3c, ``experts/prefill.py``), so a
+      pass that fits one chunk (``tokens_per_pass <= 4096``) is slot independent -- a user's logits depend on the SET
+      of users in its pass (inherent to hot / cold), not on its slot;
     * everything else -- the users the plan leaves out (long buckets, cached prefixes), calls with on-device
       ``sampling_params`` (the batched sampling contract is not implemented), unpaged KV, hidden-state requests,
       row-sharded / data-parallel models, or ``options.enabled`` False -- runs today's per-user path unchanged, one
@@ -1528,7 +1652,7 @@ def prefill_forward_text_batched(
     )
     plan = plan_batched_prefill(prompt_lens, options, num_cached=num_cached) if packable else None
 
-    def record(users, seq_len, padded_batch, packed, traced, t0):
+    def record(users, seq_len, padded_batch, packed, traced, t0, head="full"):
         t1 = time.perf_counter()
         log.append(
             BatchedPrefillPassRecord(
@@ -1540,6 +1664,7 @@ def prefill_forward_text_batched(
                 traced=traced,
                 duration_s=t1 - t0,
                 ttft_s=t1 - t_call,
+                head=head,
             )
         )
 
@@ -1571,8 +1696,39 @@ def prefill_forward_text_batched(
     output = torch.zeros(batch_size, 1, primary.vocab_size)
     slots_before = set(getattr(generator, "_slots_prefilled_since_decode", set()))
     first_call = True
+    gather_head = getattr(options, "head", "full") == "gather"
     for pass_ in plan.passes:
         users = list(pass_.users)
+        if gather_head:
+            # Solar's own pass (Model.packed_prefill_pass): eager, gather head, users re-slotted to 0..m-1 with their
+            # own page-table rows. The Generator's bookkeeping the parent path would do: warmup on the first call,
+            # mode PREFILL (decode_forward reloads its inputs after a mode switch).
+            t0 = time.perf_counter()
+            if warmup_prefill and first_call:
+                model0 = generator.model[0]
+                generator.warmup_model_prefill(
+                    kv_cache=kv_cache,
+                    enable_trace=bool(enable_trace),
+                    can_sample_on_device=bool(
+                        getattr(model0, "_supports_on_device_sampling", False)
+                        and getattr(model0, "sampling", None) is not None
+                    ),
+                )
+            if kv_cache is None:
+                raise ValueError("the gather head needs the paged KV cache (kv_cache) of the packed users")
+            generator.mode = GeneratorMode.PREFILL
+            res = generator.model[0].packed_prefill_pass(
+                tokens[users],
+                [prompt_lens[u] for u in users],
+                page_table[users],
+                kv_cache[0],  # the Generator indexes kv_cache[model_id]; data_parallel == 1 here
+                seq_len=pass_.seq_len,
+                padded_batch=pass_.padded_batch,
+            )
+            first_call = False
+            output[users] = res
+            record(users, pass_.seq_len, pass_.padded_batch, True, False, t0, head="gather")
+            continue
         traced = bool(enable_trace) and primary.can_enable_batched_prefill_trace(pass_.padded_batch, pass_.seq_len)
         t0 = time.perf_counter()
         with batched_prefill_flag(model_args_list, True):

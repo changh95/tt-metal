@@ -39,6 +39,16 @@ margin is >= 3 logits, distinct users); the ground-truth gate of the packed path
 tests/accuracy/test_teacher_forced.py -k b32 with SOLAR_OPEN_BATCHED_PREFILL=1 (the whole 32 x 128 batch as ONE pass
 against the bf16 HF reference; phase-3a: 0.9297 / 0.9690 / 0.9211 / 0.97969 / 0.99064 / 0.0312 sequential -- see
 the README "Recorded baselines" phase-3a rows for the packed values).
+
+Phase 3c (slot independence, design_traced_prefill.md G1): ``Model.ttnn_prefill_forward`` marks a packed pass
+(``experts/prefill.py: packed_prefill_pass``) and the expert-sorted MoE then plans its hot / cold sets ONCE per
+4096-token chunk (``_sorted_moe_chunk_plan``, arithmetic in ``experts/sorted_plan.py``, host tests in
+tests/unit/test_sorted_moe_chunk_plan.py) instead of per 1024-token split, so a user's numerics no longer depend on
+the split its slot falls into (the phase-3a failure of tests/test_multi_user_consistency.py with the flag). The
+optional GATHER head (``BatchedPrefillOptions.head == "gather"``, env SOLAR_OPEN_BATCHED_PREFILL_HEAD) runs the pass
+through Solar's own ``Model.packed_prefill_pass``: norm + lm_head on the 32 gathered last-token rows and ONE readback
+per pass (design_packed_prefill.md 2.6 item 1); the device case ``b32_s128_gather`` compares it against the sequential
+arm with the same floors as the "full" head. The single-user prefill path (batch_size 1) is untouched by both.
 """
 
 import json
@@ -85,6 +95,7 @@ BATCHED_ENV = (
     "SOLAR_OPEN_BATCHED_PREFILL",
     "SOLAR_OPEN_BATCHED_PREFILL_TOKENS",
     "SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN",
+    "SOLAR_OPEN_BATCHED_PREFILL_HEAD",
 )
 
 
@@ -116,6 +127,16 @@ def test_host_options_defaults_and_env(clean_batched_env, expect_error):
     assert mc.BatchedPrefillOptions.from_env().tokens_per_pass == mc.BATCHED_PREFILL_MAX_TOKENS
     clean_batched_env.setenv("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", "32")
     assert mc.BatchedPrefillOptions.from_env().tokens_per_pass == mc.BATCHED_PREFILL_MIN_TOKENS
+    # phase 3c: the head of a packed pass ("full" = tt_transformers batched path, "gather" = Model.packed_prefill_pass)
+    assert mc.BatchedPrefillOptions.from_env().head == "full" and "head=full" in mc.BatchedPrefillOptions().describe()
+    clean_batched_env.setenv("SOLAR_OPEN_BATCHED_PREFILL_HEAD", "Gather")
+    assert mc.BatchedPrefillOptions.from_env().head == "gather"
+    clean_batched_env.setenv("SOLAR_OPEN_BATCHED_PREFILL_HEAD", "slice")
+    with expect_error(ValueError, "SOLAR_OPEN_BATCHED_PREFILL_HEAD='slice' is not one of"):
+        mc.BatchedPrefillOptions.from_env()
+    clean_batched_env.delenv("SOLAR_OPEN_BATCHED_PREFILL_HEAD", raising=False)
+    with expect_error(ValueError, "head must be one of"):
+        mc.BatchedPrefillOptions(head="slice")
     clean_batched_env.setenv("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", "abc")
     with expect_error(ValueError, "SOLAR_OPEN_BATCHED_PREFILL_TOKENS='abc' is not an integer"):
         mc.BatchedPrefillOptions.from_env()
@@ -172,6 +193,33 @@ def test_host_plan_mixed_buckets_and_fallbacks(expect_error):
     assert plan.passes == () and plan.sequential == (0, 1, 2, 3)
 
 
+class _FakeModel:
+    """Records every ``packed_prefill_pass`` (gather head) call of the driver; same fake logits as the generator."""
+
+    users_row_sharded = False
+    _supports_on_device_sampling = False
+    sampling = None
+
+    def __init__(self, vocab):
+        self.vocab_size = vocab
+        self.pass_calls = []
+
+    def packed_prefill_pass(self, tokens, prompt_lens, page_table, kv_cache, seq_len, padded_batch):
+        self.pass_calls.append(
+            {
+                "batch": int(tokens.shape[0]),
+                "lens": list(prompt_lens),
+                "page_rows": page_table[:, 0].tolist(),
+                "kv_cache": kv_cache,
+                "seq_len": int(seq_len),
+                "padded_batch": int(padded_batch),
+            }
+        )
+        out = torch.zeros(tokens.shape[0], 1, self.vocab_size)
+        out[:, 0, 0] = tokens[:, 0].float()
+        return out
+
+
 class _FakeGenerator:
     """Records every prefill_forward_text call; returns logits whose column 0 carries the user's first token id."""
 
@@ -183,10 +231,15 @@ class _FakeGenerator:
         args.packed_prefill_trace_shapes = set(trace_shapes)
         args.can_enable_batched_prefill_trace = lambda b, s: (int(b), int(s)) in args.packed_prefill_trace_shapes
         self.model_args = [args]
-        self.model = [SimpleNamespace(users_row_sharded=False)]
+        self.model = [_FakeModel(self.VOCAB)]
         self.data_parallel = 1
         self.calls = []
+        self.warmups = []
+        self.mode = None
         self._slots_prefilled_since_decode = {7}
+
+    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, greedy_only=False):
+        self.warmups.append({"trace": enable_trace, "sample": can_sample_on_device})
 
     def prefill_forward_text(
         self,
@@ -279,6 +332,54 @@ def test_host_driver_microbatches_and_real_slots():
     assert [r.padded_batch for r in gen.batched_prefill_pass_log] == [8, 8, 4]
     assert gen.batched_prefill_pass_log[2].slots == (28, 29, 30, 31)
     assert gen._slots_prefilled_since_decode == {7} | set(slots)
+
+
+def test_host_driver_gather_head_uses_the_model_pass(expect_error):
+    """head == "gather": packed passes run Model.packed_prefill_pass (re-slotted users, their own page-table rows,
+    the model's kv_cache, the pass's padded batch), never the Generator's batched path; the remainder stays
+    sequential through the Generator; the pass log records the head; the Generator is put in PREFILL mode."""
+    from models.tt_transformers.tt.common import Mode as GeneratorMode
+
+    options = mc.BatchedPrefillOptions(enabled=True, tokens_per_pass=512, max_seq_len=128, head="gather")
+    gen = _FakeGenerator(options)
+    tokens, page_table = _fake_inputs(9)
+    kv_cache = [["layer-kv"]]  # the Generator's per-model list
+    out = prefill_forward_text_batched(
+        gen,
+        tokens,
+        page_table=page_table,
+        kv_cache=kv_cache,
+        prompt_lens=[80] * 8 + [900],
+        empty_slots=list(range(9)),
+        enable_trace=True,
+        warmup_prefill=True,
+    )
+    assert torch.equal(out[:, 0, 0], tokens[:, 0].float())
+    passes = gen.model[0].pass_calls
+    assert [p["batch"] for p in passes] == [4, 4] and [p["padded_batch"] for p in passes] == [4, 4]
+    assert passes[1]["page_rows"] == [40, 50, 60, 70] and passes[1]["lens"] == [80] * 4
+    assert all(p["seq_len"] == 128 and p["kv_cache"] == ["layer-kv"] for p in passes)
+    assert gen.mode == GeneratorMode.PREFILL
+    assert gen.warmups == [{"trace": True, "sample": False}]  # once, on the first call
+    # the 900-token user is sequential through the Generator (flag lowered, no warmup again)
+    assert len(gen.calls) == 1 and gen.calls[0]["batch"] == 1 and gen.calls[0]["slots"] == [8]
+    assert gen.calls[0]["flag_disable_batched"] is True and gen.calls[0]["warmup"] is False
+    log = gen.batched_prefill_pass_log
+    assert [(r.packed, r.traced, r.head) for r in log] == [
+        (True, False, "gather"),
+        (True, False, "gather"),
+        (False, True, "full"),
+    ]
+    assert gen._slots_prefilled_since_decode == {7} | set(range(9))
+    # the gather head needs the paged KV cache
+    with expect_error(ValueError, "the gather head needs the paged KV cache"):
+        prefill_forward_text_batched(_FakeGenerator(options), *_fake_inputs(4), prompt_lens=[80] * 4)
+    # the default "full" head keeps the Generator's batched path (no model pass)
+    gen = _FakeGenerator(mc.BatchedPrefillOptions(enabled=True, tokens_per_pass=512, max_seq_len=128))
+    prefill_forward_text_batched(gen, *_fake_inputs(4), prompt_lens=[80] * 4)
+    assert (
+        gen.model[0].pass_calls == [] and gen.calls[0]["batch"] == 4 and gen.batched_prefill_pass_log[0].head == "full"
+    )
 
 
 def test_host_driver_delegates_when_nothing_is_packable():
@@ -504,18 +605,26 @@ def _compare_rows(name, seq_logits, bat_logits):
 
 @pytest.mark.timeout(3600)
 @pytest.mark.parametrize(
-    "batch_size, seq_len, tokens_per_pass",
+    "batch_size, seq_len, tokens_per_pass, head",
     [
-        (2, 128, 256),  # T = 256: dense-bmm MoE in both arms
-        (8, 128, 1024),  # one pass of 8 (the demo's default microbatch): T = 1024 expert-sorted MoE
-        (32, 128, 4096),  # one pass of 32: T = 4096, the whole batch-32 demo in one forward
-        (4, 1024, 4096),  # the 1K bucket opted in (max_seq_len 1024): 4 distinct ~1K prompts in one 4096-token pass
-        (8, 128, 512),  # TWO passes of 4: users 4..7 re-slotted to device rows 0..3
+        (2, 128, 256, "full"),  # T = 256: dense-bmm MoE in both arms
+        (8, 128, 1024, "full"),  # one pass of 8 (the demo's default microbatch): T = 1024 expert-sorted MoE
+        (32, 128, 4096, "full"),  # one pass of 32: T = 4096, the whole batch-32 demo in one forward
+        (
+            4,
+            1024,
+            4096,
+            "full",
+        ),  # the 1K bucket opted in (max_seq_len 1024): 4 distinct ~1K prompts in one 4096-token pass
+        (8, 128, 512, "full"),  # TWO passes of 4: users 4..7 re-slotted to device rows 0..3
+        (32, 128, 4096, "gather"),  # phase 3c: the same 32 x 128 pass through Model.packed_prefill_pass (gather head)
     ],
-    ids=["b2_s128", "b8_s128", "b32_s128", "b4_s1024", "b8_s128_x2"],
+    ids=["b2_s128", "b8_s128", "b32_s128", "b4_s1024", "b8_s128_x2", "b32_s128_gather"],
 )
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_batched_vs_sequential_prefill(mesh_device, device_params, batch_size, seq_len, tokens_per_pass, state_dict):
+def test_batched_vs_sequential_prefill(
+    mesh_device, device_params, batch_size, seq_len, tokens_per_pass, head, state_dict
+):
     mesh_shape = tuple(mesh_device.shape)
     if mesh_shape[0] != 1 or mesh_shape[1] < 8:
         pytest.skip(f"validated on 1x8 meshes (TP=8), got {mesh_shape}")
@@ -578,7 +687,7 @@ def test_batched_vs_sequential_prefill(mesh_device, device_params, batch_size, s
     seq_decode = seq_decode[..., :vocab]
 
     # (b) Packed: the same users through prefill_forward_text_batched with an explicit policy for this case.
-    options = mc.BatchedPrefillOptions(enabled=True, tokens_per_pass=tokens_per_pass, max_seq_len=seq_len)
+    options = mc.BatchedPrefillOptions(enabled=True, tokens_per_pass=tokens_per_pass, max_seq_len=seq_len, head=head)
     expected_passes = math.ceil(batch_size / options.users_per_pass(seq_len))
     _clear_kv(models, generator, mesh_device)
     t0 = time.perf_counter()
@@ -594,7 +703,14 @@ def test_batched_vs_sequential_prefill(mesh_device, device_params, batch_size, s
     ttnn.synchronize_device(mesh_device)
     bat_wall = time.perf_counter() - t0
     log = generator.batched_prefill_pass_log
-    assert len(log) == expected_passes and all(r.packed and not r.traced for r in log), log
+    assert len(log) == expected_passes and all(r.packed and not r.traced and r.head == head for r in log), log
+    # phase 3c: a packed pass of several 1024-token splits is planned once per chunk (Model marks the pass)
+    from models.demos.solar_open.tt.experts import prefill as experts_prefill
+
+    last_plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
+    logger.info(f"sorted-MoE plan of the last split (mode {experts_prefill.SORTED_MOE_PLAN}): {last_plan}")
+    if experts_prefill.SORTED_MOE_PLAN == "auto" and options.users_per_pass(seq_len) * seq_len > 1024:
+        assert last_plan.get("per_chunk") is True, f"a packed multi-split pass must be planned per chunk: {last_plan}"
     assert sorted(u for r in log for u in r.users) == list(range(batch_size))
     summary = summarize_batched_prefill_log(log, batch_size)
     logger.info(

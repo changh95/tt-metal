@@ -102,6 +102,14 @@ void kernel_main() {
     // sparsity mask holds more non-zeros than announced (the in0 kernel asserts the contract under watcher).
     constexpr uint32_t expert_groups = EXPERT_GROUPS;
     constexpr uint32_t expert_groups_nnz = EXPERT_GROUPS_NNZ;
+#if defined(EGP_ZERO_FILL)
+    // Writer zero-fill (set by the EGP factory for EXPANDED scan outputs only): the host no longer zero-fills the
+    // output before the program runs; instead, for every slot that is NOT computed (invalid mask entry, or rank
+    // >= EXPERT_GROUPS_NNZ), the cores of group (slot % expert_groups) write zero tiles over exactly the output
+    // tiles their block owns, with the same tile walk as a computed slot. Every (slot, tile) is thus written
+    // exactly once per run, by compute or by zeros, which is what lets the op skip its FILL pass.
+    static_assert(!compact_output, "EGP_ZERO_FILL is only set for expanded outputs");
+#endif  // EGP_ZERO_FILL
 #endif  // EXPERT_GROUPS
 
     // When sparsity is disabled, we just loop once
@@ -258,6 +266,74 @@ void kernel_main() {
     DataflowBuffer dfb_sparsity(dfb_id_sparsity);
     const auto s_sparsity = TensorAccessor(sparsity_args, sparsity_addr);
 
+#if defined(EXPERT_GROUPS) && defined(EGP_ZERO_FILL)
+    // Zero source: one output tile of zeros in cb_zero (a fresh CB, never pushed or popped, so its read pointer
+    // stays at its base and every zero write reads the same page). Written once here with plain L1 stores.
+    constexpr uint32_t dfb_id_zero = get_named_compile_time_arg_val("cb_zero");
+    static_assert(get_tile_size(dfb_id_zero) == output_single_tile_size_bytes, "cb_zero must hold one output tile");
+    DataflowBuffer dfb_zero(dfb_id_zero);
+    {
+        volatile tt_l1_ptr uint32_t* zero_words =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dfb_zero.get_read_ptr());
+        for (uint32_t w = 0; w < output_single_tile_size_bytes / sizeof(uint32_t); ++w) {
+            zero_words[w] = 0;
+        }
+    }
+
+    // Zero-fill of one expanded output slot: the tiles of this core's block, enumerated with the SAME
+    // (bh, bw, sbh, sbw, h, w) walk and the same ragged-last-block guards as the writer below (only the CB waits /
+    // pops and the source differ). Keep the two in lock-step; test_sparse_matmul_expert_groups.py's poisoned-output
+    // and ragged-last-block cases lock them together.
+    auto zero_fill_block = [&](uint32_t slot_start_tile_id) {
+        uint32_t zf_h_dim_block_tile_id = slot_start_tile_id;
+        for (uint32_t bh = 0; bh < num_blocks_h_dim; ++bh) {
+            uint32_t zf_w_dim_block_tile_id = zf_h_dim_block_tile_id;
+            for (uint32_t bw = 0; bw < num_blocks_w_dim; ++bw) {
+                const uint32_t num_blocks_w_dim_ =
+                    bw >= last_num_blocks_w_dim - 1 ? last_num_blocks_w_dim : num_blocks_w_dim;
+                if (bw < num_blocks_w_dim_) {  // the writer's per-tile guard, hoisted (no CB traffic to keep up)
+                    const uint32_t out_num_nonzero_subblocks_w_ =
+                        bw == num_blocks_w_dim_ - 1 ? out_last_num_nonzero_subblocks_w : out_num_nonzero_subblocks_w;
+                    uint32_t zf_sbh_start_tile_id = zf_w_dim_block_tile_id;
+                    for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h; ++sbh) {
+                        uint32_t zf_sbw_start_tile_id = zf_sbh_start_tile_id;
+                        for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w_; ++sbw) {
+                            uint32_t zf_sb_row_start_tile_id = zf_sbw_start_tile_id;
+                            const uint32_t out_subblock_h_ =
+                                (bh == num_blocks_h_dim - 1 && sbh == out_num_nonzero_subblocks_h - 1)
+                                    ? out_last_subblock_h
+                                    : out_subblock_h;
+                            const uint32_t out_subblock_w_ =
+                                (bw == num_blocks_w_dim_ - 1 && sbw == out_num_nonzero_subblocks_w_ - 1)
+                                    ? out_last_subblock_w
+                                    : out_subblock_w;
+                            for (uint32_t h = 0; h < out_subblock_h_; ++h) {
+                                uint32_t zf_tile_id = zf_sb_row_start_tile_id;
+                                for (uint32_t w = 0; w < out_subblock_w_; ++w) {
+                                    noc.async_write(
+                                        dfb_zero,
+                                        s,
+                                        output_single_tile_size_bytes,
+                                        {.offset_bytes = 0},
+                                        {.page_id = zf_tile_id});
+                                    zf_tile_id += out_tensor_stride_w;
+                                }
+                                zf_sb_row_start_tile_id += out_tensor_stride_h;
+                            }
+                            zf_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
+                        }
+                        zf_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
+                    }
+                }
+                zf_w_dim_block_tile_id += out_tensor_next_w_dim_block_stride;
+            }
+            zf_h_dim_block_tile_id += out_tensor_next_h_dim_block_stride;
+        }
+        // No barrier here: the writes are non-posted on this kernel's NoC, so the per-subblock
+        // async_write_barrier() of the next computed slot and the kernel's final barrier cover them.
+    };
+#endif  // EXPERT_GROUPS && EGP_ZERO_FILL
+
 #ifndef SKIP_MCAST
     // Set ur local VALID value, to be mcasted to destinations flag address after the data has been mcasted
     receiver_sem.set(VALID);
@@ -339,9 +415,19 @@ void kernel_main() {
                 if (is_batch_valid) {
                     ++egp_rank;
                 }
-                const bool is_mine = is_batch_valid && (rank % expert_groups) == group_id &&
-                                     (expert_groups_nnz == 0 || rank < expert_groups_nnz);
+                // `computed`: some group computes this slot (same expression as the in0 EGP kernel's is_mine
+                // without the group test); `is_mine`: this group does.
+                const bool computed = is_batch_valid && (expert_groups_nnz == 0 || rank < expert_groups_nnz);
+                const bool is_mine = computed && (rank % expert_groups) == group_id;
                 if (!is_mine) {
+#if defined(EGP_ZERO_FILL)
+                    // Nobody computes this slot: group (slot % G) writes zeros over it (its expanded slot base is
+                    // out_tensor_start_tile_id, exactly as for a computed slot). Slot-index based, so every group
+                    // gets the same share (+-1) of the non-computed slots whatever the mask.
+                    if (!computed && (bB % expert_groups) == group_id) {
+                        zero_fill_block(out_tensor_start_tile_id);
+                    }
+#endif  // EGP_ZERO_FILL
                     if constexpr (!compact_output) {
                         out_tensor_start_tile_id += MtNt;
                     }

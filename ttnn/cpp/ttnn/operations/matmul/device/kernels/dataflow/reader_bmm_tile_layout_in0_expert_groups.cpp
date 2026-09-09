@@ -56,6 +56,15 @@ void kernel_main() {
     // expert-group args
     const uint32_t group_id = get_arg_val<uint32_t>(rt_args_idx++);
     [[maybe_unused]] const bool is_sender = get_arg_val<uint32_t>(rt_args_idx++) != 0;
+#ifdef EGP_ZERO_FILL
+    // Zero-fill geometry (set by the factory for EXPANDED scan outputs with the in0 placement): this core's output
+    // block, exactly as the in1 writer sees it ([7] out addr, [8] start tile, [20], [14], [15] of its args).
+    const uint32_t out_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
+    const uint32_t out_tensor_start_tile_id = get_arg_val<uint32_t>(rt_args_idx++);
+    const uint32_t last_num_blocks_w_dim = get_arg_val<uint32_t>(rt_args_idx++);
+    const uint32_t out_last_num_nonzero_subblocks_w = get_arg_val<uint32_t>(rt_args_idx++);
+    const uint32_t out_last_subblock_w = get_arg_val<uint32_t>(rt_args_idx++);
+#endif  // EGP_ZERO_FILL
 
     // COMPILE TIME ARGS
     // in0 tensor args
@@ -122,6 +131,91 @@ void kernel_main() {
         noc.async_read(s_sparsity, dfb_sparsity, sparsity_pagesize, {.page_id = 0}, {.offset_bytes = 0});
         noc.async_read_barrier();
     }
+
+#ifdef EGP_ZERO_FILL
+    // Kernel zero-fill of the non-computed slots (the op skips its host FILL pass): for every slot that is
+    // valid-but-uncomputed or invalid, the cores of group (slot % expert_groups) write zero tiles over exactly the
+    // output tiles their block owns, with the SAME (bh, bw, sbh, sbw, h, w) walk and ragged-last-block guards as
+    // the in1 writer (reader_bmm_tile_layout_in1_sender_writer_padding.cpp, "WRITER"; that kernel carries the same
+    // walk under its own EGP_ZERO_FILL for the `in1` placement). Every (slot, tile) is thus written exactly once
+    // per run, by compute or by zeros. The writes ride on this kernel's NoC (the weight stream uses the other one)
+    // and are covered by the async_write_barrier() at the end of the kernel.
+    static_assert(!use_indices, "EGP_ZERO_FILL is only set for expanded scan outputs");
+    constexpr auto out_args = TensorAccessorArgs<sparsity_args.next_compile_time_args_offset()>();
+    constexpr uint32_t zf_ct = out_args.next_compile_time_args_offset();
+    constexpr uint32_t out_tensor_stride_w = 1;
+    constexpr uint32_t out_tensor_stride_h = get_compile_time_arg_val(zf_ct + 0);
+    constexpr uint32_t out_subblock_w = get_compile_time_arg_val(zf_ct + 1);
+    constexpr uint32_t out_subblock_h = get_compile_time_arg_val(zf_ct + 2);
+    constexpr uint32_t out_tensor_next_w_dim_block_stride = get_compile_time_arg_val(zf_ct + 3);
+    constexpr uint32_t out_tensor_next_h_dim_block_stride = get_compile_time_arg_val(zf_ct + 4);
+    constexpr uint32_t MtNt = get_compile_time_arg_val(zf_ct + 5);
+    constexpr uint32_t out_num_nonzero_subblocks_h = get_compile_time_arg_val(zf_ct + 6);
+    constexpr uint32_t out_num_nonzero_subblocks_w = get_compile_time_arg_val(zf_ct + 7);
+    constexpr uint32_t out_tensor_next_subblock_stride_w = out_subblock_w;
+    constexpr uint32_t out_tensor_next_subblock_stride_h = out_subblock_h * out_tensor_stride_h;
+    // No height padding in the EGP factory: the last h subblock is a full one.
+    constexpr uint32_t out_last_subblock_h = out_subblock_h;
+    constexpr uint32_t dfb_id_zero = get_named_compile_time_arg_val("cb_zero");
+    constexpr uint32_t output_single_tile_size_bytes = get_tile_size(dfb_id_zero);
+    const auto s_out = TensorAccessor(out_args, out_tensor_addr);
+    // Zero source: one output tile of zeros in cb_zero (a fresh CB, never pushed or popped, so its read pointer
+    // stays at its base and every zero write reads the same page). Written once here with plain L1 stores.
+    DataflowBuffer dfb_zero(dfb_id_zero);
+    {
+        volatile tt_l1_ptr uint32_t* zero_words =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dfb_zero.get_read_ptr());
+        for (uint32_t w = 0; w < output_single_tile_size_bytes / sizeof(uint32_t); ++w) {
+            zero_words[w] = 0;
+        }
+    }
+    auto zero_fill_block = [&](uint32_t slot_start_tile_id) {
+        uint32_t zf_h_dim_block_tile_id = slot_start_tile_id;
+        for (uint32_t bh = 0; bh < num_blocks_h_dim; ++bh) {
+            uint32_t zf_w_dim_block_tile_id = zf_h_dim_block_tile_id;
+            for (uint32_t bw = 0; bw < num_blocks_w_dim; ++bw) {
+                const uint32_t num_blocks_w_dim_ =
+                    bw >= last_num_blocks_w_dim - 1 ? last_num_blocks_w_dim : num_blocks_w_dim;
+                if (bw < num_blocks_w_dim_) {
+                    const uint32_t out_num_nonzero_subblocks_w_ =
+                        bw == num_blocks_w_dim_ - 1 ? out_last_num_nonzero_subblocks_w : out_num_nonzero_subblocks_w;
+                    uint32_t zf_sbh_start_tile_id = zf_w_dim_block_tile_id;
+                    for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h; ++sbh) {
+                        uint32_t zf_sbw_start_tile_id = zf_sbh_start_tile_id;
+                        for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w_; ++sbw) {
+                            uint32_t zf_sb_row_start_tile_id = zf_sbw_start_tile_id;
+                            const uint32_t out_subblock_h_ =
+                                (bh == num_blocks_h_dim - 1 && sbh == out_num_nonzero_subblocks_h - 1)
+                                    ? out_last_subblock_h
+                                    : out_subblock_h;
+                            const uint32_t out_subblock_w_ =
+                                (bw == num_blocks_w_dim_ - 1 && sbw == out_num_nonzero_subblocks_w_ - 1)
+                                    ? out_last_subblock_w
+                                    : out_subblock_w;
+                            for (uint32_t h = 0; h < out_subblock_h_; ++h) {
+                                uint32_t zf_tile_id = zf_sb_row_start_tile_id;
+                                for (uint32_t w = 0; w < out_subblock_w_; ++w) {
+                                    noc.async_write(
+                                        dfb_zero,
+                                        s_out,
+                                        output_single_tile_size_bytes,
+                                        {.offset_bytes = 0},
+                                        {.page_id = zf_tile_id});
+                                    zf_tile_id += out_tensor_stride_w;
+                                }
+                                zf_sb_row_start_tile_id += out_tensor_stride_h;
+                            }
+                            zf_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
+                        }
+                        zf_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
+                    }
+                }
+                zf_w_dim_block_tile_id += out_tensor_next_w_dim_block_stride;
+            }
+            zf_h_dim_block_tile_id += out_tensor_next_h_dim_block_stride;
+        }
+    };
+#endif  // EGP_ZERO_FILL
 
     // Reads one [in0_block_h, in0_block_w] block of in0 (tile ids from block_start_tile_id) into the slot the
     // caller has just reserved in dfb_in0; the caller issues the read barrier. Identical tile walk (including
@@ -232,6 +326,8 @@ void kernel_main() {
     [[maybe_unused]] uint32_t rank = 0;
     for (uint32_t i = 0; i < batch_loop_lim; ++i) {
         bool is_mine = false;
+        // `computed`: some group computes this slot (the in1 writer evaluates the same expression).
+        [[maybe_unused]] bool computed = true;
         if constexpr (use_indices) {
             is_mine = (i % expert_groups) == group_id;
         } else {
@@ -241,7 +337,8 @@ void kernel_main() {
             if (is_batch_valid) {
                 ++rank;
             }
-            is_mine = is_batch_valid && (r % expert_groups) == group_id && (expected_nnz == 0 || r < expected_nnz);
+            computed = is_batch_valid && (expected_nnz == 0 || r < expected_nnz);
+            is_mine = computed && (r % expert_groups) == group_id;
         }
 
         // The compute kernel reads one validity word per batch iteration on each of its three threads.
@@ -249,6 +346,13 @@ void kernel_main() {
         ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, is_mine);
         ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, is_mine);
         if (!is_mine) {
+#ifdef EGP_ZERO_FILL
+            // Nobody computes this slot: group (slot % G) writes zeros over it. Slot-index based, so every group
+            // gets the same share (+-1) of the non-computed slots whatever the mask.
+            if (!computed && (i % expert_groups) == group_id) {
+                zero_fill_block(out_tensor_start_tile_id + i * MtNt);
+            }
+#endif  // EGP_ZERO_FILL
             continue;
         }
 

@@ -284,15 +284,37 @@ class TestDecodeExpertGroups:
         assert (pc.decode_down_cores_batched, pc.decode_down_batched_subblock_w) == ((11, 8), 8)
         assert (pc.decode_down_batched_expert_groups, pc.decode_down_batched_min_tokens) == (11, 2)
         assert (pc.decode_down_cores, pc.decode_down_subblock_w, pc.decode_down_expert_groups) == ((8, 4), 4, None)
+        assert (pc.decode_down_indexed_cores, pc.decode_down_indexed_subblock_w) == ((8, 8), 2)
+        assert pc.decode_down_indexed_expert_groups is None
         # gate|up: 10 output blocks of 1 tile x 11 groups = the whole 11x10 grid, the whole K as one block
         for rows in (1, 32):
             assert self._key(pc.get_decode_gate_up_config(rows, 2 * IP, k=H)) == ((11, 10), 1, 1, 1, 128, 11)
         # batched down: 8 blocks of 16 tiles x 11 groups = 11x8, out_subblock_w 8 (the widest legal), Kt 5 as one block
         for users in (2, 8, 16, 32):
             assert self._key(pc.get_decode_down_config(users, H, k=IP)) == ((11, 8), 16, 8, 8, 5, 11)
-        # single-user down (b1 indexed / scan): the legacy 8x4 x 4 tiles, no groups
+        # single-user scan-path down: the legacy 8x4 x 4 tiles, no groups
         assert self._key(pc.get_decode_down_config(1, H, k=IP)) == ((8, 4), 4, 4, 4, 5, None)
+        # the indexed compact-A down (the shipped b1 path, phase 3c): the legacy 8x8 x 2 tiles, out_subblock_w 2, no groups
+        assert self._key(pc.get_decode_down_config(1, H, k=IP, indexed=True)) == ((8, 8), 2, 2, 2, 5, None)
         assert isinstance(pc.get_decode_gate_up_config(32, 2 * IP, k=H), SparseMatmulConfig)
+
+    def test_indexed_down_grid(self, expect_error):
+        """Phase 3c: ``get_decode_down_config(indexed=True)`` takes the decode_down_indexed_* values when set, else the
+        single-user ones (never the batched grid); it serves one token only."""
+        pc = SolarOpenProgramConfig()
+        with expect_error(ValueError, "exactly one token"):
+            pc.get_decode_down_config(2, H, k=IP, indexed=True)
+        # None = the single-user (scan-path) values, whatever the batched threshold says
+        pc_off = SolarOpenProgramConfig(decode_down_indexed_cores=None, decode_down_batched_min_tokens=1)
+        assert self._key(pc_off.get_decode_down_config(1, H, k=IP, indexed=True)) == ((8, 4), 4, 4, 4, 5, None)
+        assert self._key(pc_off.get_decode_down_config(1, H, k=IP)) == ((11, 8), 16, 8, 8, 5, 11)
+        # the indexed grid resolves under the same exact-fill rule (identity for the shipped values, shrink otherwise)
+        pc_egp = SolarOpenProgramConfig(
+            decode_down_indexed_cores=(11, 8), decode_down_indexed_subblock_w=8, decode_down_indexed_expert_groups=11
+        )
+        assert self._key(pc_egp.get_decode_down_config(1, H, k=IP, indexed=True)) == ((11, 8), 16, 8, 8, 5, 11)
+        with expect_error(ValueError, "decode_down_indexed_cores"):
+            SolarOpenProgramConfig(decode_down_indexed_cores=(0, 8))
 
     @pytest.mark.parametrize(
         "cores, n, groups, expected",
@@ -338,14 +360,19 @@ class TestDecodeExpertGroups:
             pc._build_matmul_config((1, 1), 32, 32, k=H, expert_groups=1)
 
     def test_field_validation(self, expect_error):
-        for name in ("decode_gate_up_expert_groups", "decode_down_expert_groups", "decode_down_batched_expert_groups"):
+        for name in (
+            "decode_gate_up_expert_groups",
+            "decode_down_expert_groups",
+            "decode_down_indexed_expert_groups",
+            "decode_down_batched_expert_groups",
+        ):
             for bad in (0, -1, 2.0, True, "11"):
                 with expect_error(ValueError, name):
                     SolarOpenProgramConfig(**{name: bad})
         assert SolarOpenProgramConfig(decode_gate_up_expert_groups=None).decode_gate_up_expert_groups is None
 
     def test_legacy_preset_reproduces_phase2(self, monkeypatch, expect_error):
-        assert set(DECODE_EGP_PRESETS) == {"on", "off"} and DECODE_EGP_PRESETS["off"] is DECODE_EGP_LEGACY
+        assert set(DECODE_EGP_PRESETS) == {"on", "p3b", "off"} and DECODE_EGP_PRESETS["off"] is DECODE_EGP_LEGACY
         assert decode_egp_overrides("on") == {} and decode_egp_overrides("") == {}
         monkeypatch.setenv(DECODE_EGP_ENV, "off")
         assert decode_egp_overrides() == DECODE_EGP_LEGACY
@@ -354,6 +381,15 @@ class TestDecodeExpertGroups:
         assert self._key(pc.get_decode_down_config(8, H, k=IP)) == ((8, 4), 4, 4, 4, 5, None)
         assert self._key(pc.get_decode_down_config(16, H, k=IP)) == ((8, 8), 2, 2, 2, 5, None)
         assert self._key(pc.get_decode_down_config(32, H, k=IP)) == ((8, 8), 2, 2, 2, 5, None)
+        # phase 2 ran the indexed down on the single-user 8x4 grid
+        assert self._key(pc.get_decode_down_config(1, H, k=IP, indexed=True)) == ((8, 4), 4, 4, 4, 5, None)
+        # p3b = phase 3b: EGP on, only the indexed down back on the 8x4 grid (the phase-3c A/B arm)
+        monkeypatch.setenv(DECODE_EGP_ENV, "p3b")
+        assert decode_egp_overrides() == {"decode_down_indexed_cores": None}
+        pc = SolarOpenProgramConfig(**decode_egp_overrides())
+        assert self._key(pc.get_decode_gate_up_config(1, 2 * IP, k=H)) == ((11, 10), 1, 1, 1, 128, 11)
+        assert self._key(pc.get_decode_down_config(32, H, k=IP)) == ((11, 8), 16, 8, 8, 5, 11)
+        assert self._key(pc.get_decode_down_config(1, H, k=IP, indexed=True)) == ((8, 4), 4, 4, 4, 5, None)
         monkeypatch.setenv(DECODE_EGP_ENV, "nonsense")
         with expect_error(ValueError, "preset"):
             decode_egp_overrides()

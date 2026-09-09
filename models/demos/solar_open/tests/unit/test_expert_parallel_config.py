@@ -142,6 +142,7 @@ def _grid(cfg):
         (lambda pc: pc.get_decode_gate_up_config(32, _GATE_UP_N, k=_H), ((11, 10), 1, 128, 1, 11), ((5, 2), 1, 128, 1)),
         (lambda pc: pc.get_decode_gate_up_config(1, _GATE_UP_N, k=_H), ((11, 10), 1, 128, 1, 11), ((5, 2), 1, 128, 1)),
         (lambda pc: pc.get_decode_down_config(1, _DOWN_N, k=_IP), ((8, 4), 4, 5, 4), ((8, 4), 4, 5, 4)),
+        (lambda pc: pc.get_decode_down_config(1, _DOWN_N, k=_IP, indexed=True), ((8, 8), 2, 5, 2), ((8, 4), 4, 5, 4)),
         (lambda pc: pc.get_decode_down_config(2, _DOWN_N, k=_IP), ((11, 8), 16, 5, 8, 11), ((8, 4), 4, 5, 4)),
         (lambda pc: pc.get_decode_down_config(8, _DOWN_N, k=_IP), ((11, 8), 16, 5, 8, 11), ((8, 4), 4, 5, 4)),
         (lambda pc: pc.get_decode_down_config(16, _DOWN_N, k=_IP), ((11, 8), 16, 5, 8, 11), ((8, 8), 2, 5, 2)),
@@ -153,6 +154,7 @@ def _grid(cfg):
         "decode_gate_up",
         "decode_gate_up_1_user",
         "decode_down_1_user",
+        "decode_down_1_user_indexed",
         "decode_down_2_users",
         "decode_down_8_users",
         "decode_down_16_users",
@@ -165,7 +167,8 @@ def test_solar_open_program_config_grids_resolve_exactly(call, expected, legacy,
     """The shipped SolarOpenProgramConfig values must be the identity under ProgramConfig._build_matmul_config
     (no silent grid shrink, no in0_block_w snap). Phase 3b (expert groups): the decode gate|up is Nt=10 as 11 groups x
     10 blocks x 1 tile on 11x10, the down for >= 2 users 11 groups x 8 blocks x 16 tiles on 11x8 (out_subblock_w 8), the
-    single-user down stays the legacy 8x4 x 4 tiles. Legacy (SOLAR_OPEN_DECODE_EGP=off, a bare ProgramConfig grid
+    single-user scan-path down stays the legacy 8x4 x 4 tiles and (phase 3c) the indexed compact-A down runs on the
+    legacy 8x8 x 2 tiles (out_subblock_w 2). Legacy (SOLAR_OPEN_DECODE_EGP=off, a bare ProgramConfig grid
     search with expert_groups None): Nt=10 on 5x2 x 1 tile, Nt=128 on 8x4 x 4 tiles below 16 users and 8x8 x 2 tiles
     from 16 users on; in0_block_w 128 == Kt (decode gate/up), 32 | Kt=128 (prefill sparse gate/up) and 5 == Kt (down);
     the decode down out_subblock_w equals per_core_N on every grid, the sparse prefill configs keep 1."""
@@ -202,7 +205,8 @@ def test_solar_open_program_config_factory_selects_batched_down_grid(grid_xy, ba
     """Compute grids of at least 11x10 keep the phase-3b expert-group decode grids (gate|up 11x10 x 11 groups, batched
     down 11x8 x 11 groups); narrower grids fall back to the legacy decode configs (5x2 gate|up, 64-core batched down
     from 16 users), and grids below 8x8 drop the batched down grid altogether (single grid for all steps, itself
-    shrunk by the builder if needed). The single-user down grid is 8x4 everywhere."""
+    shrunk by the builder if needed). The single-user scan-path down grid is 8x4 everywhere; the indexed compact-A down
+    grid (8x8 x 2 tiles, measured on Blackhole only) follows the same gate and falls back to the 8x4 grid (None)."""
     monkeypatch.delenv(DECODE_EGP_ENV, raising=False)
     mesh_device = MagicMock()
     mesh_device.compute_with_storage_grid_size.return_value = SimpleNamespace(x=grid_xy[0], y=grid_xy[1])
@@ -212,6 +216,8 @@ def test_solar_open_program_config_factory_selects_batched_down_grid(grid_xy, ba
     assert pc.decode_gate_up_cores == gate_up and pc.decode_gate_up_expert_groups == groups
     assert pc.decode_down_batched_min_tokens == (2 if groups else 16)
     assert pc.decode_down_cores == (8, 4) and pc.decode_down_expert_groups is None
+    assert pc.decode_down_indexed_cores == ((8, 8) if groups else None)
+    assert pc.get_decode_down_config(1, _DOWN_N, k=_IP, indexed=True).program_config.per_core_N == (2 if groups else 4)
 
 
 def test_program_config_rejects_bad_dense_knobs(expect_error):

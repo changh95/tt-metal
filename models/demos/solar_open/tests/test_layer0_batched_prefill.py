@@ -13,6 +13,13 @@ row-wise numerics), 3. the whole layer; each also against the HF ``SolarOpenDeco
 comparison must stay at the run-to-run level of the phase-2 tree (the same input through the same ops is bit-identical
 on this box; the two forms differ only by matmul blocking at another row count, i.e. bfp8-floor noise).
 
+Phase 3c (slot independence): the packed calls run under ``experts_prefill.packed_prefill_pass(True)`` -- the mark
+``Model.ttnn_prefill_forward`` sets for a packed pass -- so the expert-sorted MoE plans its hot / cold sets once per
+4096-token chunk. ``b16_s128_dup`` (T = 2048 = TWO 1024-token splits; users 8..15 are copies of users 0..7 and sit in
+the OTHER split) is the layer-level gate of that fix: with the phase-3b per-split plan the copies were not
+bit-identical to their originals in the MoE (the hot / cold sets of the two splits differed), with the per-chunk
+plan they must be. ``b4_s128_dup`` (T = 512, one split) was bit-identical before and stays so.
+
     pytest models/demos/solar_open/tests/test_layer0_batched_prefill.py -k 1x8
 """
 
@@ -21,6 +28,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.demos.solar_open.tt.experts import prefill as experts_prefill
 
 from .test_factory import TestFactory, compare_tensors, parametrize_mesh_with_fabric
 from .test_layer0_real_weights import (  # noqa: F401 -- layer0_weights is a fixture
@@ -55,8 +63,8 @@ def _pcc_rows(a, b):
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize(
     "batch_size, seq_len, duplicate_users",
-    [(4, 128, False), (4, 128, True)],
-    ids=["b4_s128", "b4_s128_dup"],
+    [(4, 128, False), (4, 128, True), (16, 128, True)],
+    ids=["b4_s128", "b4_s128_dup", "b16_s128_dup"],
 )
 @parametrize_mesh_with_fabric([(1, 8)])
 def test_layer0_packed_vs_per_user_prefill(
@@ -157,15 +165,16 @@ def test_layer0_packed_vs_per_user_prefill(
             hidden_states=attn_in, position_embeddings=position_embeddings_ref, attention_mask=mask
         )
     attn_in_bf16 = attn_in.to(torch.bfloat16).float()
-    tt_attn_packed = decoder_layer.self_attn(
-        upload(attn_in_bf16.reshape(num_tokens, -1)),
-        rope_mats=rope_mats,
-        position_idx=None,
-        page_table=page_table_tt,
-        is_decode=False,
-        user_id=0,
-        batch_size=batch_size,
-    )
+    with experts_prefill.packed_prefill_pass(True):  # what Model.ttnn_prefill_forward does for batch_size > 1
+        tt_attn_packed = decoder_layer.self_attn(
+            upload(attn_in_bf16.reshape(num_tokens, -1)),
+            rope_mats=rope_mats,
+            position_idx=None,
+            page_table=page_table_tt,
+            is_decode=False,
+            user_id=0,
+            batch_size=batch_size,
+        )
     attn_packed = download(tt_attn_packed, num_tokens)
     tt_attn_packed.deallocate(True)
     attn_per_user = []
@@ -193,9 +202,23 @@ def test_layer0_packed_vs_per_user_prefill(
         moe_in = reference_layer.post_attention_layernorm(hidden_states + attn_ref)
         moe_ref = reference_layer.mlp(moe_in).reshape(num_tokens, -1)
     moe_in_bf16 = moe_in.to(torch.bfloat16).float()
-    tt_moe = decoder_layer.mlp(upload(moe_in_bf16.reshape(num_tokens, -1)), is_decode=False)
+    experts_prefill.LAST_SORTED_MOE_PLAN.clear()
+    with experts_prefill.packed_prefill_pass(True):
+        tt_moe = decoder_layer.mlp(upload(moe_in_bf16.reshape(num_tokens, -1)), is_decode=False)
     moe_packed = download(tt_moe, num_tokens)
     tt_moe.deallocate(True)
+    plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
+    split_len = decoder_layer.mlp.experts.program_config.get_down_split_size(num_tokens)
+    n_sorted_splits = num_tokens // split_len if num_tokens > split_len else 1
+    logger.info(
+        f"[moe] packed pass of {num_tokens} tokens: sorted-MoE plan {plan or None} (mode {experts_prefill.SORTED_MOE_PLAN})"
+    )
+    if num_tokens > decoder_layer.mlp.experts.program_config.dense_bmm_max_tokens and plan:
+        # phase 3c: several sorted splits of a packed pass share one plan (auto / chunk modes); one split = per split
+        expect_per_chunk = n_sorted_splits > 1 and experts_prefill.SORTED_MOE_PLAN in ("auto", "chunk")
+        assert plan.get("per_chunk") is expect_per_chunk, (plan, n_sorted_splits, experts_prefill.SORTED_MOE_PLAN)
+        if expect_per_chunk:
+            assert plan.get("n_splits") == n_sorted_splits, plan
     moe_per_user = []
     for u in range(batch_size):
         tt_out = decoder_layer.mlp(upload(moe_in_bf16[u]), is_decode=False)
@@ -212,15 +235,16 @@ def test_layer0_packed_vs_per_user_prefill(
     with torch.no_grad():
         layer_ref = reference_layer(hidden_states, attention_mask=mask, position_embeddings=position_embeddings_ref)
         layer_ref = layer_ref.reshape(num_tokens, -1)
-    tt_layer = decoder_layer(
-        upload(hidden_states.reshape(num_tokens, -1)),
-        position_embeddings=rope_mats,
-        position_idx=None,
-        page_table=page_table_tt,
-        is_decode=False,
-        user_id=0,
-        batch_size=batch_size,
-    )
+    with experts_prefill.packed_prefill_pass(True):
+        tt_layer = decoder_layer(
+            upload(hidden_states.reshape(num_tokens, -1)),
+            position_embeddings=rope_mats,
+            position_idx=None,
+            page_table=page_table_tt,
+            is_decode=False,
+            user_id=0,
+            batch_size=batch_size,
+        )
     layer_packed = download(tt_layer, num_tokens)
     tt_layer.deallocate(True)
     # K/V blocks the packed pass wrote (per-user page-table rows, batch_idx 0 per user), device 0

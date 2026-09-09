@@ -10,6 +10,8 @@
 #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
 #include "ttnn/operations/matmul/device/config/matmul_program_config_types.hpp"
 
+#include <cstdlib>
+#include <string>
 #include <variant>
 
 #include <tt-metalium/work_split.hpp>
@@ -79,6 +81,29 @@ ttnn::Shape compute_sparse_matmul_compact_output_shape(
 }  // namespace
 
 namespace ttnn::prim {
+
+namespace {
+// TT_SPARSE_MATMUL_EGP_ZERO_FILL, read once: "0" = off (phase-3b FILL), "in1" = writer placement, else in0 reader.
+// The knob is an A/B arm, not a per-call setting (it is not part of the program hash).
+const std::string& egp_zero_fill_knob() {
+    static const std::string knob = [] {
+        const char* env = std::getenv("TT_SPARSE_MATMUL_EGP_ZERO_FILL");
+        return std::string(env != nullptr ? env : "");
+    }();
+    return knob;
+}
+}  // namespace
+
+bool sparse_matmul_egp_zero_fill_enabled() { return egp_zero_fill_knob() != "0"; }
+
+bool sparse_matmul_egp_zero_fill_in_in1_writer() { return egp_zero_fill_knob() == "in1"; }
+
+bool sparse_matmul_egp_kernel_writes_whole_output(const SparseMatmulParams& operation_attributes) {
+    // Expanded scan: the in1 writer zero-fills the non-computed slots (EGP_ZERO_FILL define, set by the factory
+    // exactly when this is true and the output is neither indexed nor compact); indexed: every entry i is computed
+    // by group i % G; compact static-nnz: every rank < nnz is computed. All three cover every output tile.
+    return operation_attributes.expert_groups.has_value() && sparse_matmul_egp_zero_fill_enabled();
+}
 
 void SparseMatmulDeviceOperation::validate_on_program_cache_hit(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
@@ -432,6 +457,21 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
             Kt,
             pc.in0_block_w);
         TT_FATAL(pc.per_core_M != 0 && pc.per_core_N != 0, "sparse_matmul: per_core_M/N must be non-zero");
+        // The EGP writer writes per_core_M full tile rows per output block (no height padding), so the h blocks
+        // partition the slot's Mt rows only when per_core_M divides Mt. This is what makes "every output tile is
+        // written exactly once per run" (the writer zero-fill contract that lets the op skip its FILL pass) hold.
+        TT_FATAL(
+            Mt % pc.per_core_M == 0,
+            "sparse_matmul: expert_groups requires Mt ({}) to be a multiple of per_core_M ({}); the EGP writer "
+            "writes whole per_core_M-row blocks (no height padding)",
+            Mt,
+            pc.per_core_M);
+        // The EGP writer addresses the output page by page through an interleaved accessor (no OUT_SHARDED
+        // path), and the zero-fill coverage argument is about interleaved pages.
+        TT_FATAL(
+            operation_attributes.output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
+            "sparse_matmul: expert_groups requires an INTERLEAVED output memory layout, got {}",
+            operation_attributes.output_mem_config.memory_layout());
         // The resident in0 ring cycles in (h-block, K-block) order, which matches the compute kernel's
         // consumption order only when at most one of the two per-core block loops has more than one
         // iteration (per_core_M == out_block_h, or per_core_N == out_block_w).
@@ -444,6 +484,15 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
             pc.out_block_h,
             pc.per_core_N,
             pc.out_block_w);
+        // The resident in0 is read by one core and multicast ONCE to the whole grid, so every core must need the
+        // same in0 rows: a broadcast A must fit one row block (per_core_M == Mt). With several row blocks the
+        // cores of rows >= 1 would compute on row block 0's activations (found by the phase-3c M = 128 diagnostic).
+        TT_FATAL(
+            operation_attributes.is_input_a_sparse || pc.per_core_M == Mt,
+            "sparse_matmul: expert_groups with a broadcast A requires per_core_M == Mt ({} vs {}): the resident in0 "
+            "is multicast once to the whole grid, so all cores must share the same in0 rows",
+            pc.per_core_M,
+            Mt);
         const uint32_t num_blocks_total = (((Mt - 1) / pc.per_core_M) + 1) * (((Nt - 1) / pc.per_core_N) + 1);
         const auto grid = pc.compute_with_storage_grid_size;
         const uint32_t num_cores = expert_groups * num_blocks_total;
@@ -538,12 +587,18 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
     const auto& optional_output_tensors = tensor_args.optional_output_tensors;
     const auto& input_tensors = tensor_args.input_tensors;
     // A compact output is fully written by the in1 writer (one block per non-zero sparsity entry),
-    // so it skips the zero-fill below; expanded outputs rely on it to zero the skipped blocks.
+    // so it skips the zero-fill below; expanded outputs on the LEGACY path rely on it to zero the skipped
+    // blocks. On the EGP path (expert_groups set) the kernels write every output tile themselves -- the in1
+    // writer zero-fills the non-computed slots of an expanded scan output, indexed and compact outputs are
+    // fully written by construction -- so the FILL pass is skipped there (see
+    // sparse_matmul_egp_kernel_writes_whole_output in sparse_matmul_device_operation_types.hpp; the EGP factory
+    // derives its EGP_ZERO_FILL define from the same predicate and TT_FATALs the coverage preconditions).
     const bool compact_output = !optional_output_tensors.empty() && optional_output_tensors[0].has_value() &&
                                 operation_attributes.nnz.has_value() &&
                                 optional_output_tensors[0]->logical_shape() ==
                                     compute_sparse_matmul_compact_output_shape(
                                         input_tensors.at(0), input_tensors.at(1), operation_attributes.nnz.value());
+    const bool kernel_writes_whole_output = sparse_matmul_egp_kernel_writes_whole_output(operation_attributes);
 
     if (!optional_output_tensors.empty() and optional_output_tensors[0].has_value()) {
         output_tensors.reserve(optional_output_tensors.size());
@@ -553,7 +608,7 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
                 "If using optional output tensors, all output tensors must have a value");
             output_tensors.emplace_back(optional_output_tensor.value());
         }
-        if (!compact_output) {
+        if (!compact_output && !kernel_writes_whole_output) {
             for (auto& output_tensor : output_tensors) {
                 output_tensor = ttnn::zeros_like(
                     output_tensor,
@@ -573,14 +628,16 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
         output_tensors.emplace_back(create_device_tensor(output_spec, device));
     }
     // Compact output requires a caller-supplied tensor, so this path is never compact.
-    for (auto& output_tensor : output_tensors) {
-        output_tensor = ttnn::zeros_like(
-            output_tensor,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::optional<Tensor>(output_tensor));
+    if (!kernel_writes_whole_output) {
+        for (auto& output_tensor : output_tensors) {
+            output_tensor = ttnn::zeros_like(
+                output_tensor,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::optional<Tensor>(output_tensor));
+        }
     }
     return output_tensors;
 }
