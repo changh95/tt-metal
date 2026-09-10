@@ -21,6 +21,11 @@ prefill against HF at the first token (see "Known limitations"). See "Recorded b
 per-test rows, then the phase 3a / 3b / 3c / 3d / 3e rows (each with its own before / after table) and the ISL/OSL x batch sweeps (`_p3cfull`, `_p3c`
 subset, `_p3b`, `_p2`).
 
+Served (phase 3f, 2026-09-10): the same tree runs under upstream vLLM 0.25.1 + vllm-tt-plugin 51b43cf through tt-inference-server
+`--local-server` on P150x8 (greedy tokens == the demo `batch32` case; 32 users 820 tok/s aggregate with the shipped `--no-async-scheduling`,
+931 tok/s with async scheduling; TTFT-last 4.8 s from the sequential prefill), see "Serving with vLLM and tt-inference-server" and the
+phase 3f rows.
+
 Numerics (relative to the bf16 HF model): weights are bfp8 (experts, attention, lm_head, KV cache) / bf16 (embeddings,
 norms, router gate, fp32 router bias); the residual stream is bf16 (`DecoderLayer._residual_add` writes each residual
 sum into a new bf16 tensor instead of the branch's bfp8 output, so the stream is never block-quantised), the norm
@@ -472,79 +477,327 @@ GiB after 200 decode steps, largest contiguous free block 15.483 -> 15.206 GiB (
 16.003 GiB). The 2.8 GiB reserve holds with a wide margin for one user; the case's thermal cost is the real limit (board 1 reached 85.6 C
 after the compile pass + timed pass of 4 x 32K each).
 
-## Serving with vLLM (untested here)
+## Serving with vLLM and tt-inference-server
 
-vLLM is NOT installed in the bring-up venv (`python -c "import vllm"` -> `ModuleNotFoundError`), so everything in
-this section is code plus a host-only smoke test; nothing has run against a live vLLM server or the TT plugin.
-Treat every statement about the vLLM side as a hypothesis to verify on a machine with the
-[TT vLLM plugin](https://github.com/tenstorrent/vllm/tree/dev/plugins/vllm-tt-plugin).
+Solar-Open-100B is served live by upstream vLLM 0.25.1 + the standalone
+[tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin) through tt-inference-server's dockerless
+`--local-server` path on the 1x8 LoudBox since 2026-09-10 (mesh `(1, 8)`, TP=8, `FABRIC_1D_RING`; 7 server launches,
+ledgers and trimmed logs under `results/vllm/` (`S1/` host setup, `S2/` live server, `S3/` this write-up), design notes
+in `design/phase3/measurements.md` section 9). Warm-cache time-to-ready is 65-74 s; `/health`, `/v1/models`, greedy /
+sampled / seeded / `top_k` / reasoning-`high` / tool-call / streaming chat completions answer; the server's greedy
+output equals the demo's batch-32 case token for token; 32 concurrent greedy users decode at 25.6 tok/s/user (820 tok/s
+aggregate; demo `batch32` 889-901 tok/s) with the shipped `--no-async-scheduling`, 29.1 tok/s/user (931 tok/s) with
+async scheduling once the plugin bug below is fixed. Everything in this section was measured on this box; the numbers
+are collected in the "Phase 3f rows" table under "Recorded baselines".
+
+### Install (the tt-metal `python_env`, Python 3.10; 2026-09-10, `results/vllm/S1/`)
+
+```bash
+git clone https://github.com/tenstorrent/vllm-tt-plugin.git /home/eslim/experiments/solar/vllm-tt-plugin
+git -C /home/eslim/experiments/solar/vllm-tt-plugin checkout 51b43cf   # the checkout that served EXAONE-4.5 on this box
+source /home/eslim/experiments/solar/env.sh                           # activates python_env, PYTHONPATH, HF_MODEL, MESH_DEVICE, TT_CACHE_PATH, HF_HUB_OFFLINE
+uv pip freeze > freeze_before.txt
+(cd /home/eslim/experiments/solar/vllm-tt-plugin && source docs/install-vllm-tt.sh)   # 39.8 s: vllm==0.25.1+empty from the PyPI sdist
+uv pip install pyjson5                                                # 2.0.1, needed by Upstage's tool parser
+python -c 'import vllm, vllm_tt_plugin, ttnn; print(vllm.__version__)'   # 0.25.1, "Platform plugin tt is activated"
+```
+
+Result: `vllm==0.25.1+empty` (built `VLLM_TARGET_DEVICE=empty`, no CUDA / torch pin), `vllm-tt-plugin==0.1.0` editable
+from the clone (remote HEAD was c9cfebcf, two test-only commits ahead), `tblib 3.2.2`, `pyjson5 2.0.1`. The pins the
+port depends on are unchanged: torch 2.11.0+cpu, torchvision 0.26.0+cpu, transformers 5.12.1, numpy 1.26.4, tokenizers
+0.22.2, safetensors 0.8.0, huggingface-hub 1.16.1. Moved by vLLM's `common.txt`: pydantic 2.9.2 -> 2.13.5, opencv-python-
+headless 4.8.1.78 -> 4.11.0.86, lark 1.3.1 -> 1.2.2, sse-starlette 0.10.3 -> 3.4.11 (+73 / -5 packages, the same end
+state as the EXAONE venv). Every tt-inference-server `run.py` launch additionally installs `vllm-tt-metal/requirements.txt`
+(pyjwt 2.7.0, requests 2.32.3, downgrading 2.13.0 / 2.34.2; harmless). Do NOT install the gemma4 checkout's
+`tt-vllm-plugin/` (vllm 0.18.1 / torch 2.10) or a PyPI vllm wheel: both replace torch. Restore point:
+`uv pip sync results/vllm/S1/freeze_before.txt` (ttnn is an editable install; re-run `create_venv.sh` if sync drops it).
+
+### tt-inference-server branch and files (worktree `/home/eslim/experiments/solar/tt-inference-server`, branch `changh95/solar-open` from `origin/main` 1c994c437)
+
+- `workflows/model_specs/dev/llm.yaml` (appended template, `id_tt-transformers_Solar-Open-100B_p150x8`): weights
+  `upstage/Solar-Open-100B`, `impl: tt_transformers`, `inference_engine: VLLM`, device `P150X8` with `max_concurrency 32`
+  (the wrapper's `MAX_BATCH_SIZE`), `max_context 16384` (first bring-up; the plugin's warm-up sweeps prefill up to
+  `max_model_len`), `max_tokens_all_users_override 655872` (benchmark-client hint only), `tensor_cache_timeout 7200`,
+  `env_vars {MESH_DEVICE P150x8, HF_HUB_OFFLINE 1, SOLAR_OPEN_TEMPLATE_DATE today}`, `override_tt_config {fabric_config
+  FABRIC_1D_RING, trace_region_size 100000000, sample_on_device_mode decode_only}`, `vllm_args {block_size 64,
+  model-class-overrides ..., no-async-scheduling true, reasoning-parser solar_open, reasoning-parser-plugin <abs path of
+  vllm_plugins/solar_open_parsers.py>, tool-call-parser solar_open, tool-parser-plugin <same>, enable-auto-tool-choice
+  true, default-chat-template-kwargs '{"reasoning_effort": "low"}'}`, `status EXPERIMENTAL`, `has_builtin_warmup true`,
+  template env `VLLM_ALLOW_LONG_MAX_MODEL_LEN 1`. No `system_requirements` (this box's KMD 2.9.1-pre trips STRICT
+  specifiers), no `tt_metal_commit` (the dev schema rejects it). The merged `vllm serve` line the spec produces:
+  `--model upstage/Solar-Open-100B --block_size 64 --max_model_len 16384 --max_num_seqs 32 --max_num_batched_tokens
+  16384 --max-log-len 32 --seed 9472 --additional_config '{"tt": {...}}' --model-class-overrides ... --no-async-scheduling
+  --reasoning-parser solar_open ... --enable-auto-tool-choice --default-chat-template-kwargs '{"reasoning_effort": "low"}'`.
+- `vllm-tt-metal/extra_models/solar_open/vllm_metadata.json` (`git add -f`: `*.json` is gitignored) =
+  `{"arch": "SolarOpenForCausalLM", "main_class": "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"}`; the
+  plugin reads `EXTRA_MODELS_DIR=<repo>/vllm-tt-metal/extra_models` in every vLLM process and registers the arch as
+  `TTSolarOpenForCausalLM` (log `Registered TT model TTSolarOpenForCausalLM -> ... (from EXTRA_MODELS_DIR/solar_open)` in
+  the launcher, the APIServer and the EngineCore).
+- `.env` (gitignored) = `HF_TOKEN=hf_offline_dummy_not_a_real_token`: `run.py` demands the variable for `--workflow
+  server` and never validates it for `--local-server`.
+- `persistent_volume/volume_id_tt_transformers-Solar-Open-100B-vNone/tt_metal_cache/cache_Solar-Open-100B/P150x8` is the
+  `TT_CACHE_PATH` the server forces (derived from `SetupConfig`: impl `tt_transformers`, version `None`, mesh `P150x8`);
+  pre-create it as a symlink to the warm cache `/home/eslim/experiments/solar/tt_cache` (holds
+  `tensor_cache_bfp8_expbfp8_(1, 8)`), otherwise the first launch does the cold 393 GB host load + ~580 s cache build.
+- Docs note for the branch / PR: `docs/solar_open_100b_p150x8_dev_note.md` in the worktree. Host tests with the entry
+  present: `pytest tests/test_model_catalog_yaml.py tests/test_model_specification.py tests/test_run_local_server.py
+  tests/test_run_vllm_api_server.py -q` -> 122 passed.
+
+### Launch, stop, client workflows
+
+```bash
+source /home/eslim/experiments/solar/env.sh            # python_env with vllm 0.25.1 + vllm_tt_plugin, PYTHONPATH = tt-metal root
+fuser -v /dev/tenstorrent/*                            # must print nothing: the vLLM server IS the device process (one at a time)
+cd /home/eslim/experiments/solar/tt-inference-server
+EXTRA_MODELS_DIR=$PWD/vllm-tt-metal/extra_models python3 run.py --model Solar-Open-100B --tt-device p150x8 \
+    --workflow server --local-server --dev-mode --tt-metal-home /home/eslim/experiments/solar/tt-metal \
+    --host-hf-cache ~/.cache/huggingface --no-auth --skip-system-sw-validation --disable-metal-timeout
+# --skip-system-sw-validation: KMD 2.9.1-pre is a prerelease; --disable-metal-timeout: clears the server's 5 s op timeout
+# (TT_METAL_OPERATION_TIMEOUT_SECONDS; the log then reads "Metal op timeout disabled via DISABLE_METAL_OP_TIMEOUT=1").
+# run.py bootstraps uv into .workflow_venvs (network on the first run), validates `import vllm` + the tt entry point,
+# installs vllm-tt-metal/requirements.txt, spawns the server (start_new_session), waits for /health (65-74 s warm) and
+# EXITS; the server keeps running. Server log: workflow_logs/local_server/vllm_local_<ts>_upstage__Solar-Open-100B_p150x8_server.log
+curl -s localhost:8000/health; curl -s localhost:8000/v1/models
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"upstage/Solar-Open-100B",
+  "messages":[{"role":"user","content":"대한민국의 수도는 어디인가요?"}],"max_tokens":200,"temperature":0,
+  "chat_template_kwargs":{"reasoning_effort":"low"},"return_token_ids":true}'
+# Client workflows against the running server (the port MUST be inside --server-url: --service-port is dropped for
+# remote targets and the client then polls port 80 for 20 min; --local-server must not be combined with --server-url):
+python3 run.py --model Solar-Open-100B --tt-device p150x8 --workflow benchmarks --dev-mode --server-url http://127.0.0.1:8000 --no-auth
+# Stop (mandatory before any other device process):
+pkill -TERM -f run_vllm_api_server.py; sleep 30; fuser -v /dev/tenstorrent/*   # must be empty
+tt-smi -r                                                                        # see "Known limitations": the stop is not graceful
+```
+
+Expected start-up lines, in order (`results/vllm/S2/server_logs/`): `Registered TT model TTSolarOpenForCausalLM ...`
+(3x), `Applying model_class_overrides {...}` (WARNING "intended for development/debugging"), `Resolved architecture:
+SolarOpenForCausalLM`, `Asynchronous scheduling is disabled`, `Attempting to open mesh device with grid shape (1, 8)`,
+`Setting fabric config: FabricConfig.FABRIC_1D_RING, reliability mode: FabricReliabilityMode.STRICT_INIT`, `TTModelRunner:
+trace_mode=all, sample_on_device_mode=decode_only, enable_model_warmup=True`, `Chunked prefill is not supported for
+model_type=solar_open; disabling it`, `Prefix caching is not supported in TT backend ... disabling it`, the weight-cache
+load (6 s warm), `Installed a synchronous ERROR+ mirror on the 'vllm' logger`, `Getting max_tokens_all_users=655872`,
+`Overriding num_gpu_blocks=10280`, `GPU KV cache size: 657,920 tokens`, `Maximum concurrency for 16,384 tokens per
+request: 40.16x`, ours `Paged KV cache: 10280 blocks x 64 tokens, 48 layers, TP=8 -> 8.00 GiB per device (budget 8.0
+GiB, experts bfp8)` and `Allocated the vLLM paged KV cache: 1 submesh x 48 layers x K/V of [10280, 1, 64, 128]
+DataType.BFLOAT8_B (replicated)` (22 s), the plugin warm-up (eager prefill 128 / 1024 / 2048 at batch 1, decode at batch
+32 over six `SamplingParams` variants, `Using batch-1-only traced prefill warmup`, `Done Capturing Prefill Trace`, two
+`Done Capturing Decode Trace`, `Decode warmup completed`; 8 s inside the 100 MB trace region), `vLLM 0.25.1 compat shims
+... {'vllm.entrypoints.openai.protocol': 'shim', 'vllm.entrypoints.openai.tool_parsers.abstract_tool_parser': 'shim'}`,
+`Registered vLLM reasoning/tool parser 'solar_open'` (both flags import the same file), `Chat template warmup completed`,
+`Application startup complete`. Harmless warnings: `Unknown motherboard 'Z13PG-D32 Series'`, `Auto-initialization of
+reasoning token IDs failed` (Upstage's parser has no `reasoning_start_str` / `reasoning_end_str`), `Allocating device
+buffers is potentially unsafe due to the existence of an active trace` (also in the demo).
+
+### What was verified live (2026-09-10, launches 3-7 of `results/vllm/S2/runs.txt`; every request file under `results/vllm/S2/`)
+
+- Start-up: 65 / 67 / 70 / 74 / 65 s to `/health` 200 over five launches (APIServer up +11 s incl. 6.6 s registry
+  inspection, EngineCore +9 s, mesh open + fabric 2 s, weight cache 6 s, KV pool 22 s, warm-up 8 s, chat-template warm-up
+  1.6 s). `/v1/models` lists `upstage/Solar-Open-100B` with `max_model_len 16384`.
+- Greedy parity with the demo (same day, `reasoning_effort low`, default system prompt, `temperature 0`): the rendered
+  prompt is the demo's 78 token ids; the server's 73 generated ids (74 with the stop id 24) are IDENTICAL, token for
+  token, to user 0 of the demo `batch32` case run the same day (`results/vllm/S2/demo_batch32_user0_ids.json` vs
+  `smoke_greedy_parity.json`). Against the demo `prefill_128` (batch-1) case the first 8 generated ids agree and the
+  9th differs (b1: "서울은 정치, 경제, 문화의 중심지로...", server / b32: "서울은 1394년 조선 태조 이성계에 의해...").
+  Cause: the server always runs the 32-slot decode program (`--max-num-seqs 32`, decode batches padded to 32), whose
+  bf16 / bfp8 arithmetic order differs from the batch-1 program at an argmax near-tie; the server's own greedy output
+  is byte-identical whether the request decodes alone, with 8 or with 32 concurrent users, async scheduling on or off.
+  Any future parity check must compare against the demo case whose batch equals the server's `--max-num-seqs`.
+- Parsers (Upstage's files through `vllm_plugins/solar_open_parsers.py`, shims below): `reasoning_effort: high` greedy
+  -> 141 tokens, `finish_reason stop`, `reasoning` ("The user asks: ...") split from `content` ("The capital of South
+  Korea is Seoul."); the same request streamed -> first visible delta 204 ms, 298 reasoning deltas in 300 chunks; a
+  `tools` + `tool_choice: auto` request -> `finish_reason tool_calls`, `get_weather {"city": "Seoul"}`, non-empty id
+  `4011803000` (S1's empty-id concern does not reproduce live). Sampling: `generation_config.json` defaults (T 0.8 /
+  top_p 0.95) and `seed 1` requests answer (the seeded one opened a `<|think|>` block despite `low`: model behaviour);
+  `top_k 50` is accepted and clamped to 32 on device without a log line.
+- Concurrency (`results/vllm/S2/conc_client.py`: template-rendered ids to `/v1/completions`, streaming, `ignore_eos`,
+  128 tokens, greedy): 32 users with the shipped `--no-async-scheduling` -> TTFT first / mean / last 0.80 / 4.17 / 4.79 s,
+  decode 14.8-27.6 (mean 25.6) tok/s/user = 820 tok/s aggregate, 436 tok/s wall incl. prefill; with async scheduling
+  (launch 4, before the crash was understood) -> TTFT 4.82 / 4.83 / 4.83 s (one scheduler step prefills all 32 users
+  sequentially at ~151 ms each and returns every first token together), 29.0-29.1 tok/s/user = 931 tok/s, 445 tok/s
+  wall. 8 users: 34.2 tok/s/user (274 tok/s) without / 36.8 (294) with async, TTFT 0.18 / 1.09 / 1.22 s. Demo the same
+  day: `batch32` 35.5-36.0 ms/step = 889-901 tok/s, TTFT-last 4.7 s; `prefill_128` 13.64 ms/step = 73.3 tok/s, TTFT
+  151 ms. A single user under the server decodes at 24-25 ms/step (~40 tok/s) because it runs the 32-slot program.
+- tt-inference-server `--workflow benchmarks` (`vllm bench serve --backend openai-chat`, random prompts, client venv
+  `.venv_llm_vllm` python 3.11 / vllm 0.13.0; JSONs `results/vllm/S2/benchmarks/`): 5 of 16 sweep points before ASIC 1
+  reached 81.6 C during the ISL 1024 x concurrency 32 point and the run was stopped:
+
+  | ISL | OSL | conc | n | req/s | out tok/s | mean TTFT ms | p99 TTFT | mean TPOT ms | mean ITL ms | s |
+  |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | 128 | 128 | 1 | 8 | 0.27 | 34.4 | 657 | 712 | 24.10 | 23.96 | 29.7 |
+  | 128 | 128 | 32 | 256 | 1.73 | 221.8 | 13483 | 14876 | 39.25 | 39.24 | 147.8 |
+  | 128 | 1024 | 1 | 4 | 0.04 | 38.5 | 618 | 683 | 25.41 | 25.98 | 106.5 |
+  | 128 | 1024 | 32 | 128 | 0.59 | 603.9 | 13768 | 14699 | 39.58 | 42.03 | 217.0 |
+  | 1024 | 128 | 1 | 4 | 0.22 | 28.7 | 1303 | 1681 | 24.91 | 24.72 | 17.9 |
+
+  Reading the table: the openai-chat backend counts `content` deltas only, so its TTFT includes the model's think block
+  (657 ms at ISL 128 vs the 150-180 ms prefill); at concurrency 32 the TTFT is the sequential per-user prefill (~151 ms
+  x 32 = 4.8 s per refill) plus queueing behind running decodes (every new prompt's prefill stalls the batch); TPOT 39 ms
+  at 32 users and 24-25 ms at one user (the 32-slot program). No perf targets are registered for the model, so the
+  workflow grades every block NA.
+
+### Wrapper mechanics (what the plugin calls and what it gets)
 
 - Wrapper: `SolarOpenForCausalLM` in `models/tt_transformers/tt/generator_vllm.py` (additive, next to the other
-  text-model wrappers, subclass of `HybridAttentionForCausalLM`). Registry key = `hf_config.architectures[0]` =
-  `SolarOpenForCausalLM` (`configs/Solar-Open-100B/config.json`); the plugin's `model_registry.py` line (out of
-  tree) is `"SolarOpenForCausalLM": ("models.tt_transformers.tt.generator_vllm", "SolarOpenForCausalLM")`. The
-  Solar-specific logic is in `tt/vllm_support.py`, importable and unit-tested without vllm.
+  text-model wrappers, subclass of `HybridAttentionForCausalLM`); the Solar-specific logic is in `tt/vllm_support.py`,
+  importable and unit-tested without vllm. Registry key = `hf_config.architectures[0]` = `SolarOpenForCausalLM`
+  (`configs/Solar-Open-100B/config.json`), registered by the plugin as `TTSolarOpenForCausalLM` from the `EXTRA_MODELS_DIR`
+  bundle. The PLAIN name must resolve to the TT class as well (`--model-class-overrides`, spec `vllm_args`): without it
+  upstream vLLM resolves the unknown arch to its Transformers backend (`TransformersMoEForCausalLM`) and vLLM >= 0.25
+  keeps that name in `model_config.architecture` / `architectures` (`model_arch_config`), which the plugin's in-place `TT`
+  prefixing of `hf_config.architectures` never reaches; the worker's KV-spec hook then looks up
+  `TTTransformersMoEForCausalLM` and the EngineCore dies (`ValueError: Model architectures ['TTTransformersMoEForCausalLM']
+  are not supported`, launch 2). With the override vLLM inspects the TT class itself, so the class carries the
+  `VllmModelForTextGeneration` protocol shim (`__init__(*args, **kwargs)`, `embed_input_ids`, `forward(input_ids,
+  positions)`, `compute_logits`; never called, same pattern as `models/demos/gemma4`) and the log reads `Resolved
+  architecture: SolarOpenForCausalLM`.
 - `initialize_vllm_model(hf_config, mesh_device, max_batch_size, max_seq_len, n_layers, tt_data_parallel,
-  optimizations)` refuses anything but the 1x8 mesh, `tt_data_parallel=1`, `max_batch_size <= 32`
-  (`--max-num-seqs`), `max_seq_len <= 131072` (`--max-model-len`), `optimizations=None` and a model name other
-  than `Solar-Open-100B` BEFORE the host load, then calls `create_tt_model(create_kv_cache=False, dtype=bfp8,
-  moe_options=MoEOptions.from_env())`: `HF_MODEL`, `TT_CACHE_PATH`, `MESH_DEVICE=P150x8` and the `SOLAR_OPEN_*`
-  flags must be exported for the server process (`source env.sh`); a cold cache does the 393 GB host load.
+  optimizations)` refuses anything but the 1x8 mesh, `tt_data_parallel=1`, `max_batch_size <= 32` (`--max-num-seqs`),
+  `max_seq_len <= 131072` (`--max-model-len`), `optimizations=None` and a model name other than `Solar-Open-100B` BEFORE
+  the host load, installs the synchronous error mirror (below), then calls `create_tt_model(create_kv_cache=False,
+  dtype=bfp8, moe_options=MoEOptions.from_env())`: `HF_MODEL`, `TT_CACHE_PATH`, `MESH_DEVICE=P150x8` and the
+  `SOLAR_OPEN_*` flags must be exported for the server process (`source env.sh`; tt-inference-server copies its
+  environment into the server).
 - KV cache: `get_kv_cache_spec` emits 48 `FullAttentionSpec` entries (`model.layers.<i>.self_attn`; SolarOpenConfig
-  has no `layer_types`, so the base class' lookup cannot be used), i.e. one KV group. `allocate_kv_cache((max_num_blocks,
-  kv_heads, block_size, 128), dtype, num_layers)` re-runs `check_kv_budget` (`create_tt_model` skipped it) and
-  zero-fills replicated bfp8 pools with `ttnn.from_torch` like `attention/kv_cache.py` - deliberately not
-  `allocate_vllm_kv_cache`, whose `as_tensor(cache_file_name=...)` would write ~27 GB of zero tensorbins per pool
-  shape. `kv_heads` is the per-device 1 (the TT worker divides the 8 KV heads by TP); an undivided 8 is accepted.
-  Use `--block-size 64` (the demo's page block; any multiple of 32 passes the guard).
-- `get_max_tokens_all_users()` = `kv_budget_tokens(MoEOptions.from_env())` from `tt/common.py`: the KV budget
-  (`SOLAR_OPEN_KV_BUDGET_GIB` or its per-expert-dtype default) divided by 13,056 B per token per device in whole
-  64-token blocks - 8 GiB -> 657,920 tokens (32 users x 20.5K), 13 GiB -> 1,069,120, 14 GiB -> 1,151,360. The pool
-  vLLM allocates from this figure is what `allocate_kv_cache` then checks against the same budget.
+  has no `layer_types`), i.e. one KV group, so the plugin takes the `allocate_kv_cache_per_layer` path with
+  `kv_cache_shape = (num_blocks, 8 // 8 = 1, block_size, 128)` (the per-device KV head; an undivided 8 is accepted).
+  `allocate_kv_cache` re-runs `check_kv_budget` (`create_tt_model` skipped it) and zero-fills replicated bfp8 pools with
+  `ttnn.from_torch` like `attention/kv_cache.py` (not `allocate_vllm_kv_cache`, whose `as_tensor(cache_file_name=...)`
+  would write ~27 GB of zero tensorbins per pool shape); vLLM's requested `torch.bfloat16` is logged and the pool stays
+  `BFLOAT8_B`. `--block-size 64` is the demo's page block (any multiple of 32 passes the guard; a bare `vllm serve`
+  would default to 16 and be refused).
+- `get_max_tokens_all_users(..., max_num_seqs=)` = the KV budget MINUS the plugin's headroom. The budget
+  (`kv_budget_tokens` in `tt/common.py`: `SOLAR_OPEN_KV_BUDGET_GIB` or its per-expert-dtype default over 13,056 B per
+  token per device, whole 64-token blocks) is 657,920 tokens at 8 GiB (32 users x 20.5K), 1,069,120 at 13 GiB,
+  1,151,360 at 14 GiB, and it is what `allocate_kv_cache` enforces. The plugin (`worker.py::get_num_available_blocks_tt`)
+  adds `block_size x max_num_seqs` tokens (2,048 at 64 x 32) to whatever the class returns before `ceil(/block_size)`,
+  so the wrapper hands out `budget - headroom` (`vllm_support.max_tokens_all_users(max_num_seqs=)`): 655,872 reported
+  -> 10,280 blocks = 8.00 GiB, guard passes. Returning the full budget (the pre-2026-09-10 code) made the pool 10,312
+  blocks = 8.025 GiB and `allocate_kv_cache` raised before any weight was loaded. Assumes `--block-size 64`.
 - `model_capabilities`: `supports_prefix_caching False` (a nonzero `start_pos` is unvalidated), `supports_async_decode
   True`, `supports_sample_on_device True`, `max_device_top_k 32` (`TTSampling.max_top_k`). `prefill_forward` /
-  `decode_forward` take `Generator`'s legacy single-`page_table` path (with one KV group the plugin's per-layer
-  tables are copies of it; `page_tables_per_layer` is accepted and ignored).
-- Stop ids: vLLM stops on `generation_config.json`'s `eos_token_id` `[2, 24, 25]` itself (`--generation-config auto`,
-  the default); the wrapper exposes `stop_token_ids` (= `ModelArgs.stop_token_ids`) for parity checks only and never
-  truncates generations. `<|end|>` (21) closes a message without ending the turn and is not a stop id.
-- Chat template (`chat_template.jinja`): kwargs `reasoning_effort` (default `high`; `low` / `minimal` prepend an
-  empty `<|think|><|end|>` block), `default_system_prompt` (default true, dated through the `strftime_now` Jinja
-  global) and `think_render_option` (`lastthink`). Per request: `"chat_template_kwargs": {"reasoning_effort": "low"}`
-  in the OpenAI request body (or the server-wide default-chat-template-kwargs option where the installed vLLM has
-  it); `vllm_support.chat_template_kwargs()` returns the demo's effective values (env `SOLAR_OPEN_REASONING_EFFORT`
-  / `SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT` applied). The demo's `low` is a demo choice, not a wrapper default.
-- Reasoning / tool parsers: the HF repo ships `solar_open_reasoning_parser.py` (`SolarOpenReasoningParser`:
-  reasoning between `<|think|>` and `<|end|>`, content after `<|content|>` / `<|tool_calls|>`, `is_reasoning_end`
-  recognises the empty think block of `low`) and `solar_open_tool_parser.py` (`SolarOpenToolParser`, needs
-  `pyjson5`) WITHOUT register decorators - Upstage's fork `UpstageAI/vllm@v0.12.0-solar-open` registers them
-  internally (`--reasoning-parser solar_open --tool-call-parser solar_open`). On a stock vLLM + TT plugin build use
-  the in-tree plugin file, which registers both under `solar_open`
-  (`vllm_support.register_vllm_parsers()`; `HF_MODEL` must be the snapshot directory):
+  `decode_forward` take `Generator`'s legacy single-`page_table` path (with one KV group the plugin's per-layer tables
+  are copies of it; `page_tables_per_layer` is accepted and ignored); together with `read_decode_output` /
+  `process_decode_output_host` they log any exception synchronously (loguru) before re-raising.
+- Sampling: Solar's device prefill path is argmax-only, so the spec serves `sample_on_device_mode: decode_only` (the
+  first token is host-sampled from the returned `[B, 1, vocab]` logits, decode samples on device over the pow2-padded
+  per-device vocab; `top_k > 32` clamped to 32). Decode batches arrive padded to `max_num_seqs` (tokens 0, positions -1,
+  zero block-table rows), which `Model.ttnn_decode_forward` demands: `--max-num-seqs` must be 1 / 2 / 4 / 8 / 16 / 32.
+- Async scheduling: `supports_async_decode True` makes vLLM enable it by default, and with plugin 51b43cf + vLLM 0.25.1
+  the request scheduled right after a request that finished on a stop token kills the EngineCore (`AssertionError:
+  captured request missing from runner state while applying sampled tokens: req_id=<the finished request>`,
+  `vllm_tt_plugin/model_runner.py:2262 _apply_sampled_tokens_to_state` via `async_decode.py:415
+  apply_completed_decode_step` / `:329 apply_ready_completed_decode_steps` at the next request's `execute_model`: the
+  speculatively submitted decode step of the finished request is applied after the runner dropped it; reproduced 4 / 4,
+  requests ending on `max_tokens` are unaffected; full traceback `results/vllm/S2/crash_traceback.txt`). The spec serves
+  with `--no-async-scheduling` (-12% decode throughput at 32 users, -7% at 8) until the plugin handles EOS-finished
+  async steps.
+- Lost tracebacks: tt-inference-server routes vLLM's records through an `AsyncLogHandler` and the API server
+  force-kills a dead EngineCore at once (`MPClient` shutdown timeout 0 s), so `logger.exception` of the fatal error
+  reached no log in three launches. `initialize_vllm_model` (which runs in the EngineCore) calls
+  `vllm_support.install_vllm_sync_error_log_handler()`, a synchronous stderr mirror of ERROR+ records of the `vllm`
+  logger (`SOLAR_OPEN_VLLM_SYNC_ERROR_LOG=0` disables it); that is how the assertion above was captured.
+- Stop ids: vLLM stops on `generation_config.json`'s `eos_token_id` `[2, 24, 25]` itself (`--generation-config auto`);
+  the wrapper exposes `stop_token_ids` (= `ModelArgs.stop_token_ids`) for parity checks only. `<|end|>` (21) closes a
+  message without ending the turn and is not a stop id.
+- Chat template (`chat_template.jinja`): kwargs `reasoning_effort` (template default `high`; `low` / `minimal` prepend
+  an empty `<|think|><|end|>` block), `default_system_prompt` (default true, dated through the `strftime_now` Jinja
+  global, i.e. the REAL date under vLLM: `SOLAR_OPEN_TEMPLATE_DATE` only governs the demo / test path) and
+  `think_render_option` (`lastthink`). The spec's `--default-chat-template-kwargs '{"reasoning_effort": "low"}'` makes
+  the demo's effort the server default; per request `"chat_template_kwargs": {"reasoning_effort": "high"}` overrides it.
+- Reasoning / tool parsers: the HF repo ships `solar_open_reasoning_parser.py` (`SolarOpenReasoningParser`: reasoning
+  between `<|think|>` and `<|end|>`, content after `<|content|>` / `<|tool_calls|>`, `is_reasoning_end` recognises the
+  empty think block of `low`) and `solar_open_tool_parser.py` (`SolarOpenToolParser`, needs `pyjson5`) WITHOUT register
+  decorators (Upstage's fork `UpstageAI/vllm@v0.12.0-solar-open` registers them internally). Both import vLLM-0.12 module
+  paths absent in 0.25.1 (`vllm.entrypoints.openai.protocol`, split into `entrypoints/openai/{chat_completion,engine,
+  responses}/protocol.py`; `vllm.entrypoints.openai.tool_parsers.abstract_tool_parser`, now
+  `vllm.tool_parsers.abstract_tool_parser`): `vllm_support.install_vllm_compat_shims()` re-creates the two legacy paths
+  in `sys.modules` from their current homes (a no-op where they still exist) and `register_vllm_parsers()` calls it
+  before importing the files. The in-tree plugin file registers both under `solar_open` (`HF_MODEL` must be the
+  snapshot directory; under tt-inference-server it is the server's `model_file_symlinks_map/Solar-Open-100B` symlink).
+  The two request logits processors of the HF README (`SolarOpenTemplateLogitsProcessor`,
+  `ParallelToolCallLogitsProcessor`) run on host logits and are incompatible with on-device sampling; requests that
+  need them must take the host-sampling path (plugin behaviour, unverified). Bare `vllm serve` equivalent of the spec:
 
   ```bash
   P=models/demos/solar_open/vllm_plugins/solar_open_parsers.py
-  vllm serve upstage/Solar-Open-100B --max-num-seqs 32 --max-model-len 8192 --block-size 64 \
+  vllm serve upstage/Solar-Open-100B --max-num-seqs 32 --max-model-len 16384 --block-size 64 \
       --reasoning-parser-plugin $P --reasoning-parser solar_open \
-      --tool-parser-plugin $P --tool-call-parser solar_open --enable-auto-tool-choice   # UNTESTED
+      --tool-parser-plugin $P --tool-call-parser solar_open --enable-auto-tool-choice \
+      --model-class-overrides '{"SolarOpenForCausalLM": "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"}' \
+      --no-async-scheduling --default-chat-template-kwargs '{"reasoning_effort": "low"}' \
+      --additional-config '{"tt": {"fabric_config": "FABRIC_1D_RING", "trace_region_size": 100000000, "sample_on_device_mode": "decode_only"}}'
   ```
 
-  The two request logits processors of the HF README (`SolarOpenTemplateLogitsProcessor`,
-  `ParallelToolCallLogitsProcessor`, token ids 20-25 / 30-34) run on host logits and are incompatible with on-device
-  sampling; requests that need them must take the host-sampling path (plugin behaviour, unverified).
-- Open items to verify on the vLLM side, in this order: (1) decode batches arrive padded to `max_num_seqs` with
-  position -1 in the unused slots (`Model.ttnn_decode_forward` raises unless the batch equals
-  `max_local_batch_size`); (2) `prefill_forward` returns pre-sampled argmax tokens when `sampling_params` is given
-  (`tt/model.py::process_output_prefill`) - correct for greedy, sampled first tokens must come from host sampling;
-  (3) the `kv_cache_shape` head count and `block_size` the plugin passes; (4) warmup (`warmup_model_prefill`, traced
-  prefill at 128 only on P150x8) and trace-region use (100 MB, `models/model_trace_region_sizes.yaml`); (5) the
-  effective `--max-model-len` x `--max-num-seqs` against the 8 GiB default budget (32 x 16K fits;
-  `SOLAR_OPEN_KV_BUDGET_GIB=13` or `SOLAR_OPEN_EXPERT_DTYPE=bfp4` for 32 x 32K).
-- Host smoke test (no device, vllm optional): `pytest models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py`
-  checks `vllm_support` with mocks (token capacity vs the budget, the 48-entry KV spec, request validation, the
-  `from_torch` allocator and its budget refusal, stop ids, template kwargs, the plugin file) and parses
-  `generator_vllm.py` to keep the wrapper's capabilities / method set / signature in sync; the cases that import the
-  wrapper class run only where vllm is importable (skipped here).
+### Open items of the pre-launch surveys, resolved on the device
+
+| item (survey ranking) | outcome on 2026-09-10 |
+|---|---|
+| KV pool vs budget (U2 #1) | fixed in `max_tokens_all_users` (budget minus headroom): 655,872 reported -> 10,280 blocks = 8.00 GiB, `check_kv_budget` passes; the pre-fix 10,312 blocks (8.025 GiB) was refused |
+| Parser imports on 0.25.1 (U2 #2) | `install_vllm_compat_shims()` + `pyjson5`; both parsers work live (reasoning split, streaming, tool call) |
+| Decode padding to `max_num_seqs` (plugin contract 1) | confirmed in the plugin (`model_runner.py` decode padding); `--max-num-seqs 32` runs the 32-slot program for every request |
+| KV shape / block (plugin contract 3) | `[10280, 1, 64, 128] BFLOAT8_B` x 48 layers, one KV group, `allocate_kv_cache_per_layer` path, `--block-size 64` |
+| Sampling mode (plugin contract 2, U2 #9) | `sample_on_device_mode: decode_only`; greedy / sampled / seeded / `top_k` requests answer; `top_k > 32` clamped silently |
+| Warm-up vs the 100 MB trace region (U2 #4) | eager 128 / 1024 / 2048 + decode b32 x 6 variants, traced prefill@128, two decode traces; 8 s, no trace OOM |
+| Fabric through the plugin (U2 #3) | `FABRIC_1D_RING` + `STRICT_INIT` from `override_tt_config.fabric_config` (plugin default `FABRIC_1D`) |
+| Op timeout (U2 #7, U1 #5) | `--disable-metal-timeout` -> `DISABLE_METAL_OP_TIMEOUT=1`; nothing timed out in any launch |
+| Unknown-arch resolution (U1 #2, U2 #6) | harmful after all: `TTTransformersMoEForCausalLM` in the worker's KV-spec hook; fixed with `--model-class-overrides` + the protocol shim |
+| Async scheduling on the shared Generator path (U2 #5) | crashes after a stop-token finish (plugin bug); `--no-async-scheduling` in the spec |
+| HF offline + dummy token (U1 #7) | config / tokenizer / parser files load from the snapshot; the token is never validated |
+| Plugin <-> tt-metal API drift (U1 #1) | none at 51b43cf on this tree (mesh open, fabric, KV, warm-up, traces all through the plugin) |
+| `max_model_len` (U1 #4, U2 #11) | 16384 first: 40.16x concurrency for 16K requests in the 8 GiB pool; the 128K warm-up sweep is untested |
+
+### Still open (backlog; details in `design/phase3/measurements.md` section 9)
+
+- vllm-tt-plugin: (a) the async-scheduling EOS assertion (drop `no-async-scheduling` from the spec once fixed: +12%
+  decode throughput at 32 users and a single-step first token for bursts); (b) plain-arch registration for
+  `EXTRA_MODELS_DIR` bundles (then `model-class-overrides` and the protocol shim become optional).
+- tt-inference-server: (a) `--server-url http://host` without a port never reaches the server (`ServerConnection.
+  url_with_port` drops `--service-port` for remote targets); (b) `AsyncLogHandler` loses the EngineCore's fatal
+  traceback (our synchronous mirror is the workaround); (c) no `EvalConfig` / perf targets for `upstage/Solar-Open-100B`
+  (the `evals` and `release` workflows and the benchmark grading need them); (d) the benchmark sweep points 6-16
+  (ISL >= 1024 at concurrency 32, 2048 .. 16384 ISL) are unmeasured (cooling pauses or a lower concurrency for the long
+  points; ASIC 1 heats fastest).
+- Wrapper / spec: `max_model_len` above 16384 (`--vllm-override-args '{"max_model_len": 131072,
+  "max_num_batched_tokens": 131072}'`: the warm-up then sweeps prefill to 128K, ~72 s chunked prefill, board 1 heats)
+  with `SOLAR_OPEN_KV_BUDGET_GIB=13` or `SOLAR_OPEN_EXPERT_DTYPE=bfp4` for 32 x 32K; `logprobs` requests (host-sampling
+  fallback) and the HF logits processors; the plugin's own `tests/tt` suite; a low-concurrency spec variant
+  (`--max-num-seqs 8`: 36.8 tok/s/user) for single-user latency.
+- Docker image: not buildable from this box until the branch is pushed (both `vllm-tt-metal/*.Dockerfile`s clone
+  tt-metal from GitHub and the tree carries ttnn C++ changes; `--dev-mode` bind mounts cannot carry a rebuilt
+  `build/lib`); then `scripts/build_single_docker.sh --tt-metal-commit <sha> --vllm-commit 51b43cf --build`.
+
+### Known limitations of the served path
+
+- Sequential prefill under vLLM: the plugin prefills the new prompts of a scheduler step one user at a time (~151 ms
+  each at ISL 128), so a 32-user burst waits 4.8 s for its last first token (with async scheduling for its FIRST one
+  too) and the benchmark's 32-concurrency points report 13.5-13.8 s mean TTFT with queueing. The demo's packed 32-user
+  prefill (`Model.prefill_forward_text_batched`, opt-in `SOLAR_OPEN_BATCHED_PREFILL=1`) is not reachable from the
+  Generator path: wiring it into the bridge is the biggest TTFT lever.
+- Single-user decode runs the 32-slot program: 24-25 ms/step (~40 tok/s) vs the demo's batch-1 13.6 ms/step; the
+  greedy tokens equal the demo's batch-32 case, not its batch-1 case.
+- `top_k > 32` is clamped to 32 on device silently (no log line under vLLM; the demo logs its clamp); `min_p` and the
+  penalties are handled by the plugin's `TTSamplingParams` padding.
+- No prefix caching and no chunked-prefill resume: the plugin disables both for `model_type=solar_open` (`Chunked prefill
+  is not supported ...`, `Prefix caching is not supported ...`); a prompt must fit `max_num_batched_tokens` (=
+  `max_model_len`) in one prefill call, and `supports_prefix_caching` stays `False` because a resumed prefill with
+  `start_pos > 0` is unvalidated.
+- The server stop is not graceful: SIGTERM to `run_vllm_api_server.py` makes the APIServer force-kill the EngineCore
+  before it closes the mesh, so the next device process fails firmware init on device 1 (`Device 1 init: failed to
+  initialize FW`) until `tt-smi -r` (~60 s). The same holds after any EngineCore crash. Untested alternative: SIGINT to
+  the EngineCore pid (its handler closes the mesh).
+- The docker images cannot run this tree (unpushed branch, ttnn C++ changes; see above); only the dockerless
+  `--local-server` path works on this box.
+- First bring-up context is 16384 tokens per request (`max_context` in the spec); sampling defaults come from
+  `generation_config.json` (T 0.8 / top_p 0.95: pass `temperature 0` for demo parity); the chat template stamps the real
+  date, so token-for-token comparisons with the demo must run on the same calendar day.
+- Host smoke test (no device; vllm optional, `HF_MODEL` optional): `pytest models/demos/solar_open/tests/unit/
+  test_vllm_wrapper_import.py` checks `vllm_support` with mocks (token capacity = budget minus headroom and the pool the
+  plugin sizes from it passing / the pre-fix pool failing the budget guard, the 48-entry KV spec, request validation,
+  the `from_torch` allocator and its budget refusal, stop ids, template kwargs, the synchronous error mirror, the
+  plugin file) and parses `generator_vllm.py` to keep the wrapper's capabilities / method set / signature in sync; with
+  vllm importable it imports the wrapper class, checks vLLM's `is_text_generation_model` accepts it, calls
+  `get_max_tokens_all_users` the way the plugin does, and (with `HF_MODEL` set) installs the compat shims and registers
+  / instantiates Upstage's parsers on the Solar tokenizer. 48 passed, 1 skipped (the no-vllm error path).
 
 ## Known limitations
 
@@ -882,6 +1135,8 @@ dtype (`THRESHOLDS["bfp4"]`: 0.87 / 0.84 / 0.92 / 0.87 / 0.95 / 0.96 / KL <= 0.1
 | `SOLAR_OPEN_ATTENTION_BF16_OUTPUT=1` (phase 2, design_misc.md (a); skips the o_proj-input and pre-all_reduce bfp8 typecasts) | test_teacher_forced b1/b32 vs the bit-identical phase-1 baselines (b1 top-1 0.9297 / full-vocab PCC 0.99215 / KL 0.0347; b32 0.9180 / 0.99219 / 0.0324), demo `prefill_128` + `batch32` step times (54.4 / 92.1 ms) | **MEASURED WORSE, root cause open, default stays OFF** (final chain1 2026-09-07 15:19-15:22, `scratchpad/phase2/final/tf/b1_bf16out`, `b32_bf16out`; same reference, same final-tree defaults as the passing rows): b1 top-1 0.9336 -> **0.8828** (per prompt 0.859 / 0.859 / 0.938 / 0.875 vs 0.938 / 0.938 / 0.953 / 0.906), decisive 0.9558 -> 0.9248 (floor 0.94), top-5 0.9180 -> 0.9008, top-64 PCC 0.97945 -> 0.97526, full PCC 0.99071 -> 0.98985, KL 0.0355 -> **0.0654** (floor 0.06; max 0.83), teacher-forced decode 45.3 -> 47.4 ms/step; b32 top-1 0.9375 -> 0.8906, decisive 0.9602 -> 0.9248, KL 0.0355 -> 0.0630, 69.8 -> 74.1 ms/step; demos b1 36.45 -> 37.22, b32 81.21 -> 80.34 ms/step, TTFT unchanged. Both teacher-forced cases FAIL the floors. Host review of the option (merge-p0 stage): in decode the ONLY change is the dtype on the all_reduce wire (o_proj already ran bf16 x bfp8 at HiFi2 with a bf16 output; the bfp8 typecast before the reshape / `ttnn.all_reduce` is skipped), in prefill the o_proj input stays bf16 (HiFi2 instead of the LoFi of two bfp8 operands) and the all_reduce moves to bf16 too; the residual add (`ttnn.add(residual, branch, dtype=bf16)`), the norms, the router and the experts never see the option, and `ttnn.all_reduce` -> `all_reduce_async` picks the reduce_scatter_minimal_async + all_gather_async path independently of the dtype -- so on paper every changed operand is at least as precise and the accuracy loss cannot be explained from the host side. Device component check (merge-p0 stage, `scratchpad/merge_p0/attn_bf16out.log`: `test_decoder --test-modules=attention -k "1x8 and pos0 and unpaged"` with the option ON, random layer-0 weights, same seeds as the default run `final/u_decoder_pos0.log`): 6 passed, every all-reduced output replica-consistent on the 8 devices; attention PCC vs HF ON / default: decode b1 0.99915 / 0.99923, b32 0.99926 / 0.99907, b16 0.99927 / 0.99909, prefill 128 0.99930 / 0.99920, 1024 0.99880 / 0.99871, 4096 0.99856 / 0.99845 -- neutral-or-better in isolation, so the whole-model loss is NOT reproducible at the component level with random weights and needs a real-weight A/B (`tests/test_layer0_real_weights.py` with the env, then a per-layer teacher-forced probe) in the device lane. Candidates left for the device lane: the reduce_scatter / all_gather kernels with bf16 pages of 2 KiB (validated exact on P150x8 only with bfp8 pages), the bf16 dst accumulation order of the 8 partials, and the auto program config the bf16 prefill o_proj gets | 2026-09-07 |
 | `SOLAR_OPEN_FUSE_SHARED_EXPERT=1` (phase-2 fusion row: shared expert as always-on slot 128; `tests/unit/test_fused_shared_expert.py -k 1x8`, random layer-0 weights, final tree) | fused vs unfused MLP, both vs `SolarOpenMoE`, weights / router columns bit-identical, one all_reduce, `ttnn.linear` launch count | PASSED 8/8 on the final tree (2026-09-07 16:52-17:14, `scratchpad/gate_p0/u_fused2.log` + `u_fused3.log`): fused vs unfused PCC decode b1 / b8 / b32 0.99890 / 0.99887 / 0.99889, prefill 128 / 1024 / 4096 0.99903 / 0.99928 / 0.99940 (floor `FUSED_VS_UNFUSED_PCC` 0.998: the phase-1 shared expert measured 0.9993-0.9994 against the fused slot, the perf-p0 1D configs moved the UNFUSED output closer to HF -- decode b1 vs HF 0.99822 -> 0.99896 -- while the fused slot (bfp8 activations, routed compute config) stays at 0.99827, so the two forms now agree at the bfp8-activation floor); vs HF unfused 0.99896 / 0.99898 / 0.99857 / 0.99863 / 0.99915 / 0.99931, fused 0.99827 / 0.99825 / 0.99780 / 0.99894 / 0.99919 / 0.99924 (the fused block is the less accurate one on decode, equal on prefill); fused weights and routed router columns bit-identical, `{'all_reduce': 1}` on both; linears 4 -> 1 (decode, prefill 128), 4 -> 2 (1K: one sorted split, always-on hot linear), 5 -> 6 (4K: 4 sorted splits, one of which also has a routed hot expert -- the expectation is `unfused - 3 x chunks + one always-on linear per sorted split`). Perf / teacher-forced ladder in fused mode NOT measured (single-user decode falls back to the batched union path, so fused b1 is slower than the unfused default): the default stays 0 | 2026-09-07 |
 | test_vllm_wrapper_import (host only, no device, vllm absent) | vllm_support plumbing with mocked ttnn / mesh + AST checks of `SolarOpenForCausalLM` | PASSED: 35 cases, the 4 cases that import the wrapper class skipped (vllm not installed); token capacities 657,920 (8 GiB bfp8 default) / 1,151,360 (14 GiB bfp4) / 1,069,120 (13 GiB); 48 FullAttentionSpec keys; 96 `from_torch` calls for 48 layers; 25.5 GiB pool refused before any allocation. UNTESTED against a live vLLM | 2026-09-07 |
+| test_vllm_wrapper_import (host only, no device; vllm 0.25.1 + vllm_tt_plugin @51b43cf installed in python_env, `HF_MODEL` set) | as above + the real wrapper import, the plugin's KV headroom arithmetic, the vLLM-0.12 import shims, Upstage's parsers registered directly and through the plugin file and run on the Solar tokenizer | PASSED: 45 cases, 1 skipped (the no-vllm error path); `get_max_tokens_all_users(max_num_seqs=32)` = 655,872 (budget 657,920 - 2,048 headroom), the plugin's pool 10,280 blocks = 8.00 GiB passes `check_kv_budget` while the pre-fix pool (10,312 blocks, 8.025 GiB) is refused; both legacy module paths shimmed on 0.25.1 (idempotent); `extract_reasoning("<\|think\|>Plan the answer.<\|end\|><\|content\|>Seoul.")` = ("Plan the answer.", "Seoul."), the `low` empty think block = ("", content); tool call `get_weather {"city": "Seoul"}` parsed with content "Checking the weather."; `ReasoningParserManager.import_reasoning_parser` / `ToolParserManager.import_tool_parser` load the plugin file. 13 s. Venv after the install: torch 2.11.0+cpu / transformers 5.12.1 / numpy 1.26.4 / tokenizers 0.22.2 unchanged (pydantic 2.9.2 -> 2.13.5, opencv 4.8.1 -> 4.11.0.86, + pyjson5 2.0.1, tblib 3.2.2); `test_model_config.py -k 'not 1x8'` 45 passed. Live server: the next row (S2) | 2026-09-10 |
+| vLLM live server (tt-inference-server `--local-server`, spec `id_tt-transformers_Solar-Open-100B_p150x8`, vllm 0.25.1 + vllm_tt_plugin @51b43cf, warm caches, `--max-model-len 16384 --max-num-seqs 32 --block-size 64`, FABRIC_1D_RING, 100 MB trace, `sample_on_device_mode decode_only`, `--model-class-overrides`, `--no-async-scheduling`) | 7 launches on the LoudBox: startup, /health, /v1/models, greedy parity vs the demo, sampled / seeded / top_k 50 / reasoning high / tool call / streaming chat, 32 and 8 concurrent greedy users (`/v1/completions`, 128 tokens, ignore_eos), tt-inference-server `--workflow benchmarks` sweep | PASSED (server up 65-74 s: mesh (1, 8), 6 s weight cache, KV pool 10,280 blocks = 8.00 GiB in 22 s, warm-up 8 s). Greedy first prompt: prompt ids == demo (78), first 8 generated ids == demo then diverges (server 32-slot decode program vs demo batch-1 build; the server's own output is identical alone / 8 / 32 users). Decode 32 users: 29.1 tok/s/user = 931 tok/s aggregate with async scheduling (TTFT all 4.8 s: one step prefills 32 users sequentially), 25.6 tok/s/user = 820 tok/s without it (TTFT first/mean/last 0.8/4.2/4.8 s); 8 users 36.8 / 34.2 tok/s/user. Single user (32-slot program) ~39 tok/s (TPOT 25 ms) vs demo b1 73 tok/s. Crashes fixed on the way: `TTTransformersMoEForCausalLM` not registered (plain arch -> Transformers backend; `--model-class-overrides` + protocol shim) and the plugin's async-scheduling assertion after a stop-token finish (`--no-async-scheduling`; traceback captured by `install_vllm_sync_error_log_handler`). `vllm bench serve` (openai-chat, random prompts): ISL/OSL 128/128 conc 1 TTFT 657 ms mean (includes the think block), conc 32 n=256 222 tok/s TPOT 39 ms; 128/1024 conc 32 n=128 604 tok/s; 1024/128 conc 1 TTFT 1.30 s TPOT 24.9 ms. Ledger `scratchpad/vllm/S2/runs.txt` | 2026-09-10 |
 | test_streaming_loader (host only, no device; `SOLAR_OPEN_STREAMING_LOAD=1` loader) | Part A synthetic 3-shard checkpoint (11 tests) + Part B real layer 0 / embed / norm / lm_head vs `from_pretrained(num_hidden_layers=1)` | PASSED 13/13 (27 s with a cold page cache): 16 real tensors sha256-identical to the phase-1 path; lazy loader 7.43 GB in 398 preads, 2 fused builds, 0 repeat reads, peak RSS 3.1 GB (reference subprocess 10.5 GB peak, 8.3 s); layout validation on the lazy dict reads 0 tensor bytes; before: phase-1 cold build 393 GB peak RSS (device smoke / full cold build pending) | 2026-09-07 |
 
 ### Phase 3a rows (2026-09-08, HEAD 47ddeabebe8 + the uncommitted phase-3a tree; `scratchpad/phase3/measurements.md`)
@@ -1670,6 +1925,41 @@ component cells within -3.1e-4 of the same-set phase-3d-arms reference (A2 fused
 Open: the packed prefill's first-token shift against HF (A0; the demo default is a tech-lead decision), the two thin margins of A2 / A3
 (teacher-forced top-1 counts moving +-5 of 256 between arms with flat KL), the thermal correctness hazard at >= 80 C (r9 -> r9b), and
 the phase-3e backlog listed in `design/phase3/measurements.md` section 8.
+
+### Phase 3f rows (2026-09-10, HEAD 3d822c9191b + the uncommitted vLLM edits; ledgers `results/vllm/S1/runs.txt`, `results/vllm/S2/runs.txt`, `results/vllm/S3/runs.txt`)
+
+Phase 3f = Solar-Open-100B served by upstream vLLM 0.25.1 + vllm-tt-plugin 51b43cf through tt-inference-server
+`--local-server` on P150x8 (see "Serving with vLLM and tt-inference-server"). Same box, same day and tree as the demo
+column, warm caches, cool box (< 60 C) before every device run, one device process at a time; `reasoning_effort low`,
+default system prompt, greedy unless stated. Demo = `text_demo.py` `prefill_128` (b1, 4K paged context) and `batch32`
+(32 users, 8K paged context, 512-token budget, sequential prefill) run the same day; server = spec
+`id_tt-transformers_Solar-Open-100B_p150x8` (`--max-num-seqs 32 --max-model-len 16384 --block-size 64`, FABRIC_1D_RING,
+100 MB trace, `sample_on_device_mode decode_only`, `--model-class-overrides`, `--no-async-scheduling` unless the cell
+says "async on"). 10 device launches in S1-S3 (S1 0, S2 9 incl. 6 servers / 3 crashed on the plugin bug / 1 demo init
+failure after a forced stop / 2 demos, S3 0). Nothing in the model code moved: the greedy tokens equal the demo's.
+
+| metric | demo (phase 3e tree, same day) | vLLM server (S2) | note |
+|---|---:|---:|---|
+| time to `/health` 200 (warm ttnn + kernel caches) | demo `prefill_128` 12.5 s pytest wall | **65 / 67 / 70 / 74 / 65 s** (launches 3-7) | APIServer +11 s (6.6 s registry inspect), EngineCore +9 s, mesh + fabric 2 s, weight cache 6 s, KV pool 22 s, warm-up 8 s, chat-template warm-up 1.6 s |
+| KV pool | 8K paged context per demo case | **10,280 blocks x 64 tokens = 8.00 GiB per device** (`[10280, 1, 64, 128] BFLOAT8_B` x 48 layers) | `max_tokens_all_users` 655,872 (budget 657,920 - 2,048 headroom); vLLM `GPU KV cache size 657,920 tokens`, `40.16x` concurrency at 16K |
+| greedy tokens, prompt 78 ids (KO capital question) | b32 user 0: 73 ids; b1: 67 ids (stop at 67) | **73 ids == demo b32 token for token**; vs demo b1 the first 8 ids agree, the 9th differs | the server runs the 32-slot decode program for every request; its output is identical alone / 8 / 32 users, async on / off |
+| single-user decode ms/step (tok/s) | b1 **13.64 (73.3)** | 24.1-25.4 TPOT (~40 tok/s) at concurrency 1 (`vllm bench` 128/128 and 1024/128) | 32-slot program vs the demo's batch-1 program |
+| single-user TTFT@128 ms | b1 **151.2** | chat request 78 + 74 tokens in 1.73 s wall; `vllm bench` openai-chat TTFT 657 ms mean (includes the think block; 150-180 ms prefill); 8-user burst first TTFT 180 ms | openai-chat counts `content` deltas only |
+| 32-user decode ms/step; tok/s/user; tok/s aggregate | b32 **35.5-36.0**; 28.2; **889-901** | **39 (mean 25.6 tok/s/user, 14.8-27.6); 820** with `--no-async-scheduling`; 34.4 (29.1); **931** async on | 128 tokens per user, `ignore_eos`, `/v1/completions`, streaming; wall incl. prefill 436 / 445 tok/s |
+| 32-user TTFT first / mean / last s | b32 sequential **0.148 / 2.44 / 4.73** | **0.80 / 4.17 / 4.79** (`--no-async-scheduling`); 4.82 / 4.83 / 4.83 async on (one step prefills all 32) | sequential ~151 ms per user under both; the demo's packed prefill (1.77 s for every user, opt-in) is unreachable from the Generator path |
+| 8-user decode tok/s/user (ms/step); aggregate; TTFT first / mean / last s | - | **34.2 (29.2); 274; 0.18 / 1.09 / 1.22** (`--no-async-scheduling`); 36.8 (27.2); 294; 1.22 / 1.22 / 1.23 async on | same client, 8 users |
+| `vllm bench serve` openai-chat (ISL/OSL conc n): out tok/s; mean TTFT ms; mean TPOT ms | - | 128/128 c1 n8: 34.4; 657; 24.10. 128/128 c32 n256: **221.8; 13483; 39.25** (1.73 req/s). 128/1024 c1 n4: 38.5; 618; 25.41. 128/1024 c32 n128: **603.9; 13768; 39.58**. 1024/128 c1 n4: 28.7; 1303; 24.91 | 5 of 16 sweep points (stopped at ISL 1024 x c32 with ASIC 1 at 81.6 C); no perf targets registered -> NA grades |
+| requests: reasoning `high` split; streaming; tool call; sampled / seeded; `top_k 50` | demo `reasoning_high` case | **reasoning / content split (141 tokens, stop); 298 reasoning deltas, first 204 ms; `finish_reason tool_calls`, `get_weather {"city": "Seoul"}`, id `4011803000`; T 0.8 / top_p 0.95 and seed 1 answer; top_k 50 accepted, clamped to 32 silently** | all on launch 7 after the async workaround; the seeded request opened a think block under `low` (model behaviour) |
+| crashes met and fixed on the way | - | launch 2 `ValueError: Model architectures ['TTTransformersMoEForCausalLM'] are not supported` -> `--model-class-overrides` + protocol shim; launches 3-6 EngineCore death at the request after a stop-token finish -> `AssertionError ... captured request missing from runner state` (plugin async path) -> `--no-async-scheduling`; traceback captured only after `install_vllm_sync_error_log_handler` | 4 / 4 reproductions of the async crash; both fixes in the spec + wrapper |
+| stop / next device process | demo processes close the mesh | `pkill -TERM -f run_vllm_api_server.py` force-kills the EngineCore (mesh never closed): next process `Device 1 init: failed to initialize FW` until `tt-smi -r` (~60 s) | procedure: stop, `fuser` empty, `tt-smi -r`, temps < 60 C |
+| venv after the install / after `run.py` | - | vllm 0.25.1+empty, vllm-tt-plugin 0.1.0 editable @51b43cf, pyjson5 2.0.1, tblib 3.2.2; torch 2.11.0+cpu / transformers 5.12.1 / numpy 1.26.4 / tokenizers 0.22.2 unchanged; pydantic 2.9.2 -> 2.13.5, opencv 4.8.1.78 -> 4.11.0.86, lark 1.3.1 -> 1.2.2; `run.py`: pyjwt 2.13.0 -> 2.7.0, requests 2.34.2 -> 2.32.3 | `install-vllm-tt.sh` 39.8 s; freezes `results/vllm/S1/freeze_{before,after}.txt` |
+| host tests | - | `test_vllm_wrapper_import.py` 48 passed, 1 skipped (13.9 s); `test_model_config.py -k 'not 1x8'` 45 passed; tt-inference-server `tests/test_model_catalog_yaml.py tests/test_model_specification.py tests/test_run_local_server.py tests/test_run_vllm_api_server.py` 122 passed | S3 re-ran the host set after pre-commit (see the S3 ledger) |
+
+Defaults after phase 3f: no model-code default moved. Served configuration = the spec above; the two workarounds
+(`--model-class-overrides`, `--no-async-scheduling`) and the two wrapper additions (protocol shim, synchronous error
+mirror) stay until the plugin fixes land. Open: the plugin's async EOS bug, the plugin's plain-arch registration for
+bundles, the graceful stop, the benchmark points 6-16, `max_model_len > 16384`, evals / perf targets, the docker image
+(needs the pushed branch), and the packed prefill under vLLM (TTFT lever) -- `design/phase3/measurements.md` section 9.
 
 ### ISL/OSL x batch sweep, phase 3c tree, full (2026-09-09, de5c31bb3dc + the uncommitted phase-3c tree, tag `_p3cfull`)
 

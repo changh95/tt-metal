@@ -1160,10 +1160,16 @@ class GptOssForCausalLM(HybridAttentionForCausalLM):
 class SolarOpenForCausalLM(HybridAttentionForCausalLM):
     """upstage/Solar-Open-100B on the 1x8 Blackhole mesh (TP=8) for the vLLM TT plugin.
 
-    UNTESTED against a live vLLM: vLLM is not installed on the Solar bring-up box, so this class has only been
-    exercised by the host-only smoke test ``models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py``.
-    Registry key = ``hf_config.architectures[0]`` = ``"SolarOpenForCausalLM"`` (the TT plugin's model_registry
-    entry points at this module / class).
+    Served live since 2026-09-10: upstream vLLM 0.25.1 (``VLLM_TARGET_DEVICE=empty``) + tenstorrent/vllm-tt-plugin
+    51b43cf in the tree's python_env, launched through tt-inference-server ``--local-server`` on P150x8 (greedy tokens
+    equal the demo's batch-32 case; 32 users 820 tok/s aggregate with ``--no-async-scheduling``). The host test
+    ``models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py`` imports this class for real and checks the
+    KV-pool arithmetic the plugin applies. Runbook: models/demos/solar_open/README.md "Serving with vLLM and
+    tt-inference-server".
+    Registry key = ``hf_config.architectures[0]`` = ``"SolarOpenForCausalLM"``, which the plugin registers as
+    ``TTSolarOpenForCausalLM`` from an EXTRA_MODELS_DIR bundle whose ``vllm_metadata.json`` points at this
+    module / class (see ``vllm_support.VLLM_ARCHITECTURE``); the PLAIN name must resolve here too
+    (``--model-class-overrides``), see the protocol-shim comment below.
 
     Solar's 48 layers are all full attention and ``SolarOpenConfig`` has no ``layer_types``, so
     ``get_kv_cache_spec`` emits the 48 ``FullAttentionSpec`` entries itself (one KV group) instead of the base
@@ -1184,21 +1190,64 @@ class SolarOpenForCausalLM(HybridAttentionForCausalLM):
         "max_device_top_k": 32,  # TTSampling.max_top_k default; the demo clamps larger top_k requests
     }
 
+    # -- vLLM ``VllmModelForTextGeneration`` protocol shim (same pattern as models/demos/gemma4) -------------------
+    #
+    # ``SolarOpenForCausalLM`` has no upstream vLLM implementation, so upstream's ``ModelConfig`` resolves the plain
+    # arch to the Transformers backend (``TransformersMoEForCausalLM``) and vLLM >= 0.25 keeps that name in
+    # ``model_config.architecture`` / ``.architectures`` (``model_arch_config``), out of reach of the plugin's
+    # in-place ``TT`` prefixing of ``hf_config.architectures``; the plugin worker then looks up
+    # ``TTTransformersMoEForCausalLM`` for the KV spec hook and dies (seen live on P150x8, 2026-09-10). The fix is to
+    # make the PLAIN name resolve to this class as well (``--model-class-overrides '{"SolarOpenForCausalLM":
+    # "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"}'`` in the tt-inference-server spec; the
+    # EXTRA_MODELS_DIR bundle still provides ``TTSolarOpenForCausalLM``), which means vLLM's registry inspects THIS
+    # class with ``is_text_generation_model``: ``__init__`` accepting ``vllm_config`` (``**kwargs`` of the base
+    # class suffices), ``embed_input_ids``, ``forward(input_ids, positions)`` and ``compute_logits``. Execution never
+    # reaches these: the TT runner calls ``prefill_forward`` / ``decode_forward``.
+    def __init__(self, *args, **kwargs):
+        # ``Generator.__init__`` has no ``**kwargs``; vLLM's ``_check_vllm_model_init`` wants a ``vllm_config`` kw.
+        super().__init__(*args, **kwargs)
+
+    def embed_input_ids(self, input_ids):  # pragma: no cover - protocol shim
+        raise NotImplementedError(
+            "SolarOpenForCausalLM is a TT bridge; embeddings happen on the device inside prefill_forward / "
+            "decode_forward, not through this method."
+        )
+
+    def forward(self, input_ids, positions, **kwargs):  # pragma: no cover - protocol shim
+        raise NotImplementedError(
+            "SolarOpenForCausalLM is a TT bridge; the TT runner invokes prefill_forward / decode_forward, not forward()."
+        )
+
+    def compute_logits(self, hidden_states, **kwargs):  # pragma: no cover - protocol shim
+        raise NotImplementedError(
+            "SolarOpenForCausalLM is a TT bridge; logits are produced on the device and surfaced through "
+            "prefill_forward / decode_forward."
+        )
+
     @classmethod
     def get_max_tokens_all_users(
         cls,
         model_name: str = "",
         num_devices: int = 1,
         tt_data_parallel: int = 1,
+        max_model_len: int = None,
+        max_num_seqs: int = None,
         **kwargs,
     ) -> int:
         """All-user KV capacity from the Solar KV budget (``SOLAR_OPEN_KV_BUDGET_GIB`` or its per-expert-dtype
-        default in ``models/demos/solar_open/tt/common.py``), in whole 64-token blocks - the same figure
-        ``allocate_kv_cache`` enforces (8 GiB -> 657,920 tokens with bfp8 experts)."""
+        default in ``models/demos/solar_open/tt/common.py``) MINUS the plugin's headroom of ``block_size x
+        max_num_seqs`` tokens, which ``vllm_tt_plugin/worker.py::get_num_available_blocks_tt`` adds back before it
+        derives the block count. The pool the plugin then allocates is exactly the budget ``allocate_kv_cache``
+        enforces: 8 GiB with bfp8 experts at ``--max-num-seqs 32`` -> 655,872 reported, 10,280 blocks = 8.00 GiB
+        allocated. ``max_num_seqs`` is the plugin's per-lane batch (defaults to the 32-user cap when not passed);
+        ``model_name`` / ``num_devices`` / ``tt_data_parallel`` / ``max_model_len`` are accepted for the contract."""
         from models.demos.solar_open.config import MoEOptions
-        from models.demos.solar_open.tt.vllm_support import max_tokens_all_users
+        from models.demos.solar_open.tt.vllm_support import MAX_BATCH_SIZE, max_tokens_all_users
 
-        return max_tokens_all_users(MoEOptions.from_env())
+        return max_tokens_all_users(
+            MoEOptions.from_env(),
+            max_num_seqs=MAX_BATCH_SIZE if max_num_seqs is None else int(max_num_seqs),
+        )
 
     @classmethod
     def get_kv_cache_spec(cls, vllm_config):
@@ -1242,8 +1291,14 @@ class SolarOpenForCausalLM(HybridAttentionForCausalLM):
     ):
         from models.demos.solar_open.config import MoEOptions
         from models.demos.solar_open.tt.common import create_tt_model
-        from models.demos.solar_open.tt.vllm_support import validate_vllm_model_request
+        from models.demos.solar_open.tt.vllm_support import (
+            install_vllm_sync_error_log_handler,
+            validate_vllm_model_request,
+        )
 
+        # This runs in the EngineCore: mirror vLLM's ERROR+ records synchronously to stderr so a fatal engine error
+        # keeps its traceback even when the serving stack's async log handler is killed before it drains.
+        install_vllm_sync_error_log_handler()
         # 1x8 / TP=8 / DP=1 / batch <= 32 / <= 131072 positions / the same checkpoint as HF_MODEL; raises before the
         # 393 GB host load of a cold cache starts.
         validate_vllm_model_request(
@@ -1283,13 +1338,45 @@ class SolarOpenForCausalLM(HybridAttentionForCausalLM):
 
         return stop_token_ids_for_vllm(self.model_args[0])
 
+    # The serving stack logs vLLM's own records through tt-inference-server's AsyncLogHandler (a queue drained by a
+    # background thread) and the API server force-kills a dead EngineCore at once, so the traceback of an exception
+    # raised inside the model bridge is routinely lost (seen live 2026-09-10). Log it synchronously here (loguru ->
+    # stderr) before re-raising; the four entry points below are everything the TT runner calls per step.
+    @staticmethod
+    def _log_bridge_failure(entry_point, exc):
+        logger.opt(exception=exc).error(
+            f"SolarOpenForCausalLM.{entry_point} raised {type(exc).__name__}: {exc} (traceback below; re-raised to vLLM)"
+        )
+
     def prefill_forward(self, *args, page_tables_per_layer=None, **kwargs):
         # One full-attention KV group: every per-layer table equals the single page_table, so the legacy path applies.
-        return super().prefill_forward_text(*args, **kwargs)
+        try:
+            return super().prefill_forward_text(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - diagnostic passthrough
+            self._log_bridge_failure("prefill_forward", exc)
+            raise
 
     def decode_forward(self, *args, page_tables_per_layer=None, **kwargs):
         # Skip HybridAttentionForCausalLM.decode_forward (a NotImplementedError placeholder); Generator's decode.
-        return super(HybridAttentionForCausalLM, self).decode_forward(*args, **kwargs)
+        try:
+            return super(HybridAttentionForCausalLM, self).decode_forward(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - diagnostic passthrough
+            self._log_bridge_failure("decode_forward", exc)
+            raise
+
+    def read_decode_output(self, *args, **kwargs):
+        try:
+            return super().read_decode_output(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - diagnostic passthrough
+            self._log_bridge_failure("read_decode_output", exc)
+            raise
+
+    def process_decode_output_host(self, *args, **kwargs):
+        try:
+            return super().process_decode_output_host(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - diagnostic passthrough
+            self._log_bridge_failure("process_decode_output_host", exc)
+            raise
 
     def allocate_kv_cache(self, kv_cache_shape, dtype, num_layers):
         """``list[submesh][layer][k, v]`` of replicated bfp8 pools, budget-checked; see vllm_support for why this is

@@ -1481,6 +1481,12 @@ def test_solar_open_demo(
                 f"=={user_label} - REASONING\n{reasoning or '<none>'}\n"
                 f"=={user_label} - TOKENS\nprompt {decoding_pos[i]}, generated {n_generated} ({stop_note})\n"
             )
+            # Raw ids (prompt as rendered by the chat template, then the generated continuation) so a served model
+            # (vLLM `return_token_ids`) can be compared token for token with the demo on the same day / template kwargs.
+            logger.info(
+                f"=={user_label} - TOKEN IDS\nprompt_ids={list(map(int, output[: decoding_pos[i]]))}\n"
+                f"generated_ids={list(map(int, output[decoding_pos[i] :]))}\n"
+            )
 
         num_tokens_generated_decode.append(iteration)  # Save the number of tokens generated for each repeat batch
 

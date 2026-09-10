@@ -12,13 +12,18 @@ all-user token capacity derived from the KV budget in ``tt/common.py``, the page
 straight to the device with ``ttnn.from_torch`` - no tensorbins - after the budget guard), the generation stop set,
 the chat-template kwargs and the registration shim for Upstage's reasoning / tool parsers.
 
-STATUS: written against the vLLM TT plugin contract (tech_reports/LLMs/vLLM_integration.md) and the text-model
-wrappers of that module; vLLM is NOT installed on the Solar bring-up box, so nothing here has run against a live vLLM.
-The only functions that need vllm (parser registration) import it lazily and fail with a clear message without it.
+STATUS: written against the standalone TT plugin (tenstorrent/vllm-tt-plugin, ``vllm_tt_plugin``; upstream vLLM 0.25.1
+built ``VLLM_TARGET_DEVICE=empty`` inside this tree's python_env since 2026-09-10) and the text-model wrappers of that
+module. Host-verified with the real vllm import (``tests/unit/test_vllm_wrapper_import.py``: the KV pool arithmetic
+the plugin applies, Upstage's parsers imported through the compat shims and instantiated on the Solar tokenizer);
+NOT yet run against a live vLLM server on the device. The functions that need vllm (shims, parser registration)
+import it lazily and fail with a clear message without it.
 """
 
 import importlib.util
+import logging
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -26,14 +31,16 @@ from loguru import logger
 
 import ttnn
 from models.demos.solar_open.config import MoEOptions
-from models.demos.solar_open.tt.common import KV_BYTES_PER_ELEMENT, check_kv_budget, kv_budget_tokens
+from models.demos.solar_open.tt.common import KV_BUDGET_ENV, KV_BYTES_PER_ELEMENT, check_kv_budget, kv_budget_tokens
 from models.demos.solar_open.tt.model_config import DEFAULT_HF_MODEL, MODEL_NAME
 from models.demos.solar_open.utils.general_utils import get_layer_types
 from models.tt_transformers.tt.common import PagedAttentionConfig
 
-# ``hf_config.architectures[0]`` of the checkpoint = the key of the TT plugin's model registry
-# (tenstorrent/vllm plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_registry.py, out of this tree):
-#   "SolarOpenForCausalLM": ("models.tt_transformers.tt.generator_vllm", "SolarOpenForCausalLM")
+# ``hf_config.architectures[0]`` of the checkpoint. The TT plugin (tenstorrent/vllm-tt-plugin) registers it, prefixed,
+# as ``TTSolarOpenForCausalLM`` from an EXTRA_MODELS_DIR bundle in every vLLM process (platform.py
+# ``_register_models_from_extra_dir``): ``$EXTRA_MODELS_DIR/solar_open/vllm_metadata.json`` =
+#   {"arch": "SolarOpenForCausalLM", "main_class": "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"}
+# (tt-inference-server branch changh95/solar-open ships it under vllm-tt-metal/extra_models/solar_open/).
 VLLM_ARCHITECTURE = "SolarOpenForCausalLM"
 VLLM_WRAPPER_MODULE = "models.tt_transformers.tt.generator_vllm"
 VLLM_WRAPPER_CLASS = "SolarOpenForCausalLM"
@@ -88,12 +95,20 @@ def vllm_available() -> bool:
     return spec is not None and spec.origin is not None
 
 
-def max_tokens_all_users(moe_options: MoEOptions = None, block_size: int = KV_BLOCK_SIZE) -> int:
-    """All-user KV capacity (tokens) the plugin should size the paged pool from.
+def plugin_headroom_tokens(max_num_seqs: int = MAX_BATCH_SIZE, block_size: int = KV_BLOCK_SIZE) -> int:
+    """The plugin's own KV padding, ``block_size x max_num_seqs`` tokens (2,048 at 64 x 32).
 
-    The same number ``check_kv_budget`` enforces at allocation: ``SOLAR_OPEN_KV_BUDGET_GIB`` (or the per-expert-dtype
-    default of ``tt/common.py``) divided by the 13,056 B per token per device, in whole page blocks - e.g. 8 GiB ->
-    657,920 tokens, 13 GiB -> 1,069,120, 14 GiB -> 1,151,360.
+    ``vllm_tt_plugin/worker.py::get_num_available_blocks_tt`` adds one extra block per user (vLLM's worst-case
+    block-allocation heuristic) to whatever ``get_max_tokens_all_users`` returns before it derives the block count.
+    """
+    return int(block_size) * int(max_num_seqs)
+
+
+def kv_budget_tokens_solar(moe_options: MoEOptions = None, block_size: int = KV_BLOCK_SIZE) -> int:
+    """The KV budget in tokens with the Solar-Open shapes: what ``check_kv_budget`` enforces at allocation.
+
+    ``SOLAR_OPEN_KV_BUDGET_GIB`` (or the per-expert-dtype default of ``tt/common.py``) over 13,056 B per token per
+    device, in whole page blocks - 8 GiB -> 657,920 tokens, 13 GiB -> 1,069,120, 14 GiB -> 1,151,360.
     """
     moe_options = moe_options or MoEOptions.from_env()
     return kv_budget_tokens(
@@ -104,6 +119,38 @@ def max_tokens_all_users(moe_options: MoEOptions = None, block_size: int = KV_BL
         tensor_parallel=TENSOR_PARALLEL,
         block_size=block_size,
     )
+
+
+def max_tokens_all_users(
+    moe_options: MoEOptions = None, block_size: int = KV_BLOCK_SIZE, max_num_seqs: int = MAX_BATCH_SIZE
+) -> int:
+    """All-user KV capacity (tokens) to report to the plugin: the KV budget MINUS the plugin's headroom.
+
+    The plugin adds ``block_size x max_num_seqs`` to this figure and takes ``ceil(/block_size)`` blocks
+    (``plugin_kv_pool_blocks``); ``allocate_paged_kv_cache`` then re-checks that pool against the same budget. So the
+    figure handed out here is ``kv_budget_tokens_solar() - plugin_headroom_tokens()``: 8 GiB at 32 users -> 655,872
+    tokens; the plugin sizes 657,920 / 64 = 10,280 blocks = 8.00 GiB, which passes the guard. (Returning the full
+    budget made the pool 10,312 blocks = 8.025 GiB > 8.0 GiB -> ValueError before any weight was loaded.)
+
+    ``max_num_seqs`` is the plugin's per-lane batch (vLLM ``--max-num-seqs``; the wrapper forwards the kwarg the
+    plugin passes, defaulting to the 32-user cap). ``block_size`` must be the served ``--block-size`` (64, the only
+    value the demo validates; the plugin does not pass it). ``max_num_seqs=0`` returns the raw budget figure.
+    """
+    budget = kv_budget_tokens_solar(moe_options, block_size=block_size)
+    headroom = plugin_headroom_tokens(max_num_seqs, block_size)
+    if headroom >= budget:
+        raise ValueError(
+            f"The plugin's KV headroom ({max_num_seqs} users x {block_size}-token blocks = {headroom} tokens) leaves "
+            f"nothing of the {budget}-token KV budget; lower --max-num-seqs or raise {KV_BUDGET_ENV}"
+        )
+    return (budget - headroom) // block_size * block_size
+
+
+def plugin_kv_pool_blocks(max_tokens: int, max_num_seqs: int = MAX_BATCH_SIZE, block_size: int = KV_BLOCK_SIZE) -> int:
+    """Blocks the plugin allocates from a ``get_max_tokens_all_users`` figure: ``ceil((max_tokens +
+    block_size x max_num_seqs) / block_size)`` (``worker.py::get_num_available_blocks_tt``; the sliding-window term
+    does not apply to Solar's single full-attention group). The tests hold this pool against ``check_kv_budget``."""
+    return -(-(int(max_tokens) + plugin_headroom_tokens(max_num_seqs, block_size)) // int(block_size))
 
 
 def validate_vllm_model_request(
@@ -323,18 +370,140 @@ def _import_tool_parser_manager():
     return ToolParserManager
 
 
+# Upstage's parser files were written against UpstageAI/vllm@v0.12.0-solar-open. vLLM >= 0.13 moved the modules they
+# import: ``vllm.entrypoints.openai.protocol`` was split into per-endpoint protocol modules and
+# ``vllm.entrypoints.openai.tool_parsers`` became ``vllm.tool_parsers``. install_vllm_compat_shims() re-creates the
+# legacy module paths in sys.modules from their current homes (a no-op where the legacy modules still exist).
+# tt-inference-server routes vLLM's records through its AsyncLogHandler (a queue drained by a background thread) and
+# the API server force-kills a dead EngineCore the moment it reports ENGINE_CORE_DEAD, so the ``logger.exception`` of
+# the fatal error in the EngineCore is routinely lost (three launches on P150x8, 2026-09-10, no traceback anywhere).
+# ``install_vllm_sync_error_log_handler`` mirrors ERROR+ records of the ``vllm`` logger synchronously to stderr from
+# inside the EngineCore (``initialize_vllm_model`` runs there). ``SOLAR_OPEN_VLLM_SYNC_ERROR_LOG=0`` disables it.
+SYNC_ERROR_LOG_ENV = "SOLAR_OPEN_VLLM_SYNC_ERROR_LOG"
+_SYNC_ERROR_LOG_HANDLER_NAME = "solar_open_sync_error_log"
+
+
+def install_vllm_sync_error_log_handler(level=logging.ERROR, stream=None) -> bool:
+    """Attach one synchronous ``StreamHandler`` (default stderr) for ERROR+ records to the ``vllm`` logger.
+
+    Idempotent (keyed by handler name) and independent of vllm being importable: it configures the standard-library
+    logger vLLM writes to. Returns True when a handler was added, False when disabled by the env or already present.
+    """
+    if os.getenv(SYNC_ERROR_LOG_ENV, "1") == "0":
+        return False
+    vllm_logger = logging.getLogger("vllm")
+    if any(getattr(h, "name", None) == _SYNC_ERROR_LOG_HANDLER_NAME for h in vllm_logger.handlers):
+        return False
+    handler = logging.StreamHandler(stream or sys.stderr)
+    handler.name = _SYNC_ERROR_LOG_HANDLER_NAME
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(asctime)s [solar_open sync mirror] %(name)s: %(message)s"))
+    vllm_logger.addHandler(handler)
+    if vllm_logger.level == logging.NOTSET or vllm_logger.level > level:
+        vllm_logger.setLevel(level if vllm_logger.level == logging.NOTSET else min(vllm_logger.level, level))
+    logger.info(f"Installed a synchronous ERROR+ mirror on the 'vllm' logger ({SYNC_ERROR_LOG_ENV}=0 disables it)")
+    return True
+
+
+LEGACY_PROTOCOL_MODULE = "vllm.entrypoints.openai.protocol"
+LEGACY_TOOL_PARSERS_PACKAGE = "vllm.entrypoints.openai.tool_parsers"
+LEGACY_ABSTRACT_TOOL_PARSER_MODULE = LEGACY_TOOL_PARSERS_PACKAGE + ".abstract_tool_parser"
+CURRENT_TOOL_PARSERS_PACKAGE = "vllm.tool_parsers"
+# The eight names the two Upstage files import from the legacy protocol module -> their vLLM 0.25.1 homes.
+LEGACY_PROTOCOL_NAMES = {
+    "ChatCompletionRequest": "vllm.entrypoints.openai.chat_completion.protocol",
+    "ResponsesRequest": "vllm.entrypoints.openai.responses.protocol",
+    "DeltaMessage": "vllm.entrypoints.openai.engine.protocol",
+    "DeltaFunctionCall": "vllm.entrypoints.openai.engine.protocol",
+    "DeltaToolCall": "vllm.entrypoints.openai.engine.protocol",
+    "ExtractedToolCallInformation": "vllm.entrypoints.openai.engine.protocol",
+    "ToolCall": "vllm.entrypoints.openai.engine.protocol",
+    "FunctionCall": "vllm.entrypoints.openai.engine.protocol",
+}
+
+
+def install_vllm_compat_shims() -> dict:
+    """Make the vLLM-0.12 module paths Upstage's parser files import resolve on the installed vLLM.
+
+    Returns ``{legacy_module: "native" | "shim"}``. "native": the module exists in this vLLM, nothing done. "shim": a
+    module re-exporting the ``LEGACY_PROTOCOL_NAMES`` from their current homes (respectively an alias of
+    ``vllm.tool_parsers`` / ``.abstract_tool_parser``) was put into ``sys.modules`` and onto ``vllm.entrypoints.openai``
+    so both ``import`` forms resolve. Idempotent (a second call reports the existing shims). Raises ImportError naming
+    the symbol if the installed vLLM moved a name again - then extend ``LEGACY_PROTOCOL_NAMES``.
+    """
+    import importlib
+    import sys
+    import types
+
+    if not vllm_available():
+        raise RuntimeError(
+            "vllm is not importable in this environment; install_vllm_compat_shims is for the serving venv"
+        )
+    import vllm
+
+    result = {}
+    openai_pkg = importlib.import_module("vllm.entrypoints.openai")
+
+    existing = sys.modules.get(LEGACY_PROTOCOL_MODULE)
+    if existing is not None and getattr(existing, "__solar_open_shim__", False):
+        result[LEGACY_PROTOCOL_MODULE] = "shim"
+    else:
+        try:
+            importlib.import_module(LEGACY_PROTOCOL_MODULE)
+            result[LEGACY_PROTOCOL_MODULE] = "native"
+        except ImportError:
+            shim = types.ModuleType(LEGACY_PROTOCOL_MODULE)
+            shim.__doc__ = (
+                "Compat shim (models/demos/solar_open/tt/vllm_support.py) re-exporting the vLLM 0.12 protocol names "
+                "Upstage's Solar-Open parsers import from their current vLLM modules."
+            )
+            shim.__solar_open_shim__ = True
+            for name, home in LEGACY_PROTOCOL_NAMES.items():
+                try:
+                    setattr(shim, name, getattr(importlib.import_module(home), name))
+                except (ImportError, AttributeError) as exc:
+                    raise ImportError(
+                        f"{name} not found in {home} (vllm {vllm.__version__}); update LEGACY_PROTOCOL_NAMES in "
+                        "models/demos/solar_open/tt/vllm_support.py"
+                    ) from exc
+            sys.modules[LEGACY_PROTOCOL_MODULE] = shim
+            setattr(openai_pkg, "protocol", shim)
+            result[LEGACY_PROTOCOL_MODULE] = "shim"
+
+    existing = sys.modules.get(LEGACY_ABSTRACT_TOOL_PARSER_MODULE)
+    if existing is not None and existing.__name__ != LEGACY_ABSTRACT_TOOL_PARSER_MODULE:
+        result[LEGACY_ABSTRACT_TOOL_PARSER_MODULE] = "shim"
+    else:
+        try:
+            importlib.import_module(LEGACY_ABSTRACT_TOOL_PARSER_MODULE)
+            result[LEGACY_ABSTRACT_TOOL_PARSER_MODULE] = "native"
+        except ImportError:
+            package = importlib.import_module(CURRENT_TOOL_PARSERS_PACKAGE)
+            abstract = importlib.import_module(CURRENT_TOOL_PARSERS_PACKAGE + ".abstract_tool_parser")
+            sys.modules[LEGACY_TOOL_PARSERS_PACKAGE] = package
+            sys.modules[LEGACY_ABSTRACT_TOOL_PARSER_MODULE] = abstract
+            setattr(openai_pkg, "tool_parsers", package)
+            result[LEGACY_ABSTRACT_TOOL_PARSER_MODULE] = "shim"
+    logger.info(f"vLLM {vllm.__version__} compat shims for Upstage's Solar-Open parsers: {result}")
+    return result
+
+
 def register_vllm_parsers(model_dir=None, reasoning=True, tool=True) -> dict:
     """Register Upstage's ``SolarOpenReasoningParser`` / ``SolarOpenToolParser`` under "solar_open" in a vLLM process.
 
     The two files ship in the HF repo (``$HF_MODEL/solar_open_reasoning_parser.py`` / ``solar_open_tool_parser.py``)
     without a register decorator (Upstage's vLLM fork registers them internally), so a stock vLLM needs this shim,
     loaded through ``--reasoning-parser-plugin`` / ``--tool-parser-plugin`` (see ``vllm_plugins/solar_open_parsers.py``).
-    Returns ``{"reasoning": cls, "tool": cls}`` for what was registered. UNTESTED against a live vLLM: the HF tool
-    parser also needs the ``pyjson5`` package, and importing the reasoning parser patches ``json._default_encoder``
-    (Upstage's file does that at import; this is why registration is opt-in and never runs on plain import).
+    ``install_vllm_compat_shims()`` runs first so the files' vLLM-0.12 imports resolve on vLLM 0.25.1; the tool parser
+    also needs the ``pyjson5`` package in the serving venv. Returns ``{"reasoning": cls, "tool": cls}`` for what was
+    registered. Importing the reasoning parser patches ``json._default_encoder`` (Upstage's file does that at import;
+    this is why registration is opt-in and never runs on plain import of this module). Host-verified on vLLM 0.25.1
+    (both parsers register, instantiate on the Solar tokenizer and parse a think/content sample) and live on 2026-09-10
+    through tt-inference-server (reasoning / content split, streamed reasoning deltas, a tool call with a non-empty id).
     """
     if not vllm_available():
         raise RuntimeError("vllm is not importable in this environment; register_vllm_parsers is for the serving venv")
+    install_vllm_compat_shims()
     model_dir = _resolve_model_dir(model_dir)
     registered = {}
     if reasoning:

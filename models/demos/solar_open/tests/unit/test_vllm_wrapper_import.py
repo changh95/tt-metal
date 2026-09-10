@@ -6,19 +6,29 @@
 
     pytest models/demos/solar_open/tests/unit/test_vllm_wrapper_import.py
 
-Two layers:
+Three layers:
 - ``models.demos.solar_open.tt.vllm_support`` (vllm-free) is imported and its plumbing checked with mocks: the token
-  capacity follows the KV budget, the 48-layer full-attention KV spec, the request validation, the ``ttnn.from_torch``
-  pool allocator (with a mocked ttnn and a mocked mesh) incl. the budget refusal, the stop ids and the template kwargs.
+  capacity follows the KV budget minus the plugin's headroom (and the pool the plugin sizes from it passes the budget
+  guard), the 48-layer full-attention KV spec, the request validation, the ``ttnn.from_torch`` pool allocator (with a
+  mocked ttnn and a mocked mesh) incl. the budget refusal, the stop ids and the template kwargs.
 - ``models.tt_transformers.tt.generator_vllm.SolarOpenForCausalLM`` imports vllm at module level, so it is imported
   only where vllm is importable (skipped otherwise). Without vllm the class is still checked structurally by parsing
   the source (capabilities dict == vllm_support.MODEL_CAPABILITIES, method set, initialize_vllm_model signature).
+- With vllm importable AND ``HF_MODEL`` pointing at a Solar-Open-100B snapshot, the vLLM-0.12 import shims are
+  checked against the installed vLLM and Upstage's reasoning / tool parsers are registered (also through the plugin
+  file, the way ``--reasoning-parser-plugin`` / ``--tool-parser-plugin`` import it), instantiated on the Solar
+  tokenizer and run on a think/content sample.
 
-Nothing here talks to a live vLLM; the wrapper is UNTESTED against one (see README "Serving with vLLM").
+Nothing here talks to a live vLLM server (see README "Serving with vLLM").
 """
 
 import ast
+import importlib
 import inspect
+import io
+import json
+import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -37,6 +47,11 @@ CONFIG_DIR = SOLAR_OPEN_DIR / "configs" / "Solar-Open-100B"
 GENERATOR_VLLM_PY = SOLAR_OPEN_DIR.parents[1] / "tt_transformers" / "tt" / "generator_vllm.py"
 PARSER_PLUGIN_PY = SOLAR_OPEN_DIR / "vllm_plugins" / "solar_open_parsers.py"
 WRAPPER_METHODS = {
+    # vLLM ``VllmModelForTextGeneration`` protocol shim: the plain arch resolves to this class (model-class-overrides)
+    "__init__",
+    "embed_input_ids",
+    "forward",
+    "compute_logits",
     "get_max_tokens_all_users",
     "get_kv_cache_spec",
     "initialize_vllm_model",
@@ -70,6 +85,19 @@ SOLAR_ENV_VARS = (
 )
 needs_vllm = pytest.mark.skipif(
     not vs.vllm_available(), reason="vllm is not installed; generator_vllm.py imports vllm at module level"
+)
+
+
+def _solar_model_dir():
+    """The HF snapshot with Upstage's parser files (``HF_MODEL``, else the tree default), or None."""
+    path = Path(os.getenv("HF_MODEL", vs.DEFAULT_HF_MODEL))
+    files = (path / vs.REASONING_PARSER_FILE, path / vs.TOOL_PARSER_FILE, path / "tokenizer.json")
+    return path if all(f.is_file() for f in files) else None
+
+
+needs_parser_files = pytest.mark.skipif(
+    _solar_model_dir() is None,
+    reason="HF_MODEL does not point at a Solar-Open-100B snapshot with Upstage's parser files and tokenizer.json",
 )
 
 
@@ -132,21 +160,42 @@ class TestVllmSupportConstants:
 
 class TestTokenCapacity:
     @pytest.mark.parametrize("expert_dtype", [ttnn.bfloat8_b, ttnn.bfloat4_b], ids=["bfp8", "bfp4"])
-    def test_follows_kv_budget(self, expert_dtype):
+    def test_follows_kv_budget_minus_plugin_headroom(self, expert_dtype):
         opts = MoEOptions(expert_dtype=expert_dtype)
-        expected = int(kv_budget_gib(opts) * 2**30 // vs.KV_BYTES_PER_TOKEN_PER_DEVICE) // 64 * 64
-        assert vs.max_tokens_all_users(opts) == expected == kv_budget_tokens(opts)
+        budget = int(kv_budget_gib(opts) * 2**30 // vs.KV_BYTES_PER_TOKEN_PER_DEVICE) // 64 * 64
+        assert vs.kv_budget_tokens_solar(opts) == budget == kv_budget_tokens(opts)
+        assert vs.max_tokens_all_users(opts, max_num_seqs=0) == budget
+        # What the wrapper reports: the budget minus the plugin's one-block-per-user headroom (worker.py adds it back).
+        assert vs.max_tokens_all_users(opts) == budget - 32 * 64
+        assert vs.max_tokens_all_users(opts, max_num_seqs=8) == budget - 8 * 64
         assert vs.max_tokens_all_users(opts) % vs.KV_BLOCK_SIZE == 0
 
     def test_env_budget_override(self, monkeypatch):
         monkeypatch.setenv(KV_BUDGET_ENV, "13")
-        assert vs.max_tokens_all_users(MoEOptions()) == 1_069_120  # int(13 GiB // 13056) // 64 * 64
+        assert vs.kv_budget_tokens_solar(MoEOptions()) == 1_069_120  # int(13 GiB // 13056) // 64 * 64
+        assert vs.max_tokens_all_users(MoEOptions()) == 1_069_120 - 2_048
         monkeypatch.setenv(KV_BUDGET_ENV, "8")
-        assert vs.max_tokens_all_users(MoEOptions()) == 657_920
+        assert vs.kv_budget_tokens_solar(MoEOptions()) == 657_920
+        assert vs.max_tokens_all_users(MoEOptions(), max_num_seqs=32) == 655_872
 
     def test_defaults_to_env_moe_options(self, monkeypatch):
         monkeypatch.setenv("SOLAR_OPEN_EXPERT_DTYPE", "bfp4")
-        assert vs.max_tokens_all_users() == kv_budget_tokens(MoEOptions(expert_dtype=ttnn.bfloat4_b))
+        assert vs.max_tokens_all_users() == kv_budget_tokens(MoEOptions(expert_dtype=ttnn.bfloat4_b)) - 2_048
+
+    def test_plugin_headroom_arithmetic(self, monkeypatch):
+        assert vs.plugin_headroom_tokens() == 2_048
+        assert vs.plugin_headroom_tokens(max_num_seqs=1) == 64
+        # ceil((655,872 + 2,048) / 64) = 10,280 blocks = 8.00 GiB; the pre-fix full-budget figure gave 10,312 = 8.025 GiB.
+        assert vs.plugin_kv_pool_blocks(655_872) == 10_280
+        assert vs.plugin_kv_pool_blocks(657_920) == 10_312
+        monkeypatch.setenv(KV_BUDGET_ENV, "8")
+        reported = vs.max_tokens_all_users(MoEOptions(), max_num_seqs=32)
+        assert vs.plugin_kv_pool_blocks(reported) * 64 == vs.kv_budget_tokens_solar(MoEOptions()) == 657_920
+
+    def test_headroom_cannot_exceed_budget(self, monkeypatch, expect_error):
+        monkeypatch.setenv(KV_BUDGET_ENV, "0.01")  # 768 tokens < the 2,048-token headroom of 32 users
+        with expect_error(ValueError, "headroom"):
+            vs.max_tokens_all_users(MoEOptions(), max_num_seqs=32)
 
 
 class TestKVCacheSpec:
@@ -235,6 +284,22 @@ class TestPagedKVCacheAllocator:
                 vs.allocate_paged_kv_cache([model], (32768, 1, 64, 128), 48, MoEOptions())
         assert ttnn_mock.from_torch.call_count == 0
 
+    def test_plugin_sized_pool_fits_the_budget(self, monkeypatch, expect_error):
+        """The pool the plugin sizes from the wrapper's figure plus its headroom passes check_kv_budget; the pool it
+        sized from the pre-fix figure (the full budget) is refused - the arithmetic of worker.py's
+        get_num_available_blocks_tt against allocate_paged_kv_cache."""
+        monkeypatch.setenv(KV_BUDGET_ENV, "8")
+        model = _fake_model()
+        blocks = vs.plugin_kv_pool_blocks(vs.max_tokens_all_users(MoEOptions(), max_num_seqs=32), max_num_seqs=32)
+        assert blocks == 10_280
+        with patch.object(vs, "ttnn", new=_ttnn_mock()):
+            kv_cache = vs.allocate_paged_kv_cache([model], (blocks, 1, 64, 128), 48, MoEOptions())
+            assert len(kv_cache[0]) == 48
+            too_many = vs.plugin_kv_pool_blocks(vs.kv_budget_tokens_solar(MoEOptions()), max_num_seqs=32)
+            assert too_many == 10_312
+            with expect_error(ValueError, KV_BUDGET_ENV):
+                vs.allocate_paged_kv_cache([model], (too_many, 1, 64, 128), 48, MoEOptions())
+
     def test_budget_env_admits_larger_pool(self, monkeypatch, expect_error):
         model = _fake_model()
         blocks_32x32k = 16384  # 12.75 GiB
@@ -254,6 +319,39 @@ class TestPagedKVCacheAllocator:
         with patch.object(vs, "ttnn", new=_ttnn_mock()):
             with expect_error(ValueError, message):
                 vs.allocate_paged_kv_cache([_fake_model()], shape, 48, MoEOptions())
+
+
+class TestSyncErrorLogMirror:
+    """The EngineCore-side ERROR mirror for vLLM's logger (plain stdlib logging; no vllm needed)."""
+
+    @staticmethod
+    def _cleanup():
+        vllm_logger = logging.getLogger("vllm")
+        for h in list(vllm_logger.handlers):
+            if getattr(h, "name", None) == vs._SYNC_ERROR_LOG_HANDLER_NAME:
+                vllm_logger.removeHandler(h)
+
+    def test_installs_once_and_mirrors_errors(self, monkeypatch):
+        self._cleanup()
+        monkeypatch.delenv(vs.SYNC_ERROR_LOG_ENV, raising=False)
+        buf = io.StringIO()
+        try:
+            assert vs.install_vllm_sync_error_log_handler(stream=buf) is True
+            assert vs.install_vllm_sync_error_log_handler(stream=buf) is False  # idempotent
+            logging.getLogger("vllm.v1.engine.core").error("EngineCore encountered a fatal error. probe-%d", 42)
+            logging.getLogger("vllm.v1.engine.core").info("not mirrored")
+            text = buf.getvalue()
+            assert "probe-42" in text and "solar_open sync mirror" in text and "not mirrored" not in text
+        finally:
+            self._cleanup()
+
+    def test_env_disables(self, monkeypatch):
+        self._cleanup()
+        monkeypatch.setenv(vs.SYNC_ERROR_LOG_ENV, "0")
+        assert vs.install_vllm_sync_error_log_handler(stream=io.StringIO()) is False
+        assert not any(
+            getattr(h, "name", None) == vs._SYNC_ERROR_LOG_HANDLER_NAME for h in logging.getLogger("vllm").handlers
+        )
 
 
 class TestStopIdsAndTemplate:
@@ -337,6 +435,32 @@ class TestWrapperWithVllm:
         assert list(inspect.signature(cls.initialize_vllm_model).parameters) == INITIALIZE_PARAMS
         assert cls.get_max_tokens_all_users() == vs.max_tokens_all_users(MoEOptions())
 
+    def test_is_a_vllm_text_generation_model(self):
+        """``--model-class-overrides`` makes upstream's ModelConfig inspect THIS class (the plain arch has no
+        upstream implementation and would otherwise resolve to the Transformers backend, whose name then sticks in
+        model_config.architecture and breaks the plugin's TT lookup). ``runner generate`` needs the protocol."""
+        from vllm.model_executor.models.interfaces_base import is_pooling_model, is_text_generation_model
+
+        cls = self._cls()
+        assert is_text_generation_model(cls)
+        assert not is_pooling_model(cls)
+
+    def test_max_tokens_all_users_as_the_plugin_calls_it(self, monkeypatch):
+        """worker.py::get_num_available_blocks_tt's call; its headroom then restores exactly the budget."""
+        monkeypatch.setenv(KV_BUDGET_ENV, "8")
+        cls = self._cls()
+        reported = cls.get_max_tokens_all_users(
+            model_name="upstage/Solar-Open-100B",
+            num_devices=8,
+            tt_data_parallel=1,
+            max_model_len=16384,
+            max_num_seqs=32,
+        )
+        assert reported == vs.max_tokens_all_users(MoEOptions(), max_num_seqs=32) == 655_872
+        assert vs.plugin_kv_pool_blocks(reported, max_num_seqs=32) * 64 == vs.kv_budget_tokens_solar(MoEOptions())
+        assert cls.get_max_tokens_all_users(max_num_seqs=4) == 657_920 - 4 * 64
+        assert cls.get_max_tokens_all_users() == 655_872  # no kwarg: the 32-user cap, the conservative default
+
     def test_kv_cache_spec(self, hf_config):
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
@@ -387,3 +511,86 @@ class TestWrapperWithVllm:
         assert ttnn_mock.from_torch.call_count == 2 * 2 * 48
         assert len(kv_cache[0]) == len(per_layer[0]) == 48
         assert instance.stop_token_ids == [2, 24, 25]
+
+
+@needs_vllm
+class TestCompatShimsWithVllm:
+    """The vLLM-0.12 module paths Upstage's parser files import, re-created from the installed vLLM's modules."""
+
+    def test_legacy_paths_resolve_to_the_current_classes(self):
+        import vllm.entrypoints.openai as openai_pkg
+
+        result = vs.install_vllm_compat_shims()
+        assert set(result) == {vs.LEGACY_PROTOCOL_MODULE, vs.LEGACY_ABSTRACT_TOOL_PARSER_MODULE}
+        assert set(result.values()) <= {"native", "shim"}
+        assert vs.install_vllm_compat_shims() == result  # idempotent
+        protocol = importlib.import_module(vs.LEGACY_PROTOCOL_MODULE)  # the path Upstage's files import
+        for name, home in vs.LEGACY_PROTOCOL_NAMES.items():
+            assert hasattr(protocol, name), name
+            if result[vs.LEGACY_PROTOCOL_MODULE] == "shim":
+                assert getattr(protocol, name) is getattr(importlib.import_module(home), name)
+        assert openai_pkg.protocol is protocol
+        legacy_abstract = importlib.import_module(vs.LEGACY_ABSTRACT_TOOL_PARSER_MODULE)
+        assert hasattr(legacy_abstract, "ToolParser")
+        if result[vs.LEGACY_ABSTRACT_TOOL_PARSER_MODULE] == "shim":
+            current = importlib.import_module(vs.CURRENT_TOOL_PARSERS_PACKAGE + ".abstract_tool_parser")
+            assert legacy_abstract is current
+            assert importlib.import_module(vs.LEGACY_TOOL_PARSERS_PACKAGE) is importlib.import_module(
+                vs.CURRENT_TOOL_PARSERS_PACKAGE
+            )
+
+
+@needs_vllm
+@needs_parser_files
+class TestParserRegistrationWithVllm:
+    """Upstage's parsers registered under "solar_open" (directly and through the plugin file, the way vLLM's
+    --reasoning-parser-plugin / --tool-parser-plugin import it) and run on the Solar tokenizer. Host only."""
+
+    @pytest.fixture(scope="class")
+    def tokenizer(self):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(_solar_model_dir())
+
+    def test_register_and_parse(self, tokenizer):
+        from vllm.reasoning import ReasoningParserManager
+        from vllm.tool_parsers import ToolParserManager
+
+        registered = vs.register_vllm_parsers()
+        assert {k: v.__name__ for k, v in registered.items()} == {
+            "reasoning": "SolarOpenReasoningParser",
+            "tool": "SolarOpenToolParser",
+        }
+        assert ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_NAME) is registered["reasoning"]
+        assert ToolParserManager.get_tool_parser(vs.TOOL_PARSER_NAME) is registered["tool"]
+
+        reasoning = registered["reasoning"](tokenizer)
+        sample = "<|think|>Plan the answer.<|end|><|content|>Seoul."
+        assert reasoning.extract_reasoning(sample, request=None) == ("Plan the answer.", "Seoul.")
+        assert reasoning.extract_reasoning("<|think|><|end|><|content|>Hi", request=None) == ("", "Hi")  # `low`
+        assert reasoning.is_reasoning_end(tokenizer.encode(sample, add_special_tokens=False))
+        assert not reasoning.is_reasoning_end(tokenizer.encode("<|think|>Still thinking", add_special_tokens=False))
+
+        tool = registered["tool"](tokenizer)
+        call = (
+            "Checking the weather.<|flush|><|tool_calls|><|tool_call:begin|><|tool_call:name|>get_weather"
+            '<|tool_call:args|>{"city": "Seoul"}<|tool_call:end|><|calls|>'
+        )
+        info = tool.extract_tool_calls(call, request=None)
+        assert info.tools_called and len(info.tool_calls) == 1 and info.content == "Checking the weather."
+        assert info.tool_calls[0].function.name == "get_weather"
+        assert json.loads(info.tool_calls[0].function.arguments) == {"city": "Seoul"}
+        assert tool.extract_tool_calls("Plain answer.<|flush|>", request=None).tools_called is False
+
+    def test_plugin_file_loads_through_the_vllm_import_path(self):
+        from vllm.reasoning import ReasoningParserManager
+        from vllm.tool_parsers import ToolParserManager
+
+        ReasoningParserManager.reasoning_parsers.pop(vs.REASONING_PARSER_NAME, None)
+        ToolParserManager.tool_parsers.pop(vs.TOOL_PARSER_NAME, None)
+        ReasoningParserManager.import_reasoning_parser(str(PARSER_PLUGIN_PY))  # what --reasoning-parser-plugin does
+        ToolParserManager.import_tool_parser(str(PARSER_PLUGIN_PY))  # what --tool-parser-plugin does
+        assert (
+            ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_NAME).__name__ == "SolarOpenReasoningParser"
+        )
+        assert ToolParserManager.get_tool_parser(vs.TOOL_PARSER_NAME).__name__ == "SolarOpenToolParser"
