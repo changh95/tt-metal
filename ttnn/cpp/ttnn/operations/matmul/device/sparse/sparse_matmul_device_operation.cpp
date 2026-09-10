@@ -105,6 +105,52 @@ bool sparse_matmul_egp_kernel_writes_whole_output(const SparseMatmulParams& oper
     return operation_attributes.expert_groups.has_value() && sparse_matmul_egp_zero_fill_enabled();
 }
 
+namespace {
+// TT_SPARSE_MATMUL_INDEXED_SKIP_FILL, read once: "0" = keep the FILL on legacy indexed op-owned outputs (phase 3c),
+// anything else (unset) = skip it. An A/B arm, not a per-call setting (not part of the program hash).
+const std::string& indexed_skip_fill_knob() {
+    static const std::string knob = [] {
+        const char* env = std::getenv("TT_SPARSE_MATMUL_INDEXED_SKIP_FILL");
+        return std::string(env != nullptr ? env : "");
+    }();
+    return knob;
+}
+}  // namespace
+
+bool sparse_matmul_indexed_skip_fill_enabled() { return indexed_skip_fill_knob() != "0"; }
+
+bool sparse_matmul_legacy_indexed_kernel_writes_whole_output(
+    const SparseMatmulParams& operation_attributes, const SparseMatmulInputs& tensor_args) {
+    using namespace operations::matmul::utilities;
+    // Legacy factory (sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp) in indexed / gather mode only; the EGP
+    // factory has its own predicate above.
+    if (operation_attributes.expert_groups.has_value() || !operation_attributes.use_indices) {
+        return false;
+    }
+    if (!sparse_matmul_indexed_skip_fill_enabled()) {
+        return false;
+    }
+    // The coverage proof (types.hpp) needs the writer geometry: an explicit mcast_in0 1D config (the legacy factory
+    // derives a config itself when none is given -- keep the FILL there) with Mt % per_core_M == 0 (the h blocks are
+    // written without height padding), and the interleaved writer path (the legacy factory never emits OUT_SHARDED).
+    if (!operation_attributes.program_config.has_value()) {
+        return false;
+    }
+    const auto* pc = std::get_if<operations::matmul::MatmulMultiCoreReuseMultiCast1DProgramConfig>(
+        &operation_attributes.program_config.value());
+    if (pc == nullptr || !pc->mcast_in0 || pc->per_core_M == 0) {
+        return false;
+    }
+    if (operation_attributes.output_mem_config.memory_layout() != tt::tt_metal::TensorMemoryLayout::INTERLEAVED) {
+        return false;
+    }
+    const auto& input_tensor_a = tensor_args.input_tensors.at(0);
+    const auto& a_shape_padded = get_matmul_tensor_padded_shape(input_tensor_a, /*transpose=*/false);
+    const auto in0_tile = get_matmul_tile(input_tensor_a, /*transpose=*/false);
+    const uint32_t Mt = a_shape_padded[-2] / in0_tile.get_height();  // == the factory's get_M_dim(ashape, in0_tile)
+    return Mt % pc->per_core_M == 0;
+}
+
 void SparseMatmulDeviceOperation::validate_on_program_cache_hit(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     validate_on_program_cache_miss(operation_attributes, tensor_args);
@@ -627,8 +673,13 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
     for (const auto& output_spec : output_specs) {
         output_tensors.emplace_back(create_device_tensor(output_spec, device));
     }
-    // Compact output requires a caller-supplied tensor, so this path is never compact.
-    if (!kernel_writes_whole_output) {
+    // Compact output requires a caller-supplied tensor, so this path is never compact. The op-allocated INDEXED
+    // output of the legacy factory is fully written by its in1 writer (every entry, every block, see
+    // sparse_matmul_legacy_indexed_kernel_writes_whole_output in sparse_matmul_device_operation_types.hpp), so it
+    // skips the FILL too (TT_SPARSE_MATMUL_INDEXED_SKIP_FILL=0 restores it).
+    const bool legacy_indexed_fully_written =
+        sparse_matmul_legacy_indexed_kernel_writes_whole_output(operation_attributes, tensor_args);
+    if (!kernel_writes_whole_output && !legacy_indexed_fully_written) {
         for (auto& output_tensor : output_tensors) {
             output_tensor = ttnn::zeros_like(
                 output_tensor,

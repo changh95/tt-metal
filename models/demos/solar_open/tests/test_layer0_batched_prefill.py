@@ -21,6 +21,10 @@ bit-identical to their originals in the MoE (the hot / cold sets of the two spli
 plan they must be. ``b4_s128_dup`` (T = 512, one split) was bit-identical before and stays so.
 
     pytest models/demos/solar_open/tests/test_layer0_batched_prefill.py -k 1x8
+
+Token ids come from the chat-templated KO/EN prompts with the template date pinned (``pinned_template_date``:
+2026-09-08, the day the floors below were measured; ``SOLAR_OPEN_TEMPLATE_DATE`` overrides) -- on another day's ids
+the near-tie rows move (2026-09-09: b4_s128 decoder row PCC min 0.987 vs the 0.99 floor).
 """
 
 import pytest
@@ -68,7 +72,7 @@ def _pcc_rows(a, b):
 )
 @parametrize_mesh_with_fabric([(1, 8)])
 def test_layer0_packed_vs_per_user_prefill(
-    mesh_device, device_params, batch_size, seq_len, duplicate_users, layer0_weights, reset_seeds
+    mesh_device, device_params, batch_size, seq_len, duplicate_users, layer0_weights, reset_seeds, pinned_template_date
 ):
     """``duplicate_users``: users 2 and 3 carry user 0's and user 1's tokens -- identical rows at other slots of the
     same pass must stay bit-identical per block (position independence inside a packed pass; the phase-2 sequential

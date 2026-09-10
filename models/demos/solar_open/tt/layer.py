@@ -10,7 +10,7 @@ from models.demos.solar_open.utils.general_utils import get_cache_file_name, get
 from models.demos.solar_open.utils.substate import substate
 
 from .attention import Attention, AttentionConfig
-from .attention_configs import SolarOpenAttentionProgramConfig
+from .attention_configs import SolarOpenAttentionProgramConfig, log_attention_levers_once
 from .mlp import MLP
 from .rms_norm import RMSNorm
 
@@ -98,13 +98,17 @@ class DecoderLayer:
             users_row_sharded=users_row_sharded,
         )
 
+        # Phase 3e / P1: the attention program config resolves its decode levers (fused Q/K chain, explicit o_proj)
+        # from the environment and the mesh's TP (both ON for TP > 1, the phase-3d chain at TP = 1).
+        attention_program_config = SolarOpenAttentionProgramConfig(tp=mesh_config.tp)
+        log_attention_levers_once(attention_program_config)
         self.self_attn = Attention(
             mesh_device=mesh_device,
             config=attention_config,
             state_dict=substate(state_dict, "self_attn"),
             ccl_manager=ccl_manager,
             mesh_config=mesh_config,
-            program_config=SolarOpenAttentionProgramConfig(),
+            program_config=attention_program_config,
             layer_idx=layer_idx,
             paged_attention_config=paged_attention_config,
             transformation_mats=transformation_mats,
@@ -123,11 +127,14 @@ class DecoderLayer:
         is_decode=True,
         user_id=0,
         batch_size=1,
+        chunk_page_table=None,
+        chunk_start_idx=None,
     ):
         """Run the block on ``hidden_states`` ``[1, 1, tokens, hidden_size]`` (replicated across TP) and return
         a tensor of the same shape. ``position_embeddings`` are the RoPE cos/sin matrices for this call,
         ``position_idx``/``page_table``/``kv_cache`` drive the KV-cache update, and ``is_decode`` selects the
-        decode or prefill kernels in attention and the MoE."""
+        decode or prefill kernels in attention and the MoE. ``chunk_page_table`` / ``chunk_start_idx`` are the
+        chunked single-user prefill's arguments (attention only; ``tt/chunked_prefill.py``)."""
         seqlen = hidden_states.shape[-2]
         if seqlen > 32 * 1024:
             # Reallocate hidden states to prevent memory fragmentation.
@@ -149,6 +156,8 @@ class DecoderLayer:
             is_decode=is_decode,
             user_id=user_id,
             batch_size=batch_size,
+            chunk_page_table=chunk_page_table,
+            chunk_start_idx=chunk_start_idx,
         )
         hidden_states_post_norm.deallocate(True)
 

@@ -107,5 +107,7 @@ class TestWiring:
         from models.demos.solar_open.tt.attention import decode
 
         src = inspect.getsource(decode.decode_forward)
-        assert "if not attention_bf16_output(program_config):" in src
-        assert src.count("ttnn.typecast(tt_out, ttnn.bfloat8_b)") == 1
+        # Two cast sites since phase 3e / A2 -- the fused all_reduce_async path (SOLAR_OPEN_DECODE_CCL=fused) casts the
+        # o_proj partial in its own layout, the composite path casts the interleaved copy -- each behind the guard.
+        assert src.count("ttnn.typecast(tt_out, ttnn.bfloat8_b)") == 2
+        assert src.count("if not attention_bf16_output(program_config):") == 2

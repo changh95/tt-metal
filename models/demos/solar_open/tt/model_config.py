@@ -13,6 +13,7 @@ with SOLAR_OPEN_STREAMING_LOAD=1, the per-layer streaming LazyStateDict that pre
 """
 
 import dataclasses
+import datetime
 import gc
 import json
 import os
@@ -26,6 +27,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 import ttnn
 from models.common.utility_functions import is_blackhole, is_wormhole_b0
 from models.demos.solar_open.config import MoEOptions
+from models.demos.solar_open.tt.chunked_prefill import prefill_chunk_tokens_from_env
 from models.demos.solar_open.tt.expert_configs import SolarOpenProgramConfig
 from models.demos.solar_open.tt.experts.prefill import is_trace_safe_prefill_len
 from models.demos.solar_open.utils.general_utils import resolve_rope_theta
@@ -72,9 +74,11 @@ _SOLAR_NUM_EXPERTS = 128
 # passes (~180 ms kernel each, 1.4 ms/token) by one expert-sorted pass at ~0.4 ms/token.
 #
 # Knobs (environment, read once by ModelArgs):
-#   SOLAR_OPEN_BATCHED_PREFILL=1              turn the batched path on (default OFF: byte-identical to phase 2)
-#   SOLAR_OPEN_BATCHED_PREFILL_TOKENS=<n>     token budget of one packed pass, B_mb x S <= n (default 1024 = 8 x 128;
-#                                             4096 = 32 x 128 in one pass; clamped to 256..8192, see the v1 cap below)
+#   SOLAR_OPEN_BATCHED_PREFILL=0              turn the packed path off everywhere (default ON since phase 3d / A3: the
+#                                             demo / driver packs; 0 = the phase-2 sequential prefill, byte-identical)
+#   SOLAR_OPEN_BATCHED_PREFILL_TOKENS=<n>     token budget of one packed pass, B_mb x S <= n (default 4096 = 32 x 128 in
+#                                             ONE pass: one MoE chunk, one hot / cold plan for the whole batch-32 demo;
+#                                             1024 = 8 x 128, four passes; clamped to 256..8192, see the v1 cap below)
 #   SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN=<n> largest PADDED per-user prefill length that is packed (default 128:
 #                                             the 1K+ buckets already run the sorted MoE per user at a flat per-token
 #                                             cost, so packing them buys little TTFT-last and costs TTFT-mean)
@@ -88,17 +92,57 @@ _SOLAR_NUM_EXPERTS = 128
 # (experts/prefill.py, SOLAR_OPEN_SORTED_MOE_PLAN), so every user of a pass that fits ONE chunk (tokens_per_pass <=
 # SolarOpenProgramConfig.sequence_chunk_size = 4096) sees the same hot / cold sets whatever its slot; a longer pass
 # spans several chunks (users in different chunks get different plans) and from_env warns.
+#
+# Who packs (phase 3d / A3, option B of the flip-on procedure): ``ModelArgs.disable_batched_prefill`` is ALWAYS True, so
+# a plain ``Generator.prefill_forward_text`` call prefills per user -- traceable at 128 -- whatever the flag says (the
+# regression harness, vLLM, the sequential arms of the teacher-forced / consistency tests); only the driver
+# ``tt/model.py: prefill_forward_text_batched`` lifts it per packed pass (``batched_prefill_flag``). The flag therefore
+# decides what the demo / driver does with a multi-user call, never what the Generator does on its own.
 BATCHED_PREFILL_MIN_TOKENS = 256
 # v1 runs the tt_transformers batched path, whose head applies norm + lm_head to ALL B*S rows ([T, 24576] bf16 per
 # device = 50 MiB at 1K, 201 MiB at 4K, 400 MiB at 8K) and reads one 32-row tile per user back; 8K tokens per pass
 # is the DRAM-safe cap until a gather head exists (design 2.6).
 BATCHED_PREFILL_MAX_TOKENS = 8 * 1024
-BATCHED_PREFILL_DEFAULT_TOKENS = 1024
+# Phase 3d / A3: one 32 x 128 pass (R1 2026-09-09: TTFT-last 1760 ms for every user vs 825 / 1535 / 2228 first / mean /
+# last with four 1024-token passes; decode plateau equal) and one plan for the whole batch (the gated configuration).
+BATCHED_PREFILL_DEFAULT_TOKENS = 4096
 BATCHED_PREFILL_DEFAULT_MAX_SEQ_LEN = 128
 BATCHED_PREFILL_HEADS = ("full", "gather")
 BATCHED_PREFILL_DEFAULT_HEAD = "full"
 # Device batch sizes the tt_transformers batched-prefill path pads a pass to (generator.SUPPORTED_PREFILL_BATCH_SIZES).
 BATCHED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+
+# Chat-template date pin (phase 3d / A2, test reproducibility). Solar's chat template stamps
+# ``strftime_now("%Y-%m-%d")`` into the dated provider system prompt, so the token ids of every chat-templated prompt --
+# and with them every PCC / KL / flip-count digit of a test that tokenizes prompts -- change from day to day.
+# ``SOLAR_OPEN_TEMPLATE_DATE=YYYY-MM-DD`` makes ``ModelArgs.encode_prompt`` (and ``template_date_kwargs`` callers such
+# as the real-weight layer-0 tests) render that fixed date instead; unset / empty / ``today`` = the real date (the
+# production rendering; vLLM's own template environment never reads this variable). The tests pin it through the
+# ``pinned_template_date`` fixture of the package conftest (``RECORDED_TEMPLATE_DATE``, the date of the recorded digits).
+TEMPLATE_DATE_ENV = "SOLAR_OPEN_TEMPLATE_DATE"
+TEMPLATE_DATE_UNPINNED = ("", "today")
+
+
+def template_date_kwargs(date_string=None):
+    """Chat-template kwargs that pin the template's ``strftime_now`` to one fixed calendar day.
+
+    ``date_string`` (``YYYY-MM-DD``) or, when None, ``$SOLAR_OPEN_TEMPLATE_DATE``. Unset, empty or ``today`` returns
+    ``{}`` (the template renders the current date). Otherwise ``{"strftime_now": f}`` where ``f(fmt)`` renders that day
+    with ``fmt`` -- a same-named template kwarg shadows the ``strftime_now`` Jinja global of transformers' template
+    environment, the mechanism ``tests/accuracy/gen_reference.py`` / ``test_teacher_forced.py`` pin their date with.
+    Splat it into ``tokenizer.apply_chat_template(...)`` or ``ModelArgs.encode_prompt(...)`` (the latter applies it by
+    itself). Raises ``ValueError`` on a malformed date so a typo cannot silently un-pin a run.
+    """
+    if date_string is None:
+        date_string = os.getenv(TEMPLATE_DATE_ENV, "")
+    date_string = date_string.strip()
+    if date_string.lower() in TEMPLATE_DATE_UNPINNED:
+        return {}
+    try:
+        day = datetime.date.fromisoformat(date_string)
+    except ValueError as exc:
+        raise ValueError(f"{TEMPLATE_DATE_ENV}={date_string!r}: expected a calendar date as YYYY-MM-DD") from exc
+    return {"strftime_now": lambda fmt: day.strftime(fmt)}
 
 
 def _env_flag(name, default=False):
@@ -149,6 +193,9 @@ class BatchedPrefillOptions:
 
     @classmethod
     def from_env(cls):
+        # phase 3d / A3 made the packed pass the driver default; phase 3e / A0 reverted it to OFF: against the bf16 HF
+        # reference the packed 32 x 128 pass flips the first token (<|think|> -> <|content|>) on 10 of 32 users while the
+        # sequential prefill matches HF on 32 / 32 (README "Known limitations"). SOLAR_OPEN_BATCHED_PREFILL=1 opts in.
         enabled = _env_flag("SOLAR_OPEN_BATCHED_PREFILL", False)
         tokens = _env_int("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", BATCHED_PREFILL_DEFAULT_TOKENS)
         clamped = min(max(tokens, BATCHED_PREFILL_MIN_TOKENS), BATCHED_PREFILL_MAX_TOKENS)
@@ -328,8 +375,13 @@ class ModelArgs:
             self.rope_theta = resolve_rope_theta(self.hf_config)  # 1e6
             self.rope_scaling = dict(getattr(self.hf_config, "rope_parameters", None) or {})
 
-        # Attributes the Generator expects
-        self.max_prefill_chunk_size = 128 * 1024
+        # Attributes the Generator expects. Phase 3d (tt/chunked_prefill.py): a single-user prompt whose PADDED length
+        # exceeds max_prefill_chunk_size is prefilled by the Generator in chunks of that many tokens (paged KV fill of
+        # each chunk, chunked SDPA over the cache prefix, RoPE rows offset by the chunk start), which admits prompts up
+        # to the 131072 positions of the RoPE tables on the 1x8 mesh; SOLAR_OPEN_PREFILL_CHUNK_TOKENS (default 32768,
+        # a power of two 2048..131072; 131072 = never chunk, the phase-3c behaviour). Prefills <= the chunk are the
+        # phase-3c ops bit for bit; traced prefill lengths (128) are far below it (can_enable_trace).
+        self.max_prefill_chunk_size = prefill_chunk_tokens_from_env()
         self.model_name = Path(self.model_path).name
         assert self.model_name == MODEL_NAME, (
             f"Unrecognized model name {self.model_name!r} inferred from model path {self.model_path}. "
@@ -351,12 +403,13 @@ class ModelArgs:
         # Phase 3a(1): packed / batched multi-user prefill (module comment above, design_packed_prefill.md). The
         # tt_transformers Generator batches equal-length users into one forward when ``disable_batched_prefill`` is
         # False; the Solar policy (which users, how many per pass, never traced) lives in ``plan_batched_prefill`` and
-        # ``tt/model.py: prefill_forward_text_batched``. Default OFF (SOLAR_OPEN_BATCHED_PREFILL=1 flips it): with the
-        # flag on, a plain Generator call with several equal-length users runs one batched pass (host sampling only --
-        # the on-device sampling contract of the batched path is not implemented, keep sampling_params=None) and any
-        # attempt to TRACE such a pass is refused (packed_prefill_trace_shapes).
+        # ``tt/model.py: prefill_forward_text_batched``. Phase 3d / A3 (option B): the flag is ON by default but the
+        # Generator's own batching stays OFF for good -- a plain Generator call always prefills per user (traceable at
+        # 128, host or device sampling), and only the driver lifts ``disable_batched_prefill`` for the packed passes it
+        # plans (``batched_prefill_flag``; host sampling only -- the on-device sampling contract of the batched path
+        # is not implemented -- and never traced: packed_prefill_trace_shapes is empty).
         self.batched_prefill = BatchedPrefillOptions.from_env()
-        self.disable_batched_prefill = not self.batched_prefill.enabled
+        self.disable_batched_prefill = True
         # (padded_batch, per-user seq_len) pairs whose batched prefill may be traced. Empty until the traced-prefill
         # work provides a trace-safe MoE for T = B x S: the expert-sorted MoE reads the per-expert counts back to the
         # host (experts/prefill.py _sorted_moe_plan) and the router's [T, E] helpers are transient above 128 rows, so a
@@ -410,8 +463,9 @@ class ModelArgs:
         return to_warmup_seq_lens
 
     def filter_warmup_seq_lens(self, to_warmup_seq_lens):
-        # Warmup lengths come from https://github.com/tenstorrent/tt-metal/pull/33143; single-user prefill on 1x8 is
-        # capped at 64K (demo limitation), so nothing at or above 64K is warmed up.
+        # Warmup lengths come from https://github.com/tenstorrent/tt-metal/pull/33143; nothing at or above 64K is
+        # warmed up (a single 64K+ pass was the 1x8 demo's cap before the phase-3d chunked prefill; warm-up stops at
+        # capped_warmup_seq_len = 2048 anyway, and a chunked prefill is never traced).
         for seq_len in to_warmup_seq_lens:
             if seq_len >= 64 * 1024:
                 to_warmup_seq_lens = to_warmup_seq_lens[: to_warmup_seq_lens.index(seq_len)]
@@ -519,12 +573,15 @@ class ModelArgs:
         Template kwargs default to ``reasoning_effort=$SOLAR_OPEN_REASONING_EFFORT`` ("high"; "low"/"minimal"
         prepend an empty think block) and ``default_system_prompt=$SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT`` ("1");
         explicit ``template_kwargs`` win. The template injects the current date via ``strftime_now``, so token ids
-        change from day to day - compare golden outputs at the string level.
+        change from day to day unless the date is pinned: ``SOLAR_OPEN_TEMPLATE_DATE=YYYY-MM-DD``
+        (``template_date_kwargs``; the tests pin it to the date of their recorded digits) or an explicit
+        ``strftime_now=`` template kwarg (the teacher-forced test's reference date), which wins over the env.
         """
         assert not instruct, "Solar-Open always applies its chat template; instruct=True is not a separate mode"
         kw = {
             "reasoning_effort": os.getenv("SOLAR_OPEN_REASONING_EFFORT", "high"),
             "default_system_prompt": os.getenv("SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT", "1") == "1",
+            **template_date_kwargs(),
             **template_kwargs,
         }
         if isinstance(prompt_text, str):

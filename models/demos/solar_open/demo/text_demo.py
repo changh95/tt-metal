@@ -29,22 +29,39 @@ Uses the refactored TestFactory and MeshConfig patterns:
     pytest models/demos/solar_open/demo/text_demo.py -k "packed_b32_128 and 1x8"   # 32 users, packed 8 x 128 prefill
     pytest models/demos/solar_open/demo/text_demo.py -k "batch32_16k and 1x8"      # 32 users x 2-15K-token contexts
     SOLAR_OPEN_KV_BUDGET_GIB=13 pytest models/demos/solar_open/demo/text_demo.py -k "batch32_32k and 1x8"
-    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_64k and 1x8"      # single user, 64K prefill
+    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_64k and 1x8 and not chunked"   # single user, 64K prefill
+    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_64k_chunked and 1x8"  # the same prompt in two 32K chunks
+    pytest models/demos/solar_open/demo/text_demo.py -k "prefill_128k and 1x8"     # single user, 128K prompt (four 32K chunks)
 
 A paged KV pool above the per-device budget (tt/common.py: 8 GiB with bfp8 experts, 14 GiB with bfp4, env
 SOLAR_OPEN_KV_BUDGET_GIB clamped to 14.5 / 20 GiB) skips the case before anything is loaded.
 
-Packed multi-user prefill (phase 3a(1), ``tt/model.py: prefill_forward_text_batched``): every multi-user case on a
-single-row mesh runs its prefill as packed passes when ``SOLAR_OPEN_BATCHED_PREFILL=1`` is set (or the case's
-``batched_prefill`` column is True, as in ``packed_b32_128``): equal-length short prompts (padded length <=
-``SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN``, default 128) go ``SOLAR_OPEN_BATCHED_PREFILL_TOKENS // S`` users at a time
-(default 1024 tokens = 8 x 128) through one eager forward each; longer prompts (the 16k / 32k cases) stay sequential
-unless the two knobs are raised. The compile pass runs the full batch eagerly once, the KV cache is cleared and the
-timed pass repeats it; TTFT first / mean / last come from the per-pass log.
+Chunked single-user prefill (phase 3d, ``tt/chunked_prefill.py``): the Generator prefills a prompt longer than
+``SOLAR_OPEN_PREFILL_CHUNK_TOKENS`` (default 32768) in chunks of that length (paged KV fill per chunk, chunked SDPA over
+the cache prefix, RoPE offset by the chunk start), which admits single-user prompts up to the 131072 positions of the
+RoPE tables on the 1x8 mesh (``prefill_128k``, the 128k step of ``seqlen-sweep``). Only an UNCHUNKED pass above 64K
+(env >= 131072) is still skipped on single-row meshes. Case ids ending in ``_chunked`` pin the env to 32768 for the
+run; ``SOLAR_OPEN_PREFILL_CHUNK_TOKENS=65536 pytest ... -k "prefill_64k and 1x8 and not chunked"`` is the unchunked
+(phase-3c) arm of the 64K parity pair.
+
+Packed multi-user prefill (phase 3a(1), ``tt/model.py: prefill_forward_text_batched``; the DEFAULT since phase 3d /
+A3): every multi-user case on a single-row mesh runs its prefill as packed passes unless ``SOLAR_OPEN_BATCHED_PREFILL=0``
+is exported (the case's ``batched_prefill`` column overrides the env either way: ``packed_b32_128`` forces packing):
+equal-length short prompts (padded length <= ``SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN``, default 128) go
+``SOLAR_OPEN_BATCHED_PREFILL_TOKENS // S`` users at a time (default 4096 tokens = the 32 x 128 batch in ONE pass) through
+one eager forward each; longer prompts (the 16k / 32k cases) stay on the sequential branch below unless the two knobs are
+raised (the branch is chosen per batch from ``plan_batched_prefill``: a plan without a packed pass runs the phase-2
+sequential code). The decode trace is captured first (a mock decode step at position 0, as the Generator's own
+sequential-branch mechanism does; a packed pass is eager, so the first decode step would otherwise pay the ~1.2 s capture
+inside the timed loop; ``SOLAR_OPEN_PACKED_DECODE_TRACE_WARMUP=0`` restores that order), then the compile pass runs the
+full batch eagerly once, the KV cache is cleared and the timed pass repeats the prefill;
+TTFT first / mean / last come from the per-pass log. Only the demo / driver packs: a plain ``Generator`` call (the
+regression harness, vLLM, the sequential test arms) always prefills per user (``ModelArgs.disable_batched_prefill``).
 """
 
 import json
 import os
+import time
 
 import pytest
 import torch
@@ -55,8 +72,14 @@ from models.common.sampling import SamplingParams
 from models.common.utility_functions import is_blackhole
 from models.demos.solar_open.config import MoEOptions
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
+from models.demos.solar_open.tt.chunked_prefill import (
+    PREFILL_CHUNK_TOKENS_ENV,
+    prefill_chunk_tokens_from_env,
+    single_row_prefill_cap,
+)
 from models.demos.solar_open.tt.common import check_kv_budget, create_tt_model
 from models.demos.solar_open.tt.model import prefill_forward_text_batched, summarize_batched_prefill_log
+from models.demos.solar_open.tt.model_config import plan_batched_prefill
 from models.demos.utils.device_sku import get_current_device_sku_name
 from models.demos.utils.llm_demo_utils import create_benchmark_data, verify_perf
 from models.demos.utils.model_targets import resolve_perf_targets
@@ -289,7 +312,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             True,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Same as prefill_128 with the first ENGLISH prompt (prefill_128 runs the first, Korean, prompt of the KO/EN file)
         (
@@ -309,7 +332,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Non-greedy on-device sampling with Solar's recommended temperature / top_p; top_k is capped at 32 (MAX_TOP_K)
         (
@@ -329,7 +352,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # reasoning_effort=high: the model thinks in a <|think|> block before <|content|>, so it needs a 2K token budget
         (
@@ -349,7 +372,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             "high",  # reasoning_effort
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_1k.json",  # input_prompts
@@ -368,7 +391,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_4k.json",  # input_prompts
@@ -387,7 +410,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_8k.json",  # input_prompts
@@ -406,7 +429,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_16k.json",  # input_prompts
@@ -425,7 +448,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_32k.json",  # input_prompts
@@ -444,7 +467,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_64k.json",  # input_prompts
@@ -463,8 +486,34 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
+        # prefill_64k_chunked (phase 3d): the 64K prompt above with SOLAR_OPEN_PREFILL_CHUNK_TOKENS pinned to 32768 by
+        # the case id (two 32K chunks: chunk 1 attends over chunk 0's KV through the chunked SDPA). Parity arm of
+        # prefill_64k: run that case with SOLAR_OPEN_PREFILL_CHUNK_TOKENS=65536 for the unchunked phase-3c pass
+        # (TTFT 29-30 s) and compare TTFT, the generated text and the decode step at the 64K context.
+        (
+            "models/tt_transformers/demo/sample_prompts/input_data_long_64k.json",  # input_prompts
+            1,  # data_parallel
+            1,  # batch_size
+            1,  # repeat_batches
+            64 * 1024,  # max_seq_len
+            200,  # max_generated_tokens
+            {"page_block_size": 64, "page_max_num_blocks_per_dp": 64 * 1024 // 64},  # page_params
+            {"temperature": 0, "top_p": 0.08},  # sampling_params (greedy decoding),
+            True,  # enable_decode_trace
+            False,  # enable_prefill_trace
+            False,  # warmup_prefill
+            False,  # users_row_sharded
+            False,  # long_context_mode
+            False,  # stop_at_eos
+            False,  # run_in_ci
+            None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
+        ),
+        # prefill_128k: single user, 128K prompt on a 2048-block pool (1.59 GiB of KV per device). On the 1x8 mesh the
+        # Generator prefills it in SOLAR_OPEN_PREFILL_CHUNK_TOKENS-token chunks (default 32768: four chunks, phase 3d);
+        # an unchunked 128K pass (env 131072) is refused on single-row meshes (never validated, DRAM).
         (
             "models/tt_transformers/demo/sample_prompts/input_data_long_128k.json",  # input_prompts
             1,  # data_parallel
@@ -482,7 +531,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Batch 128
         (
@@ -502,7 +551,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             True,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Batch 128 with logprobs (top-5)
         (
@@ -527,7 +576,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Long-context mode: 1 user per row with 128k tokens, batch=128 for decode throughput
         (
@@ -547,7 +596,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Long-context mode: short prefill, long decode
         (
@@ -567,13 +616,16 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Batch 32 on a single-row mesh (8x Blackhole P150): TP=8, EP=1, users are NOT row-sharded and the MoE runs the
         # union-of-experts decode on the whole 32-user tile (see experts/decode.py). 16 Korean + 16 English prompts.
         # Page table: 32 users x (8K / 64) blocks = 4096 blocks (~3.2 GiB of paged bfp8 KV per device: 48 layers, hd128).
         # 512-token budget: even with reasoning_effort=low the model opens a <|think|> block for most of these prompts
-        # (23/32 on 2026-09-07) and a 200-token budget truncated them before <|content|>.
+        # (23/32 on 2026-09-07) and a 200-token budget truncated them before <|content|>. Prefill (phase 3d / A3): the
+        # 32 x 128-token prompts run as ONE packed 4096-token pass through prefill_forward_text_batched by default
+        # (TTFT ~1.8 s for every user; SOLAR_OPEN_BATCHED_PREFILL=0 = the phase-2 arm: 32 sequential traced 128-token
+        # prefills, TTFT-last ~4.7 s). enable_prefill_trace only reaches the sequential arm (packed passes are eager).
         (
             "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
             1,  # data_parallel
@@ -591,14 +643,16 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
-        # Batch 32 with PACKED prefill (phase 3a(1), design_packed_prefill.md): the same 32 prompts as batch32, but the
-        # 32 x 128-token prefill runs as packed multi-user passes (SOLAR_OPEN_BATCHED_PREFILL_TOKENS tokens per pass,
-        # default 1024 = four passes of 8 users; 4096 = one pass of 32) through tt/model.py prefill_forward_text_batched
-        # instead of 32 sequential traced 128-token prefills (TTFT-last 4.9 s). Packed passes are always eager (the
-        # T = B x 128 MoE is not trace-safe), so enable_prefill_trace is off; the decode trace is unchanged. The demo
-        # logs TTFT first / mean / last from the per-pass log. Separate id on purpose: the plain batch-32 command
+        # Batch 32 with PACKED prefill FORCED (phase 3a(1), design_packed_prefill.md): the same 32 prompts as batch32
+        # with batched_prefill=True, i.e. packed even when SOLAR_OPEN_BATCHED_PREFILL=0 is exported (the A/B arm of the
+        # phase-3a/3c studies; since phase 3d the plain batch32 case packs by default, so the two cases differ only in
+        # that override). SOLAR_OPEN_BATCHED_PREFILL_TOKENS tokens per pass (default 4096 = one pass of 32; 1024 = four
+        # passes of 8 users) through tt/model.py prefill_forward_text_batched instead of 32 sequential traced 128-token
+        # prefills (TTFT-last 4.7 s). Packed passes are always eager (the T = B x 128 MoE is not trace-safe), so
+        # enable_prefill_trace is off; the decode trace is captured after the compile pass. The demo logs TTFT first /
+        # mean / last from the per-pass log. Separate id on purpose: the plain batch-32 command
         # `-k "batch32 and 1x8 and not 16k and not 32k"` must not pick this case up.
         (
             "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json",  # input_prompts
@@ -617,7 +671,7 @@ def prepare_solar_open_generator_args(
             True,  # stop_at_eos
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            True,  # batched_prefill (forces SOLAR_OPEN_BATCHED_PREFILL=1 for this case)
+            True,  # batched_prefill (forces SOLAR_OPEN_BATCHED_PREFILL=1 for this case, whatever the env says)
         ),
         # Batch 32 x 16K context (phase 2, design_misc.md (b)): 32 users each read a DIFFERENT clip (2K..15K tokens)
         # of the cached Frankenstein text followed by a KO/EN question about it (distinct contexts keep the union of
@@ -642,7 +696,7 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos (measure a fixed 256 steps)
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
         # Batch 32 x 32K context: clips of 4K..31K tokens, page table 32 x 512 blocks = 16384 blocks = 12.75 GiB of KV
         # per device. Above the 8 GiB bfp8 default budget on purpose: the case SKIPS unless SOLAR_OPEN_KV_BUDGET_GIB=13
@@ -667,9 +721,10 @@ def prepare_solar_open_generator_args(
             False,  # stop_at_eos (measure a fixed 256 steps)
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
-        # Seqlen sweep: 1k-128k context lengths, one step per seqlen (on single-row meshes, >64k steps are skipped)
+        # Seqlen sweep: 1k-128k context lengths, one step per seqlen (on single-row meshes the 128k step runs in
+        # SOLAR_OPEN_PREFILL_CHUNK_TOKENS-token chunks, phase 3d; it is skipped only when the env disables chunking)
         (
             [
                 "models/tt_transformers/demo/sample_prompts/input_data_long_1k.json",
@@ -684,7 +739,7 @@ def prepare_solar_open_generator_args(
             1,  # data_parallel
             1,  # batch_size
             8,  # repeat_batches (one per seqlen step)
-            128 * 1024,  # max_seq_len (single-row meshes cap at 64k via is_seqlen_sweep guard)
+            128 * 1024,  # max_seq_len (single-row meshes: single_row_prefill_cap, 128K with the default 32K chunk)
             32,  # max_generated_tokens (minimal decode to verify prefill works)
             {"page_block_size": 64, "page_max_num_blocks_per_dp": 2048},  # page_params
             {"temperature": 0, "top_p": 0.08},  # sampling_params
@@ -699,7 +754,7 @@ def prepare_solar_open_generator_args(
             # via -k "seqlen-sweep".
             False,  # run_in_ci
             None,  # reasoning_effort (None -> SOLAR_OPEN_REASONING_EFFORT, demo default low)
-            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off)
+            None,  # batched_prefill (None -> env SOLAR_OPEN_BATCHED_PREFILL, default off again since phase 3e / A0)
         ),
     ],
     ids=[
@@ -713,6 +768,7 @@ def prepare_solar_open_generator_args(
         "prefill_16k",
         "prefill_32k",
         "prefill_64k",
+        "prefill_64k_chunked",
         "prefill_128k",
         "batch128",
         "batch128_logprobs",
@@ -750,13 +806,26 @@ def test_solar_open_demo(
     request,
     state_dict,
     monkeypatch,
+    pinned_template_date,
 ):
-    """Solar-Open-100B demo on the full tt_transformers generation pipeline (prefill + traced decode + sampling)."""
+    """Solar-Open-100B demo on the full tt_transformers generation pipeline (prefill + traced decode + sampling).
+
+    The chat template's date is pinned to the recorded-baseline day (``pinned_template_date``, conftest
+    ``RECORDED_TEMPLATE_DATE``) so the prompt token counts and greedy continuations of the recorded rows reproduce on any
+    day; ``SOLAR_OPEN_TEMPLATE_DATE=today`` renders the real date as a served model would."""
     mesh_shape = tuple(mesh_device.shape)
     test_id = request.node.callspec.id if hasattr(request.node, "callspec") else request.node.name
     is_seqlen_sweep = "seqlen-sweep" in test_id
-    # On single-row meshes (T3K, LoudBox), cap max_seq_len at 64k for seqlen-sweep so steps >64k are skipped
-    actual_max_seq_len = min(max_seq_len, 64 * 1024) if (is_seqlen_sweep and mesh_shape[0] == 1) else max_seq_len
+    # Chunked single-user prefill (phase 3d, tt/chunked_prefill.py): a case id ending in "_chunked" pins the chunk to
+    # 32K for this run (ModelArgs reads the env at construction, below); every other case follows the environment
+    # (default 32768). On a single-row mesh the longest admitted single-user prompt is the RoPE tables' 131072
+    # positions once the Generator chunks at or below 64K, else the validated unchunked cap of 64K.
+    if "_chunked" in test_id:
+        monkeypatch.setenv(PREFILL_CHUNK_TOKENS_ENV, "32768")
+    prefill_chunk_tokens = prefill_chunk_tokens_from_env()
+    single_row_cap = single_row_prefill_cap(prefill_chunk_tokens)
+    # On single-row meshes (T3K, LoudBox), cap max_seq_len for seqlen-sweep so steps beyond the cap are skipped
+    actual_max_seq_len = min(max_seq_len, single_row_cap) if (is_seqlen_sweep and mesh_shape[0] == 1) else max_seq_len
     if mesh_shape[0] == 1:
         if users_row_sharded or batch_size > 32:
             pytest.skip(
@@ -769,9 +838,13 @@ def test_solar_open_demo(
                 f"Batch size {batch_size} skipped for mesh shape {mesh_shape}: multi-user single-row decode is "
                 "validated for TP=8 (1x8) only."
             )
-        elif max_seq_len > 64 * 1024 and not is_seqlen_sweep:
-            # Seqlen sweep uses actual_max_seq_len (capped at 64k) for execution; skip only non-sweep tests
-            pytest.skip(f"Long context demo with >64k tokens skipped for mesh shape {mesh_shape} due to OOM.")
+        elif max_seq_len > single_row_cap and not is_seqlen_sweep:
+            # Seqlen sweep uses actual_max_seq_len (capped above) for execution; skip only non-sweep tests
+            pytest.skip(
+                f"Long context demo with >{single_row_cap // 1024}k tokens skipped for mesh shape {mesh_shape}: an "
+                f"unchunked prefill above 64K was never run on a single-row mesh (DRAM); set "
+                f"{PREFILL_CHUNK_TOKENS_ENV} <= 65536 (default 32768) to prefill it in chunks."
+            )
     elif batch_size > 1 and not users_row_sharded:
         pytest.skip(
             f"Batch size {batch_size} without row sharding skipped for multi-row mesh {mesh_shape}: "
@@ -792,11 +865,12 @@ def test_solar_open_demo(
         monkeypatch.setenv("SOLAR_OPEN_REASONING_EFFORT", reasoning_effort)
     logger.info(
         f"Chat template: reasoning_effort={os.environ['SOLAR_OPEN_REASONING_EFFORT']}, "
-        f"default_system_prompt={os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}"
+        f"default_system_prompt={os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}, "
+        f"date={pinned_template_date}"
     )
     # Packed multi-user prefill (phase 3a(1)): the case column wins over the environment; None keeps the env default
-    # (SOLAR_OPEN_BATCHED_PREFILL, off unless set), so `batch32` runs either arm of the A/B from the shell. ModelArgs
-    # reads the env at construction, i.e. below in prepare_solar_open_generator_args.
+    # (SOLAR_OPEN_BATCHED_PREFILL, on unless set to 0 since phase 3d / A3), so `batch32` runs either arm of the A/B from
+    # the shell. ModelArgs reads the env at construction, i.e. below in prepare_solar_open_generator_args.
     if batched_prefill is not None:
         monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "1" if batched_prefill else "0")
 
@@ -910,14 +984,35 @@ def test_solar_open_demo(
     log_device_memory(mesh_device, "after model load")
 
     # Packed multi-user prefill applies to the single-row multi-user path only (row-sharded / long-context prefills
-    # have their own branches below). With the flag off this is False and the prefill branch is byte-identical to
-    # phase 2; with it on, prefill_forward_text_batched decides per user what is packed (see its docstring).
+    # have their own branches below). With the flag off (SOLAR_OPEN_BATCHED_PREFILL=0) this is False and the prefill
+    # branch is byte-identical to phase 2; with it on (the default since phase 3d / A3) the packed branch runs whenever
+    # plan_batched_prefill packs at least one pass of the batch (decided per batch below: the 16k / 32k cases plan no
+    # pass at the default max_seq_len 128 and keep the sequential branch, compile pass on user 0 included), and
+    # prefill_forward_text_batched decides per user what is packed (see its docstring). Only this demo / driver path
+    # packs: ModelArgs.disable_batched_prefill stays True for every plain Generator call.
     batched_prefill_options = model_args[0].batched_prefill
     use_batched_prefill = (
         batched_prefill_options.enabled and global_batch_size > 1 and not users_row_sharded and not long_context_mode
     )
-    logger.info(f"Prefill policy: {batched_prefill_options.describe()} -> packed prefill path {use_batched_prefill}")
+    assert all(a.disable_batched_prefill for a in model_args), "a plain Generator call must stay per-user (phase 3d)"
+    # SOLAR_OPEN_PACKED_DECODE_TRACE_WARMUP=0 skips the decode-trace capture before the packed compile pass (the
+    # phase-3c order: iteration 0 then captures the trace, ~1.2 s once) -- the A/B lever for the packed TTFT.
+    packed_decode_trace_warmup = os.getenv("SOLAR_OPEN_PACKED_DECODE_TRACE_WARMUP", "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "",
+    )
+    logger.info(
+        f"Prefill policy: {batched_prefill_options.describe()} -> packed prefill path {use_batched_prefill}"
+        + (
+            f", decode trace captured before the compile pass: {packed_decode_trace_warmup}"
+            if use_batched_prefill
+            else ""
+        )
+    )
     ttft_summary = None  # TTFT first / mean / last of the first batch (seconds), filled after its prefill
+    packed_prefill_ran = False  # the first batch's prefill really took the packed branch (its plan had a packed pass)
 
     # Create on-device sampling params
     SAMPLING_BATCH_SIZE = 32
@@ -1157,10 +1252,34 @@ def test_solar_open_demo(
             profiler.end(f"inference_prefill", iteration=batch_idx)
             logger.info("Row-parallel batched prefill finished")
 
-        elif use_batched_prefill:
+        elif use_batched_prefill and plan_batched_prefill(decoding_pos, batched_prefill_options).passes:
             # Packed multi-user prefill (phase 3a(1)). The compile pass runs the FULL batch through the exact packed
             # shapes the timed pass uses (a new (B_pad, S) shape compiles its programs on first use, 30-60 s), then the
             # KV cache is cleared (as the row-sharded branch does) so the timed pass rewrites every user's blocks.
+            if batch_idx == 0:
+                packed_prefill_ran = True
+            if enable_decode_trace and batch_idx == 0 and packed_decode_trace_warmup:
+                # Capture the decode trace BEFORE the compile pass (phase 3d / A3), the way the Generator does it for the
+                # sequential branch: its first TRACED prefill call compiles decode at position 0 with mock inputs before
+                # the prefill and records the trace right after (_prepare_decode_trace_once / _record_pending_traces),
+                # so iteration 0 replays in ~24 ms. Packed passes are eager and never arm that; without this step the
+                # first decode iteration captured the trace inside the timed loop (R1 2026-09-09: 1.21-1.23 s, every
+                # user's second token ~1.2 s late). One decode step at position 0 over the users' real page-table rows
+                # captures it now; its mock K/V is overwritten by the compile pass and cleared before the timed pass.
+                # Placed here and not between the compile pass and the timed pass on purpose: an eager prefill right
+                # after a trace capture pays ~0.4-0.5 s once (A3 d1 / d2 / d4: 2155-2308 ms vs 1760 ms), and the compile
+                # pass is the untimed place to absorb that.
+                logger.info("Capturing the decode trace (position 0, mock tokens) before the packed compile pass...")
+                t_trace = time.perf_counter()
+                generator.decode_forward(
+                    input_tokens_prefill_pt[:, :1].clone(),
+                    torch.zeros(global_batch_size, dtype=torch.long),
+                    enable_trace=True,
+                    page_table=page_table,
+                    kv_cache=tt_kv_cache,
+                    sampling_params=device_sampling_params if on_device_sampling_supported else None,
+                )
+                logger.info(f"Decode trace captured in {time.perf_counter() - t_trace:.2f} s (not part of the TTFT)")
             logger.info("Starting packed prefill compile pass (full batch, eager)...")
             profiler.start(f"compile_prefill", iteration=batch_idx)
             prefill_forward_text_batched(
@@ -1423,7 +1542,7 @@ def test_solar_open_demo(
     logger.info("")
     logger.info(f"Average Time to First Token (TTFT): {round(avg_time_to_first_token * 1000, 2)}ms")
     logger.info(
-        f"TTFT over {effective_batch_size} users ({'packed' if use_batched_prefill else 'sequential'} prefill): "
+        f"TTFT over {effective_batch_size} users ({'packed' if packed_prefill_ran else 'sequential'} prefill): "
         f"first {round(ttft_summary['first'] * 1000, 1)}ms, mean {round(ttft_summary['mean'] * 1000, 1)}ms, "
         f"last {round(ttft_summary['last'] * 1000, 1)}ms"
     )

@@ -13,6 +13,7 @@ patched to "P150x8".
 """
 
 import dataclasses
+import datetime
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from transformers import AutoConfig
 import ttnn
 from models.demos.solar_open.config import MoEOptions
 from models.demos.solar_open.tt import model_config as mc
+from models.demos.solar_open.tt.chunked_prefill import PREFILL_CHUNK_TOKENS_DEFAULT
 from models.demos.solar_open.tt.common import check_kv_budget, kv_budget_gib, paged_kv_cache_gib, unpaged_kv_cache_gib
 from models.demos.solar_open.tt.model_config import ModelArgs
 from models.demos.solar_open.utils.general_utils import get_layer_types, get_sliding_window, resolve_rope_theta
@@ -41,11 +43,17 @@ SOLAR_ENV_VARS = (
     "SOLAR_OPEN_ROUTER_IMPL",
     "SOLAR_OPEN_ROUTER_FP32_LOGITS",
     "SOLAR_OPEN_FUSE_SHARED_EXPERT",
+    "SOLAR_OPEN_INDEXED_DECODE",
+    "SOLAR_OPEN_SHARED_DOWN_BFP8",
+    "SOLAR_OPEN_ATTENTION_FUSED_QK",
+    "SOLAR_OPEN_ATTENTION_OUT_GRID",
     "SOLAR_OPEN_REASONING_EFFORT",
     "SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT",
     "SOLAR_OPEN_FORCE_MODEL_LOAD",
     "SOLAR_OPEN_KV_BUDGET_GIB",
     "SOLAR_OPEN_STREAMING_LOAD",
+    "SOLAR_OPEN_TEMPLATE_DATE",
+    "SOLAR_OPEN_PREFILL_CHUNK_TOKENS",
 )
 DEFAULT_MARKER_MOE = {
     "expert_dtype": "bfp8",
@@ -124,6 +132,7 @@ class TestMoEOptions:
         assert opts.router_fp32_logits is True
         assert opts.fuse_shared_expert is False  # phase 2: off until the fused path is validated
         assert opts.indexed_decode is True  # phase 2 (perf-p2): indexed single-user expert path, validated
+        assert opts.shared_down_bfp8 is True  # phase 3e / A3: on since its gates passed (0 = the A2 behaviour)
         assert opts.expert_dtype_str == "bfp8"
         assert opts.marker_fields() == DEFAULT_MARKER_MOE
         assert MoEOptions.from_env() == opts
@@ -135,6 +144,7 @@ class TestMoEOptions:
         monkeypatch.setenv("SOLAR_OPEN_ROUTER_FP32_LOGITS", "0")
         monkeypatch.setenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "1")
         monkeypatch.setenv("SOLAR_OPEN_INDEXED_DECODE", "0")
+        monkeypatch.setenv("SOLAR_OPEN_SHARED_DOWN_BFP8", "0")
         opts = MoEOptions.from_env()
         assert opts.expert_dtype == ttnn.bfloat4_b
         assert opts.shared_expert_dtype == ttnn.bfloat16
@@ -142,6 +152,7 @@ class TestMoEOptions:
         assert opts.router_fp32_logits is False
         assert opts.fuse_shared_expert is True
         assert opts.indexed_decode is False
+        assert opts.shared_down_bfp8 is False
         assert opts.expert_dtype_str == "bfp4"
         fields = opts.marker_fields()
         assert fields == {
@@ -163,6 +174,20 @@ class TestMoEOptions:
         assert MoEOptions.from_env() == unfused
         monkeypatch.setenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "yes")  # anything but "1" keeps the flag off
         assert MoEOptions.from_env() == unfused
+
+    def test_shared_down_bfp8_is_cache_neutral(self, monkeypatch):
+        """The decode partial dtype (phase 3e / A3) is a runtime choice over the same weight tensors: neither the marker
+        fields nor the cache directory may change; "1" (the default) turns it on, anything else off."""
+        on, off = MoEOptions(), MoEOptions(shared_down_bfp8=False)
+        assert on != off and on.marker_fields() == off.marker_fields() == DEFAULT_MARKER_MOE
+        assert "shared_down_bfp8" not in on.marker_fields()
+        assert on.expert_dtype_str == off.expert_dtype_str
+        monkeypatch.setenv("SOLAR_OPEN_SHARED_DOWN_BFP8", "1")
+        assert MoEOptions.from_env() == on
+        monkeypatch.setenv("SOLAR_OPEN_SHARED_DOWN_BFP8", "0")
+        assert MoEOptions.from_env() == off
+        monkeypatch.setenv("SOLAR_OPEN_SHARED_DOWN_BFP8", "yes")
+        assert MoEOptions.from_env() == off
 
     @pytest.mark.parametrize(
         "var, value",
@@ -284,7 +309,9 @@ class TestModelArgs:
         assert args.rope_scaling["original_max_position_embeddings"] == 65536
         assert args.rope_scaling["rope_theta"] == 1_000_000
         assert (
-            args.max_local_batch_size == 32 and args.max_context_len == 8192 and args.max_prefill_chunk_size == 131072
+            args.max_local_batch_size == 32
+            and args.max_context_len == 8192
+            and args.max_prefill_chunk_size == PREFILL_CHUNK_TOKENS_DEFAULT  # phase 3d: 32768, chunked above
         )
         assert args.processor is None and args.tokenizer is not None
 
@@ -361,6 +388,82 @@ class TestModelArgs:
         low_ids = args.encode_prompt("What is the capital of Korea?", reasoning_effort="low")
         low_text = args.tokenizer.decode(low_ids, skip_special_tokens=False)
         assert low_text.endswith("<|begin|>assistant<|think|><|end|><|begin|>assistant")
+
+
+class TestTemplateDate:
+    """Phase 3d / A2: the chat-template date pin (``SOLAR_OPEN_TEMPLATE_DATE``, ``template_date_kwargs``, the package
+    conftest's ``pinned_template_date`` fixture). The autouse ``_isolated_env`` clears the variable first."""
+
+    RECORDED = "2026-09-08"
+
+    def test_template_date_kwargs_resolution(self, monkeypatch, expect_error):
+        assert mc.TEMPLATE_DATE_ENV == "SOLAR_OPEN_TEMPLATE_DATE"
+        assert mc.template_date_kwargs() == {}  # unset: today's date, the production rendering
+        for unpinned in ("", "today", " Today ", "TODAY"):
+            monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, unpinned)
+            assert mc.template_date_kwargs() == {}, repr(unpinned)
+            assert mc.template_date_kwargs(unpinned) == {}, repr(unpinned)
+        monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, "2026-09-09")
+        kw = mc.template_date_kwargs()
+        assert set(kw) == {"strftime_now"}
+        assert kw["strftime_now"]("%Y-%m-%d") == "2026-09-09"  # the template's own format
+        assert kw["strftime_now"]("%d.%m.%Y") == "09.09.2026"  # honours fmt like the Jinja global it shadows
+        explicit = mc.template_date_kwargs(self.RECORDED)  # an explicit date wins over the env
+        assert explicit["strftime_now"]("%Y-%m-%d") == self.RECORDED
+        for bad in ("2026-9-8", "09/08/2026", "yesterday", "2026-13-01"):
+            with expect_error(ValueError, mc.TEMPLATE_DATE_ENV):
+                mc.template_date_kwargs(bad)
+            monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, bad)
+            with expect_error(ValueError, "YYYY-MM-DD"):
+                mc.template_date_kwargs()
+
+    def test_encode_prompt_applies_the_env_pin(self, monkeypatch, mesh_1x8, stub_tokenizer):
+        monkeypatch.setenv("HF_MODEL", str(CONFIG_DIR))
+        args = ModelArgs(mesh_device=mesh_1x8)
+        args.encode_prompt("x")
+        _, kw = stub_tokenizer.calls[-1]
+        assert "strftime_now" not in kw  # unpinned: the template's Jinja global renders today
+        monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, self.RECORDED)
+        args.encode_prompt("x")
+        _, kw = stub_tokenizer.calls[-1]
+        assert kw["strftime_now"]("%Y-%m-%d") == self.RECORDED
+        assert kw["reasoning_effort"] == "high" and kw["default_system_prompt"] is True  # the other defaults untouched
+        args.encode_prompt("x", strftime_now=lambda fmt: "2025-01-01")  # explicit kwarg (teacher-forced test) wins
+        _, kw = stub_tokenizer.calls[-1]
+        assert kw["strftime_now"]("%Y-%m-%d") == "2025-01-01"
+        monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, "today")
+        args.encode_prompt("x")
+        _, kw = stub_tokenizer.calls[-1]
+        assert "strftime_now" not in kw
+
+    def test_pinned_template_date_fixture(self, pinned_template_date):
+        # The package conftest's fixture sets the variable model_config reads (same name) to the recorded date.
+        assert pinned_template_date == self.RECORDED
+        assert os.environ[mc.TEMPLATE_DATE_ENV] == self.RECORDED
+        assert mc.template_date_kwargs()["strftime_now"]("%Y-%m-%d") == self.RECORDED
+
+    def test_pinned_vs_unpinned_ids_differ_only_in_the_date(self, monkeypatch, mesh_1x8, snapshot_dir):
+        if not any((snapshot_dir / f).is_file() for f in ("tokenizer.json", "tokenizer_config.json")):
+            pytest.skip("tokenizer files not downloaded yet")
+        monkeypatch.setenv("HF_MODEL", str(snapshot_dir))
+        args = ModelArgs(mesh_device=mesh_1x8)
+        prompt = "대한민국의 수도는 어디인가요?"
+        today = datetime.date.today().isoformat()
+        unpinned = args.encode_prompt(prompt)
+        assert args.encode_prompt(prompt, **mc.template_date_kwargs(today)) == unpinned  # pin to today == unpinned
+        monkeypatch.setenv(mc.TEMPLATE_DATE_ENV, self.RECORDED)
+        pinned = args.encode_prompt(prompt)
+        # Same mechanism (a strftime_now template kwarg) as gen_reference.py / test_teacher_forced.py -> same ids.
+        assert pinned == args.encode_prompt(prompt, strftime_now=lambda fmt: self.RECORDED)
+        text_pinned = args.tokenizer.decode(pinned, skip_special_tokens=False)
+        text_unpinned = args.tokenizer.decode(unpinned, skip_special_tokens=False)
+        assert f"The current date is {self.RECORDED}." in text_pinned
+        assert text_pinned.replace(self.RECORDED, today) == text_unpinned  # the date sentence is the only difference
+        if today != self.RECORDED:
+            assert pinned != unpinned
+            assert f"The current date is {today}." in text_unpinned
+        # And the ids of a pinned day are a pure function of the prompt: a second call reproduces them exactly.
+        assert args.encode_prompt(prompt) == pinned
 
 
 class TestWeightCacheMarker:

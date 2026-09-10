@@ -19,7 +19,11 @@ device's own) - and compares the device logits of every step with the reference:
 
 plus the device's own free-running greedy continuation vs the reference continuation (first divergence position). The
 b32 case puts the prompts in all 32 slots (prompt i in slots i, i+4, ...) so the batched union-of-experts decode
-path is measured too and the copies of one prompt can be checked against each other.
+path is measured too and the copies of one prompt can be checked against each other. The packed32 case (phase 3d /
+A3) is b32 with the 32 prompts prefilled as ONE 32 x 128 packed pass through the driver ``tt/model.py:
+prefill_forward_text_batched`` (``PACKED_GATE_OPTIONS``: 4096 tokens per pass, the demo's default) instead of 32
+sequential per-user prefills -- the accuracy gate of the packed path, same floors (the ``b1`` / ``b32`` cases stay
+sequential: ``ModelArgs.disable_batched_prefill`` is always True, only the driver packs).
 
 Reading the numbers: a wrong FIRST step (prefill) points at the embedding / lm_head / chat template; a drift that
 grows with the step index points at RoPE or the KV cache; a flat per-step noise with occasional near-tie flips is the
@@ -27,7 +31,8 @@ bfp8 / fp32-selection numerics floor. Thresholds are keyed by the expert dtype (
 
     timeout 10800 python models/demos/solar_open/tests/accuracy/gen_reference.py      # host only, once per checkpoint
     pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "b1 and 1x8"
-    pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "b32 and 1x8"
+    pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "b32 and 1x8"        # sequential prefill
+    pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "packed32 and 1x8"   # one packed 32 x 128 pass
 
 ``SOLAR_OPEN_TF_REFERENCE`` points at the reference file (default ``$TT_CACHE_PATH/teacher_forced_reference.pt``);
 ``SOLAR_OPEN_TF_REPORT_DIR`` (optional) receives a markdown report per case.
@@ -46,6 +51,8 @@ from models.demos.solar_open.config import MoEOptions
 from models.demos.solar_open.demo.text_demo import prepare_solar_open_generator_args
 from models.demos.solar_open.tests.accuracy.gen_reference import default_reference_path, render_prompt_ids
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
+from models.demos.solar_open.tt.model import prefill_forward_text_batched
+from models.demos.solar_open.tt.model_config import BatchedPrefillOptions
 from models.tt_transformers.tt.generator import Generator
 
 # Thresholds (design D13: ~0.02 below the first measured values; recorded in README.md "Recorded baselines"), keyed by
@@ -90,6 +97,10 @@ THRESHOLDS = {
     },
 }
 MIN_REPLICA_PCC = 0.97  # copies of one prompt in other slots vs its first slot (b32); a leak collapses this below 0.3
+# packed32: the pass shape of the packed arm, pinned here (not the env): all 32 slots in ONE 4096-token pass = one MoE
+# chunk, one hot / cold plan for the whole set (the demo's default since phase 3d / A3; P2 2026-09-09 measured this
+# pass at 0.9336 / 0.9690 / 0.9180 / 0.98195 / 0.99266 / KL 0.03039, slot copies 1792 / 1792).
+PACKED_GATE_OPTIONS = BatchedPrefillOptions(enabled=True, tokens_per_pass=4096, max_seq_len=128)
 DECISIVE_MARGIN = 0.5  # reference top-1 margin (logits) above which a top-1 flip is not a bf16 near tie
 
 
@@ -101,8 +112,12 @@ def _clear_kv_caches(models):
             ttnn.mul(v_cache, 0, output_tensor=v_cache)
 
 
-def _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot):
-    """Clear the KV cache and prefill every slot with its token ids (eager prefill). Returns (logits [B, V] fp32, pos)."""
+def _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, packed=False):
+    """Clear the KV cache and prefill every slot with its token ids (eager prefill). Returns (logits [B, V] fp32, pos).
+
+    ``packed``: ONE packed pass of all slots through the driver (``PACKED_GATE_OPTIONS``, asserted); otherwise the plain
+    Generator, which prefills per user (``disable_batched_prefill`` is always True).
+    """
     batch = len(prompt_ids_per_slot)
     _clear_kv_caches(models)
     generator.prev_page_table = None
@@ -110,9 +125,28 @@ def _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot):
     tokens = torch.zeros(batch, max(lens), dtype=torch.long)
     for b, ids in enumerate(prompt_ids_per_slot):
         tokens[b, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-    logits = generator.prefill_forward_text(
-        tokens, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=lens, enable_trace=False
-    )
+    if packed:
+        logits = prefill_forward_text_batched(
+            generator,
+            tokens,
+            page_table=page_table,
+            kv_cache=tt_kv_cache,
+            prompt_lens=lens,
+            enable_trace=False,
+            options=PACKED_GATE_OPTIONS,
+        )
+        log = generator.batched_prefill_pass_log
+        assert (
+            len(log) == 1
+            and log[0].packed
+            and not log[0].traced
+            and len(log[0].users) == batch
+            and log[0].seq_len == 128
+        ), f"expected ONE packed {batch} x 128 pass, got {log}"
+    else:
+        logits = generator.prefill_forward_text(
+            tokens, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=lens, enable_trace=False
+        )
     return logits.reshape(batch, -1).float(), torch.tensor(lens)
 
 
@@ -123,10 +157,10 @@ def _decode_step(generator, tt_kv_cache, page_table, tokens, current_pos):
     return logits.reshape(tokens.shape[0], -1)
 
 
-def _teacher_forced_logits(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, forced):
+def _teacher_forced_logits(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, forced, packed=False):
     """Prefill, then feed ``forced[b, t - 1]`` at decode step t. Returns (logits [B, T, V] bf16, step times)."""
     batch, num_steps = forced.shape
-    logits0, current_pos = _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot)
+    logits0, current_pos = _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, packed)
     vocab = logits0.shape[-1]
     out = torch.empty(batch, num_steps, vocab, dtype=torch.bfloat16)  # the device emits bf16 logits: lossless
     out[:, 0] = logits0.to(torch.bfloat16)
@@ -140,10 +174,10 @@ def _teacher_forced_logits(generator, models, tt_kv_cache, page_table, prompt_id
     return out, times
 
 
-def _greedy_tokens(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, num_steps):
+def _greedy_tokens(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, num_steps, packed=False):
     """Free-running greedy continuation (host argmax of the device logits). Returns tokens [B, T]."""
     batch = len(prompt_ids_per_slot)
-    logits0, current_pos = _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot)
+    logits0, current_pos = _prefill(generator, models, tt_kv_cache, page_table, prompt_ids_per_slot, packed)
     vocab = logits0.shape[-1]
     tokens = torch.empty(batch, num_steps, dtype=torch.long)
     tokens[:, 0] = logits0.argmax(-1)
@@ -310,9 +344,13 @@ def _save_device_outputs(report_dir, case, ref, tt_logits, greedy, all_metrics, 
 
 
 @pytest.mark.timeout(3600)
-@pytest.mark.parametrize("batch_size, max_seq_len", [(1, 4 * 1024), (32, 8 * 1024)], ids=["b1", "b32"])
+@pytest.mark.parametrize(
+    "batch_size, max_seq_len, packed_prefill",
+    [(1, 4 * 1024, False), (32, 8 * 1024, False), (32, 8 * 1024, True)],
+    ids=["b1", "b32", "packed32"],
+)
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, state_dict):
+def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, packed_prefill, state_dict):
     mesh_shape = tuple(mesh_device.shape)
     if mesh_shape[0] != 1 or mesh_shape[1] < 8:
         pytest.skip(f"validated on 1x8 meshes (TP=8), got {mesh_shape}")
@@ -344,6 +382,17 @@ def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, sta
     )
     generator = Generator(models, model_args, mesh_device, processor=None, tokenizer=tokenizer)
     assert model_args[0].vocab_size == meta["vocab_size"]
+    assert all(a.disable_batched_prefill for a in model_args), "a plain Generator call must stay per-user (phase 3d)"
+    case_name = "packed32" if packed_prefill else f"b{batch_size}"
+    logger.info(
+        f"case {case_name}: prefill "
+        + (
+            f"as ONE packed {batch_size} x 128 pass through the driver ({PACKED_GATE_OPTIONS.describe()})"
+            if packed_prefill
+            else "sequential per user through the plain Generator"
+        )
+        + f"; ModelArgs policy {model_args[0].batched_prefill.describe()}"
+    )
 
     # The device run must tokenize exactly like the reference: same tokenizer, same template kwargs, same fixed date.
     for entry in prompts:
@@ -376,9 +425,9 @@ def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, sta
     for layout in layouts:
         slot_ids = [prompts[p]["prompt_ids"].tolist() for p in layout]
         forced = torch.stack([prompts[p]["gen_ids"] for p in layout])  # [B, T]
-        logits, times = _teacher_forced_logits(*args, slot_ids, forced)
+        logits, times = _teacher_forced_logits(*args, slot_ids, forced, packed=packed_prefill)
         step_times += times
-        greedy_tokens = _greedy_tokens(*args, slot_ids, num_steps)
+        greedy_tokens = _greedy_tokens(*args, slot_ids, num_steps, packed=packed_prefill)
         for slot, p in enumerate(layout):
             if tt_logits[p] is None:
                 tt_logits[p] = logits[slot]
@@ -400,7 +449,9 @@ def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, sta
         )
     steady = step_times[2:] if len(step_times) > 2 else step_times
     decode_ms = 1000 * sum(steady) / max(1, len(steady))
-    logger.info(f"teacher-forced decode (batch {batch_size}): {decode_ms:.1f} ms/step over {len(steady)} steps")
+    logger.info(
+        f"teacher-forced decode (batch {batch_size}, {case_name}): {decode_ms:.1f} ms/step over {len(steady)} steps"
+    )
 
     # Per-prompt and aggregate metrics against the reference.
     summaries, rows, all_metrics = [], [], []
@@ -442,7 +493,8 @@ def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, sta
         "kl_max": kl_all.max().item(),
     }
     logger.info(
-        f"[all {num_prompts} prompts x {num_steps} steps, batch {batch_size}] top-1 agreement {agg['top1']:.4f} "
+        f"[all {num_prompts} prompts x {num_steps} steps, batch {batch_size}, {case_name}] top-1 agreement "
+        f"{agg['top1']:.4f} "
         f"({int(top1_all.sum())}/{top1_all.numel()}; decisive {agg['top1_decisive']:.4f} of {int(decisive_all.sum())}), "
         f"top-5 overlap {agg['top5']:.4f}, top-64 PCC mean {agg['pcc_top64_mean']:.5f} / min {agg['pcc_top64_min']:.5f}, "
         f"full-vocab PCC mean {agg['pcc_full_mean']:.5f} / min {agg['pcc_full_min']:.5f}, KL mean {agg['kl_mean']:.5f} / "
@@ -455,8 +507,8 @@ def test_teacher_forced(mesh_device, device_params, batch_size, max_seq_len, sta
     )
     report_dir = os.getenv("SOLAR_OPEN_TF_REPORT_DIR")
     if report_dir:
-        _write_report(report_dir, f"b{batch_size}", ref, tokenizer, rows, greedy, per_slot_top1, summaries, decode_ms)
-        _save_device_outputs(report_dir, f"b{batch_size}", ref, tt_logits, greedy, all_metrics, decode_ms)
+        _write_report(report_dir, case_name, ref, tokenizer, rows, greedy, per_slot_top1, summaries, decode_ms)
+        _save_device_outputs(report_dir, case_name, ref, tt_logits, greedy, all_metrics, decode_ms)
 
     expert_dtype = MoEOptions.from_env().expert_dtype_str
     th = THRESHOLDS[expert_dtype]

@@ -19,6 +19,13 @@ split). Same fidelity (HiFi2 / bf16 x bfp8), same math; only the K-block accumul
 With ``MoEOptions.fuse_shared_expert`` the MLP does not build this module: it calls ``load_shared_expert_weights``
 (the same three cache stems) and folds the shards into the routed expert tensors as the always-on slot
 (``tt/experts/weights.py::fuse_always_on_expert``).
+
+Partial dtype (phase 3e / A3, ``MoEOptions.shared_down_bfp8`` = ``SOLAR_OPEN_SHARED_DOWN_BFP8``): the down linear
+emits bf16 by default. With ``decode_down_bfp8`` a DECODE call emits bfloat8_b instead, so the routed experts'
+in-place ``ttnn.add(next_states_bfp8, shared, output_tensor=next_states_bfp8)`` becomes a same-dtype add (the
+mixed-dtype in-place add on the single-user ``[1, 1, 1, H]`` partial is pathological: 12.6 us per layer at b1, 2.4 us
+at b32, ~2 us as bfp8 += bfp8; design_decode_levers.md 2.6 (a)). Not bit-identical: the shared partial is rounded to
+bfp8 before instead of after the add. Prefill calls always return bf16 (byte-identical to the previous behaviour).
 """
 
 import ttnn
@@ -139,7 +146,9 @@ class SharedExpert:
     Per device: ``w_gate``/``w_up`` ``[1, 1, H, I/tp]`` (column-parallel) and ``w_down`` ``[1, 1, I/tp, H]``
     (row-parallel).  ``__call__`` runs 4 launches (2 linears, one fused SiLU-GLU multiply, the down linear) and returns
     this device's partial over its ``I/tp`` intermediate columns as a bf16 tensor -- the dtype the experts' in-place
-    ``ttnn.add(next_states_bfp8, shared_bf16, output_tensor=next_states_bfp8)`` was validated with.
+    ``ttnn.add(next_states_bfp8, shared_bf16, output_tensor=next_states_bfp8)`` was validated with -- or, with
+    ``decode_down_bfp8`` (``MoEOptions.shared_down_bfp8``), as a bfloat8_b tensor for DECODE calls (``partial_dtype``),
+    which makes that add a same-dtype op (phase 3e / A3). Prefill partials are bf16 in both cases.
 
     The three linears run with the explicit 1D in0-multicast program configs of ``shared_expert_program_configs``
     for inputs of up to ``SHARED_EXPERT_CONFIG_MAX_ROWS`` rows (decode, traced prefill@128) and with ttnn's auto
@@ -158,6 +167,7 @@ class SharedExpert:
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
         program_configs=True,
+        decode_down_bfp8=False,
     ):
         """
         Args:
@@ -167,10 +177,13 @@ class SharedExpert:
             state_dict: ``substate(mlp_state_dict, "shared_experts")`` = ``gate_proj.weight [I, H]``,
                 ``up_proj.weight [I, H]``, ``down_proj.weight [H, I]``; ``{}`` loads every tensor from the cache
             mesh_config: ``MeshConfig`` (provides ``tp`` and the column-/row-parallel mesh mappers)
-            dtype: weight dtype (``MoEOptions.shared_expert_dtype``; the output is always bf16)
+            dtype: weight dtype (``MoEOptions.shared_expert_dtype``; the output dtype is ``partial_dtype``)
             tensor_cache_path: cache directory for this module's weights (None disables caching)
             program_configs: use the explicit 1D program configs (default); False = ttnn auto configs
+            decode_down_bfp8: emit the DECODE down projection (the partial) in bfloat8_b instead of bf16
+                (``MoEOptions.shared_down_bfp8``, phase 3e / A3); prefill partials stay bf16
         """
+        self.decode_down_bfp8 = bool(decode_down_bfp8)
         activation = getattr(hf_config, "hidden_act", "silu")
         assert activation == "silu", f"SharedExpert implements silu only, hf_config.hidden_act={activation!r}"
         tp = mesh_config.tp
@@ -215,6 +228,10 @@ class SharedExpert:
             self._program_configs[rows] = configs
         return configs
 
+    def partial_dtype(self, is_decode):
+        """dtype of the partial ``__call__`` returns: bfloat8_b for a decode call with ``decode_down_bfp8``, else bf16."""
+        return ttnn.bfloat8_b if (is_decode and self.decode_down_bfp8) else ttnn.bfloat16
+
     def __call__(self, x, is_decode=None):
         """Compute this device's partial of the shared-expert output.
 
@@ -226,14 +243,16 @@ class SharedExpert:
                 None.
 
         Returns:
-            ``[1, 1, T, H]`` bf16 TILE interleaved: the partial sum over this device's ``I/tp`` intermediate columns
-            (no CCL; the routed experts add it before their single TP all_reduce).
+            ``[1, 1, T, H]`` TILE interleaved, ``partial_dtype(is_decode)`` (bf16; bfloat8_b for a decode call with
+            ``decode_down_bfp8``): the partial sum over this device's ``I/tp`` intermediate columns (no CCL; the routed
+            experts add it in place into their bfloat8_b partial before their single TP all_reduce).
         """
         rows = x.shape[-2]
         if is_decode is None:
             is_decode = rows <= ttnn.TILE_SIZE
         memory_config = ttnn.L1_MEMORY_CONFIG if is_decode else ttnn.DRAM_MEMORY_CONFIG
         gate_up_config, down_config = self._get_program_configs(rows)
+        partial_dtype = self.partial_dtype(is_decode)
 
         gate = ttnn.linear(
             x,
@@ -258,10 +277,10 @@ class SharedExpert:
         partial = ttnn.linear(
             activated,
             self.w_down,
-            dtype=ttnn.bfloat16,
+            dtype=partial_dtype,
             memory_config=memory_config,
             compute_kernel_config=self.compute_kernel_config,
             program_config=down_config,
-        )  # [1, 1, T, H], partial over this device's I/tp columns
+        )  # [1, 1, T, H], partial over this device's I/tp columns (bf16, or bfp8 at decode with decode_down_bfp8)
         activated.deallocate(True)
         return partial

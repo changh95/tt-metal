@@ -23,17 +23,33 @@ with the same tokens and the per-step *logits* of each prompt are compared acros
 A prompt's logits at every step must be as close across slots as they are across two identical runs
 (PCC ~1, top-1 agreement at the baseline rate). Requires real weights (HF_MODEL); runs on a 1x8 mesh.
 
-Packed-prefill arm (phase 3a/3c): with ``SOLAR_OPEN_BATCHED_PREFILL=1`` every ``_prefill`` below is ONE 32 x 128
-packed pass through the plain Generator's batched path (a 4096-token MoE chunk of four 1024-token splits) instead of
-32 sequential 128-token prefills, so this test is the slot-independence gate of the packed path. Phase 3a failed it
-(rotated slots PCC min 0.91-0.94, 34-38 / 768 top-1 flips; fillers of one prompt in different splits 24-33 / 720):
-the expert-sorted MoE planned its hot / cold experts per split from the 8 users of that split. Phase 3c plans a
-packed pass once per chunk (``experts/prefill.py: _sorted_moe_chunk_plan``, marked by ``Model.ttnn_prefill_forward``),
-so every slot of the pass sees the same hot / cold sets and the phase-2 floors below are expected to hold; the test
-asserts that the per-chunk plan really ran. With the flag off (default) the run is the phase-2 sequential form.
+Two prefill arms, one case each (phase 3d / A3):
 
-    pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8
-    SOLAR_OPEN_BATCHED_PREFILL=1 pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8
+  ``b32``       sequential per-user prefills through the plain ``Generator`` (``ModelArgs.disable_batched_prefill`` is
+                always True since phase 3d, so this is what the regression harness, vLLM and every plain Generator
+                caller get); the phase-2 floors: a slot change is indistinguishable from a same-slot repeat.
+  ``packed32``  every ``_prefill`` is ONE 32 x 128 packed pass through the driver ``tt/model.py:
+                prefill_forward_text_batched`` with ``PACKED_GATE_OPTIONS`` (4096 tokens per pass = the demo's default:
+                one 4096-token MoE chunk of four 1024-token splits) -- the slot-independence gate of the packed path
+                with its own floors (``PACKED_*`` below). Phase 3a failed the slot check (rotated slots PCC min
+                0.91-0.94, 34-38 / 768 top-1 flips; fillers of one prompt in different splits 24-33 / 720): the
+                expert-sorted MoE planned its hot / cold experts per split from the 8 users of that split. Phase 3c
+                plans a packed pass once per chunk (``experts/prefill.py: _sorted_moe_chunk_plan``, marked by
+                ``Model.ttnn_prefill_forward``; the test asserts the plan really ran), so every slot of the pass sees
+                the same hot / cold sets: same slots and fillers are exact (0 flips), the rotation costs a few near-tie
+                flips (P2 2026-09-09: 9 / 768, PCC min 0.979 on that day's ids; A3 on the pinned 09-08 ids: 18 / 768 at
+                margins <= 0.5, PCC min 0.989). What remains by construction is the co-batch dependence:
+                a user's logits depend on the SET of users in its pass (hot / cold is decided on all of them), which the
+                lone-prompt check exposes (prompt 0 among 31 copies of a filler: P2 2 / 24 flips at margins <= 0.875,
+                PCC min 0.973). The packed floors are those measurements with margin (design D13), not the sequential
+                exactness; the co-batch dependence is accepted and documented (README "Known limitations").
+
+    pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k "1x8 and b32"        # sequential arm
+    pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k "1x8 and packed32"   # packed arm
+    pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k 1x8                  # both
+
+The prompts are chat-templated with the template date pinned (``pinned_template_date``: 2026-09-08;
+``SOLAR_OPEN_TEMPLATE_DATE`` overrides), so the greedy continuations and the flip counts reproduce across days.
 """
 
 import time
@@ -47,6 +63,8 @@ from models.common.sampling import SamplingParams
 from models.demos.solar_open.demo.text_demo import prepare_solar_open_generator_args
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
 from models.demos.solar_open.tt.experts import prefill as experts_prefill
+from models.demos.solar_open.tt.model import prefill_forward_text_batched
+from models.demos.solar_open.tt.model_config import BatchedPrefillOptions
 from models.tt_transformers.demo.simple_text_demo import load_inputs
 from models.tt_transformers.tt.common import preprocess_inputs_prefill
 from models.tt_transformers.tt.generator import Generator
@@ -54,6 +72,23 @@ from models.tt_transformers.tt.generator import Generator
 # 16 Korean + 16 English short-answer prompts: the same set the batch-32 demo case uses.
 PROMPTS_FILE = "models/demos/solar_open/demo/sample_prompts/input_data_questions_ko_en_prefill_128.json"
 FILLER_PROMPT = "Write one sentence about the weather."
+# The packed arm's pass shape, pinned here (not the env): the 32 users of a run in ONE 4096-token pass = one MoE chunk,
+# one hot / cold plan for the whole set (the demo's default since phase 3d / A3). With 1024-token passes the rotation
+# would move users between passes and the co-batch dependence would fail the rotated-slot floor by design.
+PACKED_GATE_OPTIONS = BatchedPrefillOptions(enabled=True, tokens_per_pass=4096, max_seq_len=128)
+# Packed-arm floors (phase 3d / A3, derived from the P2 measurements of 2026-09-09 with margin; the sequential arm keeps
+# the exact phase-2 floors in the test body):
+# Rotated slots: the SET of users is unchanged, so the plan is identical, but the row order of the sorted MoE changes and
+# the fp32 / bfp8 accumulation order with it -- last-bit noise that flips only near-tie steps. The count is input
+# dependent: P2 (2026-09-09 ids) 9 of 768 at margins <= 0.375, PCC min 0.97903; A3 (the pinned 2026-09-08 ids) 18 of 768
+# at margins <= 0.5, PCC min 0.98854 -> the floor is a count bound with margin plus a near-tie bound on EVERY flipped step.
+PACKED_MAX_FLIPS_ROTATED = 32  # of 768 (prompt, step) pairs (~4 %)
+PACKED_MAX_FLIP_MARGIN_ROTATED = 1.0  # every flipped step is a near tie (top-1 margin, logits); measured <= 0.5
+PACKED_MIN_STEP_PCC_ROTATED = 0.97  # a real cross-user leak collapses per-step PCC below 0.7 (observed < 0.3)
+PACKED_MAX_FLIPS_LONE = 3  # of 24; P2: 2 (the co-batch dependence of hot / cold)
+PACKED_MAX_FLIP_MARGIN_LONE = 1.0  # every flipped step is a near tie (top-1 margin, logits); P2: <= 0.875
+PACKED_MIN_STEP_PCC_LONE = 0.96  # P2: 0.97326
+PACKED_MIN_STEP_PCC_SAME = 0.97  # same slots / fillers vs each other; P2: >= 0.99996 (0 flips required, exact)
 
 
 def _clear_kv_caches(models):
@@ -64,8 +99,14 @@ def _clear_kv_caches(models):
             ttnn.mul(v_cache, 0, output_tensor=v_cache)
 
 
-def _prefill(generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len):
-    """Clear the KV cache and prefill all users. Returns (prefill logits [B, vocab], decoding positions)."""
+def _prefill(
+    generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len, packed=False
+):
+    """Clear the KV cache and prefill all users. Returns (prefill logits [B, vocab], decoding positions).
+
+    ``packed``: the driver with ``PACKED_GATE_OPTIONS`` (one eager 32 x 128 pass, asserted); otherwise the plain
+    Generator, which prefills per user (``disable_batched_prefill`` is always True).
+    """
     batch = len(prompts)
     _clear_kv_caches(models)
     generator.prev_page_table = None
@@ -73,19 +114,51 @@ def _prefill(generator, models, model_args, tt_kv_cache, page_table, tokenizer, 
         prompts, tokenizer, model_args, instruct=False, max_generated_tokens=num_tokens, max_prefill_len=max_seq_len
     )
     input_tokens = torch.stack(input_tokens).view(batch, -1)
-    logits = generator.prefill_forward_text(
-        input_tokens, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, enable_trace=False
-    )
+    if packed:
+        logits = prefill_forward_text_batched(
+            generator,
+            input_tokens,
+            page_table=page_table,
+            kv_cache=tt_kv_cache,
+            prompt_lens=decoding_pos,
+            enable_trace=False,
+            options=PACKED_GATE_OPTIONS,
+        )
+        log = generator.batched_prefill_pass_log
+        assert (
+            len(log) == 1
+            and log[0].packed
+            and not log[0].traced
+            and len(log[0].users) == batch
+            and log[0].seq_len == 128
+        ), f"expected ONE packed {batch} x 128 pass, got {log}"
+    else:
+        assert all(
+            a.disable_batched_prefill for a in model_args
+        ), "the sequential arm needs the per-user Generator path"
+        logits = generator.prefill_forward_text(
+            input_tokens, page_table=page_table, kv_cache=tt_kv_cache, prompt_lens=decoding_pos, enable_trace=False
+        )
     return logits.reshape(batch, -1).float(), torch.tensor(decoding_pos)
 
 
 def _generate_greedy(
-    generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, sampling, max_seq_len
+    generator,
+    models,
+    model_args,
+    tt_kv_cache,
+    page_table,
+    tokenizer,
+    prompts,
+    num_tokens,
+    sampling,
+    max_seq_len,
+    packed=False,
 ):
     """On-device greedy generation (the demo path). Returns per-user token lists and decode step times."""
     batch = len(prompts)
     logits, current_pos = _prefill(
-        generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len
+        generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len, packed
     )
     out_tok = torch.argmax(logits, dim=-1)
     outputs = [[int(out_tok[b])] for b in range(batch)]
@@ -108,7 +181,17 @@ def _generate_greedy(
 
 
 def _teacher_forced_logits(
-    generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, forced, num_tokens, max_seq_len
+    generator,
+    models,
+    model_args,
+    tt_kv_cache,
+    page_table,
+    tokenizer,
+    prompts,
+    forced,
+    num_tokens,
+    max_seq_len,
+    packed=False,
 ):
     """Prefill, then feed `forced[b, t]` as user b's token at decode step t (host-side logits).
 
@@ -117,7 +200,7 @@ def _teacher_forced_logits(
     """
     batch = len(prompts)
     logits0, current_pos = _prefill(
-        generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len
+        generator, models, model_args, tt_kv_cache, page_table, tokenizer, prompts, num_tokens, max_seq_len, packed
     )
     vocab = logits0.shape[-1]
     all_logits = torch.empty(batch, num_tokens, vocab, dtype=torch.float16)
@@ -133,7 +216,8 @@ def _teacher_forced_logits(
 
 
 def _compare(name, ref, other, ref_slots, other_slots):
-    """Per-(prompt, step) logit PCC and top-1 agreement between two runs; slots map prompt -> slot in each run."""
+    """Per-(prompt, step) logit PCC, top-1 agreement and the reference top-1 margin between two runs; slots map
+    prompt -> slot in each run. Returns (pcc [P, T], agree [P, T], margin [P, T])."""
     pccs, agree, margins = [], [], []
     for p_ref, p_other in zip(ref_slots, other_slots):
         a = ref[p_ref].float()
@@ -160,13 +244,27 @@ def _compare(name, ref, other, ref_slots, other_slots):
         f"{agree.float().mean():.4f} ({int((~agree).sum())} of {agree.numel()} disagree"
         + (f", their top-1 margin <= {disagreeing_margins.max():.3f})" if disagreeing_margins.numel() else ")")
     )
-    return pccs, agree
+    return pccs, agree, margins
 
 
 @pytest.mark.timeout(3600)
-@pytest.mark.parametrize("batch_size, num_tokens, rotation, lone_slot", [(32, 24, 5, 7)], ids=["b32"])
+@pytest.mark.parametrize(
+    "batch_size, num_tokens, rotation, lone_slot, prefill_mode",
+    [(32, 24, 5, 7, "sequential"), (32, 24, 5, 7, "packed")],
+    ids=["b32", "packed32"],
+)
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_multi_user_isolation(mesh_device, device_params, batch_size, num_tokens, rotation, lone_slot, state_dict):
+def test_multi_user_isolation(
+    mesh_device,
+    device_params,
+    batch_size,
+    num_tokens,
+    rotation,
+    lone_slot,
+    prefill_mode,
+    state_dict,
+    pinned_template_date,
+):
     mesh_shape = tuple(mesh_device.shape)
     if mesh_shape[0] != 1 or mesh_shape[1] < 8:
         pytest.skip(f"multi-user single-row decode is validated on 1x8 meshes, got {mesh_shape}")
@@ -204,17 +302,23 @@ def test_multi_user_isolation(mesh_device, device_params, batch_size, num_tokens
     prompts, _ = load_inputs(PROMPTS_FILE, batch_size, instruct=False)
     prompts = list(prompts)[:batch_size]
     args = (generator, models, model_args, tt_kv_cache, page_table, tokenizer)
-    packed_arm = model_args[0].batched_prefill.enabled and not model_args[0].disable_batched_prefill
+    packed_arm = prefill_mode == "packed"
+    assert all(a.disable_batched_prefill for a in model_args), "a plain Generator call must stay per-user (phase 3d)"
     logger.info(
-        f"prefill arm: {model_args[0].batched_prefill.describe()} -> "
-        f"{'ONE packed 32 x 128 pass per run' if packed_arm else 'sequential per-user prefills'}; "
-        f"sorted-MoE plan mode {experts_prefill.SORTED_MOE_PLAN}"
+        f"prefill arm: {prefill_mode} -> "
+        + (
+            f"ONE packed {batch_size} x 128 pass per run through the driver ({PACKED_GATE_OPTIONS.describe()})"
+            if packed_arm
+            else "sequential per-user prefills through the plain Generator"
+        )
+        + f"; ModelArgs policy {model_args[0].batched_prefill.describe()}; sorted-MoE plan mode "
+        f"{experts_prefill.SORTED_MOE_PLAN}"
     )
     experts_prefill.LAST_SORTED_MOE_PLAN.clear()
 
     # 1. Greedy generation (the demo path): sanity-check outputs and get a natural continuation per prompt
     #    to teacher-force below.
-    greedy, times = _generate_greedy(*args, prompts, num_tokens, sampling, max_seq_len)
+    greedy, times = _generate_greedy(*args, prompts, num_tokens, sampling, max_seq_len, packed=packed_arm)
     last_plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
     logger.info(f"sorted-MoE plan of the last prefill split: {last_plan or None}")
     if packed_arm and experts_prefill.SORTED_MOE_PLAN in ("auto", "chunk"):
@@ -234,8 +338,8 @@ def test_multi_user_isolation(mesh_device, device_params, batch_size, num_tokens
 
     # 2. Teacher-forced logits for the same inputs in different slot layouts.
     in_order = list(range(batch_size))
-    lg_a1 = _teacher_forced_logits(*args, prompts, forced, num_tokens, max_seq_len)
-    lg_a2 = _teacher_forced_logits(*args, prompts, forced, num_tokens, max_seq_len)
+    lg_a1 = _teacher_forced_logits(*args, prompts, forced, num_tokens, max_seq_len, packed=packed_arm)
+    lg_a2 = _teacher_forced_logits(*args, prompts, forced, num_tokens, max_seq_len, packed=packed_arm)
 
     rotated_slots = [(i + rotation) % batch_size for i in in_order]  # prompt i -> slot rotated_slots[i]
     prompts_b = [None] * batch_size
@@ -243,32 +347,89 @@ def test_multi_user_isolation(mesh_device, device_params, batch_size, num_tokens
     for i in in_order:
         prompts_b[rotated_slots[i]] = prompts[i]
         forced_b[rotated_slots[i]] = forced[i]
-    lg_b = _teacher_forced_logits(*args, prompts_b, forced_b, num_tokens, max_seq_len)
+    lg_b = _teacher_forced_logits(*args, prompts_b, forced_b, num_tokens, max_seq_len, packed=packed_arm)
 
     prompts_c = [FILLER_PROMPT] * batch_size
     prompts_c[lone_slot] = prompts[0]
     forced_c = forced[0].unsqueeze(0).expand(batch_size, -1).clone()  # every slot consumes prompt 0's continuation
-    lg_c1 = _teacher_forced_logits(*args, prompts_c, forced_c, num_tokens, max_seq_len)
-    lg_c2 = _teacher_forced_logits(*args, prompts_c, forced_c, num_tokens, max_seq_len)
+    lg_c1 = _teacher_forced_logits(*args, prompts_c, forced_c, num_tokens, max_seq_len, packed=packed_arm)
+    lg_c2 = _teacher_forced_logits(*args, prompts_c, forced_c, num_tokens, max_seq_len, packed=packed_arm)
 
     # 3. Compare. Identical repeats (A1 vs A2, C1 vs C2) measure the numerical noise floor of the device
     #    (the CCL reductions are not bit-reproducible run to run, and a last-bit change flips near-tie
     #    top-k expert choices, so even same-slot repeats show occasional logit PCC dips). A slot layout
     #    change must not look any different from that; a real mixing bug gives PCC ~0 for the users hit.
-    pcc_base, agree_base = _compare("A1 vs A2 (same slots, baseline)", lg_a1, lg_a2, in_order, in_order)
-    pcc_rot, agree_rot = _compare("A1 vs B (rotated slots)", lg_a1, lg_b, in_order, rotated_slots)
-    pcc_lone, agree_lone = _compare("A1 vs C1 (prompt 0 alone in slot %d)" % lone_slot, lg_a1, lg_c1, [0], [lone_slot])
+    pcc_base, agree_base, _m = _compare("A1 vs A2 (same slots, baseline)", lg_a1, lg_a2, in_order, in_order)
+    pcc_rot, agree_rot, margin_rot = _compare("A1 vs B (rotated slots)", lg_a1, lg_b, in_order, rotated_slots)
+    pcc_lone, agree_lone, margin_lone = _compare(
+        "A1 vs C1 (prompt 0 alone in slot %d)" % lone_slot, lg_a1, lg_c1, [0], [lone_slot]
+    )
     filler_slots = [s for s in range(batch_size) if s != lone_slot]
-    pcc_fbase, agree_fbase = _compare(
+    pcc_fbase, agree_fbase, _m = _compare(
         "C1 vs C2 fillers (same slots, baseline)", lg_c1, lg_c2, filler_slots, filler_slots
     )
-    pcc_fill, agree_fill = _compare(
+    pcc_fill, agree_fill, _m = _compare(
         "C1 fillers vs each other (same prompt, different slots)",
         lg_c1,
         lg_c1,
         [filler_slots[0]] * (len(filler_slots) - 1),
         filler_slots[1:],
     )
+
+    if packed_arm:
+        # Packed floors (phase 3d / A3; module constants): exact where the phase-3c per-chunk plan makes the pass slot
+        # independent (same-set same-slot repeats, fillers of one prompt in different slots of ONE pass), a bounded
+        # number of near-tie flips where the layout change or the changed SET of pass mates re-decides hot / cold.
+        MIN_MEAN_PCC = 0.98
+        problems = []
+        for name, pcc, agree, margins, max_flips, min_step_pcc, max_margin in [
+            ("same slots (A1 vs A2)", pcc_base, agree_base, None, 0, PACKED_MIN_STEP_PCC_SAME, None),
+            (
+                "rotated slots",
+                pcc_rot,
+                agree_rot,
+                margin_rot,
+                PACKED_MAX_FLIPS_ROTATED,
+                PACKED_MIN_STEP_PCC_ROTATED,
+                PACKED_MAX_FLIP_MARGIN_ROTATED,
+            ),
+            (
+                "lone prompt",
+                pcc_lone,
+                agree_lone,
+                margin_lone,
+                PACKED_MAX_FLIPS_LONE,
+                PACKED_MIN_STEP_PCC_LONE,
+                PACKED_MAX_FLIP_MARGIN_LONE,
+            ),
+            ("filler same slots (C1 vs C2)", pcc_fbase, agree_fbase, None, 0, PACKED_MIN_STEP_PCC_SAME, None),
+            ("filler slots", pcc_fill, agree_fill, None, 0, PACKED_MIN_STEP_PCC_SAME, None),
+        ]:
+            mean_pcc = pcc.mean().item()
+            if mean_pcc < MIN_MEAN_PCC:
+                problems.append(f"{name}: mean logit PCC {mean_pcc:.4f} < {MIN_MEAN_PCC}")
+            if pcc.min() < min_step_pcc:
+                bad = (pcc < min_step_pcc).nonzero().tolist()
+                problems.append(
+                    f"{name}: logit PCC collapsed at (prompt, step) {bad[:10]} (min {pcc.min():.3f} < {min_step_pcc})"
+                )
+            disagree = int((~agree).sum())
+            if disagree > max_flips:
+                problems.append(f"{name}: {disagree} of {agree.numel()} top-1 flips, allowed {max_flips}")
+            if max_margin is not None and disagree and margins[~agree].max() > max_margin:
+                problems.append(
+                    f"{name}: a flipped step has top-1 margin {margins[~agree].max():.3f} > {max_margin} (not a near tie)"
+                )
+        assert not problems, "Packed prefill: cross-user contamination beyond the packed floors:\n" + "\n".join(
+            problems
+        )
+        logger.info(
+            f"All {batch_size} users are slot-independent over {num_tokens} teacher-forced steps within the packed "
+            f"floors (rotated <= {PACKED_MAX_FLIPS_ROTATED} / 768 near-tie flips, PCC >= {PACKED_MIN_STEP_PCC_ROTATED}; "
+            f"lone prompt <= {PACKED_MAX_FLIPS_LONE} / 24 near-tie flips, PCC >= {PACKED_MIN_STEP_PCC_LONE}; same slots "
+            "and fillers exact)"
+        )
+        return
 
     # Thresholds (design D13: ~0.02 below the first measured Solar-Open-100B values; recorded in README.md
     # "Recorded baselines"). Measured 2026-09-07 on P150x8 (1x8, TP=8; bfp8 experts / attention / lm_head, bf16

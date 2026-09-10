@@ -84,6 +84,35 @@ def apply_rope(tensor, rope_mats, transformation_mat, is_decode_mode: bool):
     )
 
 
+def apply_rope_fused_qk(q, k, rope_mats, transformation_mat):
+    """Decode RoPE of Q and K in ONE launch (``ttnn.experimental.rotary_embedding_llama_fused_qk``; phase 3e B1).
+
+    Contracts (device op ``rotary_embedding_llama_fused_qk_device_operation.cpp::validate_on_program_cache_miss``):
+    ``q`` / ``k`` ``[1, B, heads, head_dim]`` bf16 TILE HEIGHT_SHARDED one user per core on DISJOINT core grids with
+    ``B <= 32`` (Q cores + K cores <= 64); ``rope_mats = (cos, sin)`` ``[1, 2B, 32, head_dim]`` bf16 HEIGHT_SHARDED
+    (rows 0..B-1 = the Q users' positions, rows B..2B-1 the same positions again for the K users -- RotarySetup with
+    ``use_qk_fused=True`` and doubled position ids); ``transformation_mat`` one ``[32, 32]`` tile per core on at
+    least the Q + K cores (``RotarySetup(use_qk_fused=True).transformation_mat``). Every core rotates the head tiles
+    resident in its L1 with the cos/sin/trans_mat shard resident in its L1 (the ``is_q`` runtime arg only selects
+    the Q or the K buffers), with the same compute kernel body and the same default compute config (HiFi4, approx,
+    bf16 dst) as ``rotary_embedding_llama`` -- so the result is expected bit-identical to two separate rope calls
+    whose cos/sin rows sit on the same cores. Returns ``(q_rotated, k_rotated)`` in the inputs' memory configs.
+    """
+    return ttnn.experimental.rotary_embedding_llama_fused_qk(q, k, rope_mats[0], rope_mats[1], transformation_mat)
+
+
+def update_kv_cache_fused(k_cache, k, v_cache, v, position_idx, page_table):
+    """Write this step's K and V rows into the caches in ONE launch (``ttnn.experimental.paged_fused_update_cache``;
+    phase 3e B1). ``k`` / ``v`` ``[1, B, kv_heads, head_dim]`` bf16 TILE, HEIGHT sharded (not WIDTH) one user per
+    core on disjoint grids of equal size and ROW_MAJOR orientation; core i of the K grid and core i of the V grid
+    (row-major order of each grid) write user i's row at ``position_idx[i]`` (INT32 ROW_MAJOR DRAM, as today) through
+    ``page_table`` (INT32 ROW_MAJOR; None = the contiguous cache). The inputs are repacked into the caches' dtype
+    (bfp8) by the same untilize / tilize kernel body as ``paged_update_cache`` (bit-identical repack expected)."""
+    ttnn.experimental.paged_fused_update_cache(
+        k_cache, k, v_cache, v, update_idxs_tensor=position_idx, page_table=page_table
+    )
+
+
 def concat_heads(tensor, is_decode_mode: bool):
     """
     Concatenate attention heads back to hidden dimension.

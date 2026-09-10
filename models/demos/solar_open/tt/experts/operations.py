@@ -5,6 +5,8 @@
 
 import ttnn
 
+from ..ccl import FUSED_SITE_MOE
+
 
 def apply_glu(gate, up, config_or_activation="silu"):
     """``up * act(gate)`` in ONE binary op (consumes nothing; returns a new tensor).
@@ -69,16 +71,24 @@ def apply_tensor_parallel_allreduce(tensor, mesh_config, mesh_device, seq_len, c
 
     Deallocates the input tensor.
 
+    Decode partials (``[1, 1, B <= 32, hidden]`` bfp8 in L1, the fast_reduce_nc output + shared-expert add) take the
+    fused single-kernel all-reduce when ``SOLAR_OPEN_DECODE_CCL=fused`` (phase 3e / A2, ``tt/ccl.py``): reshard onto
+    the 8x4 width-sharded grid, ``all_reduce_async`` on the MoE site's persistent (buffer, semaphore) pair, reshard
+    back to L1 interleaved -- the same output contract as ``ttnn.all_reduce`` (not bit-identical: a different,
+    deterministic reduction order). Prefill partials (DRAM, > 32 rows) always run the composite ``ttnn.all_reduce``.
+
     Args:
         tensor: Input tensor to allreduce (this device's partial sum)
         mesh_config: Mesh configuration (provides tp_axis)
         mesh_device: TTNN mesh device
         seq_len: Sequence length (informational)
-        ccl_manager: Communication manager (provides num_links)
+        ccl_manager: Communication manager (provides num_links and the fused decode all-reduce)
 
     Returns:
         Allreduced tensor
     """
+    if ccl_manager.fused_decode_applies(tensor):
+        return ccl_manager.fused_decode_all_reduce_interleaved(tensor, FUSED_SITE_MOE, cluster_axis=mesh_config.tp_axis)
     tensor_allreduced = ttnn.all_reduce(
         tensor, num_links=ccl_manager.num_links, topology=ttnn.Topology.Ring, cluster_axis=mesh_config.tp_axis
     )

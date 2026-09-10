@@ -224,7 +224,16 @@ def test_layer0_eager_host(mesh_device, device_params, batch_size, layer0_weight
     )
     decode_context.fill_kv_cache(mesh_device, layer, page_table_tt, apply_input_norm=True)
     _, _, rope_mats, tt_position_idx = tm.build_rope_inputs(
-        setup, config, hidden_states, batch_size, seq_len, context_len, batch_size, True, cache_position=context_len
+        setup,
+        config,
+        hidden_states,
+        batch_size,
+        seq_len,
+        context_len,
+        batch_size,
+        True,
+        cache_position=context_len,
+        fused_qk=bool(getattr(layer.self_attn.program_config, "fused_qk", False)),  # phase 3e
     )
     replicate = ttnn.ShardTensor2dMesh(dims=(None, None), mesh_shape=mesh_device.shape, mesh_device=mesh_device)
 

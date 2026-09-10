@@ -19,6 +19,10 @@ and, with ``SOLAR_OPEN_PERF_OUT=<json>``, written to that file.
     with fp32 destination accumulation -- call site ``attention/decode.py`` (lever d).
   * ``o_proj``: decode out projection (8x8, per_core_N 2, in0_block_w 4, out_subblock_w 2) on the WIDTH-sharded
     ``nlp_concat_heads_decode`` output vs the auto linear -- not adopted (no gain in the production layout).
+  * ``o_proj_8x8_interleaved``: the phase-3e B1 lever (``SOLAR_OPEN_ATTENTION_OUT_GRID=8x8``): the same (8x8) config
+    from an L1-INTERLEAVED in0 (``sharded_to_interleaved`` moved in front of the matmul) with the HiFi2 compute config
+    restated, as a two-op chain vs the production auto linear + reshard chain -- PCC vs the fp32 reference (floor:
+    not worse than auto by 2e-4) and the chain wall times -- call site ``attention/decode.py::decode_output_projection``.
   * ``shared``: the shared expert's gate (= up) and down linears with ``shared_expert_program_configs`` vs auto at
     M = 1 / 32 / 128 rows (lever a).
   * ``router``: the router linear (bf16 x bf16 -> fp32, HiFi4, fp32 acc) with ``router_linear_program_config`` vs
@@ -276,6 +280,47 @@ def test_config_candidates(mesh_device, device_params, reset_seeds):
     results["o_proj_cand"] = _time(device, o_cand)
     logger.info(
         f"[cand o_proj] auto {results['o_proj_auto']['wall_ms_min']:.3f} ms -> cand {results['o_proj_cand']['wall_ms_min']:.3f} ms"
+    )
+
+    # ---------------- 3b. phase 3e B1 slice 2: o_proj (8x8) from an INTERLEAVED in0, HiFi2 restated ----------------
+    # Production legacy chain = auto linear on the width-sharded concat output + to_memory_config(L1 interleaved);
+    # candidate chain = sharded_to_interleaved first, then the explicit (8, 8) config (per_core_N 2, in0_block_w 4,
+    # out_subblock_w 2) straight into an L1-interleaved output. Both chains end in the same layout, so their wall
+    # times are the per-layer difference of the lever (design_decode_levers.md 3.3: 24.0 -> ~12.9 us incl. reshard).
+    apc_oi = SolarOpenAttentionProgramConfig(decode_out_cores=(8, 8))  # the SOLAR_OPEN_ATTENTION_OUT_GRID=8x8 values
+    oi_cfg = apc_oi.get_decode_out_config(batch, H, O_K)
+    oi_compute = apc_oi.get_decode_out_compute_config(device.arch())
+    logger.info(f"o_proj interleaved-in0 candidate config: {oi_cfg} compute {oi_compute}")
+
+    def o_auto_chain():
+        t = ttnn.linear(sdpa_out, w_o, dtype=ttnn.bfloat16, memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG)
+        il = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
+        t.deallocate(True)
+        return il
+
+    def o_interleaved_chain():
+        il = ttnn.sharded_to_interleaved(sdpa_out, ttnn.L1_MEMORY_CONFIG)
+        t = ttnn.linear(
+            il,
+            w_o,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            program_config=oi_cfg,
+            compute_kernel_config=oi_compute,
+        )
+        il.deallocate(True)
+        return t
+
+    ref_oi, got_oi = o_auto_chain(), o_interleaved_chain()
+    assert got_oi.memory_config().memory_layout == ttnn.TensorMemoryLayout.INTERLEAVED
+    _compare("o_proj_8x8_interleaved", ref_oi, got_oi, results, reference=ref_oproj)
+    ref_oi.deallocate(True)
+    got_oi.deallocate(True)
+    results["o_proj_8x8_interleaved_auto"] = _time(device, o_auto_chain)
+    results["o_proj_8x8_interleaved_cand"] = _time(device, o_interleaved_chain)
+    logger.info(
+        f"[cand o_proj_8x8_interleaved] auto chain {results['o_proj_8x8_interleaved_auto']['wall_ms_min']:.3f} ms -> "
+        f"interleaved-in0 chain {results['o_proj_8x8_interleaved_cand']['wall_ms_min']:.3f} ms"
     )
     sdpa_out.deallocate(True)
     w_o.deallocate(True)

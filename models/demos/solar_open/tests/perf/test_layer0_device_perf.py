@@ -177,6 +177,7 @@ def test_layer0_device_perf(mesh_device, device_params, batch_size, seq_len, lay
         batch_size,
         is_decode,
         cache_position=context_len,
+        fused_qk=is_decode and bool(getattr(layer.self_attn.program_config, "fused_qk", False)),  # phase 3e
     )
     replicate = ttnn.ShardTensor2dMesh(dims=(None, None), mesh_shape=mesh_device.shape, mesh_device=mesh_device)
 
@@ -198,7 +199,24 @@ def test_layer0_device_perf(mesh_device, device_params, batch_size, seq_len, lay
             is_decode=is_decode,
         )
 
-    record = {"case": case, "batch": batch_size, "seq_len": seq_len, "context_len": context_len}
+    record = {
+        "case": case,
+        "batch": batch_size,
+        "seq_len": seq_len,
+        "context_len": context_len,
+        "decode_ccl": setup["ccl_manager"].decode_ccl,  # SOLAR_OPEN_DECODE_CCL arm (phase 3e / A2)
+        # SOLAR_OPEN_SHARED_DOWN_BFP8 arm (phase 3e / A3); None with the fused shared expert (no separate partial)
+        "shared_down_bfp8": (layer.mlp.shared_expert.decode_down_bfp8 if layer.mlp.shared_expert is not None else None),
+        # phase 3e / P1 attention arms: SOLAR_OPEN_ATTENTION_FUSED_QK (fused Q/K RoPE + fused K/V update) and
+        # SOLAR_OPEN_ATTENTION_OUT_GRID (explicit o_proj config; None = the auto linear)
+        "attention_fused_qk": bool(getattr(layer.self_attn.program_config, "fused_qk", False)),
+        "attention_out_grid": getattr(layer.self_attn.program_config, "decode_out_cores", None),
+    }
+    logger.info(f"[{case}] decode all-reduce arm: {setup['ccl_manager'].decode_ccl}")
+    logger.info(f"[{case}] shared-expert decode partial bfp8 arm: {record['shared_down_bfp8']}")
+    logger.info(
+        f"[{case}] attention arms: fused_qk {record['attention_fused_qk']}, o_proj grid {record['attention_out_grid']}"
+    )
 
     # compile pass (eager)
     _sync(mesh_device)

@@ -29,6 +29,9 @@ KV_BYTES_PER_ELEMENT = 1.0625
 #   pool (4.5 GiB left for activations) needs SOLAR_OPEN_KV_BUDGET_GIB >= 13 (phase 2, design_misc.md (b)).
 # - hard cap: DRAM - weights - 2.8 GiB reserve for long-prefill activations, program binaries and the trace region;
 #   SOLAR_OPEN_KV_BUDGET_GIB is clamped to it (a pool above the cap would OOM on the device after the host load).
+#   Phase 3d: a single-user prefill longer than SOLAR_OPEN_PREFILL_CHUNK_TOKENS (default 32K) runs in chunks of that
+#   length (tt/chunked_prefill.py), so the transient peak is the 32K prefill's whatever the prompt length; the 1 x 128K
+#   pool itself is 1.59 GiB (paged_kv_cache_gib), well inside the 8 GiB default budget -- no extra guard is needed.
 KV_BUDGET_GIB_BFP8_EXPERTS = 8.0
 KV_BUDGET_GIB_BFP4_EXPERTS = 14.0
 KV_HARD_CAP_GIB_BFP8_EXPERTS = 14.5

@@ -115,6 +115,8 @@ class Attention:
         is_decode=True,
         user_id=0,
         batch_size=1,
+        chunk_page_table=None,
+        chunk_start_idx=None,
     ):
         """
         Forward pass - dispatches to decode or prefill.
@@ -128,6 +130,8 @@ class Attention:
             is_decode: Whether this is decode mode (default: True)
             user_id: User/batch index for KV cache fill in prefill mode (default: 0)
             batch_size: Number of users packed into the prefill input (default: 1)
+            chunk_page_table: chunked prefill only -- page-table slice of the chunk's blocks (see prefill_forward)
+            chunk_start_idx: chunked prefill only -- absolute start of the chunk (python int; None / 0 = no prefix)
 
         Returns:
             Attention output with the same shape as hidden_states, all-reduced over the TP axis
@@ -171,4 +175,6 @@ class Attention:
                 page_table=page_table,
                 ccl_manager=self.ccl_manager,
                 batch_size=batch_size,
+                chunk_page_table=chunk_page_table,
+                chunk_start_idx=chunk_start_idx,
             )

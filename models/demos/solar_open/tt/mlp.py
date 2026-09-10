@@ -5,7 +5,8 @@
 
 Mirrors ``SolarOpenMoE.forward`` (``experts(x, idx, w) + shared_experts(x)``, both on the same post-attention-norm
 input).  The shared expert's per-device partial is added inside the routed experts, before their all_reduce
-(``Experts.__call__(..., shared_expert=...)``), so the block still issues a single CCL.
+(``Experts.__call__(..., shared_expert=...)``), so the block still issues a single CCL. ``MoEOptions.shared_down_bfp8``
+(phase 3e / A3) makes the separate module emit that partial in bfloat8_b at decode so the add is a same-dtype op.
 
 ``MoEOptions.fuse_shared_expert`` (phase 2, design D2 follow-up) replaces the separate ``SharedExpert`` module by the
 "129th expert": the shared shards are appended ON DEVICE as slot ``num_local_experts`` of the routed expert tensors
@@ -52,6 +53,24 @@ def indexed_decode_enabled(options: MoEOptions, fuse_shared: bool, decode_ep: in
     if options.router_impl != "fused":
         return False, f"router_impl={options.router_impl!r} emits uint32 ids (the fused router's uint16 ids are needed)"
     return True, ""
+
+
+_SHARED_DOWN_DTYPE_LOGGED = set()
+
+
+def _log_shared_down_dtype_once(shared_down_bfp8: bool):
+    """One INFO line per process for the shared-expert decode partial dtype (48 MLPs share it), so a device run's log
+    shows which SOLAR_OPEN_SHARED_DOWN_BFP8 arm it ran (phase 3e / A3)."""
+    if shared_down_bfp8 not in _SHARED_DOWN_DTYPE_LOGGED:
+        _SHARED_DOWN_DTYPE_LOGGED.add(shared_down_bfp8)
+        logger.info(
+            "shared-expert decode partial: "
+            + (
+                "bfloat8_b (SOLAR_OPEN_SHARED_DOWN_BFP8=1)"
+                if shared_down_bfp8
+                else "bf16 (SOLAR_OPEN_SHARED_DOWN_BFP8=0)"
+            )
+        )
 
 
 def _fuse_shared_expert_into_experts(experts: Experts, w_gate, w_up, w_down):
@@ -197,7 +216,9 @@ class MLP:
                     mesh_config,
                     dtype=options.shared_expert_dtype,
                     tensor_cache_path=shared_cache_path,
+                    decode_down_bfp8=options.shared_down_bfp8,
                 )
+                _log_shared_down_dtype_once(options.shared_down_bfp8)
 
     def route(self, hidden_states, is_decode):
         """Run the router in the form the experts will consume: ``(dense, indexed)`` with exactly one of them set.

@@ -640,9 +640,11 @@ def run_shared_expert_component(mesh_device, hidden_shape, reference_layer, deco
     )
     tt_partial = shared_expert(tt_hidden_states, is_decode=is_decode)
 
+    # Contract C4: bf16, or bfloat8_b for a decode call under MoEOptions.shared_down_bfp8 (phase 3e / A3).
+    expected_dtype = shared_expert.partial_dtype(is_decode)
     assert (
-        tt_partial.dtype == ttnn.bfloat16
-    ), f"shared expert partial must be bf16 (contract C4), got {tt_partial.dtype}"
+        tt_partial.dtype == expected_dtype
+    ), f"shared expert partial must be {expected_dtype} (contract C4), got {tt_partial.dtype}"
     assert (
         tt_partial.shape[-2] == num_tokens and tt_partial.shape[-1] == hidden_size
     ), f"shared expert partial shape {tt_partial.shape} != [1, 1, {num_tokens}, {hidden_size}]"
@@ -693,7 +695,10 @@ def run_full_mlp_pipeline(
         assert_replicated(tt_output, "MoE output")
 
     # ONE collective per MoE call (the TP all_reduce; none at TP=1): routed + shared partials are summed on device first.
-    expected_ccl = {"all_reduce": 1} if tuple(mesh_device.shape)[1] > 1 else {}
+    # With SOLAR_OPEN_DECODE_CCL=fused a DECODE call issues the fused ttnn.experimental.all_reduce_async instead
+    # (prefill keeps ttnn.all_reduce).
+    fused_decode = is_decode and decoder_layer.mlp.experts.ccl_manager.fused_decode_allreduce
+    expected_ccl = {"all_reduce_async" if fused_decode else "all_reduce": 1} if tuple(mesh_device.shape)[1] > 1 else {}
     assert (
         dict(ccl_counts) == expected_ccl
     ), f"the MoE block must issue exactly {expected_ccl}, it launched {dict(ccl_counts)}"
@@ -751,7 +756,8 @@ def setup_decoder_layer(
     # transformation matrix is height-sharded one tile per user core and rotary_embedding_llama reads it
     # from the local core's L1, so its batch (and the row-sharding / mesh-dim handling on multi-row
     # meshes) must match the decode batch. A batch_size=1 setup leaves 31 of 32 cores reading
-    # unallocated memory at local batch 32.
+    # unallocated memory at local batch 32. create_rope_setup reads SOLAR_OPEN_ATTENTION_FUSED_QK like the layer's
+    # attention program config does (phase 3e), so the trans_mat covers the 2B-core grid of the fused chain.
     users_row_sharded = setup["mesh_device"].shape[0] > 1 and local_batch_size > 1
     rope_setup = create_rope_setup(
         mesh_device=setup["mesh_device"],
@@ -800,7 +806,16 @@ def make_paged_attention(mesh_device, local_batch_size, seq_len, block_size=64):
 
 
 def build_rope_inputs(
-    setup, config, hidden_states, batch_size, seq_len, pos_offset, local_batch_size, is_decode, cache_position=None
+    setup,
+    config,
+    hidden_states,
+    batch_size,
+    seq_len,
+    pos_offset,
+    local_batch_size,
+    is_decode,
+    cache_position=None,
+    fused_qk=False,
 ):
     """RoPE inputs for one test case, positions ``pos_offset .. pos_offset + seq_len - 1`` for every user.
 
@@ -809,7 +824,10 @@ def build_rope_inputs(
     same ``YarnRotaryEmbedding`` production's ``RotarySetup`` uses; attention factor 1.0693 on cos and sin), never
     from the unscaled ``precompute_freqs``. Decode cos/sin are height-sharded on the per-user grid Q/K/V use.
     ``cache_position`` (decode only) overrides the KV-cache slot the decode token is written to / attends up to
-    (``tt_position_idx``); by default it equals the RoPE position.
+    (``tt_position_idx``); by default it equals the RoPE position. ``fused_qk`` (decode only; the attention program
+    config's ``fused_qk``, phase 3e) builds the doubled decode tables of the fused Q/K chain: ``[1, 2B, 32, hd]`` with
+    rows B..2B-1 repeating rows 0..B-1, height-sharded on the 2B-core grid of ``get_decode_qk_fused_grids`` (Q users
+    on cores [0, B), K users on [B, 2B)) -- what ``RotarySetup(use_qk_fused=True).get_rot_mats`` produces.
     """
     from transformers.models.solar_open.modeling_solar_open import SolarOpenRotaryEmbedding
 
@@ -849,8 +867,13 @@ def build_rope_inputs(
     if is_decode:
         # rotary_embedding_llama reads cos/sin from the core that holds the user's Q shard, so the grids must agree
         # with RotarySetup / attention/decode.py: 8 wide for batches <= 8 or multiples of 32, the device compute
-        # grid otherwise (13 wide for 16 users on Blackhole).
-        batch_grid, _ = AttentionProgramConfig.get_decode_user_grid(mesh_device, local_batch_size)
+        # grid otherwise (13 wide for 16 users on Blackhole). Fused Q/K chain: 2B rows on the 2B-core grid.
+        if fused_qk:
+            batch_grid, _, _ = AttentionProgramConfig.get_decode_qk_fused_grids(mesh_device, local_batch_size)
+            tt_cos = ttnn.concat([tt_cos, tt_cos], dim=1)
+            tt_sin = ttnn.concat([tt_sin, tt_sin], dim=1)
+        else:
+            batch_grid, _ = AttentionProgramConfig.get_decode_user_grid(mesh_device, local_batch_size)
         mem_config = ttnn.create_sharded_memory_config(
             shape=(ttnn.TILE_SIZE, config.head_dim),
             core_grid=batch_grid,
@@ -1036,6 +1059,8 @@ def test_decoder(
         local_batch_size,
         is_decode,
         cache_position=context_len if decode_context is not None else None,
+        # phase 3e: the layer's attention config (SOLAR_OPEN_ATTENTION_FUSED_QK) decides the decode table layout
+        fused_qk=is_decode and bool(getattr(decoder_layer.self_attn.program_config, "fused_qk", False)),
     )
 
     logger.info(

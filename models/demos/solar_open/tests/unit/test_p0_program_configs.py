@@ -206,7 +206,11 @@ class TestAttentionQkvConfig:
         assert (cfg.compute_with_storage_grid_size.x, cfg.compute_with_storage_grid_size.y) == (8, 5)
         assert cfg.per_core_N == 1 and cfg.per_core_M == 1 and cfg.in0_block_w == apc.decode_qkv_in0_block_w
         assert cfg.fuse_batch and cfg.mcast_in0
-        assert apc.decode_out_cores is None  # o_proj stays auto (no gain on the width-sharded input)
+        assert apc.decode_out_cores == (
+            8,
+            8,
+        )  # phase 3e / P1: the (8, 8) o_proj from the interleaved in0 (bit-identical, faster)
+        assert SolarOpenAttentionProgramConfig(tp=1).decode_out_cores is None  # TP = 1 keeps the auto o_proj
 
     def test_compute_config_restates_hifi2_with_bf16_dst(self):
         # bf16 destination by default: the fp32-dst variant is closer to the fp32 reference on the qkv op alone

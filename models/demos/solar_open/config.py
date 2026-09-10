@@ -245,7 +245,7 @@ class MoEOptions:
         expert_dtype: routed expert weight dtype, ``SOLAR_OPEN_EXPERT_DTYPE`` bfp8 (default) | bfp4. Folded into
             the weight-cache directory name (``tensor_cache_<dtype>_exp<expert_dtype>_<mesh>``).
         shared_expert_dtype: shared expert weight dtype, ``SOLAR_OPEN_SHARED_EXPERT_DTYPE`` bfp8 (default) | bf16.
-            Weights only: the shared partial is always emitted in bf16.
+            Weights only: the shared partial is emitted in bf16 (bfloat8_b at decode with ``shared_down_bfp8``).
         router_impl: ``SOLAR_OPEN_ROUTER_IMPL`` "fused" (``moe_grouped_topk``, 3 launches, default) | "ops"
             (pure ttnn op chain, exact fp32 sigmoid, ~10 launches).
         router_fp32_logits: ``SOLAR_OPEN_ROUTER_FP32_LOGITS`` 1 (default) | 0. With 0 the router matmul emits
@@ -266,6 +266,17 @@ class MoEOptions:
             users) always take the union-of-experts path. Requires the fused router (uint16 ids), EP=1 and the
             unfused shared expert; otherwise the flag is ignored (logged once per MLP). Cache-neutral (not in
             ``marker_fields()``). 0 restores the phase-1 single-user scan path for A/B runs.
+        shared_down_bfp8: ``SOLAR_OPEN_SHARED_DOWN_BFP8`` 1 (default since phase 3e / A3) | 0. With 1 the unfused
+            shared expert emits its
+            DECODE down projection (the per-device partial the routed experts add in place to their bfloat8_b partial
+            before the single TP all_reduce) in bfloat8_b instead of bf16, so that add is a same-dtype op (phase 3e /
+            A3, design_decode_levers.md 2.6 (a): the mixed-dtype in-place add on the single-user [1, 1, 1, H] partial
+            costs 12.6 us per layer, the bfp8 += bfp8 one ~2 us; measured traced real layer 0 b1 0.310 -> 0.299 ms,
+            demo b1 14.67 -> 14.14 ms/step, b32 neutral). Not bit-identical: the shared partial is rounded to bfp8
+            before instead of after the add (teacher-forced floors held, digits in the README). Prefill partials
+            stay bf16 (the prefill path is unchanged byte for byte) and the fused shared expert
+            (``fuse_shared_expert``) has no separate partial, so the flag is ignored there. Runtime-only (weights are
+            untouched): cache-neutral, not in ``marker_fields()``. 0 = the phase-3d / A2 behaviour (bf16 partial).
     """
 
     expert_dtype: ttnn.DataType = ttnn.bfloat8_b
@@ -274,6 +285,7 @@ class MoEOptions:
     router_fp32_logits: bool = True
     fuse_shared_expert: bool = False
     indexed_decode: bool = True
+    shared_down_bfp8: bool = True
 
     ROUTER_IMPLS: ClassVar[tuple] = ("fused", "ops")
     EXPERT_DTYPES: ClassVar[tuple] = ("bfp8", "bfp4")
@@ -310,6 +322,7 @@ class MoEOptions:
             router_fp32_logits=os.getenv("SOLAR_OPEN_ROUTER_FP32_LOGITS", "1") == "1",
             fuse_shared_expert=os.getenv("SOLAR_OPEN_FUSE_SHARED_EXPERT", "0") == "1",
             indexed_decode=os.getenv("SOLAR_OPEN_INDEXED_DECODE", "1") == "1",
+            shared_down_bfp8=os.getenv("SOLAR_OPEN_SHARED_DOWN_BFP8", "1") == "1",
         )
 
     @classmethod
@@ -328,8 +341,8 @@ class MoEOptions:
 
         ``fuse_shared_expert`` is deliberately absent: both modes read the SAME cache files (the fused expert tensors
         are concatenated on device from the cached routed and shared shards), so flipping it must not invalidate the
-        marker or force a cold load. ``indexed_decode`` is absent for the same reason (a pure runtime path choice
-        over the same weight tensors)."""
+        marker or force a cold load. ``indexed_decode`` and ``shared_down_bfp8`` are absent for the same reason (pure
+        runtime choices over the same weight tensors)."""
         return {
             "expert_dtype": self.expert_dtype_str,
             "shared_expert_dtype": self.dtype_str(self.shared_expert_dtype),

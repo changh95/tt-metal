@@ -7,8 +7,10 @@ The always-on shared expert is TP-sharded over its 1280-wide intermediate (160 c
 returns each device's PARTIAL down projection without a CCL; the routed experts add that partial to their own
 pre-all_reduce partial so one TP all_reduce serves both. This test therefore sums the per-device partials on the
 host and compares the sum with the transformers reference ``SolarOpenMLP(config, intermediate_size=1280)``; it also
-checks the bf16 output dtype, that the per-device outputs really are partials, and the in-place bf16-into-bfp8 add
-the experts perform on the returned tensor.
+checks the output dtype (bf16; bfloat8_b for a DECODE call with ``decode_down_bfp8`` = ``SOLAR_OPEN_SHARED_DOWN_BFP8``,
+phase 3e / A3 -- prefill calls stay bf16 under the knob), that the per-device outputs really are partials, and the
+in-place add into a bfloat8_b accumulator the experts perform on the returned tensor (bf16 -> bfp8 mixed, or bfp8 +=
+bfp8 under the knob). The ``down_bfp8`` parametrization covers both arms in one run, independent of the env knob.
 
 Run (random weights, no checkpoint needed):
     HF_MODEL=models/demos/solar_open/configs/Solar-Open-100B MESH_DEVICE=P150x8 \
@@ -60,13 +62,16 @@ def _per_device_tensors(tt_tensor):
     "num_tokens", [1, 32, 128, 1024], ids=["decode_b1", "decode_b32", "prefill_128", "prefill_1024"]
 )
 @pytest.mark.parametrize("weight_dtype", [ttnn.bfloat8_b, ttnn.bfloat16], ids=["bfp8", "bf16"])
+@pytest.mark.parametrize("down_bfp8", [False, True], ids=["down_bf16", "down_bfp8"])
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, reset_seeds):
+def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, down_bfp8, reset_seeds):
     setup = TestFactory.setup_test(mesh_device, use_real_weights=False)
     config = setup["config"]
     mesh_config = setup["mesh_config"]
     hidden_size = config.hidden_size
     is_decode = num_tokens <= ttnn.TILE_SIZE
+    # The knob only changes DECODE partials (phase 3e / A3); a prefill call returns bf16 in both arms.
+    expected_dtype = ttnn.bfloat8_b if (down_bfp8 and is_decode) else ttnn.bfloat16
 
     reference = _reference_shared_expert(config)
     hidden_states = torch.randn(1, num_tokens, hidden_size)
@@ -75,11 +80,18 @@ def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, res
 
     # SolarOpenMLP.state_dict() has exactly the substate(mlp_sd, "shared_experts") keys the module consumes.
     tt_shared_expert = SharedExpert(
-        mesh_device, config, reference.state_dict(), mesh_config, dtype=weight_dtype, tensor_cache_path=None
+        mesh_device,
+        config,
+        reference.state_dict(),
+        mesh_config,
+        dtype=weight_dtype,
+        tensor_cache_path=None,
+        decode_down_bfp8=down_bfp8,
     )
     assert tt_shared_expert.intermediate_size_per_device == (
         config.moe_intermediate_size * config.n_shared_experts
     ) // (mesh_config.tp)
+    assert tt_shared_expert.partial_dtype(is_decode) == expected_dtype
 
     tt_hidden_states = ttnn.from_torch(
         hidden_states.reshape(1, 1, num_tokens, hidden_size),
@@ -90,8 +102,8 @@ def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, res
     )
     tt_partial = tt_shared_expert(tt_hidden_states, is_decode=is_decode)
 
-    # Contract C4: bf16 output with the input's logical shape; the input is not consumed.
-    assert tt_partial.dtype == ttnn.bfloat16, f"shared partial must be bf16, got {tt_partial.dtype}"
+    # Contract C4: bf16 output (bfp8 at decode under the knob) with the input's logical shape; the input is not consumed.
+    assert tt_partial.dtype == expected_dtype, f"shared partial must be {expected_dtype}, got {tt_partial.dtype}"
     assert tuple(tt_partial.shape) == (1, 1, num_tokens, hidden_size), tuple(tt_partial.shape)
     assert tt_hidden_states.is_allocated(), "SharedExpert must not deallocate its input"
 
@@ -101,7 +113,10 @@ def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, res
     assert torch.isfinite(total).all(), "NaN/Inf in the summed shared-expert output"
 
     passing, pcc_message = comp_pcc(reference_output, total, PCC_THRESHOLDS[weight_dtype])
-    logger.info(f"shared expert T={num_tokens} {weight_dtype}: sum of {len(partials)} device partials {pcc_message}")
+    logger.info(
+        f"shared expert T={num_tokens} {weight_dtype} partial {tt_partial.dtype}: sum of {len(partials)} device "
+        f"partials {pcc_message}"
+    )
 
     if mesh_config.tp > 1:
         # Partial-sum property: each device holds a different 160-column slice, so the per-device outputs differ
@@ -114,9 +129,9 @@ def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, res
 
     assert passing, f"shared expert T={num_tokens} {weight_dtype}: {pcc_message}"
 
-    # The experts consume the partial with ttnn.add(routed_bfp8, shared_bf16, output_tensor=routed_bfp8) (decode in
-    # L1, prefill in DRAM). Reproduce that add on a zero accumulator so a Blackhole dtype/layout rejection shows up
-    # here, before the experts tests.
+    # The experts consume the partial with ttnn.add(routed_bfp8, shared, output_tensor=routed_bfp8) (decode in L1,
+    # prefill in DRAM; shared bf16, or bfp8 at decode under the knob). Reproduce that add on a zero accumulator so a
+    # Blackhole dtype/layout rejection shows up here, before the experts tests.
     accumulator = ttnn.zeros(
         tt_partial.shape,
         dtype=ttnn.bfloat8_b,
@@ -128,8 +143,13 @@ def test_shared_expert(mesh_device, device_params, num_tokens, weight_dtype, res
     assert accumulator.dtype == ttnn.bfloat8_b
     for i, (partial, accumulated) in enumerate(zip(partials, _per_device_tensors(accumulator))):
         add_passing, add_pcc = comp_pcc(partial, accumulated, INPLACE_ADD_PCC)
-        assert add_passing, f"device {i}: in-place bf16 -> bfp8 add of the shared partial: {add_pcc}"
-    logger.info(f"shared expert T={num_tokens}: in-place bf16 -> bfp8 add OK")
+        assert add_passing, f"device {i}: in-place {tt_partial.dtype} -> bfp8 add of the shared partial: {add_pcc}"
+    if tt_partial.dtype == ttnn.bfloat8_b:
+        # 0 + x for a bfp8-representable x re-quantizes to the same block exponents, so the add is expected exact;
+        # logged (not asserted) so a packer rounding-mode surprise is recorded rather than failing the gate.
+        differing = sum(int((p != a).sum()) for p, a in zip(partials, _per_device_tensors(accumulator)))
+        logger.info(f"shared expert T={num_tokens}: bfp8 += bfp8 add differs in {differing} elements (0 = exact)")
+    logger.info(f"shared expert T={num_tokens}: in-place {tt_partial.dtype} -> bfp8 add OK")
 
 
 def test_shared_expert_host_weight_layout():

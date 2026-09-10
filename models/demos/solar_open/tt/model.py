@@ -19,6 +19,7 @@ from models.tt_transformers.tt.common import Mode as GeneratorMode
 from models.tt_transformers.tt.common import copy_host_to_device, rope_scaling_model_factory
 from models.tt_transformers.tt.rope import RotarySetup
 
+from .chunked_prefill import rope_slice_bounds
 from .experts import prefill as experts_prefill
 from .layer import DecoderLayer
 from .model_config import BATCHED_PREFILL_BATCH_SIZES, BatchedPrefillOptions, plan_batched_prefill
@@ -52,6 +53,8 @@ def create_rope_setup(
     users_row_sharded=False,
     datatype=ttnn.bfloat16,
     shard_batch_to_mesh_dim=0,
+    use_qk_fused=None,
+    tp=None,
 ):
     """
     Create and return a RotarySetup instance for the Solar-Open model.
@@ -75,10 +78,24 @@ def create_rope_setup(
         users_row_sharded: Whether users are row-sharded across devices (default: False)
         datatype: TTNN data type for tensors (default: ttnn.bfloat16)
         shard_batch_to_mesh_dim: Mesh dimension to shard batch to (default: 0)
+        use_qk_fused: build the decode tables for the fused Q/K RoPE (phase 3e, ``SolarOpenAttentionProgramConfig.
+            fused_qk``): the RotarySetup batch is doubled (2B cos/sin rows and trans_mat tiles on the 2B-core grid of
+            ``ProgramConfig.get_decode_qk_fused_grids``; ``get_rot_idxs`` repeats the positions for the K half, and so
+            does ``Model.get_tt_pos_idx``). None (default) = the same rule the layers' attention program config applies
+            (``SOLAR_OPEN_ATTENTION_FUSED_QK`` when set, else on for TP > 1: ``attention_configs.resolve_fused_qk``),
+            so the tables and the decode chain always agree.
+        tp: the mesh's TP for that rule (``Model`` passes ``mesh_config.tp``); None = ``mesh_device.shape[1]``, the
+            TP axis of this port (``MeshConfig``'s default decode TP).
 
     Returns:
         RotarySetup: Configured rotary setup instance with cos/sin matrices
     """
+    if use_qk_fused is None:
+        from .attention_configs import SolarOpenAttentionProgramConfig
+
+        if tp is None:
+            tp = tuple(mesh_device.shape)[1]
+        use_qk_fused = bool(SolarOpenAttentionProgramConfig(tp=tp).fused_qk)
     max_seq_len = getattr(hf_config, "max_position_embeddings", 131072)
     rope_scaling = rope_scaling_model_factory(hf_config.rope_scaling)
     batch_size = max_local_batch_size * mesh_device.shape[0] if users_row_sharded else max_local_batch_size
@@ -90,6 +107,7 @@ def create_rope_setup(
         max_seq_len=max_seq_len,
         rope_theta=resolve_rope_theta(hf_config),
         rope_scaling=rope_scaling,
+        use_qk_fused=use_qk_fused,
         datatype=datatype,
         shard_batch_to_mesh_dim=shard_batch_to_mesh_dim,
     )
@@ -159,6 +177,17 @@ class Model:
         self.users_row_sharded = users_row_sharded
 
         self.ccl_manager = ccl_manager
+        # Fused decode all-reduce (SOLAR_OPEN_DECODE_CCL=fused, phase 3e / A2): allocate the persistent buffers and
+        # global semaphores NOW -- first L1 allocation of the model, before any weight, KV or trace-capture activity
+        # (an allocation inside a capture is a forbidden device write). bfp8 pairs for both sites; a bf16 pair too when
+        # the attention branch keeps its bf16 partial (SOLAR_OPEN_ATTENTION_BF16_OUTPUT). No-op with the composite knob.
+        self._ccl_mode = None
+        if ccl_manager.fused_decode_allreduce:
+            from .attention.operations import attention_bf16_output
+
+            fused_dtypes = (ttnn.bfloat8_b,) + ((ttnn.bfloat16,) if attention_bf16_output() else ())
+            ccl_manager.ensure_fused_pool(hf_config.hidden_size, dtypes=fused_dtypes)
+        logger.info(f"decode all-reduce: {ccl_manager.decode_ccl} (SOLAR_OPEN_DECODE_CCL)")
 
         # Use mode-aware MeshConfig (stores separate configs for prefill and decode)
         # Decode: EP=rows for expert parallelism, SP=1
@@ -176,6 +205,7 @@ class Model:
             users_row_sharded=users_row_sharded,
             datatype=ttnn.bfloat16,
             shard_batch_to_mesh_dim=0,
+            tp=self.mesh_config.tp,  # phase 3e / P1: the fused Q/K tables follow the layers' TP-aware default rule
         )
 
         # Attention decode places user b's Q/K/V shard on the core RotarySetup put user b's cos/sin/trans_mat
@@ -185,7 +215,13 @@ class Model:
         if not users_row_sharded:
             from .attention.config import ProgramConfig as _AttnProgramConfig
 
-            user_cores, _ = _AttnProgramConfig.get_decode_user_grid(mesh_device, max_local_batch_size)
+            if self.rope_setup.use_qk_fused:
+                # Phase 3e fused chain: the 2B-core grid (Q of user b on core b, K on core B + b) must be the grid
+                # RotarySetup(use_qk_fused=True) put the 2B cos/sin rows on (get_decode_qk_fused_grids asserts the
+                # create-heads derivation and the SDPA reducer cores).
+                user_cores, _, _ = _AttnProgramConfig.get_decode_qk_fused_grids(mesh_device, max_local_batch_size)
+            else:
+                user_cores, _ = _AttnProgramConfig.get_decode_user_grid(mesh_device, max_local_batch_size)
             # nlp_concat_heads_decode needs one core per user on a single rectangle (<= 8x8); validate the batch here
             # rather than at the first decode step, i.e. after the host weight load (raises ValueError with the rule).
             _AttnProgramConfig.get_decode_concat_grid(max_local_batch_size)
@@ -196,8 +232,9 @@ class Model:
                 if expected != actual:
                     raise RuntimeError(
                         f"RoPE core placement {actual[:4]}... does not match attention's per-user grid "
-                        f"{expected[:4]}... for max_local_batch_size={max_local_batch_size}; update "
-                        "ProgramConfig.get_decode_user_grid to mirror RotarySetup.get_batch_grid"
+                        f"{expected[:4]}... for max_local_batch_size={max_local_batch_size} "
+                        f"(fused_qk={self.rope_setup.use_qk_fused}); update ProgramConfig.get_decode_user_grid / "
+                        "get_decode_qk_fused_grids to mirror RotarySetup.get_batch_grid"
                     )
 
         # Keep references for compatibility
@@ -395,7 +432,16 @@ class Model:
         return instance
 
     def switch_mode(self, mode: Mode):
-        # No-op; required by tt_transformers generator interface.
+        """tt_transformers Generator interface (it passes its own ``Mode`` enum, compared by value). The Generator calls
+        this before every decode step and before every decode trace capture, never inside a capture. The only work:
+        on a transition INTO decode, reset the fused decode all-reduce's global semaphores to 0 (``SOLAR_OPEN_DECODE_CCL
+        =fused``; the prefill / decode boundary of design_decode_levers.md 2.7) -- a no-op with the composite knob."""
+        mode_value = getattr(mode, "value", mode)
+        if mode_value == self._ccl_mode:
+            return None
+        self._ccl_mode = mode_value
+        if mode_value == Mode.DECODE.value:
+            self.ccl_manager.reset_fused_semaphores()
         return None
 
     def _forward_layers_and_head(
@@ -411,6 +457,8 @@ class Model:
         batch_size=1,
         skip_lm_head=False,
         page_tables_per_layer=None,
+        chunk_page_table=None,
+        chunk_start_idx=None,
     ):
         """
         Shared forward pass through decoder layers and final projection.
@@ -422,6 +470,10 @@ class Model:
             page_table: Single page table; used for every layer when
                 ``page_tables_per_layer`` is None (legacy / uniform attention).
             kv_cache: KV cache list per layer.
+            chunk_page_table, chunk_start_idx: chunked single-user prefill (phase 3d,
+                ``tt/chunked_prefill.py``): the chunk's page-table slice and its absolute
+                start (python int, None = no cached prefix). Prefill only; every layer's
+                attention receives both.
             page_tables_per_layer: Optional list of per-layer page tables, one
                 entry per decoder layer. When set, each layer's attention
                 receives ``page_tables_per_layer[i]`` instead of ``page_table``.
@@ -457,6 +509,8 @@ class Model:
                 is_decode=is_decode,
                 user_id=user_id,
                 batch_size=batch_size,
+                chunk_page_table=chunk_page_table,
+                chunk_start_idx=chunk_start_idx,
             )
         logits = hidden_states
 
@@ -659,22 +713,35 @@ class Model:
             page_tables_per_layer = getattr(self, "_active_page_tables_per_layer", None)
         page_tables_per_layer = self._page_tables_to_ttnn(page_tables_per_layer)
         """Prefill forward pass - processes full sequences"""
-        # Use provided rotation matrices or slice from rope_setup (matches tt-transformers)
         seq_len = x.shape[-2]
+        # Chunked single-user prefill (phase 3d, tt/chunked_prefill.py): the Generator's chunk loop passes the chunk's
+        # absolute start as a python int (0 for the first chunk) and its page-table slice; the traced prefill passes
+        # the [1] int32 device tensor prepare_inputs_prefill built from start_pos = 0 (a traced non-zero offset is
+        # refused there), which no layer reads. Only a positive int selects the chunked attention; 0 / None / the
+        # tensor run the legacy ops (chunk 0 == a plain prefill of its length; the chunk_page_table, when given,
+        # names the same blocks the whole table would fill).
+        if isinstance(chunk_start_idx, ttnn.Tensor):
+            chunk_start_idx = None
+        elif chunk_start_idx is not None:
+            chunk_start_idx = int(chunk_start_idx) or None
+        if (chunk_start_idx is not None or chunk_page_table is not None) and batch_size > 1:
+            raise NotImplementedError("chunked prefill (chunk_start_idx / chunk_page_table) is single-user only")
+        # Use provided rotation matrices or slice from rope_setup (matches tt-transformers)
         if rot_mats_global is not None:
             rope_mats = rot_mats_global
         else:
-            # Slice cos/sin matrices for prefill sequence length (matches tt-transformers model.py lines 156-159)
+            # Slice cos/sin matrices for the chunk's positions (matches tt-transformers model.py lines 156-159)
+            start, end = rope_slice_bounds(chunk_start_idx or 0, seq_len, self.rope_setup.cos_matrix_prefill.shape[2])
             rope_mats = [
-                self.rope_setup.cos_matrix_prefill[:, :, :seq_len, :],
-                self.rope_setup.sin_matrix_prefill[:, :, :seq_len, :],
+                self.rope_setup.cos_matrix_prefill[:, :, start:end, :],
+                self.rope_setup.sin_matrix_prefill[:, :, start:end, :],
             ]
 
         # Forward through layers and head (shared with decode). A packed multi-user pass (batch_size > 1, tokens of B
         # users concatenated along the sequence) is marked for the expert-sorted MoE planner, which then plans its
         # hot / cold sets once per 4096-token chunk instead of per 1024-token split (phase 3c: a user's numerics must
         # not depend on the split its slot falls into; experts/prefill.py packed_prefill_pass, SOLAR_OPEN_SORTED_MOE_PLAN).
-        # Host state only: a single-user prefill (batch_size 1) runs exactly the phase-3b ops.
+        # Host state only: a single-user prefill (batch_size 1, chunked or not) runs exactly the phase-3b ops.
         with experts_prefill.packed_prefill_pass(batch_size > 1):
             logits = self._forward_layers_and_head(
                 hidden_states=x,
@@ -688,6 +755,8 @@ class Model:
                 batch_size=batch_size,
                 skip_lm_head=skip_lm_head,
                 page_tables_per_layer=page_tables_per_layer,
+                chunk_page_table=chunk_page_table,
+                chunk_start_idx=chunk_start_idx,
             )
 
         return logits
@@ -1166,6 +1235,12 @@ class Model:
             rot_current_pos = rot_current_pos.reshape(1, B)  # [1, batch]
             assert rot_current_pos.shape == (1, B), "rot_current_pos must be a [1, batch] tensor"
             assert torch.min(rot_current_pos) >= 0, "rot_current_pos must be non-negative"
+            if self.rope_setup.use_qk_fused:
+                # Fused Q/K RoPE (phase 3e): the cos/sin lookup serves the Q users on cores [0, B) and the K users on
+                # cores [B, 2B) with the same positions (RotarySetup.get_rot_idxs repeats them the same way); the
+                # on-device increment (ttnn.plus_one) advances both halves. Shape [1, 2B] before the padding below.
+                rot_current_pos = rot_current_pos.repeat(1, 2)
+                B = 2 * B
             # Add padding if needed
             pad_size = nearest_32(B) - B
             rot_current_pos = torch.nn.functional.pad(rot_current_pos, (0, pad_size), "constant", 0)
@@ -1336,13 +1411,29 @@ class Model:
             if seq_len % batch_size != 0:
                 raise ValueError(f"packed prefill of {seq_len} tokens is not divisible by batch_size={batch_size}")
             seq_len //= batch_size
-        rot_mats_global = self._prefill_rope_slices.get(seq_len)
+        # Chunked single-user prefill (phase 3d): chunk i of the Generator's loop starts at absolute position
+        # ``start_pos`` = i x chunk size, so its cos / sin rows are [start_pos, start_pos + seq_len) of the 131072-row
+        # YaRN tables (positions beyond 65536 included); cached per (start, length) like the position-0 slices.
+        rope_offset = int(start_pos or 0)
+        if rope_offset:
+            if trace_enabled:
+                raise NotImplementedError(
+                    f"a traced prefill starting at position {rope_offset} (resumed / chunked) is not supported: the "
+                    "chunked prefill runs eagerly (ModelArgs.can_enable_trace refuses num_cached_tokens > 0)"
+                )
+            if batch_size > 1 or batched_prefill:
+                raise NotImplementedError("a prefill with start_pos > 0 (chunked / resumed) is single-user only")
+            rope_start, rope_end = rope_slice_bounds(rope_offset, seq_len, self.rope_setup.cos_matrix_prefill.shape[2])
+            rope_key = (rope_start, seq_len)
+        else:
+            rope_start, rope_end, rope_key = 0, seq_len, seq_len
+        rot_mats_global = self._prefill_rope_slices.get(rope_key)
         if rot_mats_global is None:
             rot_mats_global = [
-                self.rope_setup.cos_matrix_prefill[:, :, :seq_len, :],
-                self.rope_setup.sin_matrix_prefill[:, :, :seq_len, :],
+                self.rope_setup.cos_matrix_prefill[:, :, rope_start:rope_end, :],
+                self.rope_setup.sin_matrix_prefill[:, :, rope_start:rope_end, :],
             ]
-            self._prefill_rope_slices[seq_len] = rot_mats_global
+            self._prefill_rope_slices[rope_key] = rot_mats_global
         rot_mats_local = None
 
         # Prepare page tables if provided
@@ -1394,8 +1485,13 @@ class Model:
                 )
 
         if chunk_page_table is not None:
+            # The chunk's blocks (paged_fill_cache target of the chunked prefill), replicated like the page table
             tt_chunk_page_table = ttnn.from_torch(
-                chunk_page_table, device=device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT
+                chunk_page_table,
+                device=device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
             )
 
         if chunk_start_idx is not None:
@@ -1532,8 +1628,10 @@ class Model:
 # ---------------------------------------------------------------------------------------------------------------------
 # Phase 3a(1): packed / batched multi-user prefill driver (design_packed_prefill.md 2.5). Wraps the tt_transformers
 # ``Generator.prefill_forward_text`` with the Solar policy; the demo and tests/unit/test_batched_prefill.py call it in
-# place of the plain generator call. The plain ``Generator`` keeps working: with SOLAR_OPEN_BATCHED_PREFILL=1 it
-# batches every equal-length multi-user call itself (one pass, no microbatching), with the flag off it is sequential.
+# place of the plain generator call. Since phase 3d / A3 the packing is driver-only: ``ModelArgs.disable_batched_prefill``
+# is always True, so a plain ``Generator.prefill_forward_text`` call (harness, vLLM, the sequential test arms) never
+# packs; only this driver lifts the flag for the duration of each packed pass (SOLAR_OPEN_BATCHED_PREFILL, default on,
+# selects whether the driver packs at all).
 
 
 @dataclasses.dataclass(frozen=True)

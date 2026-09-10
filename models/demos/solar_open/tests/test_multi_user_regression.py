@@ -38,7 +38,9 @@ table at the end of each case.
 Solar specifics: the model is built through ``tt/common.py::create_tt_model`` (the demo's path) rather than
 ``demo/text_demo.py``, whose import chain opens the devices at collection time; prompts always go through Solar's
 chat template (``ModelArgs.encode_prompt``, ``reasoning_effort`` from ``SOLAR_OPEN_REASONING_EFFORT``, default
-"low" here as in the demo; the long-prompt files contribute their Gutenberg context alone as the user message, the
+"low" here as in the demo; the template date pinned to 2026-09-08 through the ``pinned_template_date`` fixture so
+the prompt's date token -- and with it the per-user token counts -- is the same on every day, ``SOLAR_OPEN_TEMPLATE_DATE``
+overrides; the long-prompt files contribute their Gutenberg context alone as the user message, the
 way the demo's ``prefill_1k``..``prefill_32k`` cases and the GPT-OSS sweep load them); the stop set is
 ``ModelArgs.stop_token_ids`` ({2, 24, 25}); ``warmup_prefill=False`` everywhere (the generic warm-up captures its
 traces in an order that corrupts prefill on this box, tt-metal #52176) with an explicit eager pre-compile of every
@@ -634,7 +636,7 @@ def _markdown_table(rows):
 @pytest.mark.timeout(int(os.getenv("SOLAR_OPEN_REGRESSION_TIMEOUT_S", "7200")))
 @pytest.mark.parametrize("batch_size", BATCH_SIZES, ids=[f"batch{b}" for b in BATCH_SIZES])
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_multi_user_regression(mesh_device, device_params, batch_size, state_dict):
+def test_multi_user_regression(mesh_device, device_params, batch_size, state_dict, pinned_template_date):
     mesh_shape = tuple(mesh_device.shape)
     if mesh_shape[0] != 1 or mesh_shape[1] < 8:
         pytest.skip(f"multi-user single-row sweep targets 1x8 meshes, got {mesh_shape}")
@@ -673,7 +675,8 @@ def test_multi_user_regression(mesh_device, device_params, batch_size, state_dic
         f"batch {batch_size}: context {max_seq_len} tokens/user ({paged_attention_config.max_num_blocks} blocks of "
         f"{BLOCK_SIZE}), pairs {pairs}, skipped {skipped}; chat template reasoning_effort="
         f"{os.environ['SOLAR_OPEN_REASONING_EFFORT']}, default_system_prompt="
-        f"{os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}; decode trace {DECODE_TRACE}"
+        f"{os.environ.get('SOLAR_OPEN_DEFAULT_SYSTEM_PROMPT', '1') == '1'}, date {pinned_template_date}; "
+        f"decode trace {DECODE_TRACE}"
     )
 
     # The demo's page table is an unseeded random block permutation; seed it so a layout-dependent failure
@@ -699,6 +702,12 @@ def test_multi_user_regression(mesh_device, device_params, batch_size, state_dic
     assert model_args_0.max_local_batch_size == batch_size, "single-row mesh: the decode batch is the whole batch"
     generator = Generator(models, model_args, mesh_device, processor=None, tokenizer=tokenizer)
     assert all(getattr(m, "sampling", None) is not None for m in models), "on-device sampling expected on 1x8"
+    # Sequential per-user prefill is this harness's contract (TTFT-last = B x per-user prefill, traced at 128, the
+    # tt-inference-server admission model). The packed multi-user prefill is the demo's default since phase 3d / A3,
+    # but it is lifted only by tt/model.py::prefill_forward_text_batched per pass -- a plain Generator call like
+    # _prefill below never packs (ModelArgs.disable_batched_prefill is always True; tests/unit/test_batched_prefill.py
+    # ::test_host_model_args_fields pins that), so the recorded sweep rows stay comparable.
+    assert all(a.disable_batched_prefill for a in model_args), "the regression harness must prefill per user"
     sampling = SamplingParams(
         temperature=[0.0] * batch_size,
         top_k=[1] * batch_size,
@@ -729,6 +738,7 @@ def test_multi_user_regression(mesh_device, device_params, batch_size, state_dic
         "context_per_user": max_seq_len,
         "kv_tokens_total": TOTAL_KV_TOKENS,
         "reasoning_effort": os.environ["SOLAR_OPEN_REASONING_EFFORT"],
+        "template_date": pinned_template_date,  # SOLAR_OPEN_TEMPLATE_DATE ("today" = unpinned)
         "expert_dtype": model_args_0.moe_options.expert_dtype_str,
         "decode_trace": DECODE_TRACE,
         "cooldown_c": COOLDOWN_C or None,

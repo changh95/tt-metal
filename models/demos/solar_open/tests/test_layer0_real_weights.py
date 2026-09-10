@@ -25,6 +25,11 @@ baseline the thresholds below are re-baselined from (design D13).
 
     HF_MODEL=/path/to/Solar-Open-100B MESH_DEVICE=P150x8 \
         pytest models/demos/solar_open/tests/test_layer0_real_weights.py -k 1x8
+
+The prompts are chat-templated, and the template stamps the current date into its system prompt, so the token ids --
+and the digits below -- depend on the day unless the date is pinned: the test requests the ``pinned_template_date``
+fixture (conftest ``RECORDED_TEMPLATE_DATE`` = 2026-09-08, the day the recorded digits were measured), which an
+exported ``SOLAR_OPEN_TEMPLATE_DATE`` (a date, or ``today``) overrides.
 """
 
 import json
@@ -37,6 +42,7 @@ from loguru import logger
 from safetensors import safe_open
 
 import ttnn
+from models.demos.solar_open.tt.model_config import template_date_kwargs
 
 from .test_factory import TestFactory, compare_tensors, parametrize_mesh_with_fabric
 from .unit import test_modules as tm
@@ -168,9 +174,20 @@ def _token_ids(snapshot, num_tokens, vocab_size, model_args):
             tokenizer = None
     if tokenizer is not None and os.path.isfile(PROMPTS_FILE):
         prompts = [p["prompt"] for p in json.loads(Path(PROMPTS_FILE).read_text())]
+        # Template defaults (reasoning_effort high, dated system prompt) as in the recorded runs; the date is pinned
+        # through SOLAR_OPEN_TEMPLATE_DATE (the pinned_template_date fixture) or today's without it.
+        date_kwargs = template_date_kwargs()
+        logger.info(
+            "layer-0 input token ids: chat template with "
+            + (
+                f"the pinned date {date_kwargs['strftime_now']('%Y-%m-%d')}"
+                if date_kwargs
+                else "today's date (unpinned)"
+            )
+        )
         for prompt in prompts:
             chat = [{"role": "user", "content": prompt}]
-            encoded = tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
+            encoded = tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True, **date_kwargs)
             encoded = encoded["input_ids"] if isinstance(encoded, dict) or hasattr(encoded, "input_ids") else encoded
             ids.extend(int(t) for t in encoded)
             if len(ids) >= num_tokens:
@@ -227,7 +244,9 @@ def build_reference_layer(config, state_dict):
 )
 @pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged"])
 @parametrize_mesh_with_fabric([(1, 8)])
-def test_layer0_real_weights(mesh_device, device_params, batch_size, seq_len, paged, layer0_weights, reset_seeds):
+def test_layer0_real_weights(
+    mesh_device, device_params, batch_size, seq_len, paged, layer0_weights, reset_seeds, pinned_template_date
+):
     """Router / MoE / full-layer PCC of layer 0 with real weights and real embeddings as input."""
     mesh_shape = tuple(mesh_device.shape)
     if mesh_shape[0] != 1 or mesh_shape[1] != 8:
@@ -274,6 +293,7 @@ def test_layer0_real_weights(mesh_device, device_params, batch_size, seq_len, pa
         batch_size,
         is_decode,
         cache_position=context_len,
+        fused_qk=is_decode and bool(getattr(decoder_layer.self_attn.program_config, "fused_qk", False)),  # phase 3e
     )
     if decode_context is not None:
         ref_input, ref_position_embeddings, ref_mask = decode_context.reference_inputs(hidden_states)

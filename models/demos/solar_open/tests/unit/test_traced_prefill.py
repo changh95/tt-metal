@@ -171,19 +171,31 @@ class TestHostTraceTable:
         assert args.trace_prefill_supported_seq_lens == [128]
         assert args.can_enable_trace(128) and not args.can_enable_trace(1024) and not args.can_enable_trace(128, 32)
         assert args.get_warmup_prefill_supported_seq_lens() == [128, 1024, 2048]
+        # Phase 3e / A0: the packed prefill is OFF by default again (phase 3d / A3 had it on), so no packed row counts
+        # are prebuilt at load; with SOLAR_OPEN_BATCHED_PREFILL=1 the router would keep its [T, E] helpers for every
+        # packed row count (B in {2..32} x 128: [256, 512, 1024, 2048, 4096], +~280 MiB DRAM per device).
         assert args.batched_prefill_token_counts == []
         assert args.router_persistent_token_counts == [1, 32, 128]
+        assert args.disable_batched_prefill is True
         assert mc.TRACE_PREFILL_SEQ_LENS[mc.MODEL_NAME]["P150x8"] == [128]  # the table itself is never mutated
 
+    def test_shipped_table_with_the_packed_prefill_off(self, host_p150x8, monkeypatch):
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "0")  # the phase-2 / 3c default: only the trace table's counts
+        args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True)
+        assert args.batched_prefill_token_counts == []
+        assert args.router_persistent_token_counts == [1, 32, 128]
+
     def test_router_counts_follow_the_batch_and_the_packed_prefill(self, host_p150x8, monkeypatch):
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "0")
         args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True, max_batch_size=32)
         assert args.router_persistent_token_counts == [32, 128]
         # Packed multi-user prefill on: the row counts of its passes (B >= 2 users x 128 tokens within the budget)
         monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "1")
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", "1024")
         args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True, max_batch_size=32)
         assert args.batched_prefill_token_counts == [256, 512, 1024]
         assert args.router_persistent_token_counts == [32, 128, 256, 512, 1024]
-        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", "4096")
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL_TOKENS", "4096")  # = the phase-3d default
         args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True, max_batch_size=8)
         assert args.batched_prefill_token_counts == [256, 512, 1024, 2048, 4096]
         assert args.router_persistent_token_counts == [8, 32, 128, 256, 512, 1024, 2048, 4096]
@@ -194,6 +206,7 @@ class TestHostTraceTable:
             ModelArgs(mesh_device=host_p150x8, dummy_weights=True)
 
     def test_length_admitted_with_a_trace_safe_split(self, host_p150x8, monkeypatch):
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "0")  # the trace table's counts alone
         monkeypatch.setitem(mc.TRACE_PREFILL_SEQ_LENS[mc.MODEL_NAME], "P150x8", [128, 1024, 2048])
         monkeypatch.setattr(mc, "SolarOpenProgramConfig", lambda: SolarOpenProgramConfig(trace_safe_split_lens=(1024,)))
         args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True)
@@ -208,6 +221,7 @@ class TestHostTraceTable:
         assert args.trace_prefill_supported_seq_lens == [128] and not args.can_enable_trace(4096)
 
     def test_other_devices_have_no_traced_prefill(self, host_p150x8, monkeypatch):
+        monkeypatch.setenv("SOLAR_OPEN_BATCHED_PREFILL", "0")  # the trace table's counts alone
         monkeypatch.setattr(mc, "determine_device_name", lambda mesh_device: "T3K")
         args = ModelArgs(mesh_device=host_p150x8, dummy_weights=True)
         assert args.trace_prefill_supported_seq_lens == [] and not args.can_enable_trace(128)

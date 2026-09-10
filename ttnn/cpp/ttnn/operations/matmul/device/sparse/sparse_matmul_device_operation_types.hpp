@@ -66,4 +66,21 @@ bool sparse_matmul_egp_zero_fill_enabled();
 bool sparse_matmul_egp_zero_fill_in_in1_writer();
 bool sparse_matmul_egp_kernel_writes_whole_output(const SparseMatmulParams& operation_attributes);
 
+// Legacy indexed FILL skip (phase 3d, lever A1). In indexed / gather mode the LEGACY factory's in1 writer visits every
+// entry i of the id list (bB = indices[i], no validity scan, nothing skipped) and addresses compact slot i absolutely
+// (out_base + i * MtNt); per slot the num_blocks_y x num_blocks_x cores write their [per_core_M rows] x [per_core_N
+// columns, last_per_core_N = Nt - (num_blocks_x - 1) * per_core_N on the last column] block with no height padding
+// (writer args out_num_nonzero_subblocks_h = out_block_h / out_subblock_h, out_last_subblock_h = out_subblock_h,
+// padded_block_tiles_h_skip = 0), so the blocks partition the slot's Mt x Nt tiles exactly when Mt % per_core_M == 0.
+// Every tile of the op-allocated compact output ([..., num_active, M, N], batchA outer batches of num_active slots)
+// is therefore written by the kernel and the ttnn::zeros_like FILL pass the op ran on it was redundant (3.8 us per
+// layer on the Solar b1 indexed down [1,8,1,4096]). The predicate below is true exactly when that proof applies:
+// legacy path (expert_groups unset), use_indices, an explicit mcast_in0 1D program config with Mt % per_core_M == 0
+// and an INTERLEAVED output. A caller-supplied optional output keeps its FILL (unchanged path).
+// A/B knob for measurements only, read once per process: TT_SPARSE_MATMUL_INDEXED_SKIP_FILL=0 restores the FILL
+// (phase-3c behaviour). Not part of the program hash -- fresh process per arm.
+bool sparse_matmul_indexed_skip_fill_enabled();
+bool sparse_matmul_legacy_indexed_kernel_writes_whole_output(
+    const SparseMatmulParams& operation_attributes, const SparseMatmulInputs& tensor_args);
+
 }  // namespace ttnn::prim
