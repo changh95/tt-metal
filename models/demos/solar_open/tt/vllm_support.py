@@ -343,14 +343,55 @@ def chat_template_kwargs(**overrides) -> dict:
     return kwargs
 
 
-def _resolve_model_dir(model_dir=None) -> Path:
-    path = Path(model_dir or os.getenv("HF_MODEL", DEFAULT_HF_MODEL))
-    if not path.is_dir():
-        raise FileNotFoundError(
-            f"{path} is not a directory; point HF_MODEL (or model_dir) at the Solar-Open-100B snapshot directory "
-            f"that holds {REASONING_PARSER_FILE} / {TOOL_PARSER_FILE} (HF hub snapshots are hashes: symlink one)"
+def _looks_like_hf_repo_id(spec: str) -> bool:
+    """``namespace/name`` with no path separators beyond the one slash and no filesystem anchors."""
+    parts = spec.split("/")
+    return len(parts) == 2 and all(p and p not in (".", "..") for p in parts) and not spec.startswith(("/", "~"))
+
+
+def _hf_snapshot_dir(repo_id: str) -> Path:
+    """The HF-cache snapshot directory of ``repo_id`` holding the two parser files (and config.json).
+
+    Only those files are requested, so with a populated cache (tt-model / tt-inference-server download the weights
+    before the server starts) this is a metadata no-op, and under ``HF_HUB_OFFLINE=1`` ``snapshot_download`` resolves
+    from the cache alone. ``HF_MODEL_REVISION`` pins the revision when set.
+    """
+    from huggingface_hub import snapshot_download
+
+    try:
+        return Path(
+            snapshot_download(
+                repo_id,
+                revision=os.getenv("HF_MODEL_REVISION") or None,
+                allow_patterns=[REASONING_PARSER_FILE, TOOL_PARSER_FILE, "config.json"],
+            )
         )
-    return path
+    except Exception as exc:  # cache miss offline, auth, network: one actionable message
+        raise FileNotFoundError(
+            f"HF_MODEL={repo_id!r} is an HF repo id but its snapshot could not be resolved from the Hugging Face cache "
+            f"({type(exc).__name__}: {exc}); download the repo first (hf download {repo_id}) or point HF_MODEL at a "
+            f"directory literally named {MODEL_NAME} that holds {REASONING_PARSER_FILE} / {TOOL_PARSER_FILE}"
+        ) from exc
+
+
+def _resolve_model_dir(model_dir=None) -> Path:
+    """Directory holding Upstage's parser files: a checkpoint directory, or the HF-cache snapshot of a repo id.
+
+    ``HF_MODEL`` is either a directory (the demo / tt-inference-server symlink) or the HF repo id
+    (``upstage/Solar-Open-100B``: what vLLM's ``--model`` carries and what a tt-model container exports), mirroring
+    what :class:`ModelArgs` accepts; a repo id is resolved through the HF cache (:func:`_hf_snapshot_dir`).
+    """
+    spec = str(model_dir or os.getenv("HF_MODEL", DEFAULT_HF_MODEL))
+    path = Path(spec)
+    if path.is_dir():
+        return path
+    if _looks_like_hf_repo_id(spec):
+        return _hf_snapshot_dir(spec)
+    raise FileNotFoundError(
+        f"{path} is not a directory; point HF_MODEL (or model_dir) at the Solar-Open-100B snapshot directory "
+        f"that holds {REASONING_PARSER_FILE} / {TOOL_PARSER_FILE} (HF hub snapshots are hashes: symlink one), "
+        f"or at the HF repo id {DEFAULT_HF_MODEL}"
+    )
 
 
 def _import_python_file(path: Path, module_name: str):

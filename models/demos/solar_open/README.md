@@ -548,6 +548,13 @@ state as the EXAONE venv). Every tt-inference-server `run.py` launch additionall
   plugin reads `EXTRA_MODELS_DIR=<repo>/vllm-tt-metal/extra_models` in every vLLM process and registers the arch as
   `TTSolarOpenForCausalLM` (log `Registered TT model TTSolarOpenForCausalLM -> ... (from EXTRA_MODELS_DIR/solar_open)` in
   the launcher, the APIServer and the EngineCore).
+  The same file is checked in here as `models/demos/solar_open/vllm_bundle/solar_open/vllm_metadata.json`, so
+  `EXTRA_MODELS_DIR=$TT_METAL_HOME/models/demos/solar_open/vllm_bundle` works from a bare tt-metal checkout and is what
+  the tt-model container package (`runtime.extra_models_dir`, see "Publishing as a tt-model container bundle") ships.
+- `HF_MODEL` may be the checkpoint directory OR the HF repo id `upstage/Solar-Open-100B` (vLLM's `--model`, and what a
+  tt-model container exports): `ModelArgs` always accepted both, and since the HF-bundle work the parser plugin
+  (`vllm_support._resolve_model_dir`) resolves a repo id to the HF-cache snapshot holding Upstage's two parser files
+  through `snapshot_download` (offline-safe once the weights are cached; `HF_MODEL_REVISION` pins the revision).
 - `.env` (gitignored) = `HF_TOKEN=hf_offline_dummy_not_a_real_token`: `run.py` demands the variable for `--workflow
   server` and never validates it for `--local-server`.
 - `persistent_volume/volume_id_tt_transformers-Solar-Open-100B-vNone/tt_metal_cache/cache_Solar-Open-100B/P150x8` is the
@@ -2514,3 +2521,16 @@ Aggregate decode tok/s:
 | 8 | 188 | 188 | 255 | 252 | 243 | 221 | 198 | 185 | 146 |
 | 16 | 311 | 314 | 461 | 454 | 443 | 369 | 357 | 290 | 245 |
 | 32 | 528 | 526 | 918 | 899 | 665 | 561 | 436 | 456 | 248 |
+
+## Publishing as a tt-model container bundle (Hugging Face)
+
+The community route to `tt serve <org>/<name>` (tt-cli) is a **tt-model-manager v5.1 container bundle**: one HF model repo
+with `tt_kernel_manifest.json`, a generated model card, the `source.code` allowlist under `code/`, an exploded OCI image
+under `image/` and `requirements.lock`; weights stay a pointer at `upstage/Solar-Open-100B`. The authoring manifest and the
+lock live in `/home/eslim/experiments/solar/hf-submission/` (`tt-model.yaml`, `requirements.lock`, `README.md` runbook):
+`tt-model package --container tt-model.yaml --out ~/tt-model-builds` builds tt-metal from this tree inside the image (the
+`ttnn.sparse_matmul(expert_groups=...)` kernels ship compiled), stages the local `vllm-tt-plugin` clone (branch
+`solar-fixes`) and registers this model only from `models/demos/solar_open/vllm_bundle` (`TT_VLLM_BUILTIN_MODELS=0`).
+The launcher exports `HF_MODEL=upstage/Solar-Open-100B` and `MESH_DEVICE=P150x8`, mounts the host HF cache at `/hf` and the
+tensor cache at `/tensor-cache` (`TT_CACHE_PATH`), and passes the parser plugin file by its in-image path
+`/opt/tt-metal/models/demos/solar_open/vllm_plugins/solar_open_parsers.py`.

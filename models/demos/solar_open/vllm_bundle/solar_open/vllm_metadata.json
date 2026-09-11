@@ -1,0 +1,4 @@
+{
+  "arch": "SolarOpenForCausalLM",
+  "main_class": "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"
+}

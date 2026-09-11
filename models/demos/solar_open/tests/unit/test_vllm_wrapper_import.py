@@ -216,6 +216,65 @@ class TestKVCacheSpec:
         assert set(spec.values()) == {("spec", tuple(sorted(common.items())))}
 
 
+class TestResolveModelDir:
+    """``_resolve_model_dir`` accepts a checkpoint directory OR an HF repo id (what vLLM's --model and a tt-model
+    container export as HF_MODEL); a repo id resolves to the HF-cache snapshot through ``snapshot_download``."""
+
+    def test_directory_is_returned_as_is(self, tmp_path):
+        assert vs._resolve_model_dir(str(tmp_path)) == tmp_path
+
+    def test_env_directory_is_used_when_no_argument(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HF_MODEL", str(tmp_path))
+        assert vs._resolve_model_dir() == tmp_path
+
+    def test_repo_id_resolves_through_the_hf_cache(self, tmp_path, monkeypatch):
+        import huggingface_hub
+
+        snapshot = tmp_path / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        calls = []
+
+        def fake_snapshot_download(repo_id, revision=None, allow_patterns=None, **kw):
+            calls.append((repo_id, revision, tuple(allow_patterns)))
+            return str(snapshot)
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+        monkeypatch.setenv("HF_MODEL", "upstage/Solar-Open-100B")
+        monkeypatch.delenv("HF_MODEL_REVISION", raising=False)
+        assert vs._resolve_model_dir() == snapshot
+        assert calls == [
+            ("upstage/Solar-Open-100B", None, (vs.REASONING_PARSER_FILE, vs.TOOL_PARSER_FILE, "config.json"))
+        ]
+
+    def test_repo_id_revision_pin(self, tmp_path, monkeypatch):
+        import huggingface_hub
+
+        seen = {}
+        monkeypatch.setattr(
+            huggingface_hub,
+            "snapshot_download",
+            lambda repo_id, revision=None, **kw: seen.update(rev=revision) or str(tmp_path),
+        )
+        monkeypatch.setenv("HF_MODEL_REVISION", "1f591439b14055004d1a5d1a975608953a022fea")
+        assert vs._resolve_model_dir("upstage/Solar-Open-100B") == tmp_path
+        assert seen == {"rev": "1f591439b14055004d1a5d1a975608953a022fea"}
+
+    def test_repo_id_cache_miss_is_actionable(self, monkeypatch, expect_error):
+        import huggingface_hub
+
+        def boom(*a, **kw):
+            raise OSError("offline and not in cache")
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", boom)
+        with expect_error(FileNotFoundError, r"hf download upstage/Solar-Open-100B"):
+            vs._resolve_model_dir("upstage/Solar-Open-100B")
+
+    @pytest.mark.parametrize("spec", ["/nonexistent/Solar-Open-100B", "Solar-Open-100B", "a/b/c", "../x"])
+    def test_non_directory_non_repo_id_raises(self, spec, expect_error):
+        with expect_error(FileNotFoundError, "is not a directory"):
+            vs._resolve_model_dir(spec)
+
+
 class TestRequestValidation:
     OK = dict(mesh_shape=(1, 8), max_batch_size=32, max_seq_len=8192, tt_data_parallel=1)
 
