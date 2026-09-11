@@ -66,6 +66,20 @@ configuration shifts the ``<|think|>`` / ``<|content|>`` gap one way, by -0.75 t
 MoE: 1 of 2), HF siding with the sequential arm on every disagreeing user. Hence the ``xfail(strict=True)`` on both
 32-user cases with the finding, and the intended HF floors (``_assert_hf_floors``) asserted only with
 ``SOLAR_OPEN_PREFILL_HF_GATE=1`` until the packed path is fixed (README "Phase 3e rows").
+
+Phase 3g / D1 + D2 (the fix): the divergence starts at layer 0, op qkv -- ttnn picks another matmul program config for
+T = B x S rows than for S rows (in0_block_w 1 vs 2), the shared expert leaves its explicit 128-row configs, the T-row
+head normalizes with the default kernel instead of the sequential head's sharded 32-row kernel and takes a 2D lm_head
+config at M = 4096, and the expert-sorted MoE of 1024-row splits differs from the dense bmm of 128-row prefills
+(``tests/test_packed_bias_bisect.py``). ``SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS`` (``tt/packed_numerics.py``; level
+2 = the default) pins every one of them to the per-user S-row programs, so a packed pass of 128-token users is
+BIT-IDENTICAL to the sequential prefills at any T (D2: 32 / 32 users exact for 2 x 128, 16 x 2 x 128, 8 x 128 and one
+32 x 128 pass; KL(HF || packed) = KL(HF || seq) 0.0698; the packed32 teacher-forced case = the sequential b32 digits).
+With the knob on (any level) the HF floors are asserted and the 32-user cases are real gates; a pass whose every op is
+pinned additionally asserts bit-identity (``_assert_bit_identical``). Level 0 (``=0``) restores the phase-3a-3f
+numerics and the ``xfail(strict=True)`` finding above; level 1 (the cheap half: qkv / o_proj / shared expert / head, the
+sorted MoE untouched) is exact up to T = 256 and leaves the sorted-MoE residual above (one 32 x 128 pass: 26 / 32 top-1
+= HF, KL 0.1865, gap -0.93).
 """
 
 import json
@@ -86,6 +100,7 @@ from models.demos.solar_open.tests.accuracy.gen_prefill_reference import (
 )
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
 from models.demos.solar_open.tt import model_config as mc
+from models.demos.solar_open.tt import packed_prefill
 from models.demos.solar_open.tt.model import (
     Model,
     batched_prefill_flag,
@@ -751,12 +766,13 @@ def _assert_hf_floors(r):
         (not over, f"users with KL(HF||packed) > KL(HF||seq) + {HF_KL_USER_SLACK}: {over}"),
     ]
     failed = [text for ok, text in verdicts if not ok]
-    if os.getenv(HF_GATE_ENV, "0") == "1":
-        assert not failed, "HF floors of the packed arm: " + "; ".join(failed)
+    asserted = _hf_floors_asserted()
     logger.info(
-        f"[HF arm] floors ({'ASSERTED' if os.getenv(HF_GATE_ENV, '0') == '1' else 'logged only, ' + HF_GATE_ENV + '=1 asserts'}): "
+        f"[HF arm] floors ({'ASSERTED' if asserted else 'logged only, ' + HF_GATE_ENV + '=1 asserts'}): "
         + ("all pass" if not failed else "FAIL -- " + "; ".join(failed))
     )
+    if asserted:
+        assert not failed, "HF floors of the packed arm: " + "; ".join(failed)
 
 
 def _compare_rows(name, seq_logits, bat_logits):
@@ -781,7 +797,42 @@ def _compare_rows(name, seq_logits, bat_logits):
     ), f"{name}: decisive users {flipped} changed their top-1 token (margins {margin[flipped].tolist()})"
 
 
+# Phase 3g / D2: the "sequential numerics" knob (SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS, tt/packed_numerics.py) makes the
+# row-wise matmuls and the head of a packed pass reproduce the per-user S-row pass bit for bit (level 1; level 2 also the
+# routed experts as dense-bmm splits). With the knob on, the 32-user cases run as real gates (no xfail) and the HF floors
+# are asserted; a pass whose every op is covered (T <= dense_bmm_max_tokens, or level 2) must equal the sequential arm
+# bit for bit (``_assert_bit_identical``). Read at import so the xfail conditions see the level of the process.
+SEQ_NUMERICS_LEVEL = packed_prefill.packed_seq_numerics_level()
+
+
+def _hf_floors_asserted():
+    """The HF floors are asserted with SOLAR_OPEN_PREFILL_HF_GATE=1 (any level) and whenever the knob is on."""
+    return os.getenv(HF_GATE_ENV, "0") == "1" or packed_prefill.packed_seq_numerics_level() >= 1
+
+
+def _every_op_pinned(tokens_per_pass, level):
+    """True when the knob at ``level`` covers every op of a ``tokens_per_pass``-token pass of 128-token users: level 1
+    pins qkv / o_proj / shared expert / head, so a pass whose MoE splits are the dense bmm anyway (T <= the
+    dense_bmm_max_tokens 256) is fully covered; level 2 also pins the routed experts (dense splits) at any T."""
+    if level >= 2:
+        return True
+    return level >= 1 and tokens_per_pass <= mc.SolarOpenProgramConfig().dense_bmm_max_tokens
+
+
+def _assert_bit_identical(name, seq_logits, bat_logits):
+    """Both arms' logits must be identical bit for bit (the knob's exactness claim); logs the per-user max |diff|."""
+    diff = (seq_logits - bat_logits).abs().amax(dim=-1)
+    users = [u for u in range(diff.numel()) if diff[u] > 0]
+    logger.info(
+        f"[{name}] packed vs sequential bit-identity: {diff.numel() - len(users)}/{diff.numel()} users exact; max |diff| {diff.max():.4f}"
+    )
+    assert (
+        not users
+    ), f"{name}: users {users} differ from the sequential arm (max |diff| {diff[users].tolist()}) although every op is pinned"
+
+
 B32_XFAIL_REASON = (
+    "SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=0 (the phase-3a-3f numerics; fixed by phase 3g / D2 at the default level 2): "
     "phase 3e / A0 (real weights, pinned 2026-09-08 ids): the packed 32 x 128 pass is the WORSE arm at the first token. Against the bf16 HF "
     "reference (tests/accuracy/gen_prefill_reference.py) the sequential arm has top-1 = HF on 32 / 32 users (KL mean 0.0698, "
     "max 0.2445) while the packed arm flips 10 users from <|think|> to <|content|> (full head: 22 / 32, KL mean 0.3517, max "
@@ -804,7 +855,7 @@ B32_XFAIL_REASON = (
             128,
             4096,
             "full",
-            marks=pytest.mark.xfail(strict=True, reason=B32_XFAIL_REASON),
+            marks=pytest.mark.xfail(condition=SEQ_NUMERICS_LEVEL == 0, strict=True, reason=B32_XFAIL_REASON),
         ),  # one pass of 32: T = 4096, the whole batch-32 demo in one forward
         (
             4,
@@ -814,10 +865,32 @@ B32_XFAIL_REASON = (
         ),  # the 1K bucket opted in (max_seq_len 1024): 4 distinct ~1K prompts in one 4096-token pass
         (8, 128, 512, "full"),  # TWO passes of 4: users 4..7 re-slotted to device rows 0..3
         pytest.param(
-            32, 128, 4096, "gather", marks=pytest.mark.xfail(strict=True, reason=B32_XFAIL_REASON)
+            32,
+            128,
+            4096,
+            "gather",
+            marks=pytest.mark.xfail(condition=SEQ_NUMERICS_LEVEL == 0, strict=True, reason=B32_XFAIL_REASON),
         ),  # phase 3c: the same 32 x 128 pass through Model.packed_prefill_pass (gather head); same finding (A0 r5)
+        # Phase 3g / D1 (bias bisection) T-sweep of the SAME 32 users against HF: 16 passes of 2 (T = 256, dense-bmm
+        # MoE: only the qkv / shared-expert / head configs differ from the sequential arm) and 4 passes of 8 (T = 1024,
+        # one expert-sorted split per pass). Diagnostic rows (the HF summary line is the result); the arm-vs-arm floors
+        # may fail on the near-tie users like the 4096-token pass, hence non-strict xfail.
+        pytest.param(
+            32,
+            128,
+            256,
+            "full",
+            marks=pytest.mark.xfail(condition=SEQ_NUMERICS_LEVEL == 0, strict=False, reason="D1 T-sweep diagnostic"),
+        ),
+        pytest.param(
+            32,
+            128,
+            1024,
+            "full",
+            marks=pytest.mark.xfail(condition=SEQ_NUMERICS_LEVEL == 0, strict=False, reason="D1 T-sweep diagnostic"),
+        ),
     ],
-    ids=["b2_s128", "b8_s128", "b32_s128", "b4_s1024", "b8_s128_x2", "b32_s128_gather"],
+    ids=["b2_s128", "b8_s128", "b32_s128", "b4_s1024", "b8_s128_x2", "b32_s128_gather", "b32_s128_x16", "b32_s128_x4"],
 )
 @parametrize_mesh_with_fabric([(1, 8)])
 def test_batched_vs_sequential_prefill(
@@ -861,7 +934,11 @@ def test_batched_vs_sequential_prefill(
     lens = [int(n) for n in decoding_pos]
     padded = [get_padded_prefill_len(n) for n in lens]
     assert padded == [seq_len] * batch_size, f"prompt lengths {lens} do not all pad to {seq_len}: {padded}"
-    logger.info(f"{batch_size} users, prompt lengths {lens} (padded {seq_len}), tokens_per_pass {tokens_per_pass}")
+    level = packed_prefill.packed_seq_numerics_level()
+    logger.info(
+        f"{batch_size} users, prompt lengths {lens} (padded {seq_len}), tokens_per_pass {tokens_per_pass}, head {head}; "
+        f"{packed_prefill.PACKED_SEQ_NUMERICS_ENV}={level} (every op pinned: {_every_op_pinned(tokens_per_pass, level)})"
+    )
 
     # (a) Sequential, today's per-user path (the Generator's batched path explicitly disabled for the call).
     _clear_kv(models, generator, mesh_device)
@@ -907,8 +984,12 @@ def test_batched_vs_sequential_prefill(
 
     last_plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
     logger.info(f"sorted-MoE plan of the last split (mode {experts_prefill.SORTED_MOE_PLAN}): {last_plan}")
-    if experts_prefill.SORTED_MOE_PLAN == "auto" and options.users_per_pass(seq_len) * seq_len > 1024:
+    if experts_prefill.SORTED_MOE_PLAN == "auto" and options.users_per_pass(seq_len) * seq_len > 1024 and level < 2:
         assert last_plan.get("per_chunk") is True, f"a packed multi-split pass must be planned per chunk: {last_plan}"
+    if level >= 2:  # dense-bmm splits of dense_bmm_max_tokens rows: no sorted plan at all
+        assert experts_prefill.LAST_PREFILL_MOE_PATH.get("path") == experts_prefill.MOE_PATH_DENSE_BMM, dict(
+            experts_prefill.LAST_PREFILL_MOE_PATH
+        )
     assert sorted(u for r in log for u in r.users) == list(range(batch_size))
     summary = summarize_batched_prefill_log(log, batch_size)
     logger.info(
@@ -939,3 +1020,5 @@ def test_batched_vs_sequential_prefill(
         ]
         logger.info(f"cross-user decode logit PCC max: packed {off_diag.max():.4f}, sequential {seq_cross.max():.4f}")
         assert off_diag.max() <= max(0.999, seq_cross.max().item()), "two users of the packed run share decode logits"
+    if _every_op_pinned(tokens_per_pass, level):
+        _assert_bit_identical("prefill logits", seq_logits, bat_logits)

@@ -558,18 +558,26 @@ class TestParserRegistrationWithVllm:
 
         registered = vs.register_vllm_parsers()
         assert {k: v.__name__ for k, v in registered.items()} == {
-            "reasoning": "SolarOpenReasoningParser",
+            "reasoning": "SolarOpenTTReasoningParser",
+            "reasoning_upstream": "SolarOpenReasoningParser",
             "tool": "SolarOpenToolParser",
         }
         assert ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_NAME) is registered["reasoning"]
+        assert (
+            ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_UPSTREAM_NAME)
+            is registered["reasoning_upstream"]
+        )
+        assert issubclass(registered["reasoning"], registered["reasoning_upstream"])
         assert ToolParserManager.get_tool_parser(vs.TOOL_PARSER_NAME) is registered["tool"]
 
-        reasoning = registered["reasoning"](tokenizer)
-        sample = "<|think|>Plan the answer.<|end|><|content|>Seoul."
-        assert reasoning.extract_reasoning(sample, request=None) == ("Plan the answer.", "Seoul.")
-        assert reasoning.extract_reasoning("<|think|><|end|><|content|>Hi", request=None) == ("", "Hi")  # `low`
-        assert reasoning.is_reasoning_end(tokenizer.encode(sample, add_special_tokens=False))
-        assert not reasoning.is_reasoning_end(tokenizer.encode("<|think|>Still thinking", add_special_tokens=False))
+        for cls in (registered["reasoning"], registered["reasoning_upstream"]):
+            reasoning = cls(tokenizer)
+            sample = "<|think|>Plan the answer.<|end|><|content|>Seoul."
+            assert reasoning.extract_reasoning(sample, request=None) == ("Plan the answer.", "Seoul.")
+            assert reasoning.extract_reasoning("<|think|><|end|><|content|>Hi", request=None) == ("", "Hi")  # `low`
+            assert reasoning.is_reasoning_end(tokenizer.encode(sample, add_special_tokens=False))
+            assert not reasoning.is_reasoning_end(tokenizer.encode("<|think|>Still thinking", add_special_tokens=False))
+        assert registered["reasoning"](tokenizer).reasoning_start_str == "<|think|>"  # thinking-budget ids, no warning
 
         tool = registered["tool"](tokenizer)
         call = (
@@ -591,6 +599,219 @@ class TestParserRegistrationWithVllm:
         ReasoningParserManager.import_reasoning_parser(str(PARSER_PLUGIN_PY))  # what --reasoning-parser-plugin does
         ToolParserManager.import_tool_parser(str(PARSER_PLUGIN_PY))  # what --tool-parser-plugin does
         assert (
-            ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_NAME).__name__ == "SolarOpenReasoningParser"
+            ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_NAME).__name__
+            == "SolarOpenTTReasoningParser"
+        )
+        assert (
+            ReasoningParserManager.get_reasoning_parser(vs.REASONING_PARSER_UPSTREAM_NAME).__name__
+            == "SolarOpenReasoningParser"
         )
         assert ToolParserManager.get_tool_parser(vs.TOOL_PARSER_NAME).__name__ == "SolarOpenToolParser"
+
+
+@needs_vllm
+@needs_parser_files
+class TestReasoningParserStreamingWithVllm:
+    """The fixed reasoning parser driven through vLLM 0.25.1's own ``Parser.parse_delta`` state machine (the one the
+    chat endpoint uses), token by token, against the deltas seen live on 2026-09-10; the upstream class registered as
+    ``solar_open_upstream`` documents the defects it fixes. Host only: template-rendered prompts, hand-written outputs.
+    """
+
+    THINK = "The user asks for the capital of Korea. Seoul."
+    ANSWER = "Seoul is the capital of South Korea."
+    TOOL_CALL = (
+        '<|tool_calls|><|tool_call:begin|>abc123defg<|tool_call:name|>get_weather<|tool_call:args|>{"city": "Seoul"}'
+        "<|tool_call:end|>"
+    )
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather in a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+            },
+        }
+    ]
+    USER = [{"role": "user", "content": "What is the capital of Korea?"}]
+
+    @pytest.fixture(scope="class")
+    def tokenizer(self):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(_solar_model_dir())
+
+    @pytest.fixture(scope="class")
+    def parsers(self):
+        """``{"fixed": Parser subclass, "upstream": Parser subclass}`` composed by vLLM's ParserManager."""
+        from vllm.parser import ParserManager
+
+        vs.register_vllm_parsers()
+        return {
+            "fixed": ParserManager.get_parser(
+                tool_parser_name=vs.TOOL_PARSER_NAME,
+                reasoning_parser_name=vs.REASONING_PARSER_NAME,
+                enable_auto_tools=True,
+                model_name="upstage/Solar-Open-100B",
+            ),
+            "upstream": ParserManager.get_parser(
+                tool_parser_name=vs.TOOL_PARSER_NAME,
+                reasoning_parser_name=vs.REASONING_PARSER_UPSTREAM_NAME,
+                enable_auto_tools=True,
+                model_name="upstage/Solar-Open-100B",
+            ),
+        }
+
+    @staticmethod
+    def _request(tools=None):
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+        body = {"model": "upstage/Solar-Open-100B", "messages": TestReasoningParserStreamingWithVllm.USER}
+        if tools:
+            body["tools"] = tools  # the validator sets tool_choice "auto"; without tools it stays "none"
+        return ChatCompletionRequest(**body)
+
+    def _prompt_ids(self, tokenizer, effort=None, prefill=None):
+        if prefill is not None:
+            text = tokenizer.apply_chat_template(
+                self.USER + [{"role": "assistant", "content": prefill}],
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
+            )
+        else:
+            kwargs = {"reasoning_effort": effort} if effort else {}
+            text = tokenizer.apply_chat_template(self.USER, tokenize=False, add_generation_prompt=True, **kwargs)
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    @staticmethod
+    def _output_ids(tokenizer, text, stop_id):
+        # what the engine yields: the tokens of the text, then the stop token (special: its text is "")
+        return tokenizer.encode(text, add_special_tokens=False) + [stop_id]
+
+    def _stream(self, parser_cls, tokenizer, prompt_ids, output_ids, request, tools=None):
+        """Feed one token per delta the way ``chat_completion_stream_generator`` does; join what the client gets."""
+        parser = parser_cls(tokenizer, tools)
+        reasoning, content, tool_calls = [], [], []
+        for i, token_id in enumerate(output_ids):
+            delta = parser.parse_delta(
+                delta_text=tokenizer.decode([token_id], skip_special_tokens=True),
+                delta_token_ids=[token_id],
+                request=request,
+                prompt_token_ids=prompt_ids,
+                finished=i == len(output_ids) - 1,
+            )
+            if delta is None:
+                continue
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+            tool_calls.extend(delta.tool_calls)
+        return "".join(reasoning), "".join(content), tool_calls
+
+    def _complete(self, parser_cls, tokenizer, output_ids, request, tools=None, enable_auto_tools=False):
+        """The non-streaming path: ``Parser.parse`` on the full text (vLLM strips the stop token's text)."""
+        parser = parser_cls(tokenizer, tools)
+        text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        return parser.parse(text, request, enable_auto_tools=enable_auto_tools, model_output_token_ids=output_ids)
+
+    def test_is_reasoning_end_on_prompts(self, tokenizer, parsers):
+        low, high = self._prompt_ids(tokenizer, "low"), self._prompt_ids(tokenizer, "high")
+        prefill = self._prompt_ids(tokenizer, prefill="Seoul is")
+        fixed, upstream = parsers["fixed"](tokenizer), parsers["upstream"](tokenizer)
+        assert tokenizer.decode(low[-6:]).endswith("<|begin|>assistant<|think|><|end|><|begin|>assistant")
+        assert upstream.is_reasoning_end(low)  # rule 1: the template's empty block -> "ended" -> raw stream
+        assert not fixed.is_reasoning_end(low)  # the model may still open a think block
+        assert not fixed.is_reasoning_end(high) and not upstream.is_reasoning_end(high)
+        assert fixed.is_reasoning_end(prefill) and upstream.is_reasoning_end(prefill)  # content already open
+        generated = tokenizer.encode(
+            f"<|think|>{self.THINK}<|end|><|begin|>assistant<|content|>", add_special_tokens=False
+        )
+        assert fixed.is_reasoning_end(generated) and upstream.is_reasoning_end(generated)
+        assert not fixed.is_reasoning_end(generated[:-3])
+
+    @pytest.mark.parametrize("effort", ["low", "high"])
+    def test_second_think_block_streams_as_reasoning(self, tokenizer, parsers, effort):
+        """The live defect: reasoning_effort low + the model re-opens <|think|> -> markers and reasoning streamed
+        as content. Fixed: reasoning / content split, no marker anywhere; effort high already worked upstream."""
+        prompt = self._prompt_ids(tokenizer, effort)
+        output = self._output_ids(
+            tokenizer, f"<|think|>{self.THINK}<|end|><|begin|>assistant<|content|>{self.ANSWER}", 24
+        )
+        reasoning, content, tool_calls = self._stream(parsers["fixed"], tokenizer, prompt, output, self._request())
+        assert (reasoning, content, tool_calls) == (self.THINK, self.ANSWER, [])
+        up_reasoning, up_content, _ = self._stream(parsers["upstream"], tokenizer, prompt, output, self._request())
+        if effort == "low":
+            assert up_reasoning == "" and "<|think|>" in up_content and "<|begin|>assistant" in up_content
+        else:
+            assert (up_reasoning, up_content) == (self.THINK, self.ANSWER)
+
+    def test_minimal_without_think_block(self, tokenizer, parsers):
+        prompt = self._prompt_ids(tokenizer, "minimal")
+        output = self._output_ids(tokenizer, f"<|content|>{self.ANSWER}", 24)
+        assert self._stream(parsers["fixed"], tokenizer, prompt, output, self._request()) == ("", self.ANSWER, [])
+        _, up_content, _ = self._stream(parsers["upstream"], tokenizer, prompt, output, self._request())
+        assert up_content.startswith("<|content|>")  # the tag leaked as content
+        for name in ("fixed", "upstream"):
+            assert self._complete(parsers[name], tokenizer, output, self._request()) == ("", self.ANSWER, [])
+
+    def test_prefilled_content_passes_through(self, tokenizer, parsers):
+        """continue_final_message: the prompt already opened <|content|>; the output carries no tag at all."""
+        prompt = self._prompt_ids(tokenizer, prefill="Seoul is")
+        rest = " the capital of South Korea."
+        output = self._output_ids(tokenizer, rest, 24)
+        for name in ("fixed", "upstream"):  # streaming was already right (pass-through after the prompt check)
+            assert self._stream(parsers[name], tokenizer, prompt, output, self._request()) == ("", rest, [])
+        assert self._complete(parsers["fixed"], tokenizer, output, self._request()) == ("", rest, [])
+        _, up_content, _ = self._complete(parsers["upstream"], tokenizer, output, self._request())
+        assert not up_content  # the live defect: 56 generated tokens, empty content
+
+    def test_tool_call_after_think_block(self, tokenizer, parsers):
+        prompt = self._prompt_ids(tokenizer, "low")
+        output = self._output_ids(
+            tokenizer, f"<|think|>Need the weather tool.<|end|><|begin|>assistant{self.TOOL_CALL}", 25
+        )
+        request = self._request(self.TOOLS)
+        assert request.tool_choice == "auto"
+        reasoning, content, tool_calls = self._stream(
+            parsers["fixed"], tokenizer, prompt, output, request, tools=request.tools
+        )
+        assert reasoning == "Need the weather tool." and content == ""
+        assert [tc.function.name for tc in tool_calls if tc.function and tc.function.name] == ["get_weather"]
+        assert [tc.id for tc in tool_calls if tc.id] == ["abc123defg"]
+        assert json.loads("".join(tc.function.arguments or "" for tc in tool_calls if tc.function)) == {"city": "Seoul"}
+        for name in ("fixed", "upstream"):
+            r, c, calls = self._complete(
+                parsers[name], tokenizer, output, request, request.tools, enable_auto_tools=True
+            )
+            assert r == "Need the weather tool." and not c
+            assert [(tc.name, json.loads(tc.arguments)) for tc in calls] == [("get_weather", {"city": "Seoul"})]
+
+    def test_merged_delta_keeps_first_content_token(self, tokenizer, parsers):
+        """A detokenizer delta "<|end|><|begin|>assistant<|content|>Seoul" must not lose "Seoul"."""
+        parser = parsers["fixed"](tokenizer, None)
+        request = self._request()
+        prompt = self._prompt_ids(tokenizer, "low")
+        chunks = ["<|think|>", self.THINK, "<|end|><|begin|>assistant<|content|>Seoul", " is the capital."]
+        ids = [tokenizer.encode(c, add_special_tokens=False) for c in chunks]
+        got = []
+        for i, (text, tid) in enumerate(zip(chunks, ids)):
+            delta = parser.parse_delta(
+                delta_text=text, delta_token_ids=tid, request=request, prompt_token_ids=prompt, finished=i == 3
+            )
+            if delta is not None:
+                got.append((delta.reasoning or "", delta.content or ""))
+        assert "".join(r for r, _ in got) == self.THINK
+        assert "".join(c for _, c in got) == "Seoul is the capital."
+
+    def test_non_streaming_matches_upstream_on_tagged_outputs(self, tokenizer, parsers):
+        fixed, upstream = parsers["fixed"](tokenizer), parsers["upstream"](tokenizer)
+        request = self._request()
+        for text in (
+            f"<|think|>{self.THINK}<|end|><|begin|>assistant<|content|>{self.ANSWER}",
+            f"<|content|>{self.ANSWER}",
+            "<|think|>truncated reasoning without an end",
+            f"<|think|><|end|><|content|>{self.ANSWER}",
+        ):
+            assert fixed.parse(text, request) == upstream.parse(text, request)

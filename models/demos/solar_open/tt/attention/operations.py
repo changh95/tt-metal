@@ -30,19 +30,29 @@ def attention_bf16_output(program_config=None) -> bool:
     return os.getenv(ATTENTION_BF16_OUTPUT_ENV, "0") == "1"
 
 
-def apply_qkv_projection(hidden_states, weights: AttentionWeights):
+def apply_qkv_projection(hidden_states, weights: AttentionWeights, program_config=None, compute_kernel_config=None):
     """
     Apply the fused, bias-free QKV projection.
 
     Args:
         hidden_states: Input tensor [batch, seq_len, hidden_size]
         weights: Attention weights container
+        program_config, compute_kernel_config: an explicit matmul program config and the compute config that must
+            accompany it (a program config alone drops the bf16 x bfp8 matmul to LoFi, see ``linear_configs``); both
+            None = ttnn's auto config (phase 1). Phase 3g / D2 pins a packed pass to the per-user pass's in0_block_w.
 
     Returns:
         Fused QKV tensor [batch, seq_len, total_qkv_dim]
     """
-    xqkv_fused = ttnn.linear(hidden_states, weights.wqkv, dtype=ttnn.bfloat16)
-    return xqkv_fused
+    if program_config is None:
+        return ttnn.linear(hidden_states, weights.wqkv, dtype=ttnn.bfloat16)
+    return ttnn.linear(
+        hidden_states,
+        weights.wqkv,
+        dtype=ttnn.bfloat16,
+        program_config=program_config,
+        compute_kernel_config=compute_kernel_config,
+    )
 
 
 def split_qkv_heads_prefill(xqkv_fused, num_heads: int, num_kv_heads: int):
@@ -129,7 +139,14 @@ def concat_heads(tensor, is_decode_mode: bool):
     return ttnn.experimental.nlp_concat_heads(tensor, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-def apply_output_projection(tensor, weights: AttentionWeights, activation_dtype, keep_bf16=False):
+def apply_output_projection(
+    tensor,
+    weights: AttentionWeights,
+    activation_dtype,
+    keep_bf16=False,
+    program_config=None,
+    compute_kernel_config=None,
+):
     """
     Apply the bias-free output projection (per-device partial sum; the TP all-reduce follows).
 
@@ -141,14 +158,20 @@ def apply_output_projection(tensor, weights: AttentionWeights, activation_dtype,
             ``attention_bf16_output``: the bf16 x bfp8 matmul then runs HiFi2). With a bfp8 activation dtype (prefill
             above 32K, prefill.py) the cast stays: the output is block-quantised anyway and a bf16 ``[S, 1024]`` input
             would only cost DRAM at that length.
+        program_config, compute_kernel_config: an explicit matmul program config and the compute config restating the
+            auto fidelity of the operand pair (LoFi for bfp8 x bfp8, HiFi2 with ``keep_bf16``); both None = ttnn's auto
+            config. Phase 3g / D2 pins a packed pass to the per-user pass's in0_block_w.
 
     Returns:
         Output tensor after projection
     """
+    kwargs = {}
+    if program_config is not None:
+        kwargs = dict(program_config=program_config, compute_kernel_config=compute_kernel_config)
     if keep_bf16 and activation_dtype == ttnn.bfloat16:
-        return ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype)
+        return ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype, **kwargs)
     tensor = ttnn.typecast(tensor, ttnn.bfloat8_b)
-    out = ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype)
+    out = ttnn.matmul(tensor, weights.o_proj, dtype=activation_dtype, **kwargs)
     tensor.deallocate(True)
     return out
 

@@ -9,22 +9,30 @@ traced prefill at 128 tokens and the Blackhole user-grid placement are kept; the
 (attention-sink logits and biases, clamped SwiGLU, sliding windows, channel-token shortcuts) is gone and Solar's
 sigmoid router with selection bias plus the shared expert are added.
 
-Status: phase 3e complete (2026-09-10): batch-32 decode 36.0 ms/step (~890 tok/s aggregate; phase 1 92.1, phase 2 62.5, phase 3b 40.3,
+Status: phase 3g complete (2026-09-10; the perf numbers are phase 3e's, nothing in the sequential path moved since): batch-32 decode 36.0 ms/step (~890 tok/s aggregate; phase 1 92.1, phase 2 62.5, phase 3b 40.3,
 phase 3c 37.8, phase 3d 37.6), batch-1 decode 14.0 ms/step (phase 1 54.4, phase 2 18.0, phase 3b / 3c 16.0, phase 3d 15.9), TTFT@128 ~150-160 ms per user,
 batch-32 TTFT 4.8 s last user with the sequential prefill (the default again since phase 3e / A0; the packed pass, opt-in `SOLAR_OPEN_BATCHED_PREFILL=1`,
-gives 1.77 s for every user but is worse than the sequential prefill against HF at the first token), single-user context to 131072 tokens (four 32K chunks: 128K TTFT 72 s, 28 ms/step, phase 3d). Phase 3e's
+was worse than the sequential prefill against HF at the first token until phase 3g / D2: with `SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=2` (default) a packed pass is BIT-IDENTICAL to the sequential prefills and takes 3.9 s for every user of a 32 x 128 pass (1.8-2.3 s at knob `0`); the default stays `0`, the flip is the user's decision -- see the decision input in "Phase 3g rows"), single-user context to 131072 tokens (four 32K chunks: 128K TTFT 72 s, 28 ms/step, phase 3d). Phase 3e's
 decode levers are on by default for TP > 1: the fused single-kernel TP all-reduce (`SOLAR_OPEN_DECODE_CCL=fused`) and the bfp8 shared-expert decode
 partial (`SOLAR_OPEN_SHARED_DOWN_BFP8=1`) are NOT bit-identical to phase 3d (closer to the fp32 sum; every accuracy floor holds, the moved digits are the
 new record), the fused Q/K RoPE + fused K/V cache update and the explicit (8,8) o_proj (`SOLAR_OPEN_ATTENTION_FUSED_QK`, `SOLAR_OPEN_ATTENTION_OUT_GRID`)
-are bit-identical; every prefill digit is unchanged. Known since phase 3e / A0: the packed 32-user prefill pass is systematically worse than the sequential
-prefill against HF at the first token (see "Known limitations"). See "Recorded baselines" at the end: the phase-1 vs phase-2 summary table first, then the
-per-test rows, then the phase 3a / 3b / 3c / 3d / 3e rows (each with its own before / after table) and the ISL/OSL x batch sweeps (`_p3cfull`, `_p3c`
+are bit-identical; every prefill digit is unchanged. The phase 3e / A0 finding (the packed 32-user prefill pass systematically worse than the sequential prefill against HF at the
+first token) is RESOLVED in phase 3g: D1 bisected it to ttnn's auto matmul `in0_block_w` changing with the row count (layer 0, op qkv, then the
+shared expert's row-count-gated configs, the T-row head and the expert-sorted MoE), D2 pinned every packed pass to the per-user programs (see
+"Known limitations" and "Phase 3g rows"). See "Recorded baselines" at the end: the phase-1 vs phase-2 summary table first, then the
+per-test rows, then the phase 3a / 3b / 3c / 3d / 3e / 3f / 3g rows (each with its own before / after table) and the ISL/OSL x batch sweeps (`_p3cfull`, `_p3c`
 subset, `_p3b`, `_p2`).
 
-Served (phase 3f, 2026-09-10): the same tree runs under upstream vLLM 0.25.1 + vllm-tt-plugin 51b43cf through tt-inference-server
-`--local-server` on P150x8 (greedy tokens == the demo `batch32` case; 32 users 820 tok/s aggregate with the shipped `--no-async-scheduling`,
-931 tok/s with async scheduling; TTFT-last 4.8 s from the sequential prefill), see "Serving with vLLM and tt-inference-server" and the
-phase 3f rows.
+Served (phase 3f, 2026-09-10): the same tree runs under upstream vLLM 0.25.1 + vllm-tt-plugin 51b43cf (+ the phase 3g / I1 patches on the
+clone's branch `solar-fixes`) through tt-inference-server
+`--local-server` on P150x8 (greedy tokens == the demo `batch32` case; 32 users 932 tok/s aggregate with async scheduling, the
+default again since phase 3g / L1 (820 tok/s with `--no-async-scheduling`); TTFT-last 4.8 s from the sequential prefill), see "Serving with vLLM and tt-inference-server" and the
+phase 3f / 3g rows. Phase 3g / I1 + L1 (2026-09-10) fixed and live-verified the three serving defects met in phase 3f -- the plugin's
+async-scheduling EOS crash and its plain-arch registration (both spec workarounds retired: `Resolved architecture: SolarOpenForCausalLM`,
+`Asynchronous scheduling is enabled.`, 0 crashes over 5 stop-token pairs + 8- / 32-user natural-stop bursts), Upstage's reasoning parser
+under `reasoning_effort low` (raw think blocks in the stream, empty assistant-prefilled content; 32 / 32 prompts clean) -- and found and
+fixed a fourth: every vLLM prompt of 129-1023 tokens decoded garbage after a correct first token (pad K/V written through the exact-fit
+page table's null-block entries; `tt/prefill_fill.py`).
 
 Numerics (relative to the bf16 HF model): weights are bfp8 (experts, attention, lm_head, KV cache) / bf16 (embeddings,
 norms, router gate, fp32 router bias); the residual stream is bf16 (`DecoderLayer._residual_add` writes each residual
@@ -145,7 +153,7 @@ without any checkpoint.
 | `SOLAR_OPEN_TF_REFERENCE` | `$TT_CACHE_PATH/teacher_forced_reference.pt` | reference file written by `tests/accuracy/gen_reference.py` and read by `tests/accuracy/test_teacher_forced.py` |
 | `SOLAR_OPEN_TF_REPORT_DIR` | unset | `test_teacher_forced.py` writes a markdown report (`teacher_forced_<case>.md`: per-prompt metrics, HF vs TT greedy continuations) into this directory |
 | `SOLAR_OPEN_NUM_DEVICES` | unset | test collection only: replaces `ttnn.get_num_devices()` in the mesh parametrizations so `pytest --collect-only` / `python -c "import ..."` never touch the devices (e.g. `SOLAR_OPEN_NUM_DEVICES=8`) |
-| `SOLAR_OPEN_BATCHED_PREFILL` | `0` (phase 3e / A0 reverted phase 3d / A3's `1`: the packed pass is worse than the sequential prefill against HF at the first token, see "Known limitations") | `0` turns the phase-3a packed multi-user prefill off everywhere (= the phase-2 sequential prefill, byte-identical). With `1` the DEMO / DRIVER packs (`tt/model.py::prefill_forward_text_batched`, policy `tt/model_config.py::plan_batched_prefill`): equal-length short prompts of one call run as ONE `[1, 1, B*S, H]` forward (per-user causal attention and paged KV fill; MoE / router / norms row-wise over `T = B*S`) instead of B sequential per-user prefills -- batch-32 TTFT-last 4.7 s -> 2.1-2.3 s for every user (A3, one 32 x 128 pass, the phase-3d default budget; R1 measured the same pass once at 1.76 s). Driver-only by design (option B of the flip-on procedure): `ModelArgs.disable_batched_prefill` is ALWAYS True, so a plain `Generator.prefill_forward_text` call (the regression harness at `enable_trace=True`, vLLM with on-device `sampling_params`, the sequential test arms) prefills per user whatever this flag says; only the driver lifts it per packed pass (`batched_prefill_flag`), host sampling only, never traced. HF-equivalent but not sequential-identical, and a user's logits depend on the SET of users in its pass (hot / cold experts are decided on all of them) -- accepted with packed-specific consistency floors, see "Known limitations" and the phase 3d rows. Phase 3c: a pass of at most `SOLAR_OPEN_BATCHED_PREFILL_TOKENS <= 4096` tokens is planned once per MoE chunk (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`), so identical users in different slots of ONE pass are bit-identical (fillers 0 of 720 flips) and rotating the 32 users over the slots costs a few near-tie flips (9 of 768 in P2). Cost of the default: the router prebuilds its `[T, E]` helpers for the packed row counts 256..4096 at every model load (+273 MiB DRAM per device measured, 17.572 -> 17.845 GiB after the batch-32 load) |
+| `SOLAR_OPEN_BATCHED_PREFILL` | `0` (phase 3e / A0 reverted phase 3d / A3's `1`: the packed pass was worse than the sequential prefill against HF at the first token -- fixed in phase 3g / D2 (`SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=2`: bit-identical to the sequential prefills, TTFT 3.9 s for every user of a 32 x 128 pass); the demo default stays `0`: R1 left the flip to the user, decision input in "Phase 3g rows") | `0` turns the phase-3a packed multi-user prefill off everywhere (= the phase-2 sequential prefill, byte-identical). With `1` the DEMO / DRIVER packs (`tt/model.py::prefill_forward_text_batched`, policy `tt/model_config.py::plan_batched_prefill`): equal-length short prompts of one call run as ONE `[1, 1, B*S, H]` forward (per-user causal attention and paged KV fill; MoE / router / norms row-wise over `T = B*S`) instead of B sequential per-user prefills -- batch-32 TTFT-last 4.7 s -> 2.1-2.3 s for every user (A3, one 32 x 128 pass, the phase-3d default budget; R1 measured the same pass once at 1.76 s). Driver-only by design (option B of the flip-on procedure): `ModelArgs.disable_batched_prefill` is ALWAYS True, so a plain `Generator.prefill_forward_text` call (the regression harness at `enable_trace=True`, vLLM with on-device `sampling_params`, the sequential test arms) prefills per user whatever this flag says; only the driver lifts it per packed pass (`batched_prefill_flag`), host sampling only, never traced. HF-equivalent but not sequential-identical, and a user's logits depend on the SET of users in its pass (hot / cold experts are decided on all of them) -- accepted with packed-specific consistency floors, see "Known limitations" and the phase 3d rows. Phase 3c: a pass of at most `SOLAR_OPEN_BATCHED_PREFILL_TOKENS <= 4096` tokens is planned once per MoE chunk (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`), so identical users in different slots of ONE pass are bit-identical (fillers 0 of 720 flips) and rotating the 32 users over the slots costs a few near-tie flips (9 of 768 in P2). Cost of the default: the router prebuilds its `[T, E]` helpers for the packed row counts 256..4096 at every model load (+273 MiB DRAM per device measured, 17.572 -> 17.845 GiB after the batch-32 load) |
 | `SOLAR_OPEN_BATCHED_PREFILL_TOKENS` | `4096` (phase 3d / A3; was `1024`) | token budget of one packed pass (`B_mb x S <= n`): 4096 = the whole batch-32 demo (32 x 128) in ONE pass = one MoE chunk and one hot / cold plan for the whole set (R1: TTFT 1760 ms for every user, decode plateau unchanged; A3 2083-2308 ms over five runs, see the phase 3d rows); 1024 = 8 x 128-token users -> four passes for batch 32 (TTFT 825 / 1535 / 2228 ms first / mean / last: better first and mean, worse last, and a user's numerics then depend on its 7 pass mates); clamped to 256..8192 (the v1 head runs norm + lm_head on every row of the pass and reads one 32-row tile per user back); above 4096 a pass spans two MoE chunks with two plans (`from_env` warns). The packed gates (`-k packed32`) pin 4096 explicitly |
 | `SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN` | `128` | largest PADDED per-user prefill length that is packed (1024 opts the 1K bucket in; the >= 1K buckets already run the expert-sorted MoE at a flat per-token cost, so packing them buys little TTFT-last and costs TTFT-mean). The demo chooses its branch per batch from the plan: a batch whose plan has no packed pass (the 16k / 32k cases at the default) runs the phase-2 sequential branch unchanged |
 | `SOLAR_OPEN_PREFILL_EXPERT_MM` | `tuned` | A/B preset of the phase-3a prefill expert matmul configs (`tt/expert_configs.py::PREFILL_EXPERT_MM_PRESETS`): `tuned` = the shipped `SolarOpenProgramConfig` values (per-expert gate\|up of the sorted hot group / per-expert loop as `ttnn.experimental.minimal_matmul` (11,5) K16 sub 3x2 -- 46 vs 81 us per expert at 1024 tokens; the hot group's down + sum over the hot experts as ONE K-concatenated minimal_matmul (11,10) K5 N12 sub 4x2 over bf16 GLU pieces -- 117 + 36 vs 394 + 205 us at 15 hot; dense down `out_subblock_h = Mt`, bit-identical), `phase2` = the phase-2 forms, `gate_up_alt` = the better-numerics (11,10) K8 gate\|up blocking, `bfp8_act` = tuned + bfp8 activation broadcast on the dense 128-token path (numerics switch, off). Cache-neutral. Measured (see the phase-3a baselines): per-layer prefill_1024 10.64 -> 8.20 ms, TTFT 1K 415 -> 388, 2K 1066 -> 721, 4K 1575 -> 1401, 8K 3191 -> 2907 ms; 128-token prefill and decode unchanged |
@@ -153,6 +161,7 @@ without any checkpoint.
 | `SOLAR_OPEN_SORTED_MOE_PLAN` | `auto` | Plan granularity of the expert-sorted prefill MoE's hot / cold sets (`tt/experts/prefill.py`, arithmetic in `tt/experts/sorted_plan.py`; phase 3c). `auto`: a PACKED multi-user pass (`Model.ttnn_prefill_forward` with `batch_size > 1`, marked through `experts.prefill.packed_prefill_pass`) is planned ONCE per 4096-token chunk -- one count readback (exact fp32 counts) and one (cap, hot set, cold mask) shared by all its 1024-token splits, so a token's path does not depend on the split its slot falls into -- while single-user prefills keep the phase-3b per-split plan (byte-identical ops: the flag-off gates of P2 reproduce every recorded digit). `chunk`: per chunk for every prefill (one sync per chunk instead of four, design_traced_prefill.md G1; single-user 2K+ outputs move at the bfp8 floor; TTFT effect not measured -- opt-in study). `split`: the phase-3b per-split plan everywhere (packed passes are then slot dependent again: the A/B arm). A chunk with ONE planned split always takes the legacy code. Cache-neutral |
 | `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT` | `average` | Hot-set rule of the per-chunk plan. `average`: an expert is hot when its chunk-AVERAGE per-split count exceeds the cost model's cap -- a function of the SET of users in the pass, not of their slot layout -- and the gather cap is raised to the smallest listed cap (32..256) that fits every cold expert in every split (a cold expert above 256 tokens in some split is promoted to hot and logged as `promoted`). `max`: the cost model on the per-expert maxima over the splits (= the union of the per-split plans' hot sets, cheaper caps) -- layout dependent, the A/B arm. `SOLAR_OPEN_SORTED_MOE_DEBUG=1` prints one line per chunk and layer: cap vs cost-model cap, hot, promoted, per-split hot counts |
 | `SOLAR_OPEN_BATCHED_PREFILL_HEAD` | `full` | Head of a packed pass (phase 3c). `full`: the tt_transformers batched path (norm + lm_head over every row of the pass, one 32-row tile read back per user). `gather`: `Model.packed_prefill_pass` gathers the B last-token rows into ONE `[1, 1, 32, H]` tile row (`ttnn.embedding`, the row gather of the sorted MoE), runs norm + lm_head on 32 rows -- the single-user head's programs -- and reads `32 x vocab` back once per pass (design_packed_prefill.md 2.6 item 1). Eager only, host sampling; per-user logits are not bit-identical to `full` (another lm_head program config). Opt-in; not part of the phase-3d default |
+| `SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS` | `2` (phase 3g / D2) | Numerics of a PACKED multi-user prefill pass (`tt/packed_numerics.py`, pure half in `tt/packed_prefill.py`; read at import, in effect only inside a packed pass -- a single-user prefill and decode never see it). `0` = the phase 3a-3f behaviour: ttnn's auto matmul configs at `T = B x S` rows and the T-row head, which is the WORSE arm at the first token (phase 3e / A0; root cause phase 3g / D1: the auto `in0_block_w` changes with the row count at qkv (1D k=2 at 128 rows -> 2D k=1 from 256), o_proj (from 1024), the shared expert leaves its explicit 128-row configs, the T-row head normalizes with the default kernel instead of the sequential head's width-sharded 32-row kernel (which is the one closer to fp32: 0.4 % vs 2.3 % RMS) and takes a 2D lm_head config at M = 4096, and the expert-sorted MoE of 1024-row splits differs from the 128-row prefill's dense bmm). `1` = every row-wise MATMUL and the head reproduce the per-user S-row pass bit for bit (qkv / o_proj through an explicit 2D config carrying the S-row `in0_block_w` + the auto compute config, the shared expert in S-row pieces, the head as 32-row tiles + lm_head pieces of <= 1024 rows): exact up to T = 256 (2 x 128, 16 x 2 x 128: 32 / 32 users bit-identical), the sorted MoE of longer passes untouched (one 32 x 128 pass: 26 / 32 top-1 = HF, KL 0.1865, gap -0.93 vs the sequential arm; ~+0.4 s per 32 x 128 pass). `2` (default) = `1` plus the routed experts as dense-bmm splits of `dense_bmm_max_tokens` rows whenever the per-user S runs the dense bmm itself (S <= 256): the whole pass equals the S-row sequential prefills bit for bit at any T -- `unit/test_batched_prefill.py` 32 / 32 users exact for 2 / 8 / 16 x 2 / 4 x 8 / 32 x 128, `-k packed32` teacher-forced = the sequential `b32` digits, consistency packed32 0 flips -- at the dense path's cost: demo `packed_b32_128` TTFT 3.9 s for every user (level 0: 1.8-2.3 s; sequential 0.15 / 2.44 / 4.74 first / mean / last). Users longer than 256 tokens (`SOLAR_OPEN_BATCHED_PREFILL_MAX_SEQ_LEN=1024`) get level-1 treatment at either level (their sequential arm is the sorted path itself). See "Phase 3g rows" |
 | `SOLAR_OPEN_PACKED_DECODE_TRACE_WARMUP` | `1` | demo only (phase 3d / A3): with the packed prefill the demo captures the decode trace BEFORE the packed compile pass (one mock decode step at position 0, the Generator's own order for the sequential branch; packed passes are eager and never arm the Generator's implicit capture), so iteration 0 replays in ~25 ms instead of capturing for ~1.2 s (R1). `0` = the phase-3c order (iteration 0 captures). A/B lever for the packed TTFT: with the capture between the compile pass and the timed pass the timed pass measured 2155-2308 ms, before the compile pass 2083 ms, R1 without any capture 1760 ms (one sample each; the eager 4096-token pass is host-bound with a spread of several 100 ms) |
 | `SOLAR_OPEN_PREFILL_CHUNK_TOKENS` | `32768` | phase 3d (B1 / P1): the tt_transformers Generator prefills a SINGLE-user prompt whose PADDED length exceeds this many tokens in chunks of this length (`ModelArgs.max_prefill_chunk_size`; `tt/chunked_prefill.py`, `tt/attention/prefill.py`): chunk i writes its K / V into its own page blocks (`chunk_page_table`) and, for i > 0, attends with `ttnn.transformer.chunked_scaled_dot_product_attention` over the paged-cache prefix, its RoPE rows offset by the chunk start; chunk 0 and every prefill up to the chunk length run the unchanged legacy ops (bit-identical to phase 3c). A power of two in 2048..131072 (else `ModelArgs` raises); `131072` = never chunk (the phase-3c behaviour: the 128K cases skip again on 1x8, the 64K prompt is one pass with the bfp8 attention output above 32K). The demo's `prefill_64k_chunked` case pins `32768`; `prefill_128k` runs on single-row meshes when the value is <= 65536 (`single_row_prefill_cap`). Multi-user / packed prefills never chunk. Measured: see the phase-3d rows |
 | `SOLAR_OPEN_DECODE_EGP` | `on` | `off` restores the phase-2 decode expert configs (`tt/expert_configs.py::DECODE_EGP_LEGACY`: legacy sparse_matmul kernels, gate\|up 5x2, batched down 8x8 x 2 tiles from 16 users, the b1 indexed down on the single-user 8x4 x 4 tiles grid); `p3b` restores the phase-3b ones (EGP on, only the b1 indexed compact-A down back on the 8x4 x 4 tiles grid: the A/B arm of the phase-3c lever, `decode_down_indexed_cores` 8x8 x 2 tiles, 20.6 -> 15.7 us kernel per layer, see "Recorded baselines", phase-3c rows). With `on` (phase 3b) the decode `ttnn.sparse_matmul`s run with EXPERT GROUPS (`expert_groups=11`, the new op keyword; `None` = the legacy kernels byte for byte): the fused gate\|up on 11x10 = 11 groups x 10 output blocks (every decode path incl. the b1 indexed one), the batched down on 11x8 = 11 groups x 8 blocks of 16 tiles from 2 users on; each group streams every 11th active expert concurrently, the activation tile is multicast once and kept resident in L1, every core decides each expert's validity locally. Bit-identical per output tile (same math): the component PCCs and the teacher-forced metrics reproduce to the digit. `solar_open_program_config()` applies the `off` values itself on compute grids narrower than 11x10. Cache-neutral. Measured (see "Recorded baselines", phase-3b rows): per layer at the 32-user union gate\|up 669 -> 276 us, down 216 -> 144 us kernel |
@@ -224,15 +233,18 @@ SOLAR_OPEN_FUSE_SHARED_EXPERT=1 pytest $T/unit/test_modules.py -k "test_decoder 
 SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_batched_prefill.py -k host      # host: phase-3a packed-prefill knobs, microbatch plan, driver (fake Generator), trace guard
 SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_traced_prefill.py -k Host       # host: MoE path selection, trace table validation, router helper persistence
 pytest $T/unit/test_traced_prefill.py -k "1x8 and prefill_128"                # real weights: traced prefill == eager (logits, KV pages, stale-trace, MoE path, router helpers); 1K/2K/4K skip until the table lists them
-pytest $T/unit/test_batched_prefill.py -k "1x8 and b8_s128"                   # real weights: packed 8 x 128 pass vs sequential per user (no-garbage floors; 4 teacher-forced decode steps over the packed KV; cross-user distinctness); also b2_s128, b32_s128, b4_s1024, b8_s128_x2
+pytest $T/unit/test_batched_prefill.py -k "1x8 and b8_s128"                   # real weights: packed 8 x 128 pass vs sequential per user (no-garbage floors; 4 teacher-forced decode steps over the packed KV; cross-user distinctness; since phase 3g BIT-IDENTITY + the HF floors at the knob's default); also b2_s128, b32_s128, b4_s1024, b8_s128_x2, b32_s128_x16, b32_s128_x4
 pytest $T/test_layer0_batched_prefill.py -k 1x8                               # real layer 0: packed (batch_size=4) vs per-user attention / MoE / layer, KV blocks, both vs HF; the `dup` cases: identical users in different slots are bit-identical (b16_s128_dup: copies in the OTHER 1024-token split, the per-chunk plan of phase 3c)
 pytest $T/unit/test_sorted_moe_chunk_plan.py                                  # host: phase-3c per-chunk planner (average / max rules, layout invariance over slot permutations, promotion), gather-head rows
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_prefill_fill.py               # host: phase-3g / L1 fill bound of a single-user eager prefill (real blocks only; traced / packed / chunked tables untouched)
+SOLAR_OPEN_NUM_DEVICES=8 pytest $T/unit/test_packed_numerics.py              # host: phase-3g "sequential numerics" knob (levels, ttnn's auto in0_block_w rule vs the D1-identified configs, row pieces, pass marker, level-2 dense splits, the 2D configs it emits)
+SOLAR_OPEN_BISECT_OUT=<dir> SOLAR_OPEN_BISECT_VERIFY_FIX=1 pytest $T/test_packed_bias_bisect.py -k 1x8   # real weights, diagnostic: per-layer / per-op bisection of a packed pass vs the sequential prefill (arms A / B / C / D), the fix's levers by bit-identity, E0 norm kernels; writes bisect_results.json / tables.md
 pytest models/demos/solar_open/tests/test_multi_user_consistency.py -k "1x8 and packed32"   # slot-independence gate of the packed path (one 32 x 128 driver pass per prefill, packed-specific floors: rotated <= 32 / 768 and lone prompt <= 3 / 24 flips, every flipped step a near tie of <= 1.0 logit, PCC >= 0.97 / 0.96, same slots / fillers exact); -k "1x8 and b32" = the sequential arm (exact floors); -k 1x8 runs both (~4 min warm)
 pytest $T/unit/test_batched_prefill.py -k "1x8 and b32_s128_gather"           # the opt-in gather head (SOLAR_OPEN_BATCHED_PREFILL_HEAD=gather) vs the sequential arm
 pytest $T/perf/test_prefill_matmul_candidates.py -k 1x1                       # one device: phase-3a prefill expert matmul candidates + the wired forms (PCC parity, dense-down bit-identity, per-op burst times)
 SOLAR_OPEN_PERF_PROFILE=1 pytest $T/perf/test_attention_prefill_microbench.py -k "sdpa or allreduce"   # under tracy: SDPA chunk/grid sweep (1x1), all_reduce dtype/links (1x8)
 pytest models/demos/solar_open/tests/accuracy/test_teacher_forced.py -k "packed32 and 1x8"   # the packed 32 x 128 pass against the HF reference (the accuracy gate of the packed path, same floors); "b32 and 1x8" = sequential prefill
-pytest $D -k "packed_b32_128 and 1x8"                                         # 32 users, packed prefill FORCED (also with SOLAR_OPEN_BATCHED_PREFILL=0); the plain batch32 case packs by default since phase 3d (one 32 x 128 pass at SOLAR_OPEN_BATCHED_PREFILL_TOKENS=4096; 1024 -> four 8 x 128 passes); both log TTFT first/mean/last
+pytest $D -k "packed_b32_128 and 1x8"                                         # 32 users, packed prefill FORCED (also with SOLAR_OPEN_BATCHED_PREFILL=0); the plain batch32 case packed by default from phase 3d / A3 to phase 3e / A0 and prefills sequentially since (SOLAR_OPEN_BATCHED_PREFILL=1 packs it: one 32 x 128 pass at SOLAR_OPEN_BATCHED_PREFILL_TOKENS=4096, 1024 -> four 8 x 128 passes; bit-identical to the sequential prefills since phase 3g / D2); both log TTFT first/mean/last
 ```
 
 Perf tests (phase 2; not correctness tests, `tests/perf/`). The first two are the fast A/B tools of every perf change
@@ -481,14 +493,15 @@ after the compile pass + timed pass of 4 x 32K each).
 
 Solar-Open-100B is served live by upstream vLLM 0.25.1 + the standalone
 [tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin) through tt-inference-server's dockerless
-`--local-server` path on the 1x8 LoudBox since 2026-09-10 (mesh `(1, 8)`, TP=8, `FABRIC_1D_RING`; 7 server launches,
-ledgers and trimmed logs under `results/vllm/` (`S1/` host setup, `S2/` live server, `S3/` this write-up), design notes
-in `design/phase3/measurements.md` section 9). Warm-cache time-to-ready is 65-74 s; `/health`, `/v1/models`, greedy /
+`--local-server` path on the 1x8 LoudBox since 2026-09-10 (mesh `(1, 8)`, TP=8, `FABRIC_1D_RING`; 7 server launches in phase 3f + 4 in phase 3g / L1,
+ledgers and trimmed logs under `results/vllm/` (`S1/` host setup, `S2/` live server, `S3/` this write-up) and `results/phase3g/` (`I1/`
+the plugin / parser patches + issue drafts, `L1/` the live validation + the long-prompt probes), design notes
+in `design/phase3/measurements.md` sections 9 and 10). Warm-cache time-to-ready is 65-74 s; `/health`, `/v1/models`, greedy /
 sampled / seeded / `top_k` / reasoning-`high` / tool-call / streaming chat completions answer; the server's greedy
 output equals the demo's batch-32 case token for token; 32 concurrent greedy users decode at 25.6 tok/s/user (820 tok/s
-aggregate; demo `batch32` 889-901 tok/s) with the shipped `--no-async-scheduling`, 29.1 tok/s/user (931 tok/s) with
-async scheduling once the plugin bug below is fixed. Everything in this section was measured on this box; the numbers
-are collected in the "Phase 3f rows" table under "Recorded baselines".
+aggregate; demo `batch32` 889-901 tok/s) with `--no-async-scheduling`, 29.1 tok/s/user (931-932 tok/s) with async
+scheduling -- the default again since the plugin patch of phase 3g / L1 (see "Phase 3g rows"). Everything in this section
+was measured on this box; the numbers are collected in the "Phase 3f rows" table under "Recorded baselines".
 
 ### Install (the tt-metal `python_env`, Python 3.10; 2026-09-10, `results/vllm/S1/`)
 
@@ -520,14 +533,16 @@ state as the EXAONE venv). Every tt-inference-server `run.py` launch additionall
   `max_model_len`), `max_tokens_all_users_override 655872` (benchmark-client hint only), `tensor_cache_timeout 7200`,
   `env_vars {MESH_DEVICE P150x8, HF_HUB_OFFLINE 1, SOLAR_OPEN_TEMPLATE_DATE today}`, `override_tt_config {fabric_config
   FABRIC_1D_RING, trace_region_size 100000000, sample_on_device_mode decode_only}`, `vllm_args {block_size 64,
-  model-class-overrides ..., no-async-scheduling true, reasoning-parser solar_open, reasoning-parser-plugin <abs path of
+  reasoning-parser solar_open, reasoning-parser-plugin <abs path of
   vllm_plugins/solar_open_parsers.py>, tool-call-parser solar_open, tool-parser-plugin <same>, enable-auto-tool-choice
   true, default-chat-template-kwargs '{"reasoning_effort": "low"}'}`, `status EXPERIMENTAL`, `has_builtin_warmup true`,
   template env `VLLM_ALLOW_LONG_MAX_MODEL_LEN 1`. No `system_requirements` (this box's KMD 2.9.1-pre trips STRICT
   specifiers), no `tt_metal_commit` (the dev schema rejects it). The merged `vllm serve` line the spec produces:
   `--model upstage/Solar-Open-100B --block_size 64 --max_model_len 16384 --max_num_seqs 32 --max_num_batched_tokens
-  16384 --max-log-len 32 --seed 9472 --additional_config '{"tt": {...}}' --model-class-overrides ... --no-async-scheduling
-  --reasoning-parser solar_open ... --enable-auto-tool-choice --default-chat-template-kwargs '{"reasoning_effort": "low"}'`.
+  16384 --max-log-len 32 --seed 9472 --additional_config '{"tt": {...}}'
+  --reasoning-parser solar_open ... --enable-auto-tool-choice --default-chat-template-kwargs '{"reasoning_effort": "low"}'`
+  (`model-class-overrides` and `no-async-scheduling` were RETIRED in phase 3g / L1 -- kept as comments in the spec with the
+  reason -- once the vllm-tt-plugin branch `solar-fixes` registered the plain arch and fixed the async EOS step).
 - `vllm-tt-metal/extra_models/solar_open/vllm_metadata.json` (`git add -f`: `*.json` is gitignored) =
   `{"arch": "SolarOpenForCausalLM", "main_class": "models.tt_transformers.tt.generator_vllm:SolarOpenForCausalLM"}`; the
   plugin reads `EXTRA_MODELS_DIR=<repo>/vllm-tt-metal/extra_models` in every vLLM process and registers the arch as
@@ -569,9 +584,12 @@ pkill -TERM -f run_vllm_api_server.py; sleep 30; fuser -v /dev/tenstorrent/*   #
 tt-smi -r                                                                        # see "Known limitations": the stop is not graceful
 ```
 
-Expected start-up lines, in order (`results/vllm/S2/server_logs/`): `Registered TT model TTSolarOpenForCausalLM ...`
-(3x), `Applying model_class_overrides {...}` (WARNING "intended for development/debugging"), `Resolved architecture:
-SolarOpenForCausalLM`, `Asynchronous scheduling is disabled`, `Attempting to open mesh device with grid shape (1, 8)`,
+Expected start-up lines, in order (phase 3g / L1 launches, plugin branch `solar-fixes`; the S2 logs under
+`results/vllm/S2/server_logs/` still show the retired `Applying model_class_overrides {...}` warning and `Asynchronous
+scheduling is disabled`): `Registered TT model TTSolarOpenForCausalLM / SolarOpenForCausalLM -> ...generator_vllm:
+SolarOpenForCausalLM (from EXTRA_MODELS_DIR/solar_open)` (3x: run.py's inspection, APIServer, EngineCore), `Resolved
+architecture: SolarOpenForCausalLM` (no override warning), `Asynchronous scheduling is enabled.` (APIServer and
+EngineCore), `Attempting to open mesh device with grid shape (1, 8)`,
 `Setting fabric config: FabricConfig.FABRIC_1D_RING, reliability mode: FabricReliabilityMode.STRICT_INIT`, `TTModelRunner:
 trace_mode=all, sample_on_device_mode=decode_only, enable_model_warmup=True`, `Chunked prefill is not supported for
 model_type=solar_open; disabling it`, `Prefix caching is not supported in TT backend ... disabling it`, the weight-cache
@@ -583,10 +601,12 @@ DataType.BFLOAT8_B (replicated)` (22 s), the plugin warm-up (eager prefill 128 /
 32 over six `SamplingParams` variants, `Using batch-1-only traced prefill warmup`, `Done Capturing Prefill Trace`, two
 `Done Capturing Decode Trace`, `Decode warmup completed`; 8 s inside the 100 MB trace region), `vLLM 0.25.1 compat shims
 ... {'vllm.entrypoints.openai.protocol': 'shim', 'vllm.entrypoints.openai.tool_parsers.abstract_tool_parser': 'shim'}`,
-`Registered vLLM reasoning/tool parser 'solar_open'` (both flags import the same file), `Chat template warmup completed`,
-`Application startup complete`. Harmless warnings: `Unknown motherboard 'Z13PG-D32 Series'`, `Auto-initialization of
-reasoning token IDs failed` (Upstage's parser has no `reasoning_start_str` / `reasoning_end_str`), `Allocating device
-buffers is potentially unsafe due to the existence of an active trace` (also in the demo).
+`Registered vLLM reasoning parser 'solar_open' -> SolarOpenTTReasoningParser (on SolarOpenReasoningParser; the upstream
+class as 'solar_open_upstream')` and `Registered vLLM tool parser 'solar_open' -> SolarOpenToolParser` (both flags import
+the same file), `Chat template warmup completed`, `Application startup complete`. Harmless warnings: `Unknown motherboard
+'Z13PG-D32 Series'`, `Allocating device buffers is potentially unsafe due to the existence of an active trace` (also in
+the demo). Gone since L1: `Auto-initialization of reasoning token IDs failed` (the fixed parser declares
+`reasoning_start_str` / `reasoning_end_str`). `/health` 200 at 67-77 s over the four L1 launches.
 
 ### What was verified live (2026-09-10, launches 3-7 of `results/vllm/S2/runs.txt`; every request file under `results/vllm/S2/`)
 
@@ -609,6 +629,43 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   `4011803000` (S1's empty-id concern does not reproduce live). Sampling: `generation_config.json` defaults (T 0.8 /
   top_p 0.95) and `seed 1` requests answer (the seeded one opened a `<|think|>` block despite `low`: model behaviour);
   `top_k 50` is accepted and clamped to 32 on device without a log line.
+- Phase 3g / I1 fixes, host-verified and then LIVE-VERIFIED on 2026-09-10 (L1, four server launches, ledger
+  `results/phase3g/L1/runs.txt`; details in "Phase 3g rows"): (1) `vllm_plugins/solar_open_parsers.py` now registers
+  `SolarOpenTTReasoningParser` (Upstage's class + `vllm_support.SolarOpenReasoningParserFixes`) as `solar_open` and the
+  class as shipped as `solar_open_upstream`. It fixes what the live runs showed: under `reasoning_effort: low` vLLM 0.25
+  asks `is_reasoning_end(prompt)` once, Upstage's rule "the template's empty `<|think|><|end|>` block means ended" says
+  yes, and the think block the model opens anyway streamed RAW into `content` (`<|think|>`, `<|end|>`,
+  `<|begin|>assistant`, `<|content|>` included); an assistant-prefilled `continue_final_message` request returned EMPTY
+  content (no channel tag in the output); the first content token merged into the `<|content|>` delta was dropped. The
+  fix keeps the reasoning phase until the GENERATED tokens reach `<|content|>` / `<|tool_calls|>` (so a JSON /
+  tool-choice grammar now starts there, not at token 0, under `low`), treats a tagless output as content, scrubs
+  structural markers from deltas, and declares `reasoning_start_str` / `reasoning_end_str` (the "Auto-initialization
+  of reasoning token IDs failed" warning goes away). Verified through vLLM's own `Parser.parse_delta` state machine in
+  `tests/unit/test_vllm_wrapper_import.py::TestReasoningParserStreamingWithVllm` (56 passed / 1 skipped for the file).
+  (2) vllm-tt-plugin clone, branch `solar-fixes` (uncommitted; diff in the phase-3g I1 scratch): the async-scheduling
+  EOS crash (`_apply_sampled_tokens_to_state` skips a deferred step whose request finished after submit) and the
+  plain-arch registration of `EXTRA_MODELS_DIR` bundles (+ the KV-spec hook scanning `hf_config.architectures`), which
+  retired `no-async-scheduling` and `model-class-overrides` from the spec: L1 confirmed `Resolved architecture:
+  SolarOpenForCausalLM` without the override warning and `Asynchronous scheduling is enabled.`, 5 / 5 stop-token-finished
+  requests followed by a second request (the S2 crash, 4 / 4 at 51b43cf) plus 8- and 32-user natural-stop bursts with 0
+  `AssertionError`, and the parser live: 32 / 32 demo prompts streamed under `low` (28 opened a think block) with 0
+  structural markers in ~6000 deltas, stream == non-stream for every case, the assistant-prefilled
+  `continue_final_message` request returns ` the capital of South Korea.` (was empty), `response_format json_object` under
+  `low` yields `{"capital": "Seoul"}` after 361 reasoning deltas, tool calls at `low` and `high` return
+  `get_weather {"city": "Seoul"}` (id `4011803000` == S2's) streamed and not.
+- Phase 3g / L1 finding and fix (tt-metal `tt/prefill_fill.py`, `Model.ttnn_prefill_forward`): every vLLM prompt of 129-1023
+  tokens (padded to the eager 1024-token prefill) decoded GARBAGE after a correct first token, non-deterministically
+  (`<|end|>` runs, digits, the assistant header re-emitted), with async scheduling on or off, while the traced 128-token
+  prefill and the demo were exact. Root cause: the Generator's exact-fit page table (`padded_len / 64` columns) pads the
+  request's real blocks with the plugin's zero padding (block 0 = vLLM's null block) and `attention/prefill.py` filled all
+  padded rows through it; the pad-block writes corrupt the request's own decode (instruction in the prompt's tail: 0 / 1 /
+  5 / 13 pad entries -> 4/4 / 2/4 / 2/4 / 0/4 correct answers; S2's single 339-token tool call had been lucky). The model
+  now cuts the fill table to `ceil((get_last_token + 32) / block_size)` columns for single-user eager non-chunked
+  prefills (traced, packed and chunked passes untouched by construction): 4/4 in every pad-entry case, 16 / 16 length
+  probes deterministic, head / tail visibility 3/3 at 161 / 336 / 911 tokens, 8 concurrent tool calls 8/8; demo
+  `prefill_1k` output byte-identical, layer-0 digits and teacher-forced `b1` unchanged. Open: the last chunk of a > 32K
+  chunked prefill keeps its pad-entry writes; why writes into the null block corrupt the request is a ttnn
+  `paged_fill_cache` / plugin question (draft `results/phase3g/L1/issue_pad_block_fill.md`).
 - Concurrency (`results/vllm/S2/conc_client.py`: template-rendered ids to `/v1/completions`, streaming, `ignore_eos`,
   128 tokens, greedy): 32 users with the shipped `--no-async-scheduling` -> TTFT first / mean / last 0.80 / 4.17 / 4.79 s,
   decode 14.8-27.6 (mean 25.6) tok/s/user = 820 tok/s aggregate, 436 tok/s wall incl. prefill; with async scheduling
@@ -617,6 +674,9 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   wall. 8 users: 34.2 tok/s/user (274 tok/s) without / 36.8 (294) with async, TTFT 0.18 / 1.09 / 1.22 s. Demo the same
   day: `batch32` 35.5-36.0 ms/step = 889-901 tok/s, TTFT-last 4.7 s; `prefill_128` 13.64 ms/step = 73.3 tok/s, TTFT
   151 ms. A single user under the server decodes at 24-25 ms/step (~40 tok/s) because it runs the 32-slot program.
+  L1 (async ON, plugin `solar-fixes`, fill fix): 32 users TTFT 4.77 / 4.78 / 4.78 s, 29.05-29.12 tok/s/user = 931.8 tok/s,
+  447.9 tok/s wall; 8 users 1.23 s, 36.7-36.8 tok/s/user = 294.2 tok/s; async OFF on the same tree (s2): 25.7 tok/s/user =
+  821.9 tok/s (13.4-26.1), 8 users 254.1 tok/s -> async ON is +13.5 % / +15.6 % aggregate decode.
 - tt-inference-server `--workflow benchmarks` (`vllm bench serve --backend openai-chat`, random prompts, client venv
   `.venv_llm_vllm` python 3.11 / vllm 0.13.0; JSONs `results/vllm/S2/benchmarks/`): 5 of 16 sweep points before ASIC 1
   reached 81.6 C during the ISL 1024 x concurrency 32 point and the run was stopped:
@@ -641,7 +701,8 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   text-model wrappers, subclass of `HybridAttentionForCausalLM`); the Solar-specific logic is in `tt/vllm_support.py`,
   importable and unit-tested without vllm. Registry key = `hf_config.architectures[0]` = `SolarOpenForCausalLM`
   (`configs/Solar-Open-100B/config.json`), registered by the plugin as `TTSolarOpenForCausalLM` from the `EXTRA_MODELS_DIR`
-  bundle. The PLAIN name must resolve to the TT class as well (`--model-class-overrides`, spec `vllm_args`): without it
+  bundle. The PLAIN name must resolve to the TT class as well (S2: `--model-class-overrides`; since L1 the plugin branch
+  `solar-fixes` registers it from the bundle and the override is retired): without it
   upstream vLLM resolves the unknown arch to its Transformers backend (`TransformersMoEForCausalLM`) and vLLM >= 0.25
   keeps that name in `model_config.architecture` / `architectures` (`model_arch_config`), which the plugin's in-place `TT`
   prefixing of `hf_config.architectures` never reaches; the worker's KV-spec hook then looks up
@@ -688,9 +749,9 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   `vllm_tt_plugin/model_runner.py:2262 _apply_sampled_tokens_to_state` via `async_decode.py:415
   apply_completed_decode_step` / `:329 apply_ready_completed_decode_steps` at the next request's `execute_model`: the
   speculatively submitted decode step of the finished request is applied after the runner dropped it; reproduced 4 / 4,
-  requests ending on `max_tokens` are unaffected; full traceback `results/vllm/S2/crash_traceback.txt`). The spec serves
-  with `--no-async-scheduling` (-12% decode throughput at 32 users, -7% at 8) until the plugin handles EOS-finished
-  async steps.
+  requests ending on `max_tokens` are unaffected; full traceback `results/vllm/S2/crash_traceback.txt`). S2 served with
+  `--no-async-scheduling` (-12% decode throughput at 32 users, -7% at 8); RESOLVED in phase 3g (I1 patch on the plugin
+  branch `solar-fixes`, live-verified in L1: 0 crashes over 5 EOS pairs + 40 natural-stop requests), the flag is retired.
 - Lost tracebacks: tt-inference-server routes vLLM's records through an `AsyncLogHandler` and the API server
   force-kills a dead EngineCore at once (`MPClient` shutdown timeout 0 s), so `logger.exception` of the fatal error
   reached no log in three launches. `initialize_vllm_model` (which runs in the EngineCore) calls
@@ -746,18 +807,27 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
 | Plugin <-> tt-metal API drift (U1 #1) | none at 51b43cf on this tree (mesh open, fabric, KV, warm-up, traces all through the plugin) |
 | `max_model_len` (U1 #4, U2 #11) | 16384 first: 40.16x concurrency for 16K requests in the 8 GiB pool; the 128K warm-up sweep is untested |
 
-### Still open (backlog; details in `design/phase3/measurements.md` section 9)
+### Still open (backlog; details in `design/phase3/measurements.md` section 9, refreshed in section 10.4)
 
-- vllm-tt-plugin: (a) the async-scheduling EOS assertion (drop `no-async-scheduling` from the spec once fixed: +12%
-  decode throughput at 32 users and a single-step first token for bursts); (b) plain-arch registration for
-  `EXTRA_MODELS_DIR` bundles (then `model-class-overrides` and the protocol shim become optional).
+- vllm-tt-plugin: (a) the async-scheduling EOS assertion and (b) the plain-arch registration for `EXTRA_MODELS_DIR`
+  bundles are FIXED on the clone's branch `solar-fixes` (phase 3g / I1, live-verified in L1; both flags retired from the
+  spec) -- to be filed upstream with the drafts and `plugin_patches.diff` in `results/phase3g/I1/` (the protocol shim stays
+  harmless); the clone's 7 modified files are UNCOMMITTED on `solar-fixes` and the editable install serves them, so a
+  fresh clone of the plugin reproduces the phase-3f crashes until the patches are merged;
+  (c) new (L1): writes of pad K/V into vLLM's null block through the Generator's exact-fit prefill page table corrupt the
+  request's decode (worked around model-side in `tt/prefill_fill.py`; draft `results/phase3g/L1/issue_pad_block_fill.md`; the
+  last chunk of a > 32K chunked prefill still writes its pad entries, and the kernel-level mechanism is unexplained).
 - tt-inference-server: (a) `--server-url http://host` without a port never reaches the server (`ServerConnection.
   url_with_port` drops `--service-port` for remote targets); (b) `AsyncLogHandler` loses the EngineCore's fatal
   traceback (our synchronous mirror is the workaround); (c) no `EvalConfig` / perf targets for `upstage/Solar-Open-100B`
   (the `evals` and `release` workflows and the benchmark grading need them); (d) the benchmark sweep points 6-16
   (ISL >= 1024 at concurrency 32, 2048 .. 16384 ISL) are unmeasured (cooling pauses or a lower concurrency for the long
-  points; ASIC 1 heats fastest).
-- Wrapper / spec: `max_model_len` above 16384 (`--vllm-override-args '{"max_model_len": 131072,
+  points; ASIC 1 heats fastest); (e) the S2 points with ISL >= 129 (128 / 1024 c1 and c32, 1024 / 128 c1) ran with the
+  pad-block corruption present (throughput valid, outputs unchecked by `vllm bench serve`) -- re-run the sweep on the fixed
+  tree with an output-quality check (`results/phase3g/L1/probe_padblocks.py` takes ~1 min against a running server).
+- Wrapper / spec: the packed prefill under vLLM (since phase 3g / D2 exact, but 3.9 s TTFT for every user of a 32 x 128
+  pass: the dense-split / single-launch shared-expert levers of "Phase 3g rows" first, then a batched-prefill hook in the
+  bridge); `max_model_len` above 16384 (`--vllm-override-args '{"max_model_len": 131072,
   "max_num_batched_tokens": 131072}'`: the warm-up then sweeps prefill to 128K, ~72 s chunked prefill, board 1 heats)
   with `SOLAR_OPEN_KV_BUDGET_GIB=13` or `SOLAR_OPEN_EXPERT_DTYPE=bfp4` for 32 x 32K; `logprobs` requests (host-sampling
   fallback) and the HF logits processors; the plugin's own `tests/tt` suite; a low-concurrency spec variant
@@ -772,7 +842,9 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   each at ISL 128), so a 32-user burst waits 4.8 s for its last first token (with async scheduling for its FIRST one
   too) and the benchmark's 32-concurrency points report 13.5-13.8 s mean TTFT with queueing. The demo's packed 32-user
   prefill (`Model.prefill_forward_text_batched`, opt-in `SOLAR_OPEN_BATCHED_PREFILL=1`) is not reachable from the
-  Generator path: wiring it into the bridge is the biggest TTFT lever.
+  Generator path: wiring it into the bridge is the biggest TTFT lever. Since phase 3g / D2 that pass is bit-identical to
+  the sequential prefills, but the exact 32 x 128 pass costs 3.9 s for EVERY user (sequential 0.15 / 2.44 / 4.74 s first /
+  mean / last), so it beats only TTFT-last until the dense-split / shared-expert levers land ("Phase 3g rows").
 - Single-user decode runs the 32-slot program: 24-25 ms/step (~40 tok/s) vs the demo's batch-1 13.6 ms/step; the
   greedy tokens equal the demo's batch-32 case, not its batch-1 case.
 - `top_k > 32` is clamped to 32 on device silently (no log line under vLLM; the demo logs its clamp); `min_p` and the
@@ -801,7 +873,8 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
 
 ## Known limitations
 
-- Packed multi-user prefill (`SOLAR_OPEN_BATCHED_PREFILL`, default `1` since phase 3d / A3; `0` = the phase-2 sequential
+- Packed multi-user prefill (`SOLAR_OPEN_BATCHED_PREFILL`, default `1` from phase 3d / A3 to phase 3e / A0 and `0` since --
+  the flip back on is the user's decision after phase 3g, see the decision input in "Phase 3g rows"; `0` = the phase-2 sequential
   prefill everywhere) is HF-equivalent and, since phase 3c, slot independent within one MoE chunk: the expert-sorted MoE plans
   a packed pass ONCE per 4096-token chunk on the chunk-average per-expert counts (`SOLAR_OPEN_SORTED_MOE_PLAN=auto`,
   `SOLAR_OPEN_SORTED_MOE_CHUNK_HOT=average`, `tt/experts/sorted_plan.py`), so every slot of a pass sees the same hot / cold
@@ -871,7 +944,17 @@ buffers is potentially unsafe due to the existence of an active trace` (also in 
   these users a `<|content|>` first token where HF and the sequential prefill give `<|think|>` (reasoning_effort low:
   whether a second think block opens). The intended HF floors are in the test (`_assert_hf_floors`, asserted with
   `SOLAR_OPEN_PREFILL_HF_GATE=1`, default logged-only); localizing and fixing the packed numerics, then flipping the gate
-  on and dropping the xfails, is the open item (see "Phase 3e rows").
+  on and dropping the xfails, was the open item (see "Phase 3e rows"). RESOLVED in phase 3g (D1 bisection, D2 fix; see
+  "Phase 3g rows"): the packed pass left the sequential pass at layer 0, op qkv, because ttnn picks another matmul program
+  config for `T = B x S` rows than for `S` rows, plus the shared expert's row-count-gated configs, the T-row head and the
+  expert-sorted MoE; `SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=2` (the default) pins every one of them to the per-user S-row
+  programs, and a packed pass of 128-token users is now BIT-IDENTICAL to the sequential prefills at any T (32 / 32 users
+  exact in every unit case, `-k packed32` teacher-forced = the sequential `b32` digits, consistency packed32 0 / 768 rotated
+  flips). The HF floors are asserted and the 32-user cases are real gates whenever the knob is on (`=0` restores the
+  finding and its `xfail`). The remaining cost is TTFT: the exact 32 x 128 pass takes 3.9 s for every user (level 0:
+  1.8-2.3 s; sequential 0.15 / 2.44 / 4.74 first / mean / last), so `SOLAR_OPEN_BATCHED_PREFILL` stays `0`: phase 3g / R1
+  weighed it and left the flip to the user (decision input in "Phase 3g rows"; levers: larger dense splits, the single-launch
+  shared-expert config, the gather head).
 - Board 1 of this box at 80 C: two hot runs of `tests/test_multi_user_consistency.py` produced NON-FINITE logits in their
   sixth prefill + decode pass (slot 20; the first five passes exact), a cool-box run (46-58 C) is exact (744/744) -- the
   test now asserts finite logits; treat >= 78 C on board 1 as a correctness hazard, not only a throttling one.
@@ -1957,9 +2040,253 @@ failure after a forced stop / 2 demos, S3 0). Nothing in the model code moved: t
 
 Defaults after phase 3f: no model-code default moved. Served configuration = the spec above; the two workarounds
 (`--model-class-overrides`, `--no-async-scheduling`) and the two wrapper additions (protocol shim, synchronous error
-mirror) stay until the plugin fixes land. Open: the plugin's async EOS bug, the plugin's plain-arch registration for
+mirror) stayed until the plugin fixes landed (phase 3g / I1 + L1: both workarounds retired, see "Phase 3g rows"). Open: the plugin's async EOS bug, the plugin's plain-arch registration for
 bundles, the graceful stop, the benchmark points 6-16, `max_model_len > 16384`, evals / perf targets, the docker image
 (needs the pushed branch), and the packed prefill under vLLM (TTFT lever) -- `design/phase3/measurements.md` section 9.
+
+### Phase 3g rows (2026-09-10, HEAD 66ff5eec2a7 + the uncommitted phase-3g tree; stages D1 / D2 / I1 / L1 / R1; ledgers `results/phase3g/<stage>/runs.txt` (D1 8 device runs, D2 8, I1 0, L1 4 server launches + 3 device runs, R1 0 -- copies of the `results/phase3g/` stage directories without the `.pt` tensors); reports `results/phase3g/D1/bisect.md`, `D2/fix.md`, the I1 / L1 issue drafts, `R1/` (host logs, git status / diffs of the three repos); `design/phase3/measurements.md` section 10)
+
+Phase 3g = (a) backlog item 8, the packed-prefill first-token bias of phase 3e / A0, **bisected (D1)** and **fixed (D2)** behind
+`SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS` (default `2` since D2; `0` = the phase 3a-3f numerics); (b) the serving bugs of phase 3f
+**fixed on the host (I1)** and **live-verified (L1)**, which also found and fixed the long-prompt corruption of the served path;
+(c) docs + host regression (**R1**, this write-up; no device launch). Same box, real weights, pinned
+2026-09-08 ids, `reasoning_effort low`, warm cache, cool box (< 60 C) before every device run, one device process at a time,
+`timeout` on every run. Diagnostic `tests/test_packed_bias_bisect.py` (new): hooks on every block of every layer, arms A
+(sequential per user), B (packed 2 x 128, T = 256), C (one user through the packed code path, T = 128), D (B with the knob),
+per-layer / per-op PCC, relative scale, router expert-set flips, fp32 host truth of the device's own operands, auto-config
+identification by bit-identity, the fix's levers on identical inputs.
+
+**D1 verdict.** The packed pass leaves the sequential pass at LAYER 0, op `qkv`: ttnn's auto matmul program config for
+`T = B x 128` rows is the 2D mcast form with `in0_block_w 1`, the 128-row pass takes the 1D systolic form with `in0_block_w 2`
+(`matmul_program_config.cpp`: a shape is "narrow" above an 8 : 1 ratio), and a bf16-destination matmul's result depends on
+the K-block length (the partial sums spill through a bf16 intermediate per K block) and on nothing else in the config. Every
+downstream op inherits it (SDPA amplifies the 0.9 % q / k perturbation to 4 %, the router flips 9-12 of 78-82 expert sets in
+layer 0 and 37-39 % of all token-layer decisions over 48 layers). Arm C is bit-identical to A in all 48 layers and a user's
+rows are bit-identical in any slot with any pass mate: the ROW COUNT, not the packed code path or cross-user leakage. Three
+blocks change with the row count at T = 256 on identical inputs -- qkv (0.9 % RMS), the shared expert (explicit 1D
+`in0_block_w 32` configs up to 128 rows vs auto above: 4.6-6.5 % RMS, the packed partial 1.8-4.8 % SMALLER along the
+sequential one at L0 / L24 / L47) and the head (the sequential head normalizes ONE 32-row tile with the width-sharded decode
+kernel and runs the lm_head at M = 32; the T-row head uses the default norm kernel, 2.8 % apart in magnitude, and at M = 4096
+a 2D lm_head config); at T >= 1024 also o_proj (1D k=2 -> 2D k=1) and the routed experts (dense bmm -> the expert-sorted hot /
+cold path, 0.7-2.6 % RMS, 0.3-0.6 % less inflated). Against an fp32 host truth the SEQUENTIAL arm's configs are the biased
+ones (shared expert +2.4 / +3.2 / +4.5 % at L0 / L24 / L47 vs +0.6 / -0.4 / -0.4 % packed; the bias of a bf16-destination
+matmul grows with `in0_block_w`: qkv k 1 -> 128 = -0.31 -> +0.78 %, lm_head k 1 -> 32 = -0.10 -> +2.62 %), the routed experts are
++4.2-4.9 % above fp32 in BOTH arms, and `fp32_dest_acc_en` makes every matmul row-count invariant and 3-5x closer to fp32
+(E3, not taken: it re-bases every sequential floor). 32-user T-sweep vs HF before the fix: 32 / 32 sequential (KL 0.0698);
+packed 16 x 2 x 128 (T = 256, dense MoE) 27 / 32, KL 0.1804, `<|think|>` / `<|content|>` gap -0.844 vs the sequential arm;
+4 x 8 x 128 (T = 1024) 26 / 32, 0.1638, -0.758; 1 x 32 x 128 (T = 4096, A0) 22 / 32, 0.3517, -1.492.
+
+**D2 fix** (`tt/packed_numerics.py`, pure half `tt/packed_prefill.py`; in effect only inside a packed pass -- `Model.ttnn_prefill_forward`
+marks it with the per-user S, `DecoderLayer.__call__` completes a marker without S): level 1 pins qkv / o_proj to an explicit
+2D config carrying the S-row auto `in0_block_w` + the auto compute config (`attention/prefill.py`), runs the shared expert in
+S-row pieces with the S-row configs (`shared_expert.py`), and runs the head as 32-row tiles through the sequential head's norm
+kernel + the lm_head in <= 1024-row pieces (`model.py::_norm_and_lm_head`; the gather head was that head already); level 2 adds
+dense-bmm MoE splits of `dense_bmm_max_tokens` rows when the per-user S runs the dense bmm itself (`experts/prefill.py`). Every
+lever was verified bit-identical on identical inputs before it was wired (D2 r1): qkv 2D k=2 at 256 / 512 / 4096 rows == the
+128-row production result, o_proj 2D k=2 at 512 / 4096 == 128, shared expert pieces at 256 / 4096 == 128, lm_head auto at
+1024 / 2048 rows == 32, the knob head == the sequential head; also a SINGLE-LAUNCH shared-gate alternative (1D k=32,
+`per_core_M 128`, `out_block_h 4` or 8) == 128 (the next stage's lever against the 32 pieces). E0: the sequential head's
+width-sharded norm kernel is the accurate one (0.43 % RMS / -0.15 % scale vs a host fp32 RMSNorm; the default kernel on 128
+rows 2.33 % / -1.70 %, last row -2.62 %) -- so the 96 layer norms of BOTH arms (default kernel) are ~2 % low vs fp32 (E3 item).
+
+| metric | before (knob `0` = phase 3a-3f) | after (D2) | note |
+|---|---:|---:|---|
+| bisect arm B (packed 2 x 128) vs A (sequential), users 0 / 1 / 12 / 19, per layer | first non-bit-identical op qkv (layer 0); `resid_moe` rel_rms 1.2e-2 (L0) -> 1.4e-1 (L47), relative scale -4.9e-2 at L47, router expert-set flips 1449-1523 of 3744-3936 row-layers; logits max \|d\| 3.8-4.8 | **arm D (knob 1): 48 / 48 layers bit-identical in EVERY hooked op for all 4 users, 0 router flips, logits max \|d\| 0.0; the knob head == the seq32 head on the captured residuals (0.0)** (r1, 57 s) | gate (1): the first divergent layer's shift closes to 0 |
+| `unit/test_batched_prefill.py` T = 256 cases (`b2_s128`, `b32_s128_x16`), knob 1 | 1 / 2 and 27 / 32 top-1 = HF, KL(HF \|\| packed) 0.4804 / 0.1804, gap vs seq -0.625 / -0.844 | **2 / 2 and 32 / 32 users BIT-IDENTICAL to the sequential arm (max \|d\| 0.0), KL = sequential (0.1605 / 0.0698), gap +0.000, HF floors asserted and pass** (r2) | the T = 256 bias was qkv + shared expert + head entirely |
+| knob 1 at T >= 512 (the sorted MoE untouched): `b8_s128_x2` (T = 512) / `b8_s128` (1024) / `b32_s128_x4` (4 x 1024) / `b32_s128` (4096) top-1 = HF; KL mean / max; gap vs seq | 4 / 8, 0.4064 / 0.9501, -0.938; 4 / 8, 0.3221 / 0.6557, -0.781; 26 / 32, 0.1638 / 0.6557, -0.758; 22 / 32, 0.3517 / 1.4257, -1.492 | 4 / 8, 0.3807 / 1.2801, -0.719; 6 / 8, 0.2015 / 0.5258, -0.250; 27 / 32, 0.1281 / 0.5258, -0.703; **26 / 32, 0.1865 / 1.1103, -0.930** (r2; HF floors FAIL as asserted) | the residual is the expert-sorted hot / cold MoE alone (an algorithm, not a config): still one-directional (22-25 of 32 users below the sequential gap) |
+| **`b32_s128` + `b32_s128_gather` (one 32 x 128 pass, T = 4096), knob 2** | 22 / 32 and 24 / 32; 0.3517 / 1.4257 and 0.2158 / 1.0660; -1.492 | **32 / 32 users BIT-IDENTICAL to the sequential arm (max \|d\| 0.0), KL(HF \|\| packed) 0.0698 / 0.2445 = sequential, gap +0.000, HF floors asserted and pass, decode-4 PCC 1.0** (r3, 72 s) | gate (2) met by construction: KL 0.3517 -> 0.0698 (target <= 0.12), 22 -> 32 / 32 (>= 31), gap 0.742 -> 2.234 (= sequential) |
+| sequential path at the shipped default (knob 2): `test_layer0_real_weights.py -k 1x8` (8 cases) mlp / decoder PCC b1 / b32 / s128 / s1024; teacher-forced `b1` | mlp 0.9998061453586851 / 0.9996036272401746 / 0.9998537568364068 / 0.9999126315854807, decoder 0.9985879906067548 / 0.9988998160145733 / 0.9999655778825997 / 0.9998533351208578; 0.9141 / 0.9558 / 0.9195 / 0.97926 / 0.99073 / 0.03455 | **IDENTICAL to the digit (8 / 8 paged == unpaged; b1 0.9141 (234/256) / 0.9558 of 226 / 0.9195 / 0.97926 (min 0.68796) / 0.99073 (min 0.87096) / 0.03455 (max 0.44346))** (r4, 173 s) | gate (3): the knob never runs outside a packed pass |
+| teacher-forced `-k packed32` (top-1 / decisive / top-5 / top-64 PCC / full PCC / KL) | 0.9219 (236/256) / 0.9513 / 0.9195 / 0.98050 / 0.99178 / 0.03336 | **0.9492 (243/256) / 0.9646 / 0.9172 / 0.97966 (min 0.74559) / 0.99078 (min 0.84667) / 0.02941 (max 0.47837) = the sequential `b32` case TO THE DIGIT**; slot copies 1792 / 1792 (PCC min 0.99998); decode 36.5 ms/step (r5) | gate (4): the packed prefill IS the sequential prefill, so the whole packed32 case equals b32 |
+| consistency `-k packed32`: same-slot / rotated / lone / fillers / fillers-vs-each-other flips; PCC min; decode | 0 / 768, 13 / 768 (PCC min 0.98073, margins <= 0.5), 0 / 24 (0.98895), 0 / 744, 0 / 720; 32.0 ms/step | **0 / 768, 0 / 768 (0.99998), 0 / 24 (1.00000), 0 / 744 (0.99999), 0 / 720 (0.99999); 28.9 ms/step, 1107 tok/s** = the sequential `b32` case's exact floors (r5) | the packed-specific floors (<= 32 / <= 3 near-tie flips) are met with 0; the co-batch dependence of "Known limitations" is gone at level 2 |
+| demo `packed_b32_128` (32 users, one 32 x 128 pass forced) TTFT every user; decode | 1760 (R1 p02) / 2083-2308 ms (A3 d1-d5), plateau ~36 ms/step | **3897 ms for every user** (knob 2: 16 dense-bmm splits of 256 rows per layer instead of 4 sorted 1024-row splits, + the 32 shared-expert pieces); first token `<\|think\|>`; decode 33-38 ms/step at iterations 20-64 (r6, 55 s) | sequential `batch32` 148 / 2444 / 4740 first / mean / last: the exact pass beats TTFT-last by 18 % and loses TTFT-mean; levers below. Knob 1 costs ~+100 ms per 8 x 128 pass (r2: 571-672 vs 474 ms) |
+| `test_layer0_batched_prefill.py -k 1x8` (4 cases) packed vs per-user row PCC min attention / MoE / decoder | 0.998520 / 0.999380 / 0.996069 (b4_s128) | r7 (the harness marked the pass without the per-user S): attention BIT-IDENTICAL (2 / 2, 4 / 4 users), MoE / decoder 0.999380 / 0.999649 unchanged (the shared expert saw no S); **r8 (`DecoderLayer.__call__` completes a marker without S; the harness passes S): attention / MoE / decoder BIT-IDENTICAL in all 4 cases (max \|d\| 0.0 for every user of b2 / b4 / b4_dup / b16_dup), both forms at the same HF PCC (0.99970 / 0.99996 / 0.99962)**, K / V blocks bit-identical (94 s) | the floors stay as the knob-`0` no-garbage record |
+| host | - | `unit/test_packed_numerics.py` 21 passed (the auto in0_block_w rule reproduces every D1-identified config); `unit/test_batched_prefill.py -k host` 12 passed; `unit/test_sorted_moe_chunk_plan.py` 16 passed; pre-commit clean on the 14 changed / new files | - |
+
+Defaults after phase 3g: `SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=2` (a packed pass of <= 256-token users is bit-identical to the
+sequential prefills; `1` = the cheap half, `0` = the phase 3a-3f numerics), `SOLAR_OPEN_PREFILL_HF_GATE` unset but the HF floors
+are asserted whenever the knob is on, the `xfail(strict)` of `b32_s128` / `b32_s128_gather` applies at knob `0` only;
+`SOLAR_OPEN_BATCHED_PREFILL=0` unchanged (R1 weighed the exact pass and left the flip to the user: the decision input is the
+paragraph after the L1 table below).
+Open: the exact pass's TTFT -- dense splits of 512 / 1024 rows if the bmm output block fits L1 (bit-identical per row by
+construction; halves / quarters the per-split expert-weight re-streaming), the single-launch shared-expert config verified in r1
+(`out_block_h` chunking) instead of 32 pieces, and the lm_head pieces; level 1's sorted-MoE residual (26 / 32 at T = 4096) is a
+numerics question of the hot / cold path itself (E3 class: it also runs in every sequential prefill of >= 512 tokens); E0's
+finding that the default `ttnn.rms_norm` kernel is ~2 % low vs fp32 on >= 128 rows (both arms, 96 norms) is an E3 item too.
+
+**I1 (serving fixes, host only, 2026-09-10; 0 device launches; ledger `results/phase3g/I1/runs.txt`, patches `plugin_patches.diff` /
+`tt_metal_patches.diff`, issue drafts `issue_async_eos.md` / `issue_plain_arch_registration.md` in the same directory).** Backlog items
+1 + 2 of phase 3f (`results/vllm/S2/notes.md` section 5) root-caused from source and patched: (1a) vllm-tt-plugin async scheduling
+schedules one decode step past a stop-token finish; the engine's next (empty) step carries `finished_req_ids`, `_update_states` pops
+the request while its speculative step is still on the output thread, and the step is applied at the next `execute_model`
+(`model_runner.py:1533` -> `async_decode.py:329 / :415` -> `model_runner.py:2262`) into a request that is gone -> `AssertionError:
+captured request missing from runner state`. Fix (branch `solar-fixes` of the clone, `model_runner.py::_apply_sampled_tokens_to_state`):
+skip a captured request that is gone when `request_states` is given (the deferred path), keep the assertion for the synchronous
+path. (1b) vLLM 0.25's `ModelConfig.architectures` is `model_arch_config.architectures`, a pydantic-validated COPY of
+`hf_config.architectures` (verified: the in-place `TT` prefix never reaches it), and an arch unknown upstream resolves to
+`TransformersMoEForCausalLM` in `ModelConfig.__post_init__` BEFORE `check_and_update_config`; the worker's KV-spec hook then looks up
+`TTTransformersMoEForCausalLM`. Fix: `_register_models_from_extra_dir` registers the bundle's plain arch too (through
+`_register_model_if_missing`, so in-tree archs are untouched; the Gemma4 approach) and `_try_get_spec_from_model_hook` also scans
+`hf_config.architectures`. (2) vLLM 0.25's `Parser.parse_delta` calls `is_reasoning_end(prompt_token_ids)` ONCE; Upstage's rule 1 ("the
+template's empty `<|think|><|end|>` block precedes the last assistant header" = every `reasoning_effort low` / `minimal` prompt) says
+True, the reasoning parser is never consulted again and the model's own second think block streams raw; `extract_reasoning` returned
+content `''` for a tagless output (assistant prefill); the transition delta's merged content was dropped. Fix in tt-metal
+(`tt/vllm_support.py::SolarOpenReasoningParserFixes`, layered over Upstage's class without touching the HF snapshot, registered as
+`solar_open`; the class as shipped stays reachable as `solar_open_upstream`): `is_reasoning_end` = rule 2 only (a content / tool-calls
+tag in the CURRENT assistant turn), tagless output = content, merged-delta content handed over, structural markers scrubbed,
+`reasoning_start_str` / `reasoning_end_str` declared. Host evidence: plugin `pytest tests --ignore=tests/tt` 188 passed / 8 skipped
+(the 6 new tests fail on unpatched 51b43cf); `test_vllm_wrapper_import.py` 56 passed / 1 skipped incl. 8 tests through vLLM's own
+`ParserManager` / `parse_delta` (effort low / high / minimal, prefilled `continue_final_message`, tool call, merged delta,
+non-streaming parity) -- the live leak reproduced on the host with the upstream class (reasoning `''`, `<|think|>` + `<|begin|>assistant`
+inside `content`; prefilled content empty) and gone with the fixed one. Patch sizes: plugin 4 src files +55 / -6 (+403 test lines);
+tt-metal 5 files +399 / -20.
+
+**L1 (serving fixes live, 2026-09-10 17:06-18:17; 4 server launches + 3 device runs; ledger `results/phase3g/L1/runs.txt`,
+clients / probes / JSONs in the same directory).** Same box and tree, vllm-tt-plugin clone on branch `solar-fixes` (I1's three
+patches, uncommitted, editable install), the tt-inference-server dev spec with `model-class-overrides` and
+`no-async-scheduling` commented out (reason kept in the YAML), the runbook launch command, stop = PID kill + `tt-smi -r`
++ < 60 C before every launch.
+
+| check | before (S2, 2026-09-10 12:xx, plugin 51b43cf) | L1 result | note |
+|---|---|---|---|
+| start-up (s1, s3, s4 async ON; s2 async OFF via `--vllm-override-args`) | `Applying model_class_overrides` WARNING, `Asynchronous scheduling is disabled`, `Auto-initialization of reasoning token IDs failed` | `Registered TT model TTSolarOpenForCausalLM / SolarOpenForCausalLM` (3x), `Resolved architecture: SolarOpenForCausalLM` with NO override warning, `Asynchronous scheduling is enabled.` (APIServer + EngineCore), `SolarOpenTTReasoningParser` registered, no auto-init warning, 0 `TTTransformersMoEForCausalLM`; `/health` at 67-77 s | the plain-arch registration patch holds; both spec workarounds retired |
+| async EOS crash (`eos_repro.py`: greedy `Say only: hello.` -> finish `stop` (4 tokens), then a second request; x5; then 8- and 32-user natural-stop bursts + follow-ups) | EngineCore dead at the second request, 4 / 4 | 5 / 5 pairs 200, bursts 8 / 8 and 32 / 32 (stop 2 / 11), follow-ups 200, health 200, 0 `AssertionError` / `captured request missing` in the log (repeated on s2 async OFF and s4) | I1's `_apply_sampled_tokens_to_state` skip |
+| parser, streaming `low` (`sweep_low.py`: 32 demo prompts, 300 tokens, 8 concurrent) | think blocks streamed RAW into `content` (`<|think|>`, `<|end|>`, `<|begin|>assistant`, `<|content|>`) | 32 / 32 200, 28 opened a think block, 0 structural markers in every delta, stop 11 / length 21, TTFT 0.24 / 0.68 / 1.29 s | I1's `SolarOpenReasoningParserFixes` |
+| parser cases (`parser_checks.py`, stream + non-stream) | prefilled `continue_final_message` -> EMPTY content; effort `high` fine | `low` parity prompt: 72 content deltas, 0 markers; `high`: 127 reasoning + 8 content deltas, stream == non-stream; `minimal` OK; prefilled -> ` the capital of South Korea.` (6 content deltas); `/v1/completions` raw `<|content|>대한민국의...`; `json_object` under `low` -> 361 reasoning deltas then `{"capital": "Seoul"}` (grammar after `<|content|>`, as documented); the open-ended leak prompt reasons for the whole 2000-token budget (a genuine plan, no repeated window) | budget-only "failures" of the 200-400-token variants |
+| tool calls (339 / 335-token prompts = padded 1024) | S2: 1 call correct (24 tokens) | BEFORE the fill fix (s1-s3): garbage (`<|tool_calls|>OkayOkay<|end|>...`, non-deterministic); AFTER (s4): `low` -> `get_weather {"city": "Seoul"}` id `4011803000` (== S2), `high` -> reasoning then the call (id `050830521v`), stream == non-stream, 8 concurrent calls 8 / 8 in 4.27 s | see the fill fix row |
+| **long-prompt corruption** (`probe_len.py`, `probe_visibility.py`, `probe_state.py`, `probe_padblocks.py`) | never probed in S2 (one 339-token request, lucky) | BEFORE: every 129-1023-token prompt (`Prefill seq len: 1024, trace: False`) garbage / corrupted after a correct first token, non-deterministic under greedy, async ON and OFF alike; 78-128 tokens (`trace: True`) exact in ~150 requests; demo `prefill_1k` (953 tokens, same eager program) coherent; instruction-in-tail answers vs pad entries of the 16-column table: 0 -> 4/4, 1 -> 2/4, 5 -> 2/4, 13 -> 0/4. **AFTER `tt/prefill_fill.py` (s4): 4/4 in every pad case, 16 / 16 length probes deterministic and sane, head / tail visibility 3/3 at 161 / 336 / 911 tokens, 15 identical requests bit-identical** | root cause: pad K/V written through the exact-fit table's zero (null-block) entries corrupts the request's own decode |
+| perf async ON (`conc_client.py`, 128 tokens, `ignore_eos`) | 931 tok/s (S2 launch 4, before the crash) | s1 / s4: 32 users TTFT 4.81-4.82 / 4.77-4.78 s, 29.05-29.15 tok/s/user = **932.7 / 931.8 tok/s**, 446-448 tok/s wall; 8 users 1.22 s, 36.7-36.8 tok/s/user = 293.7-294.2 tok/s; async OFF (s2): 821.9 / 254.1 tok/s | the fill fix costs nothing measurable at 78-token prompts (traced path) |
+| sequential gates after the fix (device, no vLLM) | - | demo `prefill_1k` reasoning text byte-identical to the pre-fix run (the cut applies: 15 of 16 columns); layer-0 real weights 8 / 8 digits = D2 (mlp 0.9998061453586851 / 0.9996036272401746 / 0.9998537568364068 / 0.9999126315854807, decoder 0.9985879906067548 / 0.9988998160145733 / 0.9999655778825997 / 0.9998533351208578); teacher-forced `b1` 0.9141 / 0.9558 / 0.9195 / 0.97926 / 0.99073 / 0.03455 unchanged | 128-token and packed / chunked paths never see the cut by construction; `unit/test_prefill_fill.py` 509 host tests |
+| D2's packed-prefill fix vs the server | - | no change on the server side: the vLLM path prefills one user at a time (`Prefilling User 1 up to N tokens`), `SOLAR_OPEN_BATCHED_PREFILL` stays 0 | - |
+
+Box: every launch started at 36-58 C; the padded-1024 eager prefills of the probes heated board 1 to 76-79 C (stop.sh waits for
+< 60 C after `tt-smi -r`). Docs updated in L1: this section, the serving section above, the tt-inference-server spec comments and
+`docs/solar_open_100b_p150x8_dev_note.md`.
+
+**Decision input for the user: `SOLAR_OPEN_BATCHED_PREFILL` (R1; the default is NOT flipped by this phase).** What is settled: with
+`SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS=2` the packed 32 x 128 pass IS the sequential prefill numerically -- 32 / 32 users bit-identical
+logits (max |d| 0.0), KL(HF || packed) mean 0.0698 / max 0.2445 = KL(HF || sequential), top-1 = HF 32 / 32, the `<|think|>` /
+`<|content|>` gap 2.234 = sequential (HF 2.664; A0 measured 0.742 packed), teacher-forced packed32 0.9492 / 0.9646 / 0.9172 / 0.97966 /
+0.99078 / 0.02941 = the sequential `b32` digits, consistency 0 flips in every arm (rotated 0 / 768, lone 0 / 24, fillers 0 / 744 and
+0 / 720), the layer-0 packed-vs-per-user test bit-identical in attention / MoE / decoder -- so the accuracy objection of phase 3e / A0
+is gone and the HF floors are asserted gates. What it costs (demo `packed_b32_128`, 32 x 128 in one pass, D2 r6): TTFT 3897 ms for
+EVERY user, against the sequential `batch32` 148 / 2444 / 4740 ms first / mean / last and the inexact knob-`0` pass 1760-2308 ms; decode
+unchanged (33-38 ms/step). I.e. flipping to `1` today trades TTFT-last -18 % (4.74 -> 3.90 s) and perfect fairness for TTFT-mean +60 %
+(2.44 -> 3.90 s) and TTFT-first 26x (0.15 -> 3.90 s). Knob `1` (~+0.1 s per 8 x 128 pass, level 0 + ~0.4 s at 32 x 128) is NOT exact at
+T >= 512 (26 / 32 users = HF at T = 4096, gap -0.93) and is no candidate for a default. Not measured: `SOLAR_OPEN_BATCHED_PREFILL_TOKENS=1024`
+(four 8 x 128 passes) at knob `2` -- at knob `1` a steady 8 x 128 pass took 571-672 ms (D2 r2), so four exact passes would land near
+0.7 / 1.6 / 2.5 s first / mean / last with each user depending on nothing (the level-2 pass is bit-identical whatever its mates), but
+that estimate lacks the level-2 dense-split cost and a run. The vLLM path is unaffected either way (the Generator prefills per user;
+the flag never reaches the server). Recommendation: keep `0` as the shipped demo default while TTFT-mean / first-token latency is the
+interactive metric and until one of the cheap levers lands (dense MoE splits of 512 / 1024 rows -- bit-identical per row by construction
+if the bmm output block fits L1, halving / quartering the per-split expert-weight re-streaming of 16 splits x (178 + 89 MB) per layer;
+the single-launch shared-expert config verified bit-identical in D2 r1 instead of 32 pieces x 4 launches; `SOLAR_OPEN_BATCHED_PREFILL_HEAD=gather`,
+exact at any level); flip to `1` (keeping the knob at `2`) if TTFT-last / equal first-token latency of a 32-user burst is the metric --
+the correctness gates are in place for either choice (`unit/test_batched_prefill.py -k 1x8`, `-k packed32` teacher-forced and
+consistency, `test_layer0_batched_prefill.py`). The user decides; nothing in this phase flipped it.
+
+**R1 (docs + host regression, 2026-09-10 18:28-18:40; 0 device launches, devices idle and no server for the whole stage; ledger
+`results/phase3g/R1/runs.txt`, logs `h*.log`, `git_status_*.txt` / `diff_stat_*.txt` / `diff_*.patch` of the three repos in the same
+directory).** Host set of the phase-3g tree at the shipped defaults (`SOLAR_OPEN_NUM_DEVICES=8`, no `SOLAR_OPEN_*` overrides):
+13 host unit files (`test_p0_program_configs`, `test_expert_parallel_config`, `test_p1_layout`, `test_p2_indexed`, `test_model_config`,
+`test_sorted_moe_chunk_plan`, `test_attention_precision_option`, `test_attention_fused_qk_config`, `unit/test_chunked_prefill`,
+`test_expert_weights`, `test_streaming_loader`, `test_packed_numerics`, `test_prefill_fill`; `-k "not 1x8 and not 1x1"`) **893 passed, 1
+failed** -> the failure is `test_attention_precision_option.py::TestWiring::test_prefill_passes_keep_bf16`, a SOURCE-CONTRACT check for the
+literal `keep_bf16=attention_bf16_output(program_config)` that D2's `attention/prefill.py` refactor (the switch is read once into
+`keep_bf16` and handed to the o_proj call AND to `packed_numerics.attention_seq_numerics_configs`) made stale while the wiring itself
+is intact; the test now asserts the new form (`keep_bf16 = attention_bf16_output(program_config)`, `keep_bf16=keep_bf16,`,
+`attention_seq_numerics_configs(`) -> **12 passed** for the file (894 / 894 for the set). Host-marked cases of the 12 device files
+(`-k "host or Host"`) **37 passed**; `unit/test_vllm_wrapper_import.py` **56 passed, 1 skipped** (the wrapper / parser set incl. the 8
+`TestReasoningParserStreamingWithVllm` tests); `--collect-only` of the 6 changed / new device test files **38 tests collected**, 0 errors
+(`test_packed_bias_bisect`, `test_layer0_batched_prefill`, `test_multi_user_consistency`, `unit/test_batched_prefill`,
+`accuracy/test_teacher_forced`, `test_layer0_real_weights`); imports of `tt.model`, `tt.packed_numerics`, `tt.prefill_fill`,
+`tt.vllm_support` OK. Other repos: vllm-tt-plugin branch `solar-fixes` `pytest tests --ignore=tests/tt` **188 passed, 8 skipped**;
+tt-inference-server `tests/test_model_catalog_yaml.py tests/test_model_specification.py tests/test_run_local_server.py
+tests/test_run_vllm_api_server.py` **122 passed**. `pre-commit run --files` on the 21 changed / new tt-metal files (15 modified + 5 new
++ the contract test): every hook passed on the FIRST pass (nothing reformatted). No device run in this stage, so no digit moved: the
+D2 / L1 gates above are the record of the tree. Nothing committed in any repo (the three `git status` snapshots are in `results/phase3g/R1/`).
+
+### ISL/OSL x batch sweep, phase 3g tree, full (2026-09-10, 66ff5eec2a7 + the uncommitted phase-3g tree, tag `_p3gfull`)
+
+The full 54-cell sweep on the current tree (phase 3e decode levers: fused single-kernel all-reduce, bfp8 shared-expert decode
+partial, fused Q/K RoPE + K/V update and the (8,8) o_proj; phase 3f/3g serving fixes; the phase-3g packed-prefill fix is inert here
+because the harness prefills sequentially) with the shipped defaults; same harness and settings as the `_p3cfull` sweep below
+(`tests/sweep/run_sweep.sh`, TMO 4000 s, cooldown gate 78 C / 120 s, cool start < 60 C per batch, KV pool `min(64K, 512K // B)`
+tokens per user, page-table seed 1234, pinned template date 2026-09-08, `reasoning_effort=low`, greedy, exactly OSL steps, traced
+decode). **54 / 54 cells ok** on the first attempt of every batch: 51 cells in the main pass (76 min of pytest, 18:40-19:56 UTC), the three
+long cells filled with `SOLAR_OPEN_REGRESSION_KV_TOKENS=1056000 SOLAR_OPEN_KV_BUDGET_GIB=13.5 SOLAR_OPEN_REGRESSION_POW2_CONTEXT=0`
+(44 min). 0 first-token failures, QA keyword accuracy 1.00 in the 12 ISL-128 cells, AI clock 1350 MHz after every prefill. Versus
+`_p3cfull`: **B1 1.12-1.19x** (128/128 15.8 -> 13.4 ms/step = 75 tok/s per user; the fused all-reduce and the bfp8 shared partial are
+b1 levers), **B2-B32 1.02-1.13x** (B32 128/128 37.3 -> 34.5 ms, 858 -> 926 tok/s aggregate); the two 32K cells at B16 / B32 are flat
+(0.97x / 0.99x) -- both ran with board 1 at 80-82 C before decode, the thermal edge seen in every sweep. TTFT is one eager prefill per
+cell (+-15 %) and no phase-3e/3g lever touches the sequential prefill path.
+
+Two greedy repetition loops, none in `_p3cfull`: B16 128/1024 user 15 ("올림픽은 몇 년마다 열리나요?") and B32 128/1024 user 12 ("일본의
+화폐 단위는 무엇인가요?") loop inside their think block for the rest of the 1024 tokens ("... the Japanese yen is used in the Japanese
+yen is used in ..."); the harness flags them (unique-token ratio) but the cells pass (floor: up to B/4 users). A/B on the same two
+cells with the phase-3e non-bit-identical levers off (`SOLAR_OPEN_DECODE_CCL=composite SOLAR_OPEN_SHARED_DOWN_BFP8=0`, tag
+`_p3g_ab`): 0 degenerate users, 14 / 16 and 30 / 32 users finished on a stop token (13 / 16 and 27 / 32 under the shipped levers) -- so
+the loops follow the phase-3e numerics (the arm that is closer to the fp32 sum per phase 3g D1), i.e. greedy 1024-token generations at
+low effort sit close to repetition attractors and the last-bit change of the all-reduce / shared partial tips two of 704 user-cells over.
+The teacher-forced floors and the consistency gates hold on these levers; recorded as a quality signal to watch, not a regression
+(backlog: a repetition-penalty / sampling default for long low-effort generations, and the `fp32_dest_acc` route to row-invariant,
+fp32-close numerics for every arm). Source: `generated/solar_open_multi_user_regression/Solar-Open-100B_1x8_p3gfull.jsonl` (54 rows;
+`logs_p3gfull/REPORT_p3gfull.md`), `Solar-Open-100B_1x8_p3g_ab.jsonl` (2 rows); copies with the driver ledgers under
+`/home/eslim/experiments/solar/results/sweep_p3g/`.
+
+Decode step ms (mean, steady state):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 13.4 | 13.5 | 13.5 | 13.8 | 14.0 | 14.5 | 14.7 | 15.5 | 17.4 |
+| 2 | 18.8 | 18.8 | 17.7 | 17.9 | 18.4 | 18.9 | 19.1 | 20.2 | 22.0 |
+| 4 | 21.0 | 20.8 | 18.2 | 18.6 | 19.0 | 20.0 | 19.6 | 20.5 | 22.7 |
+| 8 | 24.1 | 24.6 | 18.5 | 18.8 | 19.9 | 21.1 | 21.1 | 23.3 | 30.3 |
+| 16 | 28.5 | 28.3 | 19.1 | 20.1 | 21.5 | 23.3 | 24.0 | 29.8 | 48.1 |
+| 32 | 34.5 | 35.3 | 19.6 | 20.8 | 23.5 | 28.1 | 29.8 | 48.7 | 70.9 |
+
+TTFT mean over users, ms (= per-user prefill x (B+1)/2):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 163 | 166 | 416 | 1194 | 1604 | 2927 | 2942 | 7518 | 12562 |
+| 2 | 232 | 235 | 596 | 1084 | 2135 | 5827 | 6514 | 10255 | 20064 |
+| 4 | 384 | 386 | 1005 | 2197 | 3712 | 9200 | 8015 | 18341 | 31798 |
+| 8 | 665 | 665 | 2324 | 3345 | 6407 | 13651 | 16280 | 26913 | 60260 |
+| 16 | 1299 | 1258 | 3452 | 6424 | 12341 | 26017 | 26427 | 54661 | 145439 |
+| 32 | 2431 | 2490 | 7078 | 12254 | 23506 | 52219 | 51151 | 127929 | 295550 |
+
+TTFT last user, ms (whole batch admitted = B x per-user prefill):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 163 | 166 | 416 | 1194 | 1604 | 2927 | 2942 | 7518 | 12562 |
+| 2 | 310 | 314 | 794 | 1446 | 2846 | 7769 | 8686 | 13674 | 26753 |
+| 4 | 614 | 617 | 1608 | 3515 | 5940 | 14720 | 12824 | 29346 | 50878 |
+| 8 | 1182 | 1182 | 4131 | 5947 | 11390 | 24268 | 28942 | 47845 | 107129 |
+| 16 | 2446 | 2368 | 6498 | 12092 | 23230 | 48972 | 49746 | 102891 | 273767 |
+| 32 | 4714 | 4829 | 13728 | 23765 | 45586 | 101273 | 99203 | 248105 | 573188 |
+
+Aggregate decode tok/s:
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 75 | 74 | 74 | 73 | 72 | 69 | 68 | 64 | 57 |
+| 2 | 106 | 106 | 113 | 112 | 109 | 106 | 105 | 99 | 91 |
+| 4 | 191 | 192 | 219 | 216 | 211 | 200 | 204 | 195 | 176 |
+| 8 | 332 | 325 | 433 | 426 | 402 | 379 | 379 | 344 | 264 |
+| 16 | 561 | 566 | 835 | 796 | 744 | 687 | 666 | 537 | 333 |
+| 32 | 926 | 906 | 1632 | 1542 | 1361 | 1141 | 1074 | 657 | 451 |
+
+Decode speed-up vs the phase-3c full sweep (`_p3cfull` ms / `_p3gfull` ms):
+
+| B \ ISL/OSL | 128/128 | 128/1024 | 1024/128 | 2048/128 | 4096/128 | 8192/128 | 8192/1024 | 16384/128 | 32768/128 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1.18x | 1.17x | 1.18x | 1.16x | 1.18x | 1.19x | 1.17x | 1.14x | 1.12x |
+| 2 | 1.09x | 1.09x | 1.10x | 1.10x | 1.08x | 1.08x | 1.08x | 1.07x | 1.07x |
+| 4 | 1.11x | 1.11x | 1.08x | 1.09x | 1.08x | 1.08x | 1.10x | 1.11x | 1.16x |
+| 8 | 1.10x | 1.07x | 1.12x | 1.10x | 1.06x | 1.06x | 1.06x | 1.07x | 1.12x |
+| 16 | 1.10x | 1.08x | 1.08x | 1.06x | 1.07x | 1.06x | 1.04x | 1.02x | 0.97x |
+| 32 | 1.08x | 1.07x | 1.11x | 1.09x | 1.07x | 1.04x | 1.13x | 1.05x | 0.99x |
 
 ### ISL/OSL x batch sweep, phase 3c tree, full (2026-09-09, de5c31bb3dc + the uncommitted phase-3c tree, tag `_p3cfull`)
 

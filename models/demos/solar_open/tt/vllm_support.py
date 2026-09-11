@@ -84,6 +84,7 @@ CHAT_TEMPLATE_KWARG_DEFAULTS = {
 # Upstage ships the vLLM parsers in the HF repo without a register decorator (its vLLM fork registers them
 # internally under "solar_open"); register_vllm_parsers() below does the same on a stock vLLM + TT plugin build.
 REASONING_PARSER_NAME = "solar_open"
+REASONING_PARSER_UPSTREAM_NAME = "solar_open_upstream"  # Upstage's class as shipped, for A/B against the fixed one
 TOOL_PARSER_NAME = "solar_open"
 REASONING_PARSER_FILE = "solar_open_reasoning_parser.py"
 TOOL_PARSER_FILE = "solar_open_tool_parser.py"
@@ -488,18 +489,148 @@ def install_vllm_compat_shims() -> dict:
     return result
 
 
+# Fixes layered over Upstage's SolarOpenReasoningParser; the result is what "solar_open" resolves to, the untouched
+# upstream class stays reachable as "solar_open_upstream". Why (live on P150x8, 2026-09-10, vLLM 0.25.1):
+# vLLM >= 0.25 drives reasoning + tool parsing through ``vllm.parser.Parser.parse_delta``: it calls
+# ``is_reasoning_end(prompt_token_ids)`` ONCE per stream and, when that says "ended", never consults the reasoning
+# parser again -- every delta goes to the tool parser (``tool_choice != "none"``) or straight to ``content``. Upstage's
+# rule 1 ("the previous assistant body is the template's empty <|think|><|end|> block", i.e. every reasoning_effort
+# low / minimal prompt: ``...<|begin|>assistant<|think|><|end|><|begin|>assistant``) makes it say "ended" although the
+# model re-opens a <|think|> block for most of those prompts (25 / 32 greedy KO/EN prompts, README), so the whole block
+# streamed RAW as content -- "<|think|>", the reasoning, "<|end|>", "<|begin|>assistant", "<|content|>" -- while the
+# non-streaming response of the same request was split correctly (``extract_reasoning`` parses the complete text).
+# Second defect: ``extract_reasoning`` returned content "" for an output without any channel tag (assistant prefill
+# with ``continue_final_message``: the prompt already opened <|content|>), so the response was EMPTY although tokens
+# were generated. Third: on the delta that opens the content phase upstream returns content "" and vLLM 0.25 hands only
+# that "" on to the tool phase, so content the detokenizer merged into the same delta was dropped.
+THINK_TAG = "<|think|>"
+END_TAG = "<|end|>"
+CONTENT_TAG = "<|content|>"
+TOOL_CALLS_TAG = "<|tool_calls|>"
+ASSISTANT_HEADER = "<|begin|>assistant"
+CHANNEL_TAGS = (THINK_TAG, CONTENT_TAG, TOOL_CALLS_TAG)
+# Structural markers that must never surface in a streamed reasoning / content delta (header before its prefix).
+STRUCTURAL_MARKERS = (ASSISTANT_HEADER, "<|begin|>", END_TAG, THINK_TAG, CONTENT_TAG, TOOL_CALLS_TAG)
+
+
+class SolarOpenReasoningParserFixes:
+    """Mixin in front of Upstage's ``SolarOpenReasoningParser`` (see :func:`build_reasoning_parser`).
+
+    Uses only the upstream helpers (``_token_ids``, ``_find_subsequence``, ``_rfind_subsequence``,
+    ``_has_content_phase``, ``_parse_content_or_calls``) and vLLM's ``ReasoningParser`` API, so it layers over any
+    revision of the HF file that keeps them. Non-streaming output is unchanged except for the tagless case.
+    """
+
+    # vLLM's ReasoningConfig derives the thinking-budget token ids from these two; the upstream class leaves them
+    # None, hence the start-up warning "Auto-initialization of reasoning token IDs failed".
+    @property
+    def reasoning_start_str(self) -> str:
+        return THINK_TAG
+
+    @property
+    def reasoning_end_str(self) -> str:
+        return END_TAG
+
+    def _token_ids(self, text: str) -> list:
+        # The upstream re-tokenizes the marker strings on every call (per delta, per request); cache per instance.
+        cache = self.__dict__.setdefault("_solar_open_token_ids_cache", {})
+        ids = cache.get(text)
+        if ids is None:
+            ids = cache[text] = list(super()._token_ids(text))
+        return ids
+
+    def is_reasoning_end(self, input_ids) -> bool:
+        """Reasoning has ended iff the CURRENT assistant turn already reached ``<|content|>`` or ``<|tool_calls|>``.
+
+        Upstream rule 2 only (the turn = the ids after the last ``<|begin|>assistant``, or everything when there is
+        no header, e.g. generated ids alone). Upstream rule 1 - "an empty <|think|><|end|> block precedes the last
+        assistant header" - is dropped: it describes what the low / minimal-effort template ASKED for, not what the
+        model does, and under vLLM >= 0.25 it switches the reasoning parser off for the whole stream. vLLM calls this
+        on the prompt once per stream and, via ``is_reasoning_end_streaming``, on the generated ids; the prompt of a
+        ``continue_final_message`` request whose last message is content still ends the reasoning phase here.
+        """
+        ids = list(input_ids)
+        header = self._token_ids(ASSISTANT_HEADER)
+        last_header = self._rfind_subsequence(ids, header)
+        tail = ids[last_header + len(header) :] if last_header != -1 else ids
+        return any(self._find_subsequence(tail, self._token_ids(tag)) != -1 for tag in (CONTENT_TAG, TOOL_CALLS_TAG))
+
+    def extract_reasoning(self, model_output: str, request):
+        reasoning, content = super().extract_reasoning(model_output, request)
+        if not content and not any(tag in model_output for tag in CHANNEL_TAGS):
+            # No channel tag anywhere: the prompt already opened the content channel (assistant prefill with
+            # continue_final_message, a no-think template) or the model answered without one -> it is all content.
+            content = model_output
+        return reasoning, content
+
+    def extract_reasoning_streaming(
+        self, previous_text, current_text, delta_text, previous_token_ids, current_token_ids, delta_token_ids
+    ):
+        delta = super().extract_reasoning_streaming(
+            previous_text, current_text, delta_text, previous_token_ids, current_token_ids, delta_token_ids
+        )
+        if delta is None:
+            return None
+        opened_content_phase = self._has_content_phase(current_text) and not self._has_content_phase(previous_text)
+        if opened_content_phase and delta.content == "" and not delta.reasoning:
+            # Upstream announces the content phase with content "" and drops the content the detokenizer merged into
+            # the same delta (e.g. "<|end|><|begin|>assistant<|content|>The"); vLLM 0.25 hands only ``delta.content``
+            # on to the tool phase, so that text would be lost. Hand over this delta's real content instead.
+            delta.content = self._parse_content_or_calls(current_text) or ""
+        if (
+            not opened_content_phase
+            and current_text.endswith(ASSISTANT_HEADER)
+            and delta_text
+            and ASSISTANT_HEADER.endswith(delta_text)
+        ):
+            # The delta completed a "<|begin|>assistant" header the model emitted before any channel tag (the tokens
+            # arrive separately: "<|begin|>", "assistant"); upstream passes it through as content.
+            return None
+        for field in ("reasoning", "content"):
+            text = getattr(delta, field)
+            if text and any(marker in text for marker in STRUCTURAL_MARKERS):
+                for marker in STRUCTURAL_MARKERS:
+                    text = text.replace(marker, "")
+                setattr(delta, field, text)
+        if not delta.reasoning and not delta.content and not delta.tool_calls and not opened_content_phase:
+            return None
+        return delta
+
+
+def build_reasoning_parser(upstream_cls):
+    """``SolarOpenTTReasoningParser`` = Upstage's ``SolarOpenReasoningParser`` with :class:`SolarOpenReasoningParserFixes`.
+
+    Built at registration time because the upstream class comes from the HF snapshot (``_import_python_file``), not
+    from an importable package.
+    """
+    return type(
+        "SolarOpenTTReasoningParser",
+        (SolarOpenReasoningParserFixes, upstream_cls),
+        {
+            "__module__": __name__,
+            "__doc__": (
+                "Upstage's SolarOpenReasoningParser (HF snapshot) with the streaming / prefill fixes of "
+                "models.demos.solar_open.tt.vllm_support.SolarOpenReasoningParserFixes; registered as 'solar_open'."
+            ),
+        },
+    )
+
+
 def register_vllm_parsers(model_dir=None, reasoning=True, tool=True) -> dict:
-    """Register Upstage's ``SolarOpenReasoningParser`` / ``SolarOpenToolParser`` under "solar_open" in a vLLM process.
+    """Register the Solar-Open reasoning / tool parsers under "solar_open" in a vLLM process.
 
     The two files ship in the HF repo (``$HF_MODEL/solar_open_reasoning_parser.py`` / ``solar_open_tool_parser.py``)
     without a register decorator (Upstage's vLLM fork registers them internally), so a stock vLLM needs this shim,
     loaded through ``--reasoning-parser-plugin`` / ``--tool-parser-plugin`` (see ``vllm_plugins/solar_open_parsers.py``).
     ``install_vllm_compat_shims()`` runs first so the files' vLLM-0.12 imports resolve on vLLM 0.25.1; the tool parser
-    also needs the ``pyjson5`` package in the serving venv. Returns ``{"reasoning": cls, "tool": cls}`` for what was
-    registered. Importing the reasoning parser patches ``json._default_encoder`` (Upstage's file does that at import;
-    this is why registration is opt-in and never runs on plain import of this module). Host-verified on vLLM 0.25.1
-    (both parsers register, instantiate on the Solar tokenizer and parse a think/content sample) and live on 2026-09-10
-    through tt-inference-server (reasoning / content split, streamed reasoning deltas, a tool call with a non-empty id).
+    also needs the ``pyjson5`` package in the serving venv. "solar_open" resolves to :func:`build_reasoning_parser`'s
+    subclass (the streaming / prefill fixes above); Upstage's class as shipped is registered as "solar_open_upstream".
+    Returns ``{"reasoning": cls, "reasoning_upstream": cls, "tool": cls}`` for what was registered. Importing the
+    reasoning parser patches ``json._default_encoder`` (Upstage's file does that at import; this is why registration
+    is opt-in and never runs on plain import of this module). Host-verified on vLLM 0.25.1 through vLLM's own
+    ``Parser.parse_delta`` state machine (``tests/unit/test_vllm_wrapper_import.py``) and live on 2026-09-10 through
+    tt-inference-server (upstream class: reasoning / content split, streamed reasoning deltas, a tool call with a
+    non-empty id; the fixed class awaits its live pass).
     """
     if not vllm_available():
         raise RuntimeError("vllm is not importable in this environment; register_vllm_parsers is for the serving venv")
@@ -510,10 +641,16 @@ def register_vllm_parsers(model_dir=None, reasoning=True, tool=True) -> dict:
         from vllm.reasoning import ReasoningParserManager
 
         module = _import_python_file(model_dir / REASONING_PARSER_FILE, "solar_open_reasoning_parser")
-        parser_cls = module.SolarOpenReasoningParser
+        upstream_cls = module.SolarOpenReasoningParser
+        parser_cls = build_reasoning_parser(upstream_cls)
         ReasoningParserManager.register_module(REASONING_PARSER_NAME, force=True, module=parser_cls)
+        ReasoningParserManager.register_module(REASONING_PARSER_UPSTREAM_NAME, force=True, module=upstream_cls)
         registered["reasoning"] = parser_cls
-        logger.info(f"Registered vLLM reasoning parser {REASONING_PARSER_NAME!r} -> {parser_cls.__name__}")
+        registered["reasoning_upstream"] = upstream_cls
+        logger.info(
+            f"Registered vLLM reasoning parser {REASONING_PARSER_NAME!r} -> {parser_cls.__name__} "
+            f"(on {upstream_cls.__name__}; the upstream class as {REASONING_PARSER_UPSTREAM_NAME!r})"
+        )
     if tool:
         manager = _import_tool_parser_manager()
         module = _import_python_file(model_dir / TOOL_PARSER_FILE, "solar_open_tool_parser")

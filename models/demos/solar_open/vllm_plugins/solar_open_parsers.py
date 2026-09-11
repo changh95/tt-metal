@@ -3,9 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-vLLM parser plugin for Solar-Open-100B: importing this file registers Upstage's ``SolarOpenReasoningParser`` and
-``SolarOpenToolParser`` (shipped in the HF repo, ``$HF_MODEL/solar_open_{reasoning,tool}_parser.py``, without a
-register decorator) under the name ``solar_open``.
+vLLM parser plugin for Solar-Open-100B: importing this file registers Upstage's ``SolarOpenToolParser`` and, as
+``SolarOpenTTReasoningParser``, Upstage's ``SolarOpenReasoningParser`` with the streaming / prefill fixes of
+``vllm_support.SolarOpenReasoningParserFixes`` (both parsers ship in the HF repo,
+``$HF_MODEL/solar_open_{reasoning,tool}_parser.py``, without a register decorator) under the name ``solar_open``;
+Upstage's reasoning parser as shipped stays reachable as ``solar_open_upstream`` (``--reasoning-parser
+solar_open_upstream`` reproduces the raw-marker streaming of reasoning_effort low, see ``vllm_support``).
 
     vllm serve upstage/Solar-Open-100B ... \\
         --reasoning-parser-plugin models/demos/solar_open/vllm_plugins/solar_open_parsers.py --reasoning-parser solar_open \\

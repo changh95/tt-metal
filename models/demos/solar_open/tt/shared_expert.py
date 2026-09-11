@@ -31,6 +31,7 @@ bfp8 before instead of after the add. Prefill calls always return bf16 (byte-ide
 import ttnn
 from models.demos.solar_open.utils.general_utils import get_cache_file_name
 
+from . import packed_numerics
 from .experts.operations import apply_glu
 from .linear_configs import grid_fits, mcast_1d_linear_config
 
@@ -152,7 +153,9 @@ class SharedExpert:
 
     The three linears run with the explicit 1D in0-multicast program configs of ``shared_expert_program_configs``
     for inputs of up to ``SHARED_EXPERT_CONFIG_MAX_ROWS`` rows (decode, traced prefill@128) and with ttnn's auto
-    configs above that; ``program_configs=False`` forces the auto configs everywhere (A/B reference).
+    configs above that; ``program_configs=False`` forces the auto configs everywhere (A/B reference). Inside a packed
+    multi-user pass under ``SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS`` (phase 3g / D2, ``packed_numerics.py``) a T-row
+    input is processed in per-user S-row pieces with the S-row configs (bit-identical to the sequential pass).
 
     Weight cache stems (under ``<layer>/mlp/shared_experts``): ``gate_proj_tp{tp}``, ``up_proj_tp{tp}``,
     ``down_proj_tp{tp}``.
@@ -251,8 +254,27 @@ class SharedExpert:
         if is_decode is None:
             is_decode = rows <= ttnn.TILE_SIZE
         memory_config = ttnn.L1_MEMORY_CONFIG if is_decode else ttnn.DRAM_MEMORY_CONFIG
-        gate_up_config, down_config = self._get_program_configs(rows)
         partial_dtype = self.partial_dtype(is_decode)
+        piece = None if is_decode else packed_numerics.shared_expert_piece_rows(rows)
+        if piece is None:
+            return self._mlp(x, rows, memory_config, partial_dtype)
+        # Phase 3g / D2 (SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS): a packed pass of T = B x S rows runs the three linears
+        # per S-row piece with the S-row program configs -- the explicit 1D in0_block_w-32 configs the sequential
+        # prefill@128 takes (the auto configs at T rows differ from them by 4.6-6.5 % RMS and make the packed shared
+        # partial 1.8-4.8 % smaller, D1) -- so every user's partial is bit-identical to its sequential pass (the explicit
+        # config at 256 rows == the 128-row result bit for bit, D1 r3 / r8: row independence). Pieces are device copies.
+        pieces = ttnn.split(x, piece, dim=2)
+        partials = [self._mlp(p, piece, memory_config, partial_dtype) for p in pieces]
+        for p in pieces:
+            p.deallocate(True)
+        partial = ttnn.concat(partials, dim=2)
+        for p in partials:
+            p.deallocate(True)
+        return partial
+
+    def _mlp(self, x, rows, memory_config, partial_dtype):
+        """The three linears + GLU on ``x`` ``[1, 1, rows, H]`` with the program configs of ``rows`` logical rows."""
+        gate_up_config, down_config = self._get_program_configs(rows)
 
         gate = ttnn.linear(
             x,

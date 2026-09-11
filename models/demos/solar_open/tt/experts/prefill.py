@@ -31,6 +31,7 @@ from loguru import logger
 import ttnn
 from models.demos.solar_open.config import Mode
 
+from .. import packed_prefill
 from .config import ExpertConfig, ProgramConfig
 from .operations import (
     apply_expert_parallel_allreduce,
@@ -170,6 +171,9 @@ def _process_prefill_chunk(
     # themselves when there is a single split, are released as each split is processed; with lazy_routing the
     # caller's routing tensor is released through its routing_tokens_all view at the end).
     split_size = program_config.get_down_split_size(seq_len)
+    if dense_moe:
+        # Phase 3g / D2, knob level 2: dense-bmm splits of dense_bmm_max_tokens rows (= the per-user pass's numerics)
+        split_size = seq_numerics_dense_split_size(split_size, program_config.dense_bmm_max_tokens)
     if seq_len > split_size:
         hidden_list = ttnn.split(hidden_states, split_size, dim=2)
         hidden_states.deallocate(True)  # the splits are device copies; the chunk is dead from here on
@@ -554,24 +558,53 @@ SORTED_MOE_CHUNK_HOT = sorted_moe_chunk_hot_rule_from_env()
 # Set by Model.ttnn_prefill_forward for the duration of a packed pass (batch_size > 1): the MoE sees a token-major
 # [1, 1, B*S, H] tensor and cannot tell a packed pass from a long single-user prompt on its own.
 _PACKED_PREFILL_PASS = False
+_PACKED_PREFILL_SEQ_LEN = None  # per-user (S) row count of the active packed pass (phase 3g / D2), None otherwise
 
 
 @contextlib.contextmanager
-def packed_prefill_pass(active=True):
+def packed_prefill_pass(active=True, seq_len=None):
     """Mark the enclosed prefill forward as a packed multi-user pass (``active`` True) for the plan-mode decision
-    (``plan_per_chunk``); restores the previous mark on exit. Host state only (no device op)."""
-    global _PACKED_PREFILL_PASS
-    previous = _PACKED_PREFILL_PASS
+    (``plan_per_chunk``) and, since phase 3g / D2, for the "sequential numerics" knob (``packed_seq_numerics_level``):
+    ``seq_len`` is the pass's PER-USER row count S (T = B x S), the row count whose numerics the knob reproduces.
+    Restores the previous mark on exit. Host state only (no device op)."""
+    global _PACKED_PREFILL_PASS, _PACKED_PREFILL_SEQ_LEN
+    previous = (_PACKED_PREFILL_PASS, _PACKED_PREFILL_SEQ_LEN)
     _PACKED_PREFILL_PASS = bool(active)
+    _PACKED_PREFILL_SEQ_LEN = int(seq_len) if (active and seq_len is not None) else None
     try:
         yield
     finally:
-        _PACKED_PREFILL_PASS = previous
+        _PACKED_PREFILL_PASS, _PACKED_PREFILL_SEQ_LEN = previous
 
 
 def packed_prefill_pass_active():
     """True inside ``packed_prefill_pass(True)``."""
     return _PACKED_PREFILL_PASS
+
+
+def packed_prefill_seq_len():
+    """Per-user row count S of the active packed pass (``packed_prefill_pass(True, seq_len=S)``), else None."""
+    return _PACKED_PREFILL_SEQ_LEN if _PACKED_PREFILL_PASS else None
+
+
+def packed_seq_numerics_level():
+    """Level of the phase 3g / D2 "sequential numerics" knob (``SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS``,
+    ``packed_prefill.packed_seq_numerics``) IN EFFECT: the knob's level inside a packed pass, 0 everywhere else -- a
+    single-user prefill never sees it."""
+    return packed_prefill.packed_seq_numerics_level() if _PACKED_PREFILL_PASS else 0
+
+
+def seq_numerics_dense_split_size(split_size, dense_bmm_max_tokens):
+    """Split length of the routed experts under the knob's level 2: ``dense_bmm_max_tokens`` -- every split then takes
+    the dense bmm path whose per-row result equals the per-user S-row pass's (D1 r3: 128 == 256 rows bit for bit) --
+    when the pass's per-user S runs the dense bmm itself (S <= dense_bmm_max_tokens; an S-row sequential pass of a
+    longer S takes the sorted path, which no dense split reproduces); otherwise ``split_size`` unchanged."""
+    if packed_seq_numerics_level() < 2:
+        return split_size
+    seq_len = packed_prefill_seq_len()
+    if seq_len is None or seq_len > dense_bmm_max_tokens:
+        return split_size
+    return min(split_size, dense_bmm_max_tokens)
 
 
 # perf-p1 layout switches (2026-09-07; module constants so an A/B run can flip them, all default ON):

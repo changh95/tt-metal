@@ -62,6 +62,7 @@ import ttnn
 from models.common.sampling import SamplingParams
 from models.demos.solar_open.demo.text_demo import prepare_solar_open_generator_args
 from models.demos.solar_open.tests.test_factory import TestFactory, parametrize_mesh_with_fabric
+from models.demos.solar_open.tt import packed_prefill
 from models.demos.solar_open.tt.experts import prefill as experts_prefill
 from models.demos.solar_open.tt.model import prefill_forward_text_batched
 from models.demos.solar_open.tt.model_config import BatchedPrefillOptions
@@ -321,7 +322,11 @@ def test_multi_user_isolation(
     greedy, times = _generate_greedy(*args, prompts, num_tokens, sampling, max_seq_len, packed=packed_arm)
     last_plan = dict(experts_prefill.LAST_SORTED_MOE_PLAN)
     logger.info(f"sorted-MoE plan of the last prefill split: {last_plan or None}")
-    if packed_arm and experts_prefill.SORTED_MOE_PLAN in ("auto", "chunk"):
+    if (
+        packed_arm
+        and experts_prefill.SORTED_MOE_PLAN in ("auto", "chunk")
+        and packed_prefill.packed_seq_numerics_level() < 2
+    ):
         # the 32 x 128 pass is one 4096-token chunk of four sorted splits: it must have been planned per chunk (phase
         # 3c), otherwise the slot floors below measure the phase-3a per-split dependence again
         assert (

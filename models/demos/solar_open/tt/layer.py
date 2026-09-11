@@ -11,6 +11,7 @@ from models.demos.solar_open.utils.substate import substate
 
 from .attention import Attention, AttentionConfig
 from .attention_configs import SolarOpenAttentionProgramConfig, log_attention_levers_once
+from .experts import prefill as experts_prefill
 from .mlp import MLP
 from .rms_norm import RMSNorm
 
@@ -139,7 +140,49 @@ class DecoderLayer:
         if seqlen > 32 * 1024:
             # Reallocate hidden states to prevent memory fragmentation.
             hidden_states = ttnn.move(hidden_states)
+        if not is_decode and batch_size > 1 and experts_prefill.packed_prefill_seq_len() is None:
+            # Phase 3g / D2: a packed pass reached this layer without the per-user row count on the pass marker (a
+            # caller other than Model.ttnn_prefill_forward, e.g. the layer-level tests); the "sequential numerics" knob
+            # needs S = T / B for the shared expert and the head, so the marker is completed for this layer's ops.
+            with experts_prefill.packed_prefill_pass(True, seq_len=seqlen // batch_size):
+                return self._forward(
+                    hidden_states,
+                    position_embeddings,
+                    position_idx,
+                    page_table,
+                    kv_cache,
+                    is_decode,
+                    user_id,
+                    batch_size,
+                    chunk_page_table,
+                    chunk_start_idx,
+                )
+        return self._forward(
+            hidden_states,
+            position_embeddings,
+            position_idx,
+            page_table,
+            kv_cache,
+            is_decode,
+            user_id,
+            batch_size,
+            chunk_page_table,
+            chunk_start_idx,
+        )
 
+    def _forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        position_idx,
+        page_table,
+        kv_cache,
+        is_decode,
+        user_id,
+        batch_size,
+        chunk_page_table,
+        chunk_start_idx,
+    ):
         # hidden_states: [1, 1, tokens/num_rows, hidden_size/num_columns]
         # residual: [1, 1, tokens/num_rows, hidden_size/num_columns]
         residual = hidden_states

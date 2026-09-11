@@ -3,6 +3,7 @@
 
 import ttnn
 
+from .. import packed_numerics
 from .config import AttentionConfig, ProgramConfig
 from .operations import (
     apply_allgather_and_slice,
@@ -108,8 +109,19 @@ def prefill_forward(
     if (chunked or chunk_page_table is not None) and page_table is None:
         raise ValueError("chunked prefill needs the paged KV cache (page_table is None)")
 
+    # Phase 3g / D2: in a packed multi-user pass under SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS the two projections take
+    # explicit program configs that pin in0_block_w to the value ttnn's auto config picks at the PER-USER row count S
+    # (T = B x S rows would otherwise take the 2D in0_block_w-1 config from 256 rows on: D1, layer 0, op qkv), so every
+    # user's rows come out bit-identical to its sequential S-row prefill. None everywhere else (auto, phase 1).
+    keep_bf16 = attention_bf16_output(program_config)
+    qkv_cfg, out_cfg = packed_numerics.attention_seq_numerics_configs(
+        total_seq_len, seq_len, batch_size, weights, mesh_device, program_config, keep_bf16
+    )
+
     # QKV projection
-    xqkv_fused = apply_qkv_projection(hidden_states, weights)
+    xqkv_fused = apply_qkv_projection(
+        hidden_states, weights, program_config=qkv_cfg[0], compute_kernel_config=qkv_cfg[1]
+    )
     hidden_states.deallocate(True)  # Free input activations after projection
 
     # Reshape for batch: [1, 1, B*S, QKV] -> [B, 1, S, QKV]
@@ -245,7 +257,12 @@ def prefill_forward(
         tt_out_result = apply_allgather_and_slice(rs_out, mesh_config, ccl_manager, hidden_size)
     else:
         tt_out = apply_output_projection(
-            tt_sdpa_out, weights, activation_dtype, keep_bf16=attention_bf16_output(program_config)
+            tt_sdpa_out,
+            weights,
+            activation_dtype,
+            keep_bf16=keep_bf16,
+            program_config=out_cfg[0],
+            compute_kernel_config=out_cfg[1],
         )
         tt_sdpa_out.deallocate(True)
         tt_out_result = apply_allreduce(tt_out, mesh_config, ccl_manager, hidden_size)

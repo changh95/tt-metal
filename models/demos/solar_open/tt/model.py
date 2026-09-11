@@ -19,6 +19,7 @@ from models.tt_transformers.tt.common import Mode as GeneratorMode
 from models.tt_transformers.tt.common import copy_host_to_device, rope_scaling_model_factory
 from models.tt_transformers.tt.rope import RotarySetup
 
+from . import packed_numerics, prefill_fill
 from .chunked_prefill import rope_slice_bounds
 from .experts import prefill as experts_prefill
 from .layer import DecoderLayer
@@ -543,14 +544,29 @@ class Model:
         # Final norm and lm_head. Logits in bf16 like the HF reference: bfp8 logits share one exponent per 16 vocab
         # entries (step ~0.23 at a block max of 30 vs 0.125 in bf16), which ties / reorders near-top candidates under
         # greedy argmax; TTSampling consumes bf16 natively (it typecasts anything else), so bf16 also saves a launch.
-        hidden_states = self.norm(hidden_states)
-        logits = ttnn.matmul(hidden_states, self.lm_head_weight, dtype=ttnn.bfloat16)
-        hidden_states.deallocate(True)
+        logits = self._norm_and_lm_head(hidden_states)
         self._prefill_sampling_active = False
         # TP all-gather is deferred to process_output_prefill / process_output_decode
         # (outside trace capture) since all_gather_async writes to device,
         # which is forbidden during trace capture.
 
+        return logits
+
+    def _norm_and_lm_head(self, hidden_states):
+        """Final norm + lm_head of ``hidden_states`` ``[1, 1, R, H]`` bf16 -> logits ``[1, 1, R, V / TP]``
+        bf16. The single-user prefill head (R = 32: one tile row, the width-sharded decode norm kernel, the 1D
+        in0_block_w-2 lm_head config) and decode run the two ops as they are. A PACKED pass under the phase 3g / D2
+        "sequential numerics" knob (``packed_numerics.seq_numerics_active``, R = T or B x 32 rows) runs the SAME two
+        programs on its rows instead of the R-row ones -- the norm per 32-row tile and the lm_head in pieces whose auto
+        config is the 32-row one -- so every user's logits equal its sequential head bit for bit (D1: the T-row head
+        differs through the norm kernel, 2.8 % in magnitude, and through the 2D lm_head config at M = 4096).
+        """
+        rows = int(hidden_states.shape[-2])
+        if rows > ttnn.TILE_SIZE and packed_numerics.seq_numerics_active():
+            return packed_numerics.head_seq_numerics(hidden_states, self.norm, self.lm_head_weight)
+        normed = self.norm(hidden_states)
+        logits = ttnn.matmul(normed, self.lm_head_weight, dtype=ttnn.bfloat16)
+        normed.deallocate(True)  # the phase-1 head frees the normed tensor only (the input dies with its reference)
         return logits
 
     def _page_table_mesh_mapper(self, B):
@@ -737,12 +753,40 @@ class Model:
                 self.rope_setup.sin_matrix_prefill[:, :, start:end, :],
             ]
 
+        # Phase 3g / L1: bound the paged-cache fill of a single-user EAGER prefill to the blocks that hold real tokens
+        # (tt/prefill_fill.py). The Generator's exact-fit table pads the padded prefill length with blocks the request
+        # does not own (vLLM: its zero-padded block table -> block 0, the null block) and attention/prefill.py fills
+        # every column; writing pad K / V through those entries corrupted the request's own decode live (L1). The table
+        # is tiny ([rows, <= 16] int32, replicated), so it is cut on the host and re-uploaded like prepare_inputs_prefill.
+        if page_table is not None and kv_cache is not None and not getattr(self, "users_row_sharded", False):
+            keep = prefill_fill.fill_table_columns(
+                int(page_table.shape[-1]),
+                int(kv_cache[0][0].shape[2]),  # [blocks, kv_heads, block_size, head_dim] per layer
+                int(seq_len),
+                int(batch_size),
+                int(get_last_token),
+                chunked=chunk_start_idx is not None or chunk_page_table is not None,
+            )
+            if keep is not None:
+                host_table = ttnn.to_torch(ttnn.get_device_tensors(page_table)[0])[:, :keep]
+                page_table = ttnn.from_torch(
+                    host_table,
+                    device=self.mesh_device,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                    dtype=ttnn.int32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                )
+
         # Forward through layers and head (shared with decode). A packed multi-user pass (batch_size > 1, tokens of B
         # users concatenated along the sequence) is marked for the expert-sorted MoE planner, which then plans its
         # hot / cold sets once per 4096-token chunk instead of per 1024-token split (phase 3c: a user's numerics must
         # not depend on the split its slot falls into; experts/prefill.py packed_prefill_pass, SOLAR_OPEN_SORTED_MOE_PLAN).
         # Host state only: a single-user prefill (batch_size 1, chunked or not) runs exactly the phase-3b ops.
-        with experts_prefill.packed_prefill_pass(batch_size > 1):
+        # Phase 3g / D2: the marker also carries the per-user row count S = T / B, which the "sequential numerics" knob
+        # (SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS, packed_numerics.py) reproduces in the row-wise matmuls and the head.
+        with experts_prefill.packed_prefill_pass(
+            batch_size > 1, seq_len=seq_len // batch_size if batch_size > 1 else None
+        ):
             logits = self._forward_layers_and_head(
                 hidden_states=x,
                 rope_mats=rope_mats,

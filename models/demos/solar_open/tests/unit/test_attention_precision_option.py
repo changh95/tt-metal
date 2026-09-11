@@ -99,7 +99,11 @@ class TestWiring:
         from models.demos.solar_open.tt.attention import prefill
 
         src = inspect.getsource(prefill.prefill_forward)
-        assert "keep_bf16=attention_bf16_output(program_config)" in src
+        # Since phase 3g / D2 the switch is read once (the packed-pass program configs of packed_numerics need it too)
+        # and the value is what the o_proj call receives.
+        assert "keep_bf16 = attention_bf16_output(program_config)" in src
+        assert "keep_bf16=keep_bf16," in src
+        assert "attention_seq_numerics_configs(" in src
 
     def test_decode_guards_the_typecast(self):
         import inspect

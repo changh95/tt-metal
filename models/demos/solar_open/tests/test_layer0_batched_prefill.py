@@ -20,6 +20,15 @@ the OTHER split) is the layer-level gate of that fix: with the phase-3b per-spli
 bit-identical to their originals in the MoE (the hot / cold sets of the two splits differed), with the per-chunk
 plan they must be. ``b4_s128_dup`` (T = 512, one split) was bit-identical before and stays so.
 
+Phase 3g / D1 (bias bisection): ``b2_s128`` (T = 256) keeps the MoE on the dense-bmm path in BOTH forms (a 256-token
+split is below ``dense_bmm_max_tokens``), so its rows isolate the row-count effect of the attention projections, the
+router / shared-expert configs (explicit 1D configs up to 128 rows, ttnn auto above) and the dense MoE alone.
+
+Phase 3g / D2: with ``SOLAR_OPEN_PACKED_PREFILL_SEQ_NUMERICS`` at its default (2, ``tt/packed_numerics.py``) the packed
+form runs the per-user S-row programs (pinned qkv / o_proj configs, the shared expert in S-row pieces, dense-bmm MoE
+splits), so every row of every case below is expected BIT-IDENTICAL to the per-user form (D2 r7); the floors are the
+``=0`` (phase 3a-3f) record and stay as no-garbage floors.
+
     pytest models/demos/solar_open/tests/test_layer0_batched_prefill.py -k 1x8
 
 Token ids come from the chat-templated KO/EN prompts with the template date pinned (``pinned_template_date``:
@@ -67,8 +76,8 @@ def _pcc_rows(a, b):
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize(
     "batch_size, seq_len, duplicate_users",
-    [(4, 128, False), (4, 128, True), (16, 128, True)],
-    ids=["b4_s128", "b4_s128_dup", "b16_s128_dup"],
+    [(2, 128, False), (4, 128, False), (4, 128, True), (16, 128, True)],
+    ids=["b2_s128", "b4_s128", "b4_s128_dup", "b16_s128_dup"],
 )
 @parametrize_mesh_with_fabric([(1, 8)])
 def test_layer0_packed_vs_per_user_prefill(
@@ -169,7 +178,7 @@ def test_layer0_packed_vs_per_user_prefill(
             hidden_states=attn_in, position_embeddings=position_embeddings_ref, attention_mask=mask
         )
     attn_in_bf16 = attn_in.to(torch.bfloat16).float()
-    with experts_prefill.packed_prefill_pass(True):  # what Model.ttnn_prefill_forward does for batch_size > 1
+    with experts_prefill.packed_prefill_pass(True, seq_len=seq_len):  # what Model.ttnn_prefill_forward does for B > 1
         tt_attn_packed = decoder_layer.self_attn(
             upload(attn_in_bf16.reshape(num_tokens, -1)),
             rope_mats=rope_mats,
@@ -207,7 +216,7 @@ def test_layer0_packed_vs_per_user_prefill(
         moe_ref = reference_layer.mlp(moe_in).reshape(num_tokens, -1)
     moe_in_bf16 = moe_in.to(torch.bfloat16).float()
     experts_prefill.LAST_SORTED_MOE_PLAN.clear()
-    with experts_prefill.packed_prefill_pass(True):
+    with experts_prefill.packed_prefill_pass(True, seq_len=seq_len):
         tt_moe = decoder_layer.mlp(upload(moe_in_bf16.reshape(num_tokens, -1)), is_decode=False)
     moe_packed = download(tt_moe, num_tokens)
     tt_moe.deallocate(True)
@@ -239,7 +248,7 @@ def test_layer0_packed_vs_per_user_prefill(
     with torch.no_grad():
         layer_ref = reference_layer(hidden_states, attention_mask=mask, position_embeddings=position_embeddings_ref)
         layer_ref = layer_ref.reshape(num_tokens, -1)
-    with experts_prefill.packed_prefill_pass(True):
+    with experts_prefill.packed_prefill_pass(True, seq_len=seq_len):
         tt_layer = decoder_layer(
             upload(hidden_states.reshape(num_tokens, -1)),
             position_embeddings=rope_mats,

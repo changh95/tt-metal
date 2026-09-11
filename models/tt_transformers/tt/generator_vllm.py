@@ -1169,7 +1169,8 @@ class SolarOpenForCausalLM(HybridAttentionForCausalLM):
     Registry key = ``hf_config.architectures[0]`` = ``"SolarOpenForCausalLM"``, which the plugin registers as
     ``TTSolarOpenForCausalLM`` from an EXTRA_MODELS_DIR bundle whose ``vllm_metadata.json`` points at this
     module / class (see ``vllm_support.VLLM_ARCHITECTURE``); the PLAIN name must resolve here too
-    (``--model-class-overrides``), see the protocol-shim comment below.
+    (``--model-class-overrides`` with plugin 51b43cf; the plugin patch on our clone's ``solar-fixes`` branch registers
+    the bundle's plain name itself, which retires the override once verified live), see the protocol-shim comment below.
 
     Solar's 48 layers are all full attention and ``SolarOpenConfig`` has no ``layer_types``, so
     ``get_kv_cache_spec`` emits the 48 ``FullAttentionSpec`` entries itself (one KV group) instead of the base
