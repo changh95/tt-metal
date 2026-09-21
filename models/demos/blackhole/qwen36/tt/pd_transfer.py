@@ -74,6 +74,14 @@ def _reorder_runs(host: torch.Tensor, runs) -> torch.Tensor:
     return torch.cat(parts, dim=0)
 
 
+def _copy_off_pool(t: torch.Tensor, pool_buf) -> torch.Tensor:
+    """`t` as a contiguous tensor that does not alias `pool_buf` (a borrowed KvExportPool entry, or None for
+    the composer read whose host tensor is already a fresh copy)."""
+    if pool_buf is not None and t.untyped_storage().data_ptr() == pool_buf.untyped_storage().data_ptr():
+        return t.clone(memory_format=torch.contiguous_format)
+    return t.contiguous()
+
+
 def _device_convert() -> bool:
     """QWEN36_PD_DEVICE_CONVERT=0 falls back to host-side tilize/untilize + dtype conversion."""
     return os.environ.get("QWEN36_PD_DEVICE_CONVERT", "1") != "0"
@@ -154,8 +162,10 @@ class KvExportPool:
     lands device d's `[n_caches * n, nkv, blk, hd]` straight in the torch memory -- no mesh composer, no host
     concat, no `to_torch` copy. One buffer serves every bucket, so the pages faulted in by the first (warm-up)
     read stay warm for all of them. `export_kv_blocks` borrows an entry for the duration of one call and hands
-    it back (its outputs are contiguous copies), so one entry per concurrent export suffices; the pool is capped
-    at `max_entries` (an exhausted pool falls back to the composer read). Memory per entry =
+    it back; its outputs never alias the entry (they are copied off it unconditionally -- at n_dev > 1 the
+    device-major -> block-major permute is already a copy, at n_dev == 1 it is a view and an explicit clone is
+    taken), so one entry per concurrent export suffices; the pool is capped at `max_entries` (an exhausted
+    pool falls back to the composer read). Memory per entry =
     4 MiB x max_blocks at TP4 (1 GiB at the default 256 blocks); buckets above `max_blocks` use the composer.
     Host memory only: safe to create at request time under captured traces.
     """
@@ -236,8 +246,10 @@ def export_kv_blocks(model, block_ids):
 
     One device read for the whole request: the blocks of all 32 cache tensors are concatenated on device
     into a single tensor, converted (bfp8 -> bf16, untilize) once, and DMA'd once into a pooled, borrowed
-    row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`; 128 blocks = 512 MiB in
-    ~35 ms vs ~320 ms through the composer). Buckets beyond the pool (or QWEN36_PD_EXPORT_POOL=0 /
+    row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`; 128 blocks = 512 MiB read in
+    ~14 ms vs ~330 ms through the composer; ~38 ms for the whole export incl. the host permute below).
+    The returned tensors own their memory (never a view of the pool entry, which is released on return).
+    Buckets beyond the pool (or QWEN36_PD_EXPORT_POOL=0 /
     QWEN36_PD_DEVICE_CONVERT=0) fall back to the dim-0 mesh composer read (~1.2 GiB/s plus a host cat;
     composing along a middle dim ran at ~0.1 GiB/s and 32 separate reads took seconds).
 
@@ -317,7 +329,10 @@ def export_kv_blocks(model, block_ids):
                 t = t.permute(1, 0, 2, 3, 4).reshape(n, n_dev * nkv, blk, hd)
                 if mode == "runs":
                     t = _reorder_runs(t, runs)
-                pair.append(t[real_off : real_off + n_real].contiguous())  # a copy: the pool entry is free after this
+                # The output must own its memory: the pool entry is released below and refilled by the next
+                # export. permute+reshape is a copy only when n_dev > 1; at n_dev == 1 it is a view (and
+                # _reorder_runs returns its input for ascending runs, .contiguous() is a no-op), so clone then.
+                pair.append(_copy_off_pool(t[real_off : real_off + n_real], host if borrowed is not None else None))
             out.append((pair[0], pair[1]))
     finally:
         if borrowed is not None:

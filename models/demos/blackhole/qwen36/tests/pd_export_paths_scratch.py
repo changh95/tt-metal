@@ -4,6 +4,8 @@
 runs / blocks / gather and compare bitwise with a host reference; time each path. No weights needed.
 
     TT_VISIBLE_DEVICES=0,1,6,7 python models/demos/blackhole/qwen36/tests/pd_export_paths_scratch.py
+
+Then (SCRATCH_N1=1, default) a 1x1 mesh phase for the n_dev == 1 pool-aliasing condition.
 """
 
 import os
@@ -19,15 +21,26 @@ from models.demos.blackhole.qwen36.tt import pd_transfer
 NB, NKV, BLK, HD, NL = int(os.environ.get("NB", "512")), 1, 64, 256, 16
 
 
-def main():
-    mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4), l1_small_size=24576)
-    mesh.enable_program_cache()
+def _pool_storage_ptrs(model):
+    pool = getattr(model, "_kv_export_pool", None)
+    return {host.untyped_storage().data_ptr() for host, _ in pool._free} if pool is not None else set()
+
+
+def _aliases_pool(out, model) -> bool:
+    """True when any exported tensor lives in a (released) KvExportPool entry."""
+    ptrs = _pool_storage_ptrs(model)
+    return any(t.untyped_storage().data_ptr() in ptrs for pair in out for t in pair)
+
+
+def build_caches(mesh, n_dev, nb, nl):
+    """Random bfp8 paged caches sharded over the mesh (dim 1 = device) + the host reference of what the device
+    holds, [nb, n_dev*nkv, blk, hd]. Returns (model, host_ref)."""
     torch.manual_seed(0)
     layers, host_ref = [], []
-    for _ in range(NL):
+    for _ in range(nl):
         pair = []
         for _ in range(2):
-            src = torch.randn(NB, 4, BLK, HD, dtype=torch.bfloat16)  # dim 1 = device
+            src = torch.randn(nb, n_dev * NKV, BLK, HD, dtype=torch.bfloat16)  # dim 1 = device
             t = ttnn.from_torch(
                 src,
                 dtype=ttnn.bfloat8_b,
@@ -43,7 +56,51 @@ def main():
             SimpleNamespace(is_full_attention=True, attention=SimpleNamespace(paged_k=pair[0][0], paged_v=pair[1][0]))
         )
         host_ref.append((pair[0][1], pair[1][1]))
-    model = SimpleNamespace(layers=layers, mesh_device=mesh, num_devices=4)
+    return SimpleNamespace(layers=layers, mesh_device=mesh, num_devices=n_dev), host_ref
+
+
+def single_device_phase() -> int:
+    """n_dev == 1: the device-major -> block-major permute is a view of the pool entry there, so the export must
+    clone explicitly. Check exactness, that no output aliases a pool entry, and that an earlier export's tensors
+    survive later exports (which refill the same entry). Returns the number of failures."""
+    mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), l1_small_size=24576)
+    mesh.enable_program_cache()
+    model, host_ref = build_caches(mesh, 1, 64, 2)
+    pd_transfer.export_warmup(model, max_bucket=8)
+    bad = 0
+    cases = {"contig3": [10, 11, 12], "desc3": [12, 11, 10], "frag3": [38, 57, 50], "one": [7]}
+    kept = []
+    for mode in ("auto", "blocks"):
+        os.environ["QWEN36_PD_EXPORT"] = mode
+        for name, ids in cases.items():
+            out = pd_transfer.export_kv_blocks(model, ids)
+            ok = all(torch.equal(k, hk[ids]) and torch.equal(v, hv[ids]) for (k, v), (hk, hv) in zip(out, host_ref))
+            ok &= all(k.is_contiguous() and v.is_contiguous() for k, v in out)
+            alias = _aliases_pool(out, model)
+            tm = pd_transfer.LAST_EXPORT_TIMING
+            logger.info(
+                f"n_dev=1 {name:8s} {mode:6s} read={tm['read']:8s} {'OK ' if ok else 'BAD'} "
+                f"{'ALIASES POOL' if alias else 'owns memory'}"
+            )
+            bad += (not ok) + alias
+            kept.append((ids, [(k.clone(), v.clone()) for k, v in out], out))
+    os.environ.pop("QWEN36_PD_EXPORT", None)
+    # every earlier export must still hold its own bytes after all the later ones refilled the pool entry
+    stale = sum(
+        not all(torch.equal(k, k0) and torch.equal(v, v0) for (k0, v0), (k, v) in zip(snap, out))
+        for _, snap, out in kept
+    )
+    logger.info(f"n_dev=1 earlier exports overwritten by later ones: {stale}/{len(kept)}")
+    bad += stale
+    ttnn.close_mesh_device(mesh)
+    return bad
+
+
+def main():
+    mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4), l1_small_size=24576)
+    mesh.enable_program_cache()
+    model, host_ref = build_caches(mesh, 4, NB, NL)
+    layers = model.layers
     logger.info("caches ready")
     t0 = time.perf_counter()
     pd_transfer.export_warmup(model, max_bucket=int(os.environ.get("WARM_MAX", "128")))
@@ -72,6 +129,7 @@ def main():
                 dt = time.perf_counter() - t0
             ok = all(torch.equal(k, hk[ids]) and torch.equal(v, hv[ids]) for (k, v), (hk, hv) in zip(out, host_ref))
             ok &= all(k.is_contiguous() and v.is_contiguous() and k.dtype == torch.bfloat16 for k, v in out)
+            ok &= not _aliases_pool(out, model)  # outputs must own their memory (pool entry is released)
             tm = dict(pd_transfer.LAST_EXPORT_TIMING)
             res[mode] = (ok, dt, tm)
             bad += not ok
@@ -115,6 +173,8 @@ def main():
     )
     bad += not ok_imp
     ttnn.close_mesh_device(mesh)
+    if os.environ.get("SCRATCH_N1", "1") == "1":
+        bad += single_device_phase()
     logger.info("ALL OK" if bad == 0 else f"{bad} MISMATCHES")
 
 
