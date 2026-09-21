@@ -42,6 +42,17 @@ for _k, _v in _QWEN36_SERVING_OPT_DEFAULTS.items():
 # l1_small_size the GDN prefill depthwise ttnn.conv1d requires.
 GDN_CONV1D_L1_SMALL_SIZE = 24576
 
+# DRAM-sharded decode matmul tunables (27B TP=4 per-device shapes; see _init_tp_config):
+#   workers    = num_workers_per_dram_bank (1 only on a multi-device mesh, see _init_tp_config)
+#   in0_cores  = L1 width-shard grid of the activation (row-major cores of the compute grid)
+#   per_core_n = OUTPUT storage shard width in tiles (output grid = ceil(N_tiles / per_core_n) cores)
+#   in0_block_w (optional) = K block; default largest divisor <= 8 of the in0 shard width
+DS_DECODE_CFG = {
+    # down: K 4352 (136 tiles -> 17 cores x 8) N 5120 bfp8 LoFi; 32 storage cores x 5 tiles. Measured 54.6 us
+    # (1D 33-core: 66.2); 34 cores x 4 tiles: 54.7; per_core_n 10: 54.7.
+    "mlp_w2": {"workers": 1, "in0_cores": 17, "per_core_n": 5},
+}
+
 
 class Qwen36ModelArgs(ModelArgs):
     """Qwen3.5-9B ModelArgs for Blackhole P150."""
@@ -130,6 +141,7 @@ class Qwen36ModelArgs(ModelArgs):
     def _init_tp_config(self, mesh_device):
         """Per-device sharded dims + DRAM matmul/mem configs for TP (num_devices>1)."""
         import ttnn
+        from models.common.utility_functions import is_blackhole
         from models.demos.blackhole.qwen36.tt import tp_common as tpc
 
         tp = self.num_devices
@@ -253,6 +265,40 @@ class Qwen36ModelArgs(ModelArgs):
         # vs the old 8x4; same 1536x5120 shape as attn_wo). On WH (decode_grid_w=8) this falls back to 8x5.
         self.gdn_out_decode_1d_progcfg = tpc.create_matmul_1d_decode_progcfg(
             M, self.gdn_value_dim_tp, self.dim, num_cores=33, grid_w=self.decode_grid_w
+        )
+
+        # DRAM-sharded decode down-projection (OPT-IN: QWEN36_DECODE_DRAM_SHARDED=1). Item A findings (P150x4,
+        # TP=4, 2026-09-21):
+        #  * The multi-reader kernel (MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig.num_workers_per_dram_bank
+        #    2-3, tt-metal #54242) is NOT reachable on a multi-device mesh: its reader placement calls
+        #    experimental::Device::get_worker_noc_hop_distance, which TT_FATALs "only supported on unit MeshDevice"
+        #    (tt_metal/impl/device/experimental/device.cpp:20) for the (1,4) mesh, so only workers=1 runs here.
+        #  * Measured with tests/test_decode_proj_dram_sharded_bench_scratch.py (traced us/op, 1 worker vs the
+        #    tuned 1D path): gate 71 vs 51, up 54 vs 46, gdn qkvzab 87 vs 63, out/wo 35 vs 28, attn qkv 74 vs 53
+        #    -> those stay on the 1D kernels; down 54.6 vs 66.2 -> the 8 bank readers stream the 23.7 MB bfp8
+        #    weight at ~430 GB/s (the 1D 33-core grid: ~360). Model harness (profile_prefill_decode, TP=4):
+        #    decode w1 25.63 -> 25.12 ms, w32 33.15 -> 32.56 ms with down on this path.
+        #  * Numerics: the K accumulation differs at the bf16-lsb level per layer (max|d| 0.0078 vs the 1D result
+        #    on random data, pcc_vs_1d 0.9999998), which through 64 layers + the GDN state gives decode-logits
+        #    PCC 0.9991-0.99997 vs the 1D reference (tests/test_decode_proj_dram_sharded_ref.py; greedy tokens
+        #    over 8 steps x 4 prompts identical, prefill argmax identical, but top-1 flips on 1-4 of 32 rows of
+        #    the synthetic fixed-input steps). That misses the item's PCC >= 0.9999 bar, so the path is OFF by
+        #    default (the flag reproduces the 1D reference bit-exactly when off) and kept as an opt-in.
+        # When on: decode-only WIDTH_SHARDED copy of w2 (~24 MB/layer; prefill keeps the interleaved one for the
+        # 2D kernel); in0 = silu(gate)*up resharded to 17 cores x 8 tiles (in0_block_w 8; 8 cores x 1-tile blocks
+        # measured 144 us); the L1 width-sharded output is re-laid-out to L1 interleaved for the reduce-scatter.
+        self.decode_grid_size = mesh_device.compute_with_storage_grid_size()
+        self.mlp_w2_ds_decode = is_blackhole() and os.environ.get("QWEN36_DECODE_DRAM_SHARDED", "0") == "1"
+        c2 = DS_DECODE_CFG["mlp_w2"]
+        self.mlp_w2_ds_workers = c2["workers"]
+        self.mlp_w2_ds_memcfg = tpc.create_dram_sharded_mem_config(self.hidden_dim // tp, self.dim, c2["workers"])
+        _hid_tiles = self.hidden_dim // tp // tpc.TILE_SIZE
+        assert _hid_tiles % c2["in0_cores"] == 0, (_hid_tiles, c2["in0_cores"])
+        self.act_shard_mlp_hidden = tpc.create_width_shard_config(
+            self.hidden_dim // tp, c2["in0_cores"], self.decode_grid_size
+        )
+        self.mlp_w2_ds_progcfg = tpc.create_dram_sharded_decode_progcfg(
+            _hid_tiles // c2["in0_cores"], c2["per_core_n"], c2["workers"], in0_block_w=c2.get("in0_block_w")
         )
 
         # Prefill matmul factory (M = seq_len)

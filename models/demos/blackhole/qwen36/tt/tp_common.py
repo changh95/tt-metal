@@ -94,12 +94,24 @@ def _find_grid(n_tiles, target=32):
 
 
 # DRAM-sharded config builders
-def create_dram_sharded_mem_config(k, n):
-    """WIDTH_SHARDED DRAM memory config for a weight matrix [k, n]."""
-    padded_n = _roundup(n, TILE_SIZE * DRAM_CORES)
+def dram_sharded_shard_width_tiles(n, workers=1):
+    """Per-bank shard width (tiles) of a DRAM WIDTH_SHARDED weight [k, n] read by `workers` cores per bank.
+
+    The multi-reader DRAM-sharded matmul factory splits each bank's shard evenly across its readers and
+    requires shard_width == workers * ceil(N_tiles / (DRAM_CORES * workers))
+    (matmul_multicore_reuse_mcast_dram_sharded_program_factory.cpp: "requires weight shard width ..."). For
+    workers=1 this is the classic ceil(N_tiles / 8). The pad columns are storage only: the tensor's logical N
+    is unchanged and the op's writer drops them, so no zero-fill / slice is needed downstream."""
+    n_tiles = math.ceil(n / TILE_SIZE)
+    return workers * math.ceil(n_tiles / (DRAM_CORES * workers))
+
+
+def create_dram_sharded_mem_config(k, n, workers=1):
+    """WIDTH_SHARDED DRAM memory config for a weight matrix [k, n]; `workers` = readers per DRAM bank the
+    decode matmul will use (sets the per-bank storage pad, see dram_sharded_shard_width_tiles)."""
     shard_spec = ttnn.ShardSpec(
         DRAM_GRID,
-        (k, padded_n // DRAM_CORES),
+        (k, dram_sharded_shard_width_tiles(n, workers) * TILE_SIZE),
         ttnn.ShardOrientation.ROW_MAJOR,
     )
     return ttnn.MemoryConfig(
@@ -107,6 +119,65 @@ def create_dram_sharded_mem_config(k, n):
         ttnn.BufferType.DRAM,
         shard_spec,
     )
+
+
+def create_dram_sharded_decode_progcfg(per_core_k_tiles, per_core_n, workers, fused_activation=None, in0_block_w=None):
+    """Multi-reader DRAM-sharded decode matmul progcfg (M = 1 tile; Blackhole only for workers > 1).
+
+    per_core_k_tiles: in0 shard width in tiles (in0 must be L1 WIDTH_SHARDED, ROW_MAJOR; K % shard == 0);
+    in0_block_w must divide it (default: largest divisor <= 8).
+    per_core_n: the OUTPUT storage shard width in tiles -- the op derives the output grid as
+    ceil(N_tiles / per_core_n) row-major cores of the compute grid and reshards the 8*workers reader cores'
+    results onto it (a ragged last storage core is fine). It is NOT the reader width, which the factory
+    computes itself as ceil(N_tiles / (8*workers)).
+    workers: num_workers_per_dram_bank (1-3)."""
+    if in0_block_w is None:
+        in0_block_w = _find_largest_divisor(per_core_k_tiles)
+    assert per_core_k_tiles % in0_block_w == 0, (per_core_k_tiles, in0_block_w)
+    return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=in0_block_w,
+        per_core_M=1,
+        per_core_N=per_core_n,
+        fused_activation=fused_activation,
+        num_workers_per_dram_bank=workers,
+    )
+
+
+def create_width_shard_config(k, cores, grid):
+    """L1 WIDTH_SHARDED config for a [32, k] decode activation on the first `cores` row-major cores of the
+    compute grid (the core order the DRAM-sharded matmul uses for its output storage grid)."""
+    assert k % (cores * TILE_SIZE) == 0, (k, cores)
+    return ttnn.create_sharded_memory_config(
+        shape=(TILE_SIZE, k // cores),
+        core_grid=ttnn.num_cores_to_corerangeset(cores, grid, True),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+
+def matmul_dram_sharded_decode(x, weight, progcfg, compute_cfg, in0_shard_cfg, out_memory_config=None):
+    """Decode (M <= 1 tile) matmul on a DRAM WIDTH_SHARDED weight with the multi-reader kernel.
+
+    x: [.., B<=32, K] activation. If it is already L1 width-sharded (the decode norm output) it is fed as-is
+    (any shard width that in0_block_w divides is legal); otherwise it is resharded to `in0_shard_cfg`.
+    The op's output is L1 WIDTH_SHARDED on the grid it derives from progcfg.per_core_N; when
+    `out_memory_config` is given the result is re-laid-out (sharded_to_interleaved) into it."""
+    x_sh = x if x.is_sharded() else ttnn.to_memory_config(x, in0_shard_cfg)
+    out = ttnn.linear(
+        x_sh,
+        weight,
+        compute_kernel_config=compute_cfg,
+        program_config=progcfg,
+        memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+    )
+    if x_sh is not x:
+        ttnn.deallocate(x_sh)
+    if out_memory_config is not None:
+        out_il = ttnn.to_memory_config(out, out_memory_config)
+        ttnn.deallocate(out)
+        return out_il
+    return out
 
 
 def create_dram_sharded_matmul_program_config(m, k, n, num_cores=None):

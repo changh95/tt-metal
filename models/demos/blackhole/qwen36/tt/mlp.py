@@ -18,6 +18,7 @@ class MLPWeights:
     w2: ttnn.Tensor  # down_proj [in, out], bfloat8_b
     w3: ttnn.Tensor  # up_proj [in, out], bfloat4_b
     w_gate_up: ttnn.Tensor = None  # TP prefill: tile-pair-interleaved packed [gate|up] for fused-swiglu AGMM
+    w2_ds: ttnn.Tensor = None  # TP decode: DRAM WIDTH_SHARDED copy of down_proj for the multi-reader decode matmul
 
 
 def _build_gate_up(gate_w, up_w, mesh, tp, cache_path):
@@ -77,6 +78,22 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
             else None
         )
 
+        # Decode-only DRAM WIDTH_SHARDED copy of down_proj for the DRAM-sharded decode matmul (opt-in,
+        # QWEN36_DECODE_DRAM_SHARDED=1 -> model_config.mlp_w2_ds_decode). Prefill keeps the interleaved w2 (2D kernel). The cache suffix carries
+        # the reader count because the per-bank storage pad is baked into the cached tensor.
+        w2_ds = (
+            tpc.shard_w(
+                state_dict["down_proj.weight"],
+                mesh_device,
+                dim=0,
+                memory_config=args.mlp_w2_ds_memcfg,
+                cache_path=cache("down_proj", f".ds{args.mlp_w2_ds_workers}"),
+                dtype=ttnn.bfloat8_b,
+            )
+            if args is not None and getattr(args, "mlp_w2_ds_decode", False)
+            else None
+        )
+
         if dram_sharded:
             return MLPWeights(
                 w1=tpc.shard_w(
@@ -133,6 +150,7 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
                 dtype=ttnn.bfloat8_b,
             ),
             w_gate_up=wgu,
+            w2_ds=w2_ds,
         )
 
     def load(name, dtype):
@@ -165,6 +183,8 @@ class Qwen36MLP:
         # 1D-decode (default): small-grid 1D matmuls beat the ~80-core DRAM-sharded grid on the
         # bandwidth-bound skinny decode MLP matmuls (see test_mlp_matmul_sweep). Forces interleaved weights.
         self._mlp_1d_decode = args is not None and getattr(args, "mlp_1d_decode", False)
+        # DRAM-sharded decode DOWN matmul (opt-in; gate/up stay 1D). See model_config.mlp_w2_ds_decode.
+        self._mlp_w2_ds_decode = args is not None and getattr(args, "mlp_w2_ds_decode", False)
         # Match load_mlp_weights dram_sharded condition for layout consistency.
         self._dram_sharded = (
             self.num_devices > 1
@@ -334,7 +354,17 @@ class Qwen36MLP:
         # down-proj OUTPUT in L1 for the tuned prefill path (DRAM input `hidden` + L1 output = the
         # validated sweep outL1 config; tt_all_reduce already consumes an L1 partial).
         mc_w2_out = ttnn.L1_MEMORY_CONFIG if (x.shape[-2] <= ttnn.TILE_SIZE or _prefill_tuned) else mc
-        partial = ttnn.linear(hidden, w.w2, compute_kernel_config=ckc, memory_config=mc_w2_out, program_config=w2_pc)
+        if self._mlp_w2_ds_decode and hidden.shape[-2] <= ttnn.TILE_SIZE and w.w2_ds is not None:
+            # Decode down-proj on the DRAM-sharded kernel (8 bank readers, ~430 GB/s vs ~360 on the 1D grid):
+            # reshard the L1 gate*up product to 17 cores x 8 tiles, matmul against the width-sharded w2 copy,
+            # re-lay the width-sharded result out to L1 interleaved for the reduce-scatter.
+            partial = tpc.matmul_dram_sharded_decode(
+                hidden, w.w2_ds, args.mlp_w2_ds_progcfg, ckc, args.act_shard_mlp_hidden, out_memory_config=mc_w2_out
+            )
+        else:
+            partial = ttnn.linear(
+                hidden, w.w2, compute_kernel_config=ckc, memory_config=mc_w2_out, program_config=w2_pc
+            )
         ttnn.deallocate(hidden)
 
         # tt_all_reduce on (1,4) mesh reduce-scatters to hidden dim (dim=3).
