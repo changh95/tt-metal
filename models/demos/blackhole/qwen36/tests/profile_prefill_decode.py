@@ -137,7 +137,8 @@ def test_profile_prefill_decode(mesh_device):
         # --- phase 2: decode at each bucket width (test_decode_width_scaling_traced + served per-step input refresh) ---
         pos0 = min(ISLS)
         for width in WIDTHS:
-            model._reset_gdn_state_for_new_sequence()  # in place: keeps the prefill trace's baked addresses valid
+            # (no GDN state reset here: after prefill_paged_slots the batched decode buffers are rebound and the
+            #  step timing does not depend on the state's values; the reset helper targets the B=1 scratch)
             tokens = torch.tensor([[100 + u] for u in range(width)], dtype=torch.int32)
             positions = torch.full((width,), pos0, dtype=torch.int32)
             pt = page_tables[:width]
