@@ -63,8 +63,7 @@ TT_ADDITIONAL_CONFIG = {
         "sample_on_device_mode": "decode_only",
     }
 }
-# Environment the model code expects (mirrors the p300x2 bundle's serve.env).  TT_DECODE_BUCKETING=0: decode
-# bucketing together with on-device sampling corrupts served state on this tt-metal (see PLAN.md of the port).
+# Environment the model code expects (mirrors the p300x2 bundle's serve.env).
 CHILD_ENV = {
     "ARCH_NAME": "blackhole",
     "TT_QWEN35_TEXT_VER": "qwen36_blackhole",
@@ -72,9 +71,9 @@ CHILD_ENV = {
     "VLLM_RPC_TIMEOUT": "900000",
     "VLLM_CONFIGURE_LOGGING": "1",
     "TORCHDYNAMO_DISABLE": "1",
-    # QWEN36_PD_DECODE_BUCKETING (default 0) selects it; 1 became safe once the generator's device-token keep path was
-    # gated off for always-refresh models (2026-09-21), pending the P/D re-measure.
-    "TT_DECODE_BUCKETING": os.environ.get("QWEN36_PD_DECODE_BUCKETING", "0"),
+    # QWEN36_PD_DECODE_BUCKETING (default 1): decode bucketing became safe once the generator's device-token keep path
+    # was gated off for always-refresh models (2026-09-21; P/D re-measure: TPOT 43 -> 33 ms at one user, GSM8K 0.835).
+    "TT_DECODE_BUCKETING": os.environ.get("QWEN36_PD_DECODE_BUCKETING", "1"),
 }
 STRIPPED_REQUEST_HEADERS = frozenset({"host", "content-length", "connection", "transfer-encoding"})
 STRIPPED_RESPONSE_HEADERS = frozenset({"content-length", "transfer-encoding", "connection"})
