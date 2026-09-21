@@ -2072,10 +2072,8 @@ class Qwen36Model:
                     for d in ttnn.get_device_tensors(dn.conv_states[0]):
                         ttnn.to_torch(d)
             _tail_ms = (
-                _PREFILL_TAIL_SLEEP_MS
-                if _PREFILL_TAIL_SLEEP_MS is not None
-                else (500.0 if self.num_devices >= 8 else 0.0)
-            )
+                _PREFILL_TAIL_SLEEP_MS if _PREFILL_TAIL_SLEEP_MS is not None else 0.0
+            )  # AICLK pin replaced the wait
             if _tail_ms and N >= _PREFILL_TAIL_SLEEP_MIN_N:
                 # Idle wait before the decode path resumes. On the 1x8 mesh the first decode after a burst of >= 8
                 # prompts wedged one chip inside SDPA-decode (tt-triage: compute stuck in the matmul unpack handshake,
@@ -2083,8 +2081,9 @@ class Qwen36Model:
                 # batched host repack: 7 hangs in 7 soaks/grids); the slow per-device-readback repack never did, and
                 # this wait alone made the fast repack survive the same soak (2026-09-21 07:56). The device is already
                 # idle here (the drain above returns in <1 ms), so the mechanism is host-side timing, still open.
-                # Default 500 ms for N >= 8 on >= 8-device meshes only (the 4-chip P/D halves never hung);
-                # QWEN36_PREFILL_TAIL_SLEEP_MS / _MIN_N override.
+                # Root cause found later that day: AICLK throttling (power/current limits) stepping the clock
+                # mid-kernel on one chip; pinning the clock (qwen36_vllm._pin_aiclk) fixed it with no wait, so the
+                # default is 0. QWEN36_PREFILL_TAIL_SLEEP_MS / _MIN_N keep the wait available as a diagnostic.
                 time.sleep(_tail_ms / 1e3)
             _t["drain"] = _tp() - _t7
         if _timing:

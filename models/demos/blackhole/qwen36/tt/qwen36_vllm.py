@@ -46,6 +46,39 @@ class TT_Qwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor, info=TT_Qwen3_5ProcessingInfo, dummy_inputs=Qwen3VLDummyInputsBuilder
 )
+def _pin_aiclk(mesh_device):
+    """Pin every Blackhole chip's AICLK (ARC FORCE_AICLK) for the life of the process.
+
+    On the 8-chip P150x8 the cards' power/current limits (tdp 150 W, tdc 200 A) throttle AICLK under heavy load; the
+    chips at the lowest core voltage throttled hardest (one dropped 1350 -> 800 MHz mid-run), and a clock step in the
+    middle of a kernel wedged the attention-decode's cross-core reduction on that chip (9 hangs on 2026-09-20/21, every
+    one on the same chip, needing tt-smi -r). Pinned at 1200 MHz the same soaks ran clean with the clock flat (TPOT
+    +9%). Default: 1200 MHz on meshes of >= 8 devices, off otherwise; QWEN36_FORCE_AICLK_MHZ=<mhz> forces a value
+    (0 = do not pin). Uses pyluwen (tt-smi's chip library); silently skipped when it is not installed. The pin persists
+    after the process exits until `scripts/force_aiclk.py 0` / a board reset releases it.
+    """
+    raw = os.environ.get("QWEN36_FORCE_AICLK_MHZ")
+    try:
+        n_dev = int(mesh_device.get_num_devices())
+    except Exception:
+        n_dev = 1
+    mhz = int(raw) if raw not in (None, "") else (1200 if n_dev >= 8 else 0)
+    if mhz <= 0:
+        return
+    try:
+        import pyluwen
+    except ImportError:
+        logger.warning(f"QWEN36_FORCE_AICLK_MHZ={mhz}: pyluwen not installed; AICLK left under firmware control")
+        return
+    try:
+        chips = pyluwen.detect_chips()
+        for chip in chips:
+            chip.arc_msg(0x33, wait_for_done=True, arg0=mhz, arg1=0, timeout=2.0)  # FORCE_AICLK
+        logger.info(f"[aiclk] pinned {len(chips)} chip(s) to {mhz} MHz (FORCE_AICLK)")
+    except Exception as e:  # never let a telemetry-side failure take the server down
+        logger.warning(f"[aiclk] FORCE_AICLK {mhz} MHz failed: {e!r}")
+
+
 class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     """vLLM-compatible wrapper for Qwen3.5-9B on Blackhole P150."""
 
@@ -140,6 +173,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             # reads the cached refs instead of reaching the HF API (refused by HF_HUB_OFFLINE=1).
             offline = os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv("CI") == "true"
             name_or_path = snapshot_download(name_or_path, local_files_only=offline)
+        _pin_aiclk(mesh_device)
         args, model, _ = create_tt_model(
             mesh_device, max_batch_size=max_batch_size, max_seq_len=max_seq_len, hf_model=name_or_path
         )
