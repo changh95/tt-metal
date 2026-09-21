@@ -23,9 +23,12 @@ prefill side reuses across requests (the second read into a pinned buffer runs a
 consumer of a snapshot hands it back with `model.pd_gdn_snapshot_release(rec, taps)` when done.
 
 Decode side: `import_kv_blocks` fills the request's blocks via `paged_fill_cache` over its page-table
-row; `import_gdn_slot` writes the snapshot into the request's decode slot through `_write_gdn_slot`
-(the same path the served prefill uses). The decode instance then continues the request with one
-ordinary decode step for the last prompt token (the prefill side computed h(N-1)).
+row (by default through `TracedKvImporter`: one staged upload + one trace replay per block bucket);
+`import_gdn_slot` writes the snapshot into the request's decode slot (by default through
+`TracedGdnImporter`: staged uploads + one per-slot trace replay of in-place row writes). Both host
+preparations (`prepare_kv_import`, `prepare_gdn_import`) are torch-only and may run off the main thread.
+The decode instance then continues the request with one ordinary decode step for the last prompt token
+(the prefill side computed h(N-1)).
 """
 
 from __future__ import annotations
@@ -385,13 +388,29 @@ def _pad_block(model, cache):
     return int(pad) if pad is not None else int(cache.shape[0]) - 1
 
 
+def kv_import_traced() -> bool:
+    """QWEN36_PD_KV_IMPORT_TRACE=1 (default): import_kv_blocks replays a per-bucket trace (TracedKvImporter); 0 = the
+    eager per-cache upload + paged_fill_cache path. Device conversion (QWEN36_PD_DEVICE_CONVERT) is required."""
+    return os.environ.get("QWEN36_PD_KV_IMPORT_TRACE", "1") == "1" and _device_convert()
+
+
 def import_kv_blocks(model, block_ids, kv):
-    """Write `kv` (the `export_kv_blocks` layout) into this instance's paged caches at `block_ids`.
+    """Write `kv` (the `export_kv_blocks` layout, or a `PreparedKvImport` of it) into this instance's paged caches at
+    `block_ids`.
 
     Program shapes (tilize, typecast, paged_fill_cache) depend on the block count, so the import is padded to
     the export's power-of-two bucket: the payload rows are followed by zero rows that land in the model's pad
     KV block (whose contents never reach a live request), and `import_warmup` compiles every bucket at start.
-    Without it every new prompt-length bucket compiled ~1-2 s inside the first request's TTFT."""
+    Without it every new prompt-length bucket compiled ~1-2 s inside the first request's TTFT.
+
+    Default path (`kv_import_traced`): `TracedKvImporter` -- one borrowed upload of all caches' payload into a
+    persistent staging tensor, the block ids into a persistent page table, and a replayed per-bucket trace of
+    tilize + 32 x (slice, paged_fill_cache). Buckets above QWEN36_PD_KV_TRACE_MAX_BUCKET (64) replay the largest
+    trace once per chunk of blocks. The eager path below stays as the fallback (QWEN36_PD_KV_IMPORT_TRACE=0)."""
+    if kv_import_traced():
+        return get_traced_kv_importer(model).import_blocks(block_ids, kv)
+    if isinstance(kv, PreparedKvImport):
+        kv = kv.kv
     t0 = time.perf_counter()
     n_dev = model.num_devices
     n_real = len(block_ids)
@@ -429,8 +448,13 @@ def import_kv_blocks(model, block_ids, kv):
 
 def import_warmup(model, max_bucket: int = 2048):
     """Compile the KV import programs for every bucket up to max_bucket: zero payloads written into the pad
-    block only."""
+    block only. With the traced importer this allocates its persistent staging + page tables and captures the
+    per-bucket traces (call it at warm-up, never at request time)."""
     t0 = time.perf_counter()
+    if kv_import_traced():
+        get_traced_kv_importer(model).warmup(max_bucket)
+        logger.info(f"[pd] import warm-up (traced): buckets <= {max_bucket} in {time.perf_counter() - t0:.1f} s")
+        return
     layers = _attention_layers(model)
     cache0 = layers[0].paged_k
     _, nkv, blk, hd = cache0.shape
@@ -442,6 +466,200 @@ def import_warmup(model, max_bucket: int = 2048):
         z = torch.zeros((b, n_dev * nkv, blk, hd), dtype=torch.bfloat16)
         import_kv_blocks(model, [pad] * b, [(z, z) for _ in layers])
     logger.info(f"[pd] import warm-up: buckets <= {max_bucket} in {time.perf_counter() - t0:.1f} s")
+
+
+# --------------------------------------------------------------------------------------
+# traced per-bucket KV import
+# --------------------------------------------------------------------------------------
+
+
+def kv_trace_max_bucket() -> int:
+    return int(os.environ.get("QWEN36_PD_KV_TRACE_MAX_BUCKET", "64"))
+
+
+class PreparedKvImport:
+    """One request's KV payload in the traced importer's staging order: `host` is
+    `[n_chunks, n_dev * n_caches, nkv, chunk * blk, hd]` bf16 with chunk = min(bucket, max traced bucket), n_chunks =
+    ceil(n_real / chunk), block b of the payload at chunk b // chunk, rows [(b % chunk) * blk, +blk) of every (device,
+    cache) row group; the last chunk's pad blocks are zero rows. Each `host[c]` is contiguous, so its upload is a
+    borrowed row-major transfer. Built by
+    `prepare_kv_import` (torch ops only: may run on the connector's pull thread); `kv` keeps the payload views for the
+    eager path."""
+
+    __slots__ = ("kv", "n_real", "bucket", "chunk", "host")
+
+    def __init__(self, kv, n_real, bucket, chunk, host):
+        self.kv = kv
+        self.n_real = n_real
+        self.bucket = bucket
+        self.chunk = chunk
+        self.host = host
+
+    @property
+    def n_chunks(self) -> int:
+        return self.host.shape[0]
+
+
+def kv_import_bucket(n_real: int) -> int:
+    return export_bucket(n_real) if os.environ.get("QWEN36_PD_IMPORT_BUCKETS", "1") == "1" else n_real
+
+
+def prepare_kv_import(model, kv) -> PreparedKvImport:
+    """Host-side preparation of `kv` (the `export_kv_blocks` layout: per layer (k, v) `[n, n_dev * nkv, blk, hd]`) for
+    `import_kv_blocks`: one padded, chunked, device-major staging tensor (see PreparedKvImport)."""
+    if isinstance(kv, PreparedKvImport):
+        return kv
+    n_dev = int(model.num_devices)
+    n_caches = 2 * len(kv)
+    n_real, ndn, blk, hd = kv[0][0].shape
+    nkv = ndn // n_dev
+    bucket = kv_import_bucket(int(n_real))
+    chunk = min(bucket, kv_trace_max_bucket())
+    n_chunks = -(-int(n_real) // chunk)  # chunks holding payload blocks; all-pad chunks of the bucket are not replayed
+    host = torch.empty(n_chunks, n_dev, n_caches, nkv, chunk, blk, hd, dtype=torch.bfloat16)
+    tail = int(n_real) - (n_chunks - 1) * chunk  # payload blocks in the last chunk
+    if tail < chunk:
+        host[n_chunks - 1, :, :, :, tail:].zero_()  # only the pad rows need defined (zero) bytes
+    for li, pair in enumerate(kv):
+        for j, t in enumerate(pair):
+            if t.shape[0] != n_real:
+                raise ValueError(f"KV layer {li}: {t.shape[0]} blocks vs {n_real}")
+            src = t.view(n_real, n_dev, nkv, blk, hd)
+            for c in range(n_chunks):
+                lo, hi = c * chunk, min((c + 1) * chunk, int(n_real))
+                # [cnt, n_dev, nkv, blk, hd] -> [n_dev, nkv, cnt, blk, hd]
+                host[c, :, 2 * li + j, :, : hi - lo] = src[lo:hi].permute(1, 2, 0, 3, 4)
+    host = host.view(n_chunks, n_dev * n_caches, nkv, chunk * blk, hd)
+    return PreparedKvImport(kv, int(n_real), bucket, chunk, host)
+
+
+class TracedKvImporter:
+    """Write a request's KV blocks into the paged caches with one trace replay per chunk of blocks.
+
+    Persistent (allocated in `warmup`, i.e. at the connector's post-warm-up hook, never at request time): per traced
+    bucket n a ROW_MAJOR bf16 staging tensor `[n_dev * n_caches, nkv, n * blk, hd]` (sharded on dim 0: device d holds
+    `[n_caches, nkv, n * blk, hd]`, n MiB at TP4) and an int32 `[1, n]` page table (replicated). The per-bucket trace:
+    tilize the staging (1 op) then per cache slice its `[1, nkv, n * blk, hd]` payload (+ typecast for a non-bf16
+    cache) and `paged_fill_cache(cache, x, page_table, batch_idx=0)` -- the page table is a TENSOR input read at replay,
+    so the block ids are runtime data: `import_blocks` copies them into the persistent page table before each replay
+    (row-major memcpy, like the payload). Replaces 32 host uploads + ~64 eager ops with 1 (+1) uploads and one replay.
+    Buckets above `kv_trace_max_bucket()` are imported chunk by chunk through the largest trace (the last chunk's
+    missing blocks are pad rows aimed at the pad block).
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.mesh = model.mesh_device
+        self.n_dev = int(model.num_devices)
+        layers = _attention_layers(model)
+        self.caches = [c for att in layers for c in (att.paged_k, att.paged_v)]
+        self.n_caches = len(self.caches)
+        num_blocks, nkv, blk, hd = self.caches[0].shape
+        self.nkv, self.blk, self.hd = int(nkv), int(blk), int(hd)
+        self.pad = _pad_block(model, self.caches[0])
+        self.max_bucket = kv_trace_max_bucket()
+        self.staging: dict[int, tuple] = {}  # bucket -> (kv_rm, page_table)
+        self.traces: dict[int, int] = {}
+        self.mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0)
+        self.replicate = ttnn.ReplicateTensorToMesh(self.mesh)
+
+    def _alloc(self, n: int):
+        """Persistent staging + page table for bucket n (page table initialized to the pad block: the compile/capture
+        passes write the zero staging there)."""
+        if n in self.staging:
+            return self.staging[n]
+        kv_rm = ttnn.from_torch(
+            torch.zeros(self.n_dev * self.n_caches, self.nkv, n * self.blk, self.hd, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self.mapper,
+        )
+        pt = ttnn.from_torch(
+            torch.full((1, n), self.pad, dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self.replicate,
+        )
+        self.staging[n] = (kv_rm, pt)
+        return self.staging[n]
+
+    def _body(self, n: int):
+        kv_rm, pt = self.staging[n]
+        kv_t = ttnn.to_layout(kv_rm, ttnn.TILE_LAYOUT)  # per device [n_caches, nkv, n*blk, hd]
+        for i, cache in enumerate(self.caches):
+            x = ttnn.slice(kv_t, (i, 0, 0, 0), (i + 1, self.nkv, n * self.blk, self.hd))
+            if x.dtype != cache.dtype:
+                xc = ttnn.typecast(x, cache.dtype)
+                ttnn.deallocate(x)
+                x = xc
+            ttnn.experimental.paged_fill_cache(cache, x, pt, batch_idx=0)
+            ttnn.deallocate(x)
+        ttnn.deallocate(kv_t)
+
+    def capture(self, n: int):
+        if n in self.traces:
+            return
+        self._alloc(n)
+        t0 = time.perf_counter()
+        self._body(n)  # compile pass (writes the zero staging into the pad block)
+        ttnn.synchronize_device(self.mesh)
+        tid = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._body(n)
+        ttnn.end_trace_capture(self.mesh, tid, cq_id=0)
+        ttnn.synchronize_device(self.mesh)
+        self.traces[n] = tid
+        logger.info(f"[pd] captured KV import trace for bucket {n} in {1e3 * (time.perf_counter() - t0):.0f} ms")
+
+    def warmup(self, max_bucket: int = 2048):
+        """Allocate the staging and capture the trace of every bucket <= min(max_bucket, max traced bucket)."""
+        for b in _EXPORT_BUCKETS:
+            if b > max_bucket or b > self.max_bucket:
+                break
+            self.capture(b)
+
+    def import_blocks(self, block_ids, kv):
+        t0 = time.perf_counter()
+        prep = prepare_kv_import(self.model, kv)
+        n_real = len(block_ids)
+        if prep.n_real != n_real:
+            raise ValueError(f"{prep.n_real} blocks in payload vs {n_real} block ids")
+        chunk = prep.chunk
+        ids = [int(b) for b in block_ids] + [self.pad] * (prep.n_chunks * chunk - n_real)
+        t1 = time.perf_counter()
+        for c in range(prep.n_chunks):
+            kv_rm, pt = self._alloc(chunk)
+            h = ttnn.from_torch(
+                prep.host[c], dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=self.mapper
+            )
+            ttnn.copy_host_to_device_tensor(h, kv_rm)
+            p = ttnn.from_torch(
+                torch.tensor([ids[c * chunk : (c + 1) * chunk]], dtype=torch.int32),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=self.replicate,
+            )
+            ttnn.copy_host_to_device_tensor(p, pt)
+            if chunk not in self.traces:
+                self.capture(chunk)
+            ttnn.execute_trace(self.mesh, self.traces[chunk], cq_id=0, blocking=False)
+            ttnn.synchronize_device(self.mesh)  # the staging is rewritten by the next chunk / import
+            del h, p
+        logger.debug(
+            f"[pd] imported {n_real} KV blocks (bucket {prep.bucket}) x {self.n_caches // 2} layers in "
+            f"{1e3 * (time.perf_counter() - t0):.1f} ms (trace, {prep.n_chunks} chunk(s) of {chunk}; host prep "
+            f"{1e3 * (t1 - t0):.1f} ms)"
+        )
+
+
+def get_traced_kv_importer(model) -> "TracedKvImporter":
+    imp = getattr(model, "pd_kv_importer", None)
+    if imp is None:
+        imp = model.pd_kv_importer = TracedKvImporter(model)
+    return imp
 
 
 # --------------------------------------------------------------------------------------
@@ -536,8 +754,11 @@ class GdnSnapshotPool:
 
 def as_device_major(rec_snap, conv_snap):
     """Normalize a GDN snapshot to the device-major pair (rec [n_dev, L, Nv, Dk, Dv], taps [n_dev, L, K, C]).
-    Accepts that pair as-is, or the per-layer lists (rec_snap[li] [n_dev, Nv, Dk, Dv], conv_snap[li][m]
+    Accepts that pair as-is, a `PreparedGdnImport` in the `conv_snap` position (host prep done ahead, e.g. on the
+    connector's pull thread), or the per-layer lists (rec_snap[li] [n_dev, Nv, Dk, Dv], conv_snap[li][m]
     [n_dev, 1, C]) an older producer emits."""
+    if isinstance(conv_snap, PreparedGdnImport):
+        return conv_snap.rec, conv_snap.taps
     if isinstance(rec_snap, torch.Tensor) and isinstance(conv_snap, torch.Tensor):
         if rec_snap.dim() != 5 or conv_snap.dim() != 4:
             raise ValueError(
@@ -555,7 +776,9 @@ def import_gdn_slot(model, slot, rec_snap, conv_snap, mode=None):
     `[n_dev, L, K, C]`; the per-layer list form is accepted too) into decode `slot`.
 
     mode "trace" (default) = TracedGdnImporter: host memcpy into fixed row-major staging tensors + one replayed
-    per-slot trace (tilize, fill_cache rows, tap row writes, packed-history row write for all layers).
+    per-slot trace (tilize, fill_cache rows, tap row writes, packed-history row write for all layers). `conv_snap`
+    may be a `PreparedGdnImport` (see `prepare_gdn_import`): the host-side preparation was then done ahead of time
+    (on another thread) and this call only uploads + replays.
     mode "host" = the served prefill's own slot write (`_write_gdn_slot`: one from_torch + slice/concat/copy
     row write per tensor, ~4 s for 48 layers); "fillcache" (default, QWEN36_PD_GDN_IMPORT) = one batched
     upload of all layers, then per layer an in-place `ttnn.fill_cache` for the recurrent state row and the
@@ -564,11 +787,12 @@ def import_gdn_slot(model, slot, rec_snap, conv_snap, mode=None):
     """
     mode = mode or os.environ.get("QWEN36_PD_GDN_IMPORT", "trace")
     t0 = time.perf_counter()
+    prepared = conv_snap if isinstance(conv_snap, PreparedGdnImport) else None
     rec_snap, conv_snap = as_device_major(rec_snap, conv_snap)
     if mode == "host":
         model._write_gdn_slot(int(slot), rec_snap, conv_snap)
     elif mode == "trace":
-        get_traced_importer(model).import_slot(int(slot), rec_snap, conv_snap)
+        get_traced_importer(model).import_slot(int(slot), rec_snap, conv_snap, prepared=prepared)
     else:
         _import_gdn_slot_fillcache(model, int(slot), rec_snap, conv_snap)
     logger.debug(f"[pd] imported GDN state into slot {slot} ({mode}) in {1e3 * (time.perf_counter() - t0):.1f} ms")
@@ -626,13 +850,146 @@ def kv_nbytes(kv):
 # --------------------------------------------------------------------------------------
 
 
+class PreparedGdnImport:
+    """A GDN snapshot with the D-side host preparation done: the borrowed-upload views of the staging row order plus
+    the packed conv-history rows for BOTH slot parities (the decode slot is only known when the request is admitted).
+    Built by `prepare_gdn_import` / `GdnHostPacker.prepare` (torch ops only, so it may run on the connector's pull
+    thread); consumed by `import_gdn_slot(model, slot, rec, prepared)` (the `conv_snap` position). `rec` / `taps`
+    are the device-major views the snapshot API documents, so `as_device_major`, `verify_gdn_slot` and
+    `gdn_state_nbytes` take a prepared import as-is."""
+
+    __slots__ = ("rec", "taps", "rec_rows", "taps_rows", "hist")
+
+    def __init__(self, rec, taps, rec_rows, taps_rows, hist):
+        self.rec = rec  # [n_dev, L, Nv, Dk, Dv]
+        self.taps = taps  # [n_dev, L, K, C]
+        self.rec_rows = rec_rows  # [n_dev*L, Nv, Dk, Dv] view of rec (staging row order)
+        self.taps_rows = taps_rows  # [n_dev*L*K, 1, C] view of taps
+        self.hist = hist  # [2, n_dev*L, Nv*4, 32, 32] bf16 packed history per parity, or None (no packed buffer)
+
+
+class GdnHostPacker:
+    """Host-only half of the traced GDN import: the model's per-device GDN geometry and the vectorized builder of the
+    packed conv-history rows (`_pack_head_tiles` for all layers/devices at once). No device tensors, no ttnn calls after
+    construction -- safe to use from a worker thread once built (build it on the main thread: `get_gdn_host_packer`)."""
+
+    def __init__(self, model):
+        self.dn = [layer.attention for layer in model.layers if not layer.is_full_attention]
+        dn0 = self.dn[0]
+        self.n_dev, self.L, self.K, (self.Nv, self.Dk, self.Dv), self.C, self.rec_dtype, _ = gdn_snapshot_dims(model)
+        self.with_hist = dn0.conv_hist_packed is not None
+        Nv, Nk, Dk, Dv = dn0.Nv, dn0.Nk, dn0.Dk, dn0.Dv
+        rf, kd = Nv // Nk, Nk * Dk
+        rows = []
+        for h in range(Nv):
+            hk = h // rf
+            rows.append(
+                torch.cat(
+                    [
+                        torch.arange(hk * Dk, (hk + 1) * Dk),
+                        torch.arange(kd + hk * Dk, kd + (hk + 1) * Dk),
+                        torch.arange(2 * kd + h * Dv, 2 * kd + (h + 1) * Dv),
+                    ]
+                )
+            )
+        # [Nv, 3*Dk] channel indices: head h reads its q chunk (kv head hk), k chunk and v chunk of a [C] row -- the
+        # vectorized form of _pack_head_tiles' per-head concat
+        self.gidx = torch.stack(rows)
+        self.n_chunks = self.gidx.shape[1] // 32
+        self._verified_pack = False
+        self._lock = threading.Lock()
+
+    def rows(self, rec, taps):
+        """The borrowed-upload views (staging row order) of a device-major snapshot."""
+        rec_rows = rec.reshape(self.n_dev * self.L, self.Nv, self.Dk, self.Dv)
+        taps_rows = taps.reshape(self.n_dev * self.L * self.K, 1, self.C)
+        return rec_rows, taps_rows
+
+    def gathered(self, taps):
+        """taps [n_dev, L, K, C] -> the per-head channel chunks [n_dev, L, Nv, K, n_chunks, 32] bf16 (the expensive
+        gather; parity-independent)."""
+        n = self.n_chunks
+        g = taps[..., self.gidx].to(torch.bfloat16).reshape(self.n_dev, self.L, self.K, self.Nv, n, 32)
+        return g.permute(0, 1, 3, 2, 4, 5)  # [n_dev, L, Nv, K, n, 32]
+
+    def _scatter(self, g, par, out):
+        # channel chunk c of tap j lands at tile row 2c + parity, tile j (see _pack_head_tiles)
+        n = self.n_chunks
+        out[..., par : 2 * n + par : 2, :] = g
+
+    def hist(self, taps, parity, g=None):
+        """Packed history rows of every layer/device at `parity`: [n_dev*L, Nv*4, 32, 32] bf16, contiguous."""
+        g = self.gathered(taps) if g is None else g
+        out = torch.zeros(self.n_dev, self.L, self.Nv, 4, 32, 32, dtype=torch.bfloat16)
+        self._scatter(g, parity, out)
+        self._verify(taps, out, parity)
+        return out.reshape(self.n_dev * self.L, self.Nv * 4, 32, 32)
+
+    def hist_both(self, taps):
+        """Both parities from one gather: [2, n_dev*L, Nv*4, 32, 32] (index [slot & 1] is contiguous)."""
+        g = self.gathered(taps)
+        out = torch.zeros(2, self.n_dev, self.L, self.Nv, 4, 32, 32, dtype=torch.bfloat16)
+        for par in (0, 1):
+            self._scatter(g, par, out[par])
+        self._verify(taps, out[0], 0)
+        return out.reshape(2, self.n_dev * self.L, self.Nv * 4, 32, 32)
+
+    def _verify(self, taps, out, par):
+        """One-time check of the vectorized layout against the layer's own scalar packer (host torch only)."""
+        if self._verified_pack:
+            return
+        with self._lock:
+            if self._verified_pack:
+                return
+            ref = self.dn[0]._pack_head_tiles([taps[0, 0, j].reshape(-1) for j in range(self.K)], parity=par)
+            if not torch.equal(ref, out[0, 0]):
+                raise RuntimeError("vectorized packed-history layout differs from _pack_head_tiles")
+            self._verified_pack = True
+
+    def prepare(self, rec, taps) -> PreparedGdnImport:
+        """Everything the import needs from the host, for any slot: views in staging row order + both parities of the
+        packed history (when the layers carry a packed buffer)."""
+        rec, taps = as_device_major(rec, taps)
+        rec_rows, taps_rows = self.rows(rec, taps)
+        return PreparedGdnImport(rec, taps, rec_rows, taps_rows, self.hist_both(taps) if self.with_hist else None)
+
+
+def get_gdn_host_packer(model) -> "GdnHostPacker":
+    """The model's GdnHostPacker (built on first use; build it on the main thread before handing it to workers)."""
+    packer = getattr(model, "pd_gdn_host_packer", None)
+    if packer is None:
+        packer = model.pd_gdn_host_packer = GdnHostPacker(model)
+    return packer
+
+
+def prepare_gdn_import(model, rec_snap, conv_snap) -> PreparedGdnImport:
+    """Host-side preparation of one request's GDN snapshot for `import_gdn_slot` (torch ops only: may run on any thread,
+    e.g. the connector's pull worker, once `get_gdn_host_packer(model)` was called on the main thread). Pass the result
+    as `import_gdn_slot`'s `conv_snap`."""
+    return get_gdn_host_packer(model).prepare(rec_snap, conv_snap)
+
+
 class TracedGdnImporter:
     """Write a request's GDN snapshot into decode slot ``slot`` with one trace replay.
 
-    The eager writes (48 layers x (recurrent row + K tap rows + packed-history row)) are ~1000 small ops and
-    dispatch-bound (~0.4 s). Here the host copies the snapshot into fixed ROW_MAJOR staging tensors (rec fp32,
-    taps bf16, packed history bf16 -- the packed row is built on the host with the layer's own
-    ``_pack_head_tiles``, parity ``slot & 1``), and a per-slot trace does tilize + all the row writes on device.
+    The host copies the snapshot into fixed ROW_MAJOR staging tensors (rec fp32, taps bf16, packed history bf16 -- the
+    packed rows are built on the host by `GdnHostPacker`, parity ``slot & 1``) and a per-slot trace does tilize + the
+    row writes on device, all IN PLACE at the decode buffers' trace-baked addresses:
+
+    * recurrent state: ``ttnn.fill_cache(rec_state, rec_l, slot)`` (rec_state ``[B, Nv, Dk, Dv]``, rec_l ``[1, Nv, Dk, Dv]``);
+    * packed conv history: ``ttnn.fill_cache`` into the ``[B, Nv*4, 32, 32]`` view of conv_hist_packed (a true view:
+      the last two dims are unchanged), the way ``_sync_conv_hist_packed_device`` writes one slot;
+    * conv taps: ``ttnn.where(onehot[slot], tap_row, conv_states[m], output_tensor=conv_states[m])`` -- a masked
+      select over the ``[1, B, C]`` tap buffer with the ``[1, 1, C]`` tap row broadcast along B and the buffer itself
+      as the (aliased) output, so row ``slot`` takes the new taps and every other row is forwarded unchanged. The
+      one-hot row masks (one ``[1, B, C]`` bf16 tensor per slot, 160 KiB each) are persistent, allocated here.
+      (``ttnn.update_cache`` was tried first: its program buffers ``32 x C/32`` tiles = 5 MiB of L1 at C = 2560.)
+
+    That is 2 + 2 + 2K = 12 device ops per layer (slice + write each), ~580 per import, vs ~51 per layer before
+    (slice/concat/copy rewrites of the WHOLE 3 MB packed-history buffer and of every [1, B, C] tap buffer, the latter
+    through untilize/tilize round trips on the tile-padded batch dim). Bytes landing in the slot rows are identical:
+    fill_cache and where forward the (already device-tilized, hence canonical) bf16/fp32 values untouched, exactly as
+    the old slice/concat/copy did.
     Traces are captured lazily per slot (or up front via ``precapture``); slot indices are baked into them.
     """
 
@@ -640,12 +997,11 @@ class TracedGdnImporter:
         self.model = model
         self.mesh = model.mesh_device
         self.n_dev = model.num_devices
-        self.dn = [layer.attention for layer in model.layers if not layer.is_full_attention]
+        self.packer = get_gdn_host_packer(model)
+        self.dn = self.packer.dn
         dn0 = self.dn[0]
-        self.L, self.K = len(self.dn), dn0.K
-        rec_shape = tuple(dn0.rec_state.shape)  # [B, Nv, Dk, Dv]
-        self.Nv, self.Dk, self.Dv = rec_shape[1], rec_shape[2], rec_shape[3]
-        self.C = int(dn0.conv_states[0].shape[-1])
+        self.L, self.K = self.packer.L, self.packer.K
+        self.Nv, self.Dk, self.Dv, self.C = self.packer.Nv, self.packer.Dk, self.packer.Dv, self.packer.C
         self.rec_dtype = dn0.rec_state.dtype
         self.with_hist = dn0.conv_hist_packed is not None
         mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0)
@@ -663,13 +1019,29 @@ class TracedGdnImporter:
         rec_torch = torch.float32 if self.rec_dtype == ttnn.float32 else torch.bfloat16
         self.rec_rm = stage((self.n_dev * self.L, self.Nv, self.Dk, self.Dv), rec_torch, self.rec_dtype)
         self.taps_rm = stage((self.n_dev * self.L * self.K, 1, self.C), torch.bfloat16, ttnn.bfloat16)
+        # 4-D: [L, Nv*4, 32, 32] per device, so a layer's slice is directly fill_cache's [1, Nv*4, 32, 32] input
         self.hist_rm = (
-            stage((self.n_dev * self.L, self.Nv, 4, 32, 32), torch.bfloat16, ttnn.bfloat16) if self.with_hist else None
+            stage((self.n_dev * self.L, self.Nv * 4, 32, 32), torch.bfloat16, ttnn.bfloat16) if self.with_hist else None
         )
+        # one-hot row masks for the tap writes: mask[s][0, b, :] = (b == s), same [1, B, C] shape as conv_states[m]
+        B = int(dn0.conv_states[0].shape[-2])
+        self.B = B
+        eye = torch.eye(B, dtype=torch.bfloat16)
+        self.masks = [
+            ttnn.from_torch(
+                eye[s].reshape(1, B, 1).expand(1, B, self.C).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
+            for s in range(B)
+        ]
         self.traces: dict[int, int] = {}
         self.mapper = mapper
         logger.info(
-            f"[pd] TracedGdnImporter: L={self.L} K={self.K} rec={self.rec_dtype} hist={'on' if self.with_hist else 'off'}; "
+            f"[pd] TracedGdnImporter: L={self.L} K={self.K} B={B} rec={self.rec_dtype} hist={'on' if self.with_hist else 'off'}; "
             f"staging {self.n_dev * self.L * self.Nv * self.Dk * self.Dv * (4 if rec_torch == torch.float32 else 2) / 2**20:.0f} MiB rec"
         )
 
@@ -680,19 +1052,31 @@ class TracedGdnImporter:
         hist_t = ttnn.to_layout(self.hist_rm, ttnn.TILE_LAYOUT) if self.with_hist else None
         K = self.K
         for li, dn in enumerate(self.dn):
-            rec_l = dn._slice_along(rec_t, 0, li, li + 1)
-            ttnn.fill_cache(dn.rec_state, rec_l, slot)
+            rec_l = dn._slice_along(rec_t, 0, li, li + 1)  # [1, Nv, Dk, Dv]
+            ttnn.fill_cache(dn.rec_state, rec_l, slot)  # in place: rec_state[slot] = rec_l
             ttnn.deallocate(rec_l)
             for m in range(K):
-                c = dn._slice_along(taps_t, 0, li * K + m, li * K + m + 1)
-                dn._write_index(dn.conv_states[m], c, slot, dim=1)  # consumes c
+                c = dn._slice_along(taps_t, 0, li * K + m, li * K + m + 1)  # [1, 1, C]
+                self._write_tap_row(dn.conv_states[m], c, slot)  # consumes c
             if hist_t is not None and dn.conv_hist_packed is not None:
-                h = dn._slice_along(hist_t, 0, li, li + 1)
-                dn._write_index(dn.conv_hist_packed, h, slot, dim=0)  # consumes h
+                h = dn._slice_along(hist_t, 0, li, li + 1)  # [1, Nv*4, 32, 32]
+                B = dn.conv_hist_packed.shape[0]
+                dst = ttnn.reshape(dn.conv_hist_packed, (B, self.Nv * 4, 32, 32))  # view of the trace-baked buffer
+                ttnn.fill_cache(dst, h, slot)  # in place: conv_hist_packed[slot] = h
+                ttnn.deallocate(h)  # dst is a reshape view: never deallocated
         ttnn.deallocate(rec_t)
         ttnn.deallocate(taps_t)
         if hist_t is not None:
             ttnn.deallocate(hist_t)
+
+    def _write_tap_row(self, conv_state, c, slot: int):
+        """conv_state[0, slot, :] = c[0, 0, :] in place (conv_state: the layer's [1, B, C] TILE tap buffer whose address
+        the decode trace baked; c: a [1, 1, C] TILE row, consumed). One masked select with the buffer as its own output:
+        rows != slot are forwarded, row slot takes the broadcast tap row. Elementwise, tile by tile, so aliasing the
+        false-operand and the output is safe (the in-place binary ops work the same way)."""
+        assert 0 <= slot < self.B, f"slot {slot} out of range [0,{self.B})"
+        ttnn.where(self.masks[slot], c, conv_state, output_tensor=conv_state)
+        ttnn.deallocate(c)
 
     def capture(self, slot: int):
         if slot in self.traces:
@@ -712,62 +1096,36 @@ class TracedGdnImporter:
             self.capture(int(s))
 
     # -- host side --
-    def _gather_index(self):
-        """[Nv, 3*Dk] channel indices: head h reads its q chunk (kv head hk), k chunk and v chunk of a [C] row --
-        the vectorized form of _pack_head_tiles' per-head concat."""
-        if getattr(self, "_gidx", None) is None:
-            dn0 = self.dn[0]
-            Nv, Nk, Dk, Dv = dn0.Nv, dn0.Nk, dn0.Dk, dn0.Dv
-            rf, kd = Nv // Nk, Nk * Dk
-            rows = []
-            for h in range(Nv):
-                hk = h // rf
-                rows.append(
-                    torch.cat(
-                        [
-                            torch.arange(hk * Dk, (hk + 1) * Dk),
-                            torch.arange(kd + hk * Dk, kd + (hk + 1) * Dk),
-                            torch.arange(2 * kd + h * Dv, 2 * kd + (h + 1) * Dv),
-                        ]
-                    )
-                )
-            self._gidx = torch.stack(rows)  # [Nv, 3*Dk]
-            self._n_chunks = self._gidx.shape[1] // 32
-            self._verified_pack = False
-        return self._gidx
+    def prepare(self, rec, taps) -> PreparedGdnImport:
+        """Host preparation for any slot (see GdnHostPacker.prepare); may run on another thread."""
+        return self.packer.prepare(rec, taps)
 
     def _host_hist(self, taps, slot):
-        """Packed history rows for all layers/devices at parity slot & 1, vectorized (torch ops only).
-        taps: device-major [n_dev, L, K, C]."""
-        gidx = self._gather_index()
-        par = slot & 1
-        n = self._n_chunks
-        # [n_dev, L, K, C] -> gather channels -> [n_dev, L, K, Nv, n, 32]
-        g = taps[..., gidx].to(torch.bfloat16).reshape(self.n_dev, self.L, self.K, self.Nv, n, 32)
-        out = torch.zeros(self.n_dev, self.L, self.Nv, 4, 32, 32, dtype=torch.bfloat16)
-        out[..., par : 2 * n + par : 2, :] = g.permute(0, 1, 3, 2, 4, 5)  # [n_dev, L, Nv, K, n, 32]
-        if not self._verified_pack:
-            # one-time check against the layer's own scalar packer
-            ref = self.dn[0]._pack_head_tiles([taps[0, 0, j].reshape(-1) for j in range(self.K)], parity=par)
-            if not torch.equal(ref, out[0, 0]):
-                raise RuntimeError("vectorized packed-history layout differs from _pack_head_tiles")
-            self._verified_pack = True
-        return out.reshape(self.n_dev * self.L, self.Nv, 4, 32, 32).contiguous()
+        """Packed history rows for all layers/devices at parity slot & 1: [n_dev*L, Nv*4, 32, 32] bf16."""
+        return self.packer.hist(taps, slot & 1)
 
     def _upload(self, host, dst):
         h = ttnn.from_torch(host, dtype=dst.dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=None, mesh_mapper=self.mapper)
         ttnn.copy_host_to_device_tensor(h, dst)
         return h  # keep alive until the replay is synchronized
 
-    def import_slot(self, slot: int, rec, taps):
+    def import_slot(self, slot: int, rec, taps, prepared: "PreparedGdnImport | None" = None):
         """rec: host [n_dev, L, Nv, Dk, Dv]; taps: host [n_dev, L, K, C] (device-major, see module docstring).
-        Both are already in the staging tensors' row order, so the uploads are borrowed views (no host copy)."""
+        Both are already in the staging tensors' row order, so the uploads are borrowed views (no host copy). With
+        `prepared` (a PreparedGdnImport of the same snapshot) the packed-history rows were built ahead of time and the
+        main thread only uploads and replays."""
         t0 = time.perf_counter()
-        rec_all = rec.reshape(self.n_dev * self.L, self.Nv, self.Dk, self.Dv)
-        taps_all = taps.reshape(self.n_dev * self.L * self.K, 1, self.C)
+        if prepared is None:
+            rec_all, taps_all = self.packer.rows(rec, taps)
+            hist = self._host_hist(taps, slot) if self.with_hist else None
+        else:
+            rec_all, taps_all = prepared.rec_rows, prepared.taps_rows
+            hist = prepared.hist[slot & 1] if self.with_hist else None
+            if self.with_hist and hist is None:
+                hist = self._host_hist(taps, slot)
         refs = [self._upload(rec_all, self.rec_rm), self._upload(taps_all, self.taps_rm)]
         if self.with_hist:
-            refs.append(self._upload(self._host_hist(taps, slot), self.hist_rm))
+            refs.append(self._upload(hist, self.hist_rm))
         t1 = time.perf_counter()
         if slot not in self.traces:
             self.capture(slot)
@@ -777,7 +1135,8 @@ class TracedGdnImporter:
         for dn in self.dn:
             dn._hist_packed_valid = dn._hist_packed_valid if dn.conv_hist_packed is None else True
         logger.debug(
-            f"[pd] traced GDN import slot {slot}: host+upload {1e3 * (t1 - t0):.1f} ms, replay {1e3 * (time.perf_counter() - t1):.1f} ms"
+            f"[pd] traced GDN import slot {slot}: host+upload {1e3 * (t1 - t0):.1f} ms"
+            f"{' (prepared)' if prepared is not None else ''}, replay {1e3 * (time.perf_counter() - t1):.1f} ms"
         )
 
 
