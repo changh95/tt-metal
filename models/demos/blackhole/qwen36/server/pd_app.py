@@ -72,7 +72,9 @@ CHILD_ENV = {
     "VLLM_RPC_TIMEOUT": "900000",
     "VLLM_CONFIGURE_LOGGING": "1",
     "TORCHDYNAMO_DISABLE": "1",
-    "TT_DECODE_BUCKETING": "0",
+    # QWEN36_PD_DECODE_BUCKETING (default 0) selects it; 1 became safe once the generator's device-token keep path was
+    # gated off for always-refresh models (2026-09-21), pending the P/D re-measure.
+    "TT_DECODE_BUCKETING": os.environ.get("QWEN36_PD_DECODE_BUCKETING", "0"),
 }
 STRIPPED_REQUEST_HEADERS = frozenset({"host", "content-length", "connection", "transfer-encoding"})
 STRIPPED_RESPONSE_HEADERS = frozenset({"content-length", "transfer-encoding", "connection"})
