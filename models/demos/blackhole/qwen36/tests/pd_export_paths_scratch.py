@@ -5,6 +5,7 @@ runs / blocks / gather and compare bitwise with a host reference; time each path
 
     TT_VISIBLE_DEVICES=0,1,6,7 python models/demos/blackhole/qwen36/tests/pd_export_paths_scratch.py
 """
+
 import os
 import time
 from types import SimpleNamespace
@@ -45,7 +46,7 @@ def main():
     model = SimpleNamespace(layers=layers, mesh_device=mesh, num_devices=4)
     logger.info("caches ready")
     t0 = time.perf_counter()
-    pd_transfer.export_warmup(model, max_bucket=int(os.environ.get("WARM_MAX", "64")))
+    pd_transfer.export_warmup(model, max_bucket=int(os.environ.get("WARM_MAX", "128")))
     logger.info(f"warm-up {time.perf_counter() - t0:.1f} s")
     cases = {
         "contig3": [10, 11, 12],
@@ -56,6 +57,8 @@ def main():
         "frag20": [int(x) for x in torch.randperm(NB)[:20]],
         "contig64": list(range(200, 264)),
         "frag64": [int(x) for x in torch.randperm(NB)[:64]],
+        "contig128": list(range(300, 428)),
+        "frag128": [int(x) for x in torch.randperm(NB)[:128]],
         "one": [7],
     }
     bad = 0
@@ -68,11 +71,16 @@ def main():
                 out = pd_transfer.export_kv_blocks(model, ids)
                 dt = time.perf_counter() - t0
             ok = all(torch.equal(k, hk[ids]) and torch.equal(v, hv[ids]) for (k, v), (hk, hv) in zip(out, host_ref))
-            res[mode] = (ok, dt)
+            ok &= all(k.is_contiguous() and v.is_contiguous() and k.dtype == torch.bfloat16 for k, v in out)
+            tm = dict(pd_transfer.LAST_EXPORT_TIMING)
+            res[mode] = (ok, dt, tm)
             bad += not ok
         logger.info(
             f"{name:9s} n={len(ids):3d} runs={len(pd_transfer.coalesce_runs(ids))} "
-            + "  ".join(f"{m}: {'OK ' if ok else 'BAD'} {1e3 * dt:7.1f} ms" for m, (ok, dt) in res.items())
+            + "  ".join(
+                f"{m}: {'OK ' if ok else 'BAD'} {tm['total_ms']:7.1f} ms (device {tm['device_ms']:.1f} {tm.get('read', 'read')} {tm['read_ms']:.1f} host {tm['host_ms']:.1f})"
+                for m, (ok, dt, tm) in res.items()
+            )
         )
     os.environ.pop("QWEN36_PD_EXPORT", None)
     # import round trip with bucket padding: 3 real blocks -> bucket 4, padding rows land in the pad block only

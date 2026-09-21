@@ -31,6 +31,7 @@ ordinary decode step for the last prompt token (the prefill side computed h(N-1)
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import torch
@@ -140,6 +141,92 @@ def pad_block_ids(block_ids, n, num_blocks):
     return ids + [ids[-1]] * k, 0
 
 
+LAST_EXPORT_TIMING = {}  # diagnostics: the last export_kv_blocks call's device/read/host split (ms)
+
+
+class KvExportPool:
+    """Reusable host buffers for the KV export read, filled by direct DMA (the GdnSnapshotPool pattern).
+
+    An entry is one torch bf16 buffer `[n_dev * n_caches * max_blocks, nkv, blk, hd]` (n_caches = 2 x attention
+    layers) plus, per export bucket `n <= max_blocks`, a ROW_MAJOR host mesh tensor made once with
+    `ttnn.from_torch(buf[: n_dev * n_caches * n], mesh_mapper=ShardTensorToMesh(dim 0))`: a contiguous prefix of
+    the buffer, so from_torch borrows it (dim-0 shards are contiguous chunks) and `ttnn.copy_device_to_host_tensor`
+    lands device d's `[n_caches * n, nkv, blk, hd]` straight in the torch memory -- no mesh composer, no host
+    concat, no `to_torch` copy. One buffer serves every bucket, so the pages faulted in by the first (warm-up)
+    read stay warm for all of them. `export_kv_blocks` borrows an entry for the duration of one call and hands
+    it back (its outputs are contiguous copies), so one entry per concurrent export suffices; the pool is capped
+    at `max_entries` (an exhausted pool falls back to the composer read). Memory per entry =
+    4 MiB x max_blocks at TP4 (1 GiB at the default 256 blocks); buckets above `max_blocks` use the composer.
+    Host memory only: safe to create at request time under captured traces.
+    """
+
+    def __init__(self, model, max_blocks: int, max_entries: int):
+        layers = _attention_layers(model)
+        _, nkv, blk, hd = layers[0].paged_k.shape
+        self.model = model
+        self.n_dev = int(model.num_devices)
+        self.n_caches = 2 * len(layers)
+        self.row_shape = (int(nkv), int(blk), int(hd))
+        self.max_blocks = int(max_blocks)
+        self.max_entries = int(max_entries)
+        self.mapper = ttnn.ShardTensorToMesh(model.mesh_device, dim=0)
+        self._lock = threading.Lock()
+        self._free = []  # entries: (host buffer, {bucket: borrowed host mesh tensor})
+        self.total = 0
+
+    def entry_nbytes(self) -> int:
+        nkv, blk, hd = self.row_shape
+        return self.n_dev * self.n_caches * self.max_blocks * nkv * blk * hd * 2
+
+    def _new(self):
+        host = torch.empty((self.n_dev * self.n_caches * self.max_blocks, *self.row_shape), dtype=torch.bfloat16)
+        self.total += 1
+        logger.info(f"[pd] KV export pool: +1 buffer ({self.entry_nbytes() / 2**20:.0f} MiB), {self.total} total")
+        return (host, {})
+
+    def acquire(self, n: int):
+        """Borrow (entry, host view [n_dev * n_caches * n, nkv, blk, hd], borrowed mesh tensor over that view) for
+        bucket `n`, or None when `n` exceeds the pool's reach or every entry is in use."""
+        if n > self.max_blocks:
+            return None
+        with self._lock:
+            if self._free:
+                entry = self._free.pop()
+            elif self.total < self.max_entries:
+                entry = self._new()
+            else:
+                return None
+        host, views = entry
+        rows = self.n_dev * self.n_caches * n
+        view = host[:rows]
+        tt = views.get(n)
+        if tt is None:
+            tt = views[n] = ttnn.from_torch(
+                view, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=self.mapper
+            )
+        return entry, view, tt
+
+    def release(self, entry):
+        with self._lock:
+            self._free.append(entry)
+
+
+def _kv_export_pool(model):
+    """The model's KvExportPool (created on first use; QWEN36_PD_EXPORT_POOL=0 disables it -> composer read).
+    QWEN36_PD_EXPORT_POOL_MAX_BLOCKS (256) bounds the pooled buckets, QWEN36_PD_EXPORT_POOL_ENTRIES (2) the
+    number of buffers."""
+    if os.environ.get("QWEN36_PD_EXPORT_POOL", "1") != "1":
+        return None
+    pool = getattr(model, "_kv_export_pool", None)
+    if pool is None:
+        pool = model._kv_export_pool = KvExportPool(
+            model,
+            max_blocks=int(os.environ.get("QWEN36_PD_EXPORT_POOL_MAX_BLOCKS", "256")),
+            max_entries=int(os.environ.get("QWEN36_PD_EXPORT_POOL_ENTRIES", "2")),
+        )
+    return pool
+
+
 def export_kv_blocks(model, block_ids):
     """Read one request's paged-KV blocks off the device.
 
@@ -148,9 +235,11 @@ def export_kv_blocks(model, block_ids):
     back through bf16 exactly), block order = `block_ids` order.
 
     One device read for the whole request: the blocks of all 32 cache tensors are concatenated on device
-    into a single tensor, converted (bfp8 -> bf16, untilize) once, and read once with a dim-0 mesh
-    composer (mesh reads cost ~60 ms fixed each and composing along a middle dim runs at ~0.1 GiB/s, so
-    32 separate reads took seconds; one dim-0 read runs at ~1.2 GiB/s).
+    into a single tensor, converted (bfp8 -> bf16, untilize) once, and DMA'd once into a pooled, borrowed
+    row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`; 128 blocks = 512 MiB in
+    ~35 ms vs ~320 ms through the composer). Buckets beyond the pool (or QWEN36_PD_EXPORT_POOL=0 /
+    QWEN36_PD_DEVICE_CONVERT=0) fall back to the dim-0 mesh composer read (~1.2 GiB/s plus a host cat;
+    composing along a middle dim ran at ~0.1 GiB/s and 32 separate reads took seconds).
 
     Program shapes depend on the block count, so the block list is padded to a power-of-two bucket
     (export_warmup compiles every bucket at startup) and read by one of two fixed-shape paths:
@@ -204,25 +293,50 @@ def export_kv_blocks(model, block_ids):
         ttnn.deallocate(big)
         big = rm
     t1 = time.perf_counter()
-    host = ttnn.to_torch(big, mesh_composer=ttnn.ConcatMeshToTensor(model.mesh_device, dim=0)).to(torch.bfloat16)
-    ttnn.deallocate(big)
-    t2 = time.perf_counter()
-    # host: [n_dev * 32 * n, nkv, blk, hd] -> [n_dev, 32, n, nkv, blk, hd]
-    host = host.view(n_dev, len(caches), n, nkv, blk, hd)
-    out = []
-    for li in range(len(layers)):
-        pair = []
-        for j in (0, 1):
-            t = host[:, 2 * li + j]  # [n_dev, n, nkv, blk, hd]
-            t = t.permute(1, 0, 2, 3, 4).reshape(n, n_dev * nkv, blk, hd)
-            if mode == "runs":
-                t = _reorder_runs(t, runs)
-            pair.append(t[real_off : real_off + n_real].contiguous())
-        out.append((pair[0], pair[1]))
+    pool = _kv_export_pool(model) if big.dtype == ttnn.bfloat16 and big.layout == ttnn.ROW_MAJOR_LAYOUT else None
+    borrowed = pool.acquire(n) if pool is not None else None
+    try:
+        if borrowed is not None:
+            _, host, host_tt = borrowed  # host: torch view the DMA lands in, [n_dev * 32 * n, nkv, blk, hd]
+            ttnn.copy_device_to_host_tensor(big, host_tt, blocking=True)
+            read = "dma"
+        else:
+            host = ttnn.to_torch(big, mesh_composer=ttnn.ConcatMeshToTensor(model.mesh_device, dim=0)).to(
+                torch.bfloat16
+            )
+            read = "composer"
+        ttnn.deallocate(big)
+        t2 = time.perf_counter()
+        # host: [n_dev * 32 * n, nkv, blk, hd] -> [n_dev, 32, n, nkv, blk, hd]
+        host = host.view(n_dev, len(caches), n, nkv, blk, hd)
+        out = []
+        for li in range(len(layers)):
+            pair = []
+            for j in (0, 1):
+                t = host[:, 2 * li + j]  # [n_dev, n, nkv, blk, hd]
+                t = t.permute(1, 0, 2, 3, 4).reshape(n, n_dev * nkv, blk, hd)
+                if mode == "runs":
+                    t = _reorder_runs(t, runs)
+                pair.append(t[real_off : real_off + n_real].contiguous())  # a copy: the pool entry is free after this
+            out.append((pair[0], pair[1]))
+    finally:
+        if borrowed is not None:
+            pool.release(borrowed[0])
+    t3 = time.perf_counter()
+    LAST_EXPORT_TIMING.update(
+        n_real=n_real,
+        bucket=n,
+        mode=mode,
+        read=read,
+        total_ms=1e3 * (t3 - t0),
+        device_ms=1e3 * (t1 - t0),
+        read_ms=1e3 * (t2 - t1),
+        host_ms=1e3 * (t3 - t2),
+    )
     logger.debug(
-        f"[pd] exported {n_real} KV blocks (bucket {n}) x {len(out)} layers in {1e3 * (time.perf_counter() - t0):.1f} ms "
-        f"({len(runs)} run(s), {mode}; device {1e3 * (t1 - t0):.1f} ms, read {1e3 * (t2 - t1):.1f} ms, "
-        f"host {1e3 * (time.perf_counter() - t2):.1f} ms)"
+        f"[pd] exported {n_real} KV blocks (bucket {n}) x {len(out)} layers in {1e3 * (t3 - t0):.1f} ms "
+        f"({len(runs)} run(s), {mode}; device {1e3 * (t1 - t0):.1f} ms, {read} read {1e3 * (t2 - t1):.1f} ms, "
+        f"host {1e3 * (t3 - t2):.1f} ms)"
     )
     return out
 
