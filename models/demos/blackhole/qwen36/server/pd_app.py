@@ -9,12 +9,15 @@ children on the two fully connected 2x2 halves of the board (each a 1x4 mesh, TP
 * **P** (``kv_producer``): prefill only, chips ``QWEN36_PD_PREFILL_CHIPS`` (default 0,1,6,7).  It prefills the prompt,
   exports the request's paged KV blocks and its Gated-DeltaNet recurrent/conv state, and returns a 1-token completion
   carrying ``kv_transfer_params``.
-* **D** (``kv_consumer``): decode, chips ``QWEN36_PD_DECODE_CHIPS`` (default 2,3,4,5).  It pulls that state over
-  Mooncake's transfer engine (TCP, in-container loopback), imports it into a free batch row and continues decoding.
+* **D** (``kv_consumer``): decode, chips ``QWEN36_PD_DECODE_CHIPS`` (default 2,3,4,5).  It maps P's /dev/shm-backed
+  staging buffer read-only (same host, no copy; ``QWEN36_PD_SHM=0`` falls back to a Mooncake TCP pull), imports the
+  state into a free batch row and continues decoding.
 
 Both run ``vllm_tt_plugin.kv_connector.tt_mooncake_connector.TTMooncakeConnector``.  The proxy (this app) is the
-public OpenAI-compatible surface: ``/v1/chat/completions`` and ``/v1/completions`` go to P (``max_tokens=1``) and
-then stream from D; ``/v1/models``, ``/health``, ``/version`` and anything else under ``/v1`` pass through to D.
+public OpenAI-compatible surface: ``/v1/chat/completions`` and ``/v1/completions`` are posted to P (``max_tokens=1``)
+and to D at the same time under a ``transfer_id`` the proxy chooses, so D tokenizes, schedules and waits on P's side
+channel while P prefills (``QWEN36_PD_PROXY_FANOUT=0`` restores the serial P-then-D round trip); the generation
+streams from D.  ``/v1/models``, ``/health``, ``/version`` and anything else under ``/v1`` pass through to D.
 ``GET /`` describes the running stack.  Either half can also be queried directly on its own port inside the
 container (``QWEN36_PD_PREFILL_PORT`` / ``QWEN36_PD_DECODE_PORT``) for experiments.
 
@@ -126,6 +129,8 @@ class BundleConfig:
     log_seconds: int = 30
     # first boot: P and D would otherwise convert the same weight cache at the same time
     serial_cold_boot: bool = True
+    # post to D concurrently with P (the proxy picks the transfer_id); off = P first, then D with P's params
+    proxy_fanout: bool = True
     extra_vllm_args: tuple[str, ...] = ()
 
     @classmethod
@@ -159,6 +164,7 @@ class BundleConfig:
             offline=env.get("HF_HUB_OFFLINE", "1") not in ("0", "false", "False"),
             log_seconds=_env_int(env, "QWEN36_PD_LOG_SECONDS", 30),
             serial_cold_boot=env.get("QWEN36_PD_SERIAL_COLD_BOOT", "1") not in ("0", "false", "False"),
+            proxy_fanout=env.get("QWEN36_PD_PROXY_FANOUT", "1") not in ("0", "false", "False"),
             extra_vllm_args=tuple(extra),
         )
 
@@ -418,8 +424,9 @@ def bundle_description(config: BundleConfig, stack: Stack | None) -> dict[str, A
             "hardware": "p150x8",
             "prefill": {"mesh": config.mesh_device, "chips": list(config.prefill_chips), "tensor_parallel": 4},
             "decode": {"mesh": config.mesh_device, "chips": list(config.decode_chips), "tensor_parallel": 4},
-            "transfer": "mooncake-transfer-engine (tcp, loopback)",
+            "transfer": "same-host /dev/shm mapping (zero-copy), Mooncake TCP loopback fallback",
             "connector": f"{CONNECTOR_MODULE}.{CONNECTOR_NAME}",
+            "proxy": "fan-out (P and D posted concurrently)" if config.proxy_fanout else "serial (P, then D)",
         },
         "limits": {"max_model_len": config.max_model_len, "block_size": config.block_size},
         "endpoints": {
@@ -433,8 +440,16 @@ def bundle_description(config: BundleConfig, stack: Stack | None) -> dict[str, A
     }
 
 
-def prefill_request(req_data: dict[str, Any]) -> dict[str, Any]:
-    """The request as P sees it: one token, non-streaming, asking for its KV to be handed on."""
+def new_transfer_id() -> str:
+    """The key P files the staged state under and D asks for.  The proxy mints it because it cannot predict
+    either engine's request id: vLLM's InputProcessor turns the ``X-Request-Id`` header into
+    ``chatcmpl-<id>-<8 random hex>``, differently on P and on D."""
+    return f"pd-{uuid.uuid4().hex}"
+
+
+def prefill_request(req_data: dict[str, Any], transfer_id: str | None = None) -> dict[str, Any]:
+    """The request as P sees it: one token, non-streaming, asking for its KV to be handed on (filed under
+    ``transfer_id`` when given; P echoes it in the returned ``kv_transfer_params``)."""
     data = dict(req_data)
     data["kv_transfer_params"] = {
         "do_remote_decode": True,
@@ -444,6 +459,8 @@ def prefill_request(req_data: dict[str, Any]) -> dict[str, Any]:
         "remote_host": None,
         "remote_port": None,
     }
+    if transfer_id is not None:
+        data["kv_transfer_params"]["transfer_id"] = transfer_id
     data["stream"] = False
     data["max_tokens"] = 1
     if "max_completion_tokens" in data:
@@ -452,6 +469,35 @@ def prefill_request(req_data: dict[str, Any]) -> dict[str, Any]:
     data.pop("min_tokens", None)
     data.pop("min_completion_tokens", None)
     return data
+
+
+def fanout_transfer_params(config: BundleConfig, transfer_id: str) -> dict[str, Any]:
+    """D's ``kv_transfer_params`` when it is posted to before P has answered: P's side channel is static and the
+    connector derives ``num_tokens`` from D's own tokenization (it checks it against the payload header)."""
+    return {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_host": "127.0.0.1",
+        "remote_port": config.side_channel_port,
+        "transfer_id": transfer_id,
+    }
+
+
+def decode_request(req_data: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """The client's request as D sees it: unchanged but for the transfer parameters."""
+    data = dict(req_data)
+    data["kv_transfer_params"] = params
+    return data
+
+
+def unlink_stale_shm_segments() -> list[str]:
+    """P's staging buffers are ``/dev/shm/qwen36-pd-<pid>-*`` files; a P that died without ``shutdown`` leaves
+    them behind.  Removes those whose pid is gone (never a live process's) and returns the names."""
+    try:
+        from vllm_tt_plugin.kv_connector.tt_mooncake_connector import unlink_stale_shm_segments as _unlink
+    except ImportError:
+        return []
+    return _unlink()
 
 
 def create_app():
@@ -467,6 +513,9 @@ def create_app():
             limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
         )
         stack = Stack(config, VllmHalf(config, "prefill"), VllmHalf(config, "decode"))
+        stale = unlink_stale_shm_segments()
+        if stale:
+            _log("shm_cleanup", removed=stale)
         warm = weight_cache_is_warm()
         serial = config.serial_cold_boot and not warm
         stack.boot = {"weight_cache_warm": warm, "serial": serial, "started_at": time.time()}
@@ -557,10 +606,30 @@ def create_app():
             background=BackgroundTask(response.aclose),
         )
 
+    async def abandon(d_task: "asyncio.Task | None") -> None:
+        """Drop a D request posted ahead of P: cancel it in flight, or close its stream.  Either way D sees the
+        client go away and aborts the request (its connector then tells P to drop any staging)."""
+        if d_task is None:
+            return
+        if not d_task.done():
+            d_task.cancel()
+            try:
+                await d_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                return
+        if d_task.cancelled() or d_task.exception() is not None:
+            return
+        await d_task.result().aclose()
+
     async def disaggregated(request: Request, path: str) -> Response:
-        """Prefill on P (one token, returns kv_transfer_params), then the full generation streamed from D."""
+        """Prefill on P (one token, returns kv_transfer_params) and the full generation streamed from D.  With
+        fan-out (default) D is posted to at the same time as P under a proxy-chosen ``transfer_id``: it tokenizes,
+        schedules and starts waiting on P's side channel while P prefills.  If P fails, the D request is abandoned
+        (cancelled) and P's error is returned.  If P does not echo the transfer_id (an older connector), D's
+        fan-out request is abandoned and the serial round trip runs with P's parameters."""
         client: httpx.AsyncClient = request.app.state.client
         stack: Stack = request.app.state.stack
+        config: BundleConfig = request.app.state.config
         dead = _dead(stack)
         if dead is not None:
             return dead
@@ -580,11 +649,21 @@ def create_app():
         auth = request.headers.get("authorization")
         if auth:
             headers["Authorization"] = auth
+        transfer_id = new_transfer_id()
+
+        def post_decode(params: dict[str, Any]) -> "asyncio.Task":
+            upstream = client.build_request(
+                "POST", f"{stack.decode.base_url}{path}", json=decode_request(req_data, params), headers=headers
+            )
+            return asyncio.ensure_future(client.send(upstream, stream=True))
+
+        d_task = post_decode(fanout_transfer_params(config, transfer_id)) if config.proxy_fanout else None
         try:
             p_response = await client.post(
-                f"{stack.prefill.base_url}{path}", json=prefill_request(req_data), headers=headers
+                f"{stack.prefill.base_url}{path}", json=prefill_request(req_data, transfer_id), headers=headers
             )
         except httpx.HTTPError as error:
+            await abandon(d_task)
             return JSONResponse(
                 {
                     "error": {
@@ -596,6 +675,7 @@ def create_app():
             )
         if p_response.status_code != 200:
             # a rejected request (bad params, too long, ...) is reported as P reported it
+            await abandon(d_task)
             return Response(
                 content=p_response.content,
                 status_code=p_response.status_code,
@@ -603,6 +683,7 @@ def create_app():
             )
         params = p_response.json().get("kv_transfer_params") or {}
         if not params.get("do_remote_prefill"):
+            await abandon(d_task)
             return JSONResponse(
                 {
                     "error": {
@@ -612,11 +693,19 @@ def create_app():
                 },
                 status_code=502,
             )
-        d_data = dict(req_data)
-        d_data["kv_transfer_params"] = params
-        upstream = client.build_request("POST", f"{stack.decode.base_url}{path}", json=d_data, headers=headers)
+        if d_task is not None and str(params.get("transfer_id")) != transfer_id:
+            _log(
+                "fanout_disabled",
+                reason="P did not echo transfer_id",
+                got=params.get("transfer_id"),
+                request=request_id,
+            )
+            await abandon(d_task)
+            d_task = None
+        if d_task is None:
+            d_task = post_decode(params)
         try:
-            d_response = await client.send(upstream, stream=True)
+            d_response = await d_task
         except httpx.HTTPError as error:
             return JSONResponse(
                 {
