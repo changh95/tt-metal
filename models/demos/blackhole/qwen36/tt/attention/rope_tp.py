@@ -250,18 +250,22 @@ def apply_interleaved_mrope(freqs, mrope_section):
 
 
 def rot_mats_decode(device, rope_dim, max_seq_len, theta, positions):
-    """Return [cos, sin] each [1, B, 1, rope_dim] for the given per-user positions.
+    """Return [cos, sin] each [1, 1, B, rope_dim] for the given per-user positions.
 
-    positions: torch.Tensor [B] of int positions. Built on host (small) then
-    replicated to the mesh — matches apply_partial_rope_decode's expected layout.
+    positions: torch.Tensor [B] of int positions. Built on host (small) then replicated to the
+    mesh. Layout contract: row b of the single [B, rope_dim] tile-row block is user b's rotation —
+    exactly what rotary_embedding_hf's prefill mode consumes (cos/sin [1, 1, seq, rope_dim] with
+    batch in the seq slot), so apply_partial_rope_decode needs no per-call re-layout. The former
+    [1, B, 1, rope_dim] layout put each user in its own tile-row and cost a real ReshapeView
+    kernel per call for every B > 1. Must match model.prepare_decode_inputs_host's host packing.
     """
     inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
     pos = positions.float()
     freqs = torch.outer(pos, inv_freq)  # [B, rope_dim/2]
     emb = torch.cat([freqs, freqs], dim=-1)  # [B, rope_dim]
     B = positions.shape[0]
-    cos = emb.cos().reshape(1, B, 1, rope_dim).to(torch.bfloat16)
-    sin = emb.sin().reshape(1, B, 1, rope_dim).to(torch.bfloat16)
+    cos = emb.cos().reshape(1, 1, B, rope_dim).to(torch.bfloat16)
+    sin = emb.sin().reshape(1, 1, B, rope_dim).to(torch.bfloat16)
     cos_tt = ttnn.from_torch(
         cos, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
     )
@@ -306,33 +310,33 @@ def rot_mats_prefill(device, rope_dim, seq_len, theta, position_ids=None, mrope_
 
 
 def apply_partial_rope_decode(x, cos_tt, sin_tt, n_heads, batch_size, rope_dim):
-    """x: [1, B, n_heads, HD]; cos/sin: [1, B, 1, rope_dim]; rotates first rope_dim dims.
+    """x: [1, B, n_heads, HD]; cos/sin: [1, 1, B, rope_dim] (rot_mats_decode / host packing layout);
+    rotates first rope_dim dims.
 
     Fused HF-convention rotate-half via ttnn.experimental.rotary_embedding_hf. The op's native
     decode mode (is_decode_mode=True) hard-requires HEIGHT_SHARDED input + cos/sin, but qwen36's
     decode attention runs interleaved (q/k are sharded_to_interleaved right after head-split). To
     avoid the reshards that sharding would add, transpose the interleaved tensor to a prefill-shaped
     [1, n_heads, B, rope_dim] (batch plays the seq role) and use the interleaved-friendly prefill
-    mode (is_decode_mode=False), then transpose back. Partial: only the first rope_dim is rotated;
-    the tail passes through.
+    mode (is_decode_mode=False), then transpose back. cos/sin already arrive in that prefill layout
+    (validate: padded dims [0]==[1]==1, seq >= B, last dim == rope_dim, TILE), so they are passed
+    straight through — no per-call reshape. Partial: only the first rope_dim is rotated; the tail
+    passes through (sliced directly to DRAM, no extra copy).
     """
     hd = x.shape[-1]
     B = batch_size
     x_rope = ttnn.slice(x, (0, 0, 0, 0), (1, B, n_heads, rope_dim))
     x_rope_t = ttnn.transpose(x_rope, 1, 2)  # [1, n_heads, B, rope_dim]
     ttnn.deallocate(x_rope)
-    # decode cos/sin [1, B, 1, rope_dim] -> prefill [1, 1, B, rope_dim] (broadcast over heads)
-    cos_p = ttnn.reshape(cos_tt, (1, 1, B, rope_dim))
-    sin_p = ttnn.reshape(sin_tt, (1, 1, B, rope_dim))
     roped_t = ttnn.experimental.rotary_embedding_hf(
-        x_rope_t, cos_p, sin_p, is_decode_mode=False, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        x_rope_t, cos_tt, sin_tt, is_decode_mode=False, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
     ttnn.deallocate(x_rope_t)
     roped = ttnn.to_memory_config(ttnn.transpose(roped_t, 1, 2), ttnn.DRAM_MEMORY_CONFIG)
     ttnn.deallocate(roped_t)
     if rope_dim == hd:
         return roped
-    x_pass = ttnn.to_memory_config(ttnn.slice(x, (0, 0, 0, rope_dim), (1, B, n_heads, hd)), ttnn.DRAM_MEMORY_CONFIG)
+    x_pass = ttnn.slice(x, (0, 0, 0, rope_dim), (1, B, n_heads, hd), memory_config=ttnn.DRAM_MEMORY_CONFIG)
     result = ttnn.concat([roped, x_pass], dim=-1)
     ttnn.deallocate(roped)
     ttnn.deallocate(x_pass)

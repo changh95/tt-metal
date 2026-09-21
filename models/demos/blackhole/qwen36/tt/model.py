@@ -4011,13 +4011,16 @@ class Qwen36Model:
         # stays the true KV position. rope_delta is 0 for text, so this is a no-op there.
         rope_pos_vec = pos_vec + self.rope.rope_delta
         if self.num_devices > 1:
-            # TP: rope_tp cos/sin [1,B,1,rope_dim] packed on host.
+            # TP: rope_tp cos/sin [1,1,B,rope_dim] packed on host as [2,1,B,rope_dim] (unpack_rope slices dim 0).
+            # Row b of the single tile-row block is user b's rotation: the layout rotary_embedding_hf's
+            # prefill mode consumes directly (rope_tp.apply_partial_rope_decode), so no per-layer re-tiling.
+            # Same values as rope_tp.rot_mats_decode; the two must stay in the same layout.
             rd = self.args.rope_head_dim
             inv_freq = 1.0 / (self.args.rope_theta ** (torch.arange(0, rd, 2).float() / rd))
             freqs = torch.outer(rope_pos_vec.float(), inv_freq)  # [B, rd/2], per-user rotation
             emb = torch.cat([freqs, freqs], dim=-1)
-            cos = emb.cos().reshape(1, B, 1, rd).to(torch.bfloat16)
-            sin = emb.sin().reshape(1, B, 1, rd).to(torch.bfloat16)
+            cos = emb.cos().reshape(1, 1, B, rd).to(torch.bfloat16)
+            sin = emb.sin().reshape(1, 1, B, rd).to(torch.bfloat16)
             rope_packed = ttnn.from_torch(torch.cat([cos, sin], dim=0), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
         else:
             # Single-device decode is B=1 in this port; per-user single-device rope is out of scope.
