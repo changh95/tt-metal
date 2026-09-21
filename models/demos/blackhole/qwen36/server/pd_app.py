@@ -608,7 +608,9 @@ def create_app():
 
     async def abandon(d_task: "asyncio.Task | None") -> None:
         """Drop a D request posted ahead of P: cancel it in flight, or close its stream.  Either way D sees the
-        client go away and aborts the request (its connector then tells P to drop any staging)."""
+        client go away and aborts the request; D's connector stops waiting on P's side channel, reports the
+        request so D's scheduler frees the blocks it held back, and sends P a CANCEL (P frees the staging, or
+        remembers the id and frees it the moment it stages) -- a payload D already fetched is DONE'd instead."""
         if d_task is None:
             return
         if not d_task.done():
