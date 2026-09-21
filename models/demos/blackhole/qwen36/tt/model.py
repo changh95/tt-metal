@@ -50,7 +50,10 @@ class _MaskedBucketBufs:
     fill_pt: object  # [1, bucket//block_size] int32 ROW_MAJOR (fixed-width KV-fill page table)
     mask_f32: object  # [1, bucket, 1] float32 TILE (GDN beta/g validity mask, all layers)
     mask_q: object  # [1, bucket, 1] bf16 TILE (GDN q/k/v validity mask, all layers)
-    conv_sel: object  # [1, K-1, bucket+K-1] bf16 TILE (FIR decode-window one-hot, all layers)
+    conv_sel: object  # [1, K-1, bucket+K-1] bf16 TILE (FIR decode-window one-hot, all layers); None on the KDA path
+    sel_x: object  # [1, K-1, bucket] bf16 TILE (fused-KDA decode-window one-hot over x); None on the FIR path
+    sel_c: object  # [1, K-1, K-1] bf16 TILE (fused-KDA decode-window one-hot over the carry); None on the FIR path
+    K: int  # GDN conv kernel size the one-hots were built for
 
 
 @dataclass
@@ -2730,7 +2733,12 @@ class Qwen36Model:
         x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
         # Fixed-shape vision splice over the persistent buffers (identity while the mask is zero).
         x = self._apply_vision_merge(x, length=bucket)
-        gdn_masks = (bufs.mask_f32, bufs.mask_q, bufs.conv_sel)
+        gdn_masks = (
+            bufs.mask_f32,
+            bufs.mask_q,
+            bufs.conv_sel,
+            (bufs.sel_x, bufs.sel_c) if bufs.sel_x is not None else None,
+        )
         for layer in self.layers:
             if layer.is_full_attention:
                 x_new = layer.forward(
@@ -2766,8 +2774,13 @@ class Qwen36Model:
         interior, so the warm pass exercises the same numerics a real request will."""
         rep = ttnn.ReplicateTensorToMesh(device)
         block_size = get_block_size(self._paged_kv_caches)
-        K = next(layer.attention.K for layer in self.layers if not layer.is_full_attention)
+        gdn0 = next(layer.attention for layer in self.layers if not layer.is_full_attention)
+        K = gdn0.K
+        # Which decode-window one-hot the GDN conv needs: the fused KDA masked path takes the split pair
+        # (sel_x @ qkv + sel_c @ carry), the FIR chain the single one-hot over concat(carry, qkv). Same for all layers.
+        kda_masked = gdn0._gdn_conv_kda and gdn0._gdn_flat_qkv and gdn0._kda_masked
         warm_len = max(1, bucket - 1)
+        sel_x_h, sel_c_h = mbt.host_conv_sel_split(warm_len, bucket, K)
         cos_t, sin_t = self._rope_tp_cos_sin_torch(0, bucket)
         m = mbt.host_masks(warm_len, bucket)
 
@@ -2786,7 +2799,12 @@ class Qwen36Model:
             mask_f32=_up(m, ttnn.float32, ttnn.TILE_LAYOUT),
             # bf16 = the GDN q/k/v dtype on the flat-qkv path (conv output; see gdn/tp.py).
             mask_q=_up(m, ttnn.bfloat16, ttnn.TILE_LAYOUT),
-            conv_sel=_up(mbt.host_conv_sel(warm_len, bucket, K), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            conv_sel=(
+                None if kda_masked else _up(mbt.host_conv_sel(warm_len, bucket, K), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            ),
+            sel_x=_up(sel_x_h, ttnn.bfloat16, ttnn.TILE_LAYOUT) if kda_masked else None,
+            sel_c=_up(sel_c_h, ttnn.bfloat16, ttnn.TILE_LAYOUT) if kda_masked else None,
+            K=K,
         )
 
     @staticmethod
@@ -2893,7 +2911,7 @@ class Qwen36Model:
             pt = pt[:, :buf_blocks]
         pt = pt.contiguous().to(torch.int32)
 
-        K = int(tr.bufs.conv_sel.shape[1]) + 1
+        K = tr.bufs.K
         m = mbt.host_masks(actual_len, bucket)
         # Host tensors stay referenced until after the synchronize: execute_trace is non-blocking
         # and their DMAs are still in flight (GC'ing one mid-flight is a use-after-free that hangs).
@@ -2923,7 +2941,12 @@ class Qwen36Model:
         )
         _dma(m, tr.bufs.mask_f32, ttnn.float32, ttnn.TILE_LAYOUT)
         _dma(m, tr.bufs.mask_q, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-        _dma(mbt.host_conv_sel(actual_len, bucket, K), tr.bufs.conv_sel, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        if tr.bufs.conv_sel is not None:
+            _dma(mbt.host_conv_sel(actual_len, bucket, K), tr.bufs.conv_sel, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        else:
+            sel_x_h, sel_c_h = mbt.host_conv_sel_split(actual_len, bucket, K)
+            _dma(sel_x_h, tr.bufs.sel_x, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            _dma(sel_c_h, tr.bufs.sel_c, ttnn.bfloat16, ttnn.TILE_LAYOUT)
 
         ttnn.execute_trace(self.device, tr.trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(self.device)
@@ -2942,7 +2965,7 @@ class Qwen36Model:
             ttnn.release_trace(self.device, tr.trace_id)
             for f in fields(tr.bufs):
                 buf = getattr(tr.bufs, f.name)
-                if buf is not None:
+                if isinstance(buf, ttnn.Tensor):  # None on the path not taken; K is a host int
                     ttnn.deallocate(buf)
         self._mb_traces = {}
 

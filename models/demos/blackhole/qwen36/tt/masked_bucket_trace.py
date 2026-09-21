@@ -54,6 +54,21 @@ def host_conv_sel(actual_len, bucket, kernel_size):
     return sel
 
 
+def host_conv_sel_split(actual_len, bucket, kernel_size):
+    """host_conv_sel split for the fused KDA conv path: (sel_x [1, K-1, bucket], sel_c [1, K-1, K-1]) float32.
+
+    The FIR one-hot indexes x_padded = concat(carry [K-1 rows], x [bucket rows]); column c of it is carry row c
+    for c < K-1 and x row c-(K-1) otherwise. Splitting it by that boundary gives two one-hots such that
+    ``sel_x @ x + sel_c @ carry == host_conv_sel @ concat(carry, x)`` exactly (each output row has a single 1.0 in
+    exactly one of the two), so the fused path never has to materialize the concat. sel_c is non-zero only when
+    actual_len < K-1 (the window still reaches into the previous chunk's carry).
+    """
+    sel = host_conv_sel(actual_len, bucket, kernel_size)
+    sel_c = sel[:, :, : kernel_size - 1].clone().contiguous()
+    sel_x = sel[:, :, kernel_size - 1 :].clone().contiguous()
+    return sel_x, sel_c
+
+
 def host_logit_sel(actual_len, bucket):
     """Last-real-row one-hot [1, 1, 1, bucket] float32 for the TP logits select (row actual_len-1)."""
     assert 1 <= actual_len <= bucket, f"actual_len {actual_len} not in [1, {bucket}]"
