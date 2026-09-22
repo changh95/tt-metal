@@ -660,52 +660,149 @@ def create_app():
             return asyncio.ensure_future(client.send(upstream, stream=True))
 
         d_task = post_decode(fanout_transfer_params(config, transfer_id)) if config.proxy_fanout else None
-        try:
-            p_response = await client.post(
-                f"{stack.prefill.base_url}{path}", json=prefill_request(req_data, transfer_id), headers=headers
+        p_task = asyncio.ensure_future(
+            client.post(f"{stack.prefill.base_url}{path}", json=prefill_request(req_data, transfer_id), headers=headers)
+        )
+
+        async def p_failure(error_or_response) -> Response | None:
+            """P's answer -> the error response to return instead of streaming, or None when P accepted."""
+            if isinstance(error_or_response, BaseException):
+                error = error_or_response
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": f"the prefill half is unreachable: {type(error).__name__}: {error}",
+                            "type": "server_error",
+                        }
+                    },
+                    status_code=502,
+                )
+            p_response = error_or_response
+            if p_response.status_code != 200:
+                # a rejected request (bad params, too long, ...) is reported as P reported it
+                return Response(
+                    content=p_response.content,
+                    status_code=p_response.status_code,
+                    media_type=p_response.headers.get("content-type"),
+                )
+            if not (p_response.json().get("kv_transfer_params") or {}).get("do_remote_prefill"):
+                return JSONResponse(
+                    {
+                        "error": {
+                            "message": "the prefill half returned no kv_transfer_params; is its KV connector active?",
+                            "type": "server_error",
+                        }
+                    },
+                    status_code=502,
+                )
+            return None
+
+        def stream(d_response, first: bytes | None = None) -> StreamingResponse:
+            # aiter_raw passes the SSE stream through chunk by chunk; a client that hangs up closes the upstream behind it
+            async def body() -> AsyncIterator[bytes]:
+                if first is not None:
+                    yield first
+                async for chunk in d_response.aiter_raw():
+                    yield chunk
+
+            async def close():
+                await d_response.aclose()
+                if not p_task.done():
+                    p_task.cancel()
+                elif not p_task.cancelled() and p_task.exception() is not None:
+                    _log("prefill_error_after_stream", request=request_id, error=repr(p_task.exception()))
+
+            return StreamingResponse(
+                body(),
+                status_code=d_response.status_code,
+                headers=dict(filtered_headers(d_response.headers, STRIPPED_RESPONSE_HEADERS)),
+                media_type=d_response.headers.get("content-type"),
+                background=BackgroundTask(close),
             )
-        except httpx.HTTPError as error:
-            await abandon(d_task)
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": f"the prefill half is unreachable: {type(error).__name__}: {error}",
-                        "type": "server_error",
-                    }
-                },
-                status_code=502,
-            )
-        if p_response.status_code != 200:
-            # a rejected request (bad params, too long, ...) is reported as P reported it
-            await abandon(d_task)
-            return Response(
-                content=p_response.content,
-                status_code=p_response.status_code,
-                media_type=p_response.headers.get("content-type"),
-            )
-        params = p_response.json().get("kv_transfer_params") or {}
-        if not params.get("do_remote_prefill"):
-            await abandon(d_task)
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "the prefill half returned no kv_transfer_params; is its KV connector active?",
-                        "type": "server_error",
-                    }
-                },
-                status_code=502,
-            )
-        if d_task is not None and str(params.get("transfer_id")) != transfer_id:
-            _log(
-                "fanout_disabled",
-                reason="P did not echo transfer_id",
-                got=params.get("transfer_id"),
-                request=request_id,
-            )
-            await abandon(d_task)
-            d_task = None
-        if d_task is None:
-            d_task = post_decode(params)
+
+        params: dict[str, Any] | None = None
+        if d_task is not None:
+            # Fan-out: forward D's stream the moment D starts producing, not after P's HTTP answer. D can only produce
+            # once P has staged, but under load P's answer for its max_tokens=1 completion lags the staging by seconds
+            # (its API server drains many finished streams); holding D's bytes until then made the client see one late
+            # first token followed by a burst (TTFT over-, TPOT under-reported). Race P's answer (the usual winner;
+            # keeps P's error codes and the cancel-D-on-failure behaviour) against D's headers and then D's first bytes.
+            d_response = first_task = None
+            await asyncio.wait({p_task, d_task}, return_when=asyncio.FIRST_COMPLETED)
+            if not p_task.done():
+                try:
+                    d_response = await d_task
+                except httpx.HTTPError as error:
+                    p_task.cancel()
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "message": f"the decode half is unreachable: {type(error).__name__}: {error}",
+                                "type": "server_error",
+                            }
+                        },
+                        status_code=502,
+                    )
+                d_iter = d_response.aiter_raw()
+                first_task = asyncio.ensure_future(d_iter.__anext__())
+                await asyncio.wait({p_task, first_task}, return_when=asyncio.FIRST_COMPLETED)
+            if p_task.done():
+                failure = await p_failure(p_task.exception() or p_task.result())
+                if failure is None:
+                    params = p_task.result().json().get("kv_transfer_params") or {}
+                    if str(params.get("transfer_id")) != transfer_id:
+                        _log(
+                            "fanout_disabled",
+                            reason="P did not echo transfer_id",
+                            got=params.get("transfer_id"),
+                            request=request_id,
+                        )
+                if failure is not None or d_task is None or str(params.get("transfer_id")) != transfer_id:
+                    if first_task is not None:
+                        first_task.cancel()
+                    await abandon(d_task)
+                    d_task = None
+                    if failure is not None:
+                        return failure
+            if d_task is not None:
+                first = None
+                if d_response is None:  # P answered first; D's headers are still on their way
+                    try:
+                        d_response = await d_task
+                    except httpx.HTTPError as error:
+                        return JSONResponse(
+                            {
+                                "error": {
+                                    "message": f"the decode half is unreachable: {type(error).__name__}: {error}",
+                                    "type": "server_error",
+                                }
+                            },
+                            status_code=502,
+                        )
+                    d_iter = d_response.aiter_raw()
+                else:
+                    try:
+                        first = await first_task
+                    except StopAsyncIteration:  # an empty body: the stream just ends
+                        first = None
+
+                async def rest() -> AsyncIterator[bytes]:
+                    async for chunk in d_iter:
+                        yield chunk
+
+                d_response.aiter_raw = rest  # continue the iterator that already yielded `first`
+                return stream(d_response, first)
+        # serial round trip (fan-out off, or P did not echo the transfer_id)
+        if params is None:
+            try:
+                p_response = await p_task
+            except httpx.HTTPError as error:
+                return await p_failure(error)
+            failure = await p_failure(p_response)
+            if failure is not None:
+                return failure
+            params = p_response.json().get("kv_transfer_params") or {}
+        d_task = post_decode(params)
         try:
             d_response = await d_task
         except httpx.HTTPError as error:
@@ -718,14 +815,7 @@ def create_app():
                 },
                 status_code=502,
             )
-        # aiter_raw passes the SSE stream through chunk by chunk; a client that hangs up closes the upstream behind it
-        return StreamingResponse(
-            d_response.aiter_raw(),
-            status_code=d_response.status_code,
-            headers=dict(filtered_headers(d_response.headers, STRIPPED_RESPONSE_HEADERS)),
-            media_type=d_response.headers.get("content-type"),
-            background=BackgroundTask(d_response.aclose),
-        )
+        return stream(d_response)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
