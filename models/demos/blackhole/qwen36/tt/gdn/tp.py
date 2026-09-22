@@ -223,6 +223,7 @@ def pack_hist_device(consts, taps, parity, fused=True):
     return packed
 
 
+from models.demos.blackhole.qwen36.tt import masked_bucket_trace as mbt
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_ops import (
     recurrent_gated_delta_rule_decode_ttnn,
@@ -231,7 +232,6 @@ from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_seq i
     chunk_gated_delta_rule_seq_adapter,
     create_chunk_masks_seq,
 )
-from models.demos.blackhole.qwen36.tt import masked_bucket_trace as mbt
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_gated_deltanet import _causal_conv1d_fir
 from models.tt_transformers.tt.ccl import tt_all_reduce
 
@@ -852,9 +852,16 @@ class TPGatedDeltaNet:
         """Row-parallel out projection: DRAM-sharded decode/prefill matmul (K=gdn_value_dim_tp),
         matching the in-proj. Falls back to plain interleaved on single device (no sharded memcfg)."""
         if getattr(self.args, "proj_1d_decode", False) and x.shape[-2] <= tpc.TILE_SIZE:
-            # Decode: tuned ~32-core 1D matmul (interleaved weight) -> DRAM for the reduce-scatter.
+            # Decode: tuned ~32-core 1D matmul (interleaved weight) -> DRAM for the reduce-scatter, or L1 for the
+            # fused all-reduce (it reshards L1->L1 into the 32-core width shard; measured 11x3 + reshard beats an
+            # 8x4 grid writing the shard directly).
+            _out_mc = (
+                ttnn.L1_MEMORY_CONFIG
+                if getattr(self.tt_ccl, "decode_all_reduce", None) is not None
+                else ttnn.DRAM_MEMORY_CONFIG
+            )
             return tpc.matmul_1d_decode(
-                x, weight, self.args.gdn_out_decode_1d_progcfg, self.cfg, out_memory_config=ttnn.DRAM_MEMORY_CONFIG
+                x, weight, self.args.gdn_out_decode_1d_progcfg, self.cfg, out_memory_config=_out_mc
             )
         if not self._out_sharded:
             if x.shape[-2] > tpc.TILE_SIZE:
@@ -2097,16 +2104,7 @@ class TPGatedDeltaNet:
             ttnn.deallocate(qkvzab)
             partial = self._row_proj(gated, tw["out"])
             ttnn.deallocate(gated)
-            partial = ttnn.reshape(partial, (1, 1, B, partial.shape[-1]))
-            return tt_all_reduce(
-                partial,
-                self.mesh,
-                self.tt_ccl,
-                cluster_axis=0,
-                dim=3,
-                topology=self.args.ccl_topology(),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            return self._decode_out_all_reduce(partial, B)
 
         qkv, z, a, b = self._project_qkvzab(x, B, out_mc=_L1)
 
@@ -2138,16 +2136,7 @@ class TPGatedDeltaNet:
             )
             partial = self._row_proj(gated, tw["out"])
             ttnn.deallocate(gated)
-            partial = ttnn.reshape(partial, (1, 1, B, partial.shape[-1]))
-            return tt_all_reduce(
-                partial,
-                self.mesh,
-                self.tt_ccl,
-                cluster_axis=0,
-                dim=3,
-                topology=self.args.ccl_topology(),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            return self._decode_out_all_reduce(partial, B)
         q = ttnn.reshape(ttnn.slice(conv, (0, 0, 0), (1, B, kd)), (B, Nk, Dk))
         k = ttnn.reshape(ttnn.slice(conv, (0, 0, kd), (1, B, 2 * kd)), (B, Nk, Dk))
         v = ttnn.reshape(ttnn.slice(conv, (0, 0, 2 * kd), (1, B, self.qkv_dim_tp)), (B, Nv, Dv))
@@ -2206,8 +2195,16 @@ class TPGatedDeltaNet:
 
         partial = self._row_proj(gated, tw["out"])
         ttnn.deallocate(gated)
-        partial = ttnn.reshape(partial, (1, 1, B, partial.shape[-1]))
-        out = tt_all_reduce(
+        return self._decode_out_all_reduce(partial, B)
+
+    def _decode_out_all_reduce(self, partial, B):
+        """Decode out-proj partial [1,B,dim] -> the layer's residual contribution: fused all_reduce_async (replicated
+        [1,1,B,dim], decode norm layout) when the model's CCL carries it, else reduce-scatter (fractured, DRAM)."""
+        partial = ttnn.reshape(partial, (1, 1, B, partial.shape[-1]))  # view (interleaved)
+        _ar = getattr(self.tt_ccl, "decode_all_reduce", None)
+        if _ar is not None:
+            return _ar(partial)
+        return tt_all_reduce(
             partial,
             self.mesh,
             self.tt_ccl,
@@ -2216,4 +2213,3 @@ class TPGatedDeltaNet:
             topology=self.args.ccl_topology(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        return out

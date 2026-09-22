@@ -263,13 +263,19 @@ class TPAttention:
         """Row-parallel output projection: DRAM-sharded decode/prefill matmul (K=attn_out_dim_tp),
         matching the in-proj. Falls back to plain interleaved when no sharded memcfg."""
         if getattr(self.args, "proj_1d_decode", False) and x.shape[-2] <= tpc.TILE_SIZE:
-            # Decode: tuned ~32-core 1D matmul (interleaved weight) -> DRAM for the reduce-scatter.
+            # Decode: tuned ~32-core 1D matmul (interleaved weight) -> DRAM for the reduce-scatter, or L1 for the
+            # fused all-reduce (L1->L1 reshard into the 32-core width shard; see gdn/tp.py _row_proj).
+            _out_mc = (
+                ttnn.L1_MEMORY_CONFIG
+                if getattr(self.tt_ccl, "decode_all_reduce", None) is not None
+                else ttnn.DRAM_MEMORY_CONFIG
+            )
             return tpc.matmul_1d_decode(
                 x,
                 weight,
                 self.args.attn_wo_decode_1d_progcfg,
                 self.compute_cfg,
-                out_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                out_memory_config=_out_mc,
             )
         if not self._wo_sharded:
             if x.shape[-2] > tpc.TILE_SIZE:
@@ -730,7 +736,11 @@ class TPAttention:
             ttnn.deallocate(gated)
         wo_partial = self._wo_proj(gated_flat, tw["wo"])
         ttnn.deallocate(gated_flat)
-        wo_partial = ttnn.reshape(wo_partial, (1, 1, B, wo_partial.shape[-1]))
+        wo_partial = ttnn.reshape(wo_partial, (1, 1, B, wo_partial.shape[-1]))  # view (interleaved)
+        # Decode: fused all_reduce_async -> replicated [1,1,B,dim] in the decode norm layout (tp_common.DecodeAllReduce).
+        _ar = getattr(self.tt_ccl, "decode_all_reduce", None)
+        if _ar is not None:
+            return _ar(wo_partial)
         return tt_all_reduce(
             wo_partial,
             self.mesh,

@@ -12,6 +12,7 @@ import torch
 
 import ttnn
 from models.common.utility_functions import is_blackhole
+from models.tt_transformers.tt.ccl import TT_CCL
 
 # Hardware constants
 TILE_SIZE = 32
@@ -1057,3 +1058,132 @@ def prepare_conv_taps(conv_w, key_dim, nk, dk, nv, dv, kernel_size, tp):
             shards.append(torch.cat([q_s, k_s, v_s]))
         taps.append(torch.cat(shards))
     return taps
+
+
+# Fused decode all-reduce (replicated residual stream)
+def decode_fused_all_reduce_enabled(mesh_device):
+    """Default ON for the TP decode path on a Blackhole (1,N)/(N,1) mesh with an even N > 1 (the fused
+    all_reduce_async kernel reduces block pairs, so the ring size must be even). QWEN36_DECODE_FUSED_AR=0 restores
+    the reduce_scatter + all_gather chain."""
+    if os.environ.get("QWEN36_DECODE_FUSED_AR", "1") == "0" or not is_blackhole():
+        return False
+    shape = [int(d) for d in mesh_device.shape]
+    if 1 not in shape:
+        return False
+    n = max(shape)
+    return n > 1 and n % 2 == 0
+
+
+class DecodeAllReduce:
+    """One fused CCL per decode sub-layer: ttnn.experimental.all_reduce_async (buffer_tensor overload) on the
+    out-projection partial [1,1,B,dim] returns the REPLICATED sum, L1 width-sharded on the decode norm grid (the
+    32-core act_shard_hidden layout), replacing reduce_scatter_minimal_async (fractured [B,dim/TP]) + the norm's
+    all_gather_async. The residual stream stays replicated in that layout for the whole decode step.
+
+    Persistent resources -- the buffer tensors ([1,1,32,TP*dim] bf16, shard [32, TP*shard_w], the kernel writes every
+    peer's slice at slot my_chip_id) and their global semaphores -- are allocated HERE, at model init, BEFORE any trace
+    capture (PLAN.md rule: buffers allocated after capture land in freed trace addresses). The op's receiver resets its
+    semaphore after the wait and has no barrier, so a peer one call ahead must never target the pair a slow device is
+    still reducing: consecutive calls alternate between `num_pairs` pairs. With 2 pairs that is safe because a device
+    cannot start call N+2 before every peer has finished call N (it needs their call-N+1 slices first). Every decode
+    forward issues an even number of calls (2 per layer), so all traces start on the same pair; begin_step() pins it.
+
+    Replicas are bit-identical by construction (each device reduces the same bytes in the same fixed slot order), so
+    the 4 residual copies never drift; the summation order differs from the ring reduce-scatter, so decode logits are
+    NOT bit-identical to the old path (gated at PCC >= 0.9999 + identical greedy tokens)."""
+
+    def __init__(self, tt_ccl, mesh_device, dim, act_memcfg, topology, num_links=None, num_pairs=2):
+        self.tt_ccl = tt_ccl
+        self.mesh = mesh_device
+        self.dim = dim
+        shape = [int(d) for d in mesh_device.shape]
+        self.cluster_axis = 1 if shape[0] == 1 else 0
+        self.ring_size = shape[self.cluster_axis]
+        assert self.ring_size % 2 == 0, f"all_reduce_async needs an even ring size, got {shape}"
+        self.act_memcfg = act_memcfg
+        spec = act_memcfg.shard_spec
+        shard_h, shard_w = (int(v) for v in spec.shape)
+        assert shard_w * spec.grid.num_cores() == dim, f"decode residual shard {spec} does not tile dim={dim}"
+        self.buf_memcfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(spec.grid, [shard_h, shard_w * self.ring_size], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        self.buffers = [
+            ttnn.from_torch(
+                torch.zeros(1, 1, shard_h, dim * self.ring_size, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=self.buf_memcfg,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+            )
+            for _ in range(num_pairs)
+        ]
+        self.semaphores = [
+            ttnn.create_global_semaphore(mesh_device, tt_ccl.sub_device_crs, 0) for _ in range(num_pairs)
+        ]
+        self.topology = topology
+        # Ring x 2 links measured fastest on the served FABRIC_1D (1,4) half (21 us vs Linear 23 us, 1 link 35 us).
+        self.num_links = num_links or tt_ccl.get_num_links(self.cluster_axis)
+        self._idx = 0
+
+    def begin_step(self):
+        """Pin the pair sequence at the start of a decode forward (trace capture and eager alike)."""
+        self._idx = 0
+
+    def __call__(self, partial):
+        """partial: this device's [1,1,B,dim] out-projection output (L1 interleaved, or already in act_memcfg).
+        Returns the replicated sum in act_memcfg; consumes `partial`."""
+        x = partial if partial.is_sharded() else ttnn.to_memory_config(partial, self.act_memcfg)
+        i = self._idx % len(self.buffers)
+        self._idx += 1
+        out = ttnn.experimental.all_reduce_async(
+            x,
+            self.buffers[i],
+            cluster_axis=self.cluster_axis,
+            mesh_device=self.mesh,
+            multi_device_global_semaphore=self.semaphores[i],
+            memory_config=self.act_memcfg,
+            topology=self.topology,
+            num_links=self.num_links,
+            fp32_dest_acc=True,
+        )
+        if x is not partial:
+            ttnn.deallocate(x)
+        ttnn.deallocate(partial)
+        return out
+
+    def gather_residual(self, x):
+        """Embedding output [1,1,B,dim/TP] (hidden-fractured) -> replicated [1,1,B,dim] in act_memcfg: the one
+        all_gather per decode step that seeds the replicated residual stream. Consumes `x`."""
+        out = ttnn.experimental.all_gather_async(
+            x,
+            persistent_output_buffer=None,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+            num_links=self.num_links,
+            topology=self.topology,
+            memory_config=self.act_memcfg,
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+            chunks_per_sync=10,
+            num_workers_per_link=2,
+            num_buffers_per_channel=2,
+        )
+        ttnn.deallocate(x)
+        return out
+
+
+class Qwen36CCL(TT_CCL):
+    """TT_CCL plus the qwen36 decode fused all-reduce resources (`decode_all_reduce`, None when disabled). Modules
+    fall back to tt_all_reduce (reduce-scatter) when their tt_ccl has no `decode_all_reduce`, so module-level tests
+    built on a plain TT_CCL keep the fractured path."""
+
+    def __init__(self, mesh_device, args):
+        super().__init__(mesh_device)
+        self.decode_all_reduce = None
+        if decode_fused_all_reduce_enabled(mesh_device):
+            from models.tt_transformers.tt.common import Mode
+
+            act_memcfg = args.get_norm_config("attn", Mode.DECODE)["sharded_output_config"]
+            self.decode_all_reduce = DecodeAllReduce(self, mesh_device, args.dim, act_memcfg, args.ccl_topology())

@@ -188,7 +188,16 @@ class Qwen36DecoderLayer:
             _attn_norm_config = _ff_norm_config = (
                 {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if mode == "decode" else None
             )
-        attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
+        # DECODE fused all-reduce path (model._decode_residual_in): x is the REPLICATED residual [1,1,B,dim], L1
+        # width-sharded in the decode norm layout -> the norms run directly on it (the wrapped sharded RMSNorm, no
+        # DistributedNorm all-gather) and the residual adds stay in that layout. Fractured x keeps the old path.
+        _replicated = self.num_devices > 1 and _norm_mode == Mode.DECODE and x.shape[-1] == self.args.dim
+        if _replicated:
+            attn_input = self.attention_norm.norm(
+                x, mode=_norm_mode, in_sharded=True, out_sharded=True, norm_config=_attn_norm_config
+            )
+        else:
+            attn_input = self.attention_norm(x, mode=_norm_mode, norm_config=_attn_norm_config)
 
         if self.num_devices > 1:
             # TP modules: input is the gathered (full-dim) norm output [1,1,B/S,dim];
@@ -254,7 +263,12 @@ class Qwen36DecoderLayer:
         h = ttnn.add(x, attn_output)
         ttnn.deallocate(attn_output)
 
-        ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
+        if _replicated:
+            ff_input = self.ffn_norm.norm(
+                h, mode=_norm_mode, in_sharded=True, out_sharded=True, norm_config=_ff_norm_config
+            )
+        else:
+            ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
 
         ff_output = self.feed_forward.forward(ff_input)
         ttnn.deallocate(ff_input)

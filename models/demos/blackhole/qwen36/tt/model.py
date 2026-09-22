@@ -76,9 +76,11 @@ class Qwen36Model:
         self.num_devices = mesh_device.get_num_devices()
         # CCL for multi-device all-reduce; None on single device (ops no-op).
         if self.num_devices > 1:
-            from models.tt_transformers.tt.ccl import TT_CCL
+            from models.demos.blackhole.qwen36.tt import tp_common as tpc
 
-            self.tt_ccl = TT_CCL(mesh_device)
+            # TT_CCL + the decode fused all-reduce resources (persistent buffers/semaphores allocated here, before
+            # any trace capture; see tp_common.DecodeAllReduce). None -> reduce-scatter path.
+            self.tt_ccl = tpc.Qwen36CCL(mesh_device, args)
         else:
             self.tt_ccl = None
         self.configuration = args  # Generator reads model.configuration.max_seq_len
@@ -576,10 +578,38 @@ class Qwen36Model:
         is forced back to DRAM so the LM-head matmul input is byte-identical (layout-only change).
         """
         if self.num_devices > 1:
+            if x.shape[-1] == self.args.dim:
+                # Fused decode all-reduce path: x is already the REPLICATED residual, L1 width-sharded in the decode
+                # norm layout -> plain sharded rms_norm on the wrapped RMSNorm (no all-gather), then DRAM for the
+                # LM-head matmul (same layout-only contract as below).
+                x = self.norm.norm(
+                    x,
+                    mode=Mode.DECODE,
+                    in_sharded=True,
+                    out_sharded=True,
+                    norm_config=self.args.get_norm_config("attn", Mode.DECODE),
+                )
+                out = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(x)
+                return out
             nc = dict(self.args.get_norm_config("lm_head", Mode.DECODE))
             nc["output_mem_config"] = ttnn.DRAM_MEMORY_CONFIG
             return self.norm(x, mode=Mode.DECODE, norm_config=nc)
         return self.norm(x, mode=Mode.DECODE)
+
+    def _decode_fused_all_reduce(self):
+        return getattr(self.tt_ccl, "decode_all_reduce", None) is not None
+
+    def _decode_residual_in(self, x):
+        """Seed the decode residual stream. Fused all-reduce path: the hidden-fractured embedding [1,1,B,dim/TP] is
+        all-gathered ONCE into the replicated, L1 width-sharded [1,1,B,dim] every sub-layer's all_reduce_async
+        returns (the layers then add/norm on that layout, no per-norm gather). Otherwise x passes through fractured.
+        Also resets the all-reduce buffer/semaphore pair sequence so every traced step starts on the same pair."""
+        ar = getattr(self.tt_ccl, "decode_all_reduce", None)
+        if ar is None:
+            return x
+        ar.begin_step()
+        return ar.gather_residual(x)
 
     @classmethod
     def from_pretrained(
@@ -700,6 +730,7 @@ class Qwen36Model:
         )
         x = self.embd(tok)  # [1,1,dim_frac]
         x = ttnn.reshape(x, (1, 1, 1, x.shape[-1]))  # [1,1,B=1,dim_frac]
+        x = self._decode_residual_in(x)
         # RoPE position offset by rope_delta for multimodal (KV position cur_pos_tt stays `pos`).
         cos, sin = rot_mats_decode(
             self.device,
@@ -965,6 +996,8 @@ class Qwen36Model:
         token_ids_ttnn = ttnn.from_torch(token_ids, dtype=ttnn.uint32, device=self.device)
         x = self.embd(token_ids_ttnn)
         ttnn.deallocate(token_ids_ttnn)
+        if self.num_devices > 1 and self._decode_fused_all_reduce():
+            x = self._decode_residual_in(ttnn.reshape(x, (1, 1, x.shape[0] * x.shape[1], x.shape[-1])))
 
         # RoPE position is offset by rope_delta for a multimodal request (image tokens compress the
         # position space); the KV/cache position (cur_pos_tensor below) stays the true sequence pos.
@@ -1003,6 +1036,7 @@ class Qwen36Model:
         if self.num_devices > 1:
             # TP expects [1,1,B,dim_frac]; embd yields [B,1,dim_frac].
             x = ttnn.reshape(x, (1, 1, x.shape[0] * x.shape[1], x.shape[-1]))
+            x = self._decode_residual_in(x)
         for layer in self.layers:
             if layer.is_full_attention:
                 x = layer.forward(x, cos, sin, position_tensor=cur_pos_tensor, page_table=page_table, mode="decode")
@@ -3947,6 +3981,8 @@ class Qwen36Model:
         token_ids_ttnn = ttnn.from_torch(token_ids, dtype=ttnn.uint32, device=self.device)
         x = self.embd(token_ids_ttnn)
         ttnn.deallocate(token_ids_ttnn)
+        if self.num_devices > 1 and self._decode_fused_all_reduce():
+            x = self._decode_residual_in(ttnn.reshape(x, (1, 1, x.shape[0] * x.shape[1], x.shape[-1])))
 
         # RoPE position offset by rope_delta for multimodal (KV position stays the true seq pos).
         position_ids = torch.full((B, 1), current_pos + self.rope.rope_delta, dtype=torch.long)

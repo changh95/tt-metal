@@ -367,6 +367,11 @@ class Qwen36MLP:
             )
         ttnn.deallocate(hidden)
 
+        # Decode: fused all_reduce_async -> replicated [1,1,B,dim] in the decode norm layout (tp_common.DecodeAllReduce).
+        _ar = getattr(self.tt_ccl, "decode_all_reduce", None)
+        if _ar is not None and x.shape[-2] <= ttnn.TILE_SIZE:
+            return _ar(partial)
+
         # tt_all_reduce on (1,4) mesh reduce-scatters to hidden dim (dim=3).
         out = tt_all_reduce(
             partial,
