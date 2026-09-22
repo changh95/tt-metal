@@ -368,8 +368,11 @@ class Qwen36MLP:
         ttnn.deallocate(hidden)
 
         # Decode: fused all_reduce_async -> replicated [1,1,B,dim] in the decode norm layout (tp_common.DecodeAllReduce).
+        # Only the decode path feeds the MLP a width-sharded norm output (layer.py: ffn_norm(..., out_sharded=True) on
+        # the replicated residual); an eager TP prefill of <= 32 tokens has the same row count but a FRACTURED,
+        # interleaved residual, and must keep the reduce-scatter path (the fused op would return the replicated width).
         _ar = getattr(self.tt_ccl, "decode_all_reduce", None)
-        if _ar is not None and x.shape[-2] <= ttnn.TILE_SIZE:
+        if _ar is not None and x.shape[-2] <= ttnn.TILE_SIZE and x.is_sharded():
             return _ar(partial)
 
         # tt_all_reduce on (1,4) mesh reduce-scatters to hidden dim (dim=3).

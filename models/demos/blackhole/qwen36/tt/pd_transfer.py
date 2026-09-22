@@ -1023,21 +1023,25 @@ class TracedGdnImporter:
         self.hist_rm = (
             stage((self.n_dev * self.L, self.Nv * 4, 32, 32), torch.bfloat16, ttnn.bfloat16) if self.with_hist else None
         )
-        # one-hot row masks for the tap writes: mask[s][0, b, :] = (b == s), same [1, B, C] shape as conv_states[m]
+        # One-hot row mask for the tap writes: mask[0, b, :] = (b == slot), the [1, B, C] shape of conv_states[m]. ONE
+        # staging tensor (replicated, ROW_MAJOR) that import_slot/capture re-upload with the slot's one-hot right before
+        # the replay, like rec_rm/taps_rm/hist_rm: the importer is built after the decode (and KV-import) traces were
+        # captured, so a constant that is written once could be clobbered by those traces' freed intermediates
+        # (allocated-after-capture hazard); a value re-uploaded immediately before each replay is not.
         B = int(dn0.conv_states[0].shape[-2])
         self.B = B
         eye = torch.eye(B, dtype=torch.bfloat16)
-        self.masks = [
-            ttnn.from_torch(
-                eye[s].reshape(1, B, 1).expand(1, B, self.C).contiguous(),
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-                device=self.mesh,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-            )
-            for s in range(B)
-        ]
+        self._mask_host = [eye[s].reshape(1, B, 1).expand(1, B, self.C).contiguous() for s in range(B)]
+        self._mask_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self.mask_rm = ttnn.from_torch(
+            self._mask_host[0],
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._mask_mapper,
+        )
+        self._mask_slot = 0
         self.traces: dict[int, int] = {}
         self.mapper = mapper
         logger.info(
@@ -1050,6 +1054,7 @@ class TracedGdnImporter:
         rec_t = ttnn.to_layout(self.rec_rm, ttnn.TILE_LAYOUT)
         taps_t = ttnn.to_layout(self.taps_rm, ttnn.TILE_LAYOUT)
         hist_t = ttnn.to_layout(self.hist_rm, ttnn.TILE_LAYOUT) if self.with_hist else None
+        mask_t = ttnn.to_layout(self.mask_rm, ttnn.TILE_LAYOUT)  # the slot's one-hot, uploaded just before
         K = self.K
         for li, dn in enumerate(self.dn):
             rec_l = dn._slice_along(rec_t, 0, li, li + 1)  # [1, Nv, Dk, Dv]
@@ -1057,7 +1062,7 @@ class TracedGdnImporter:
             ttnn.deallocate(rec_l)
             for m in range(K):
                 c = dn._slice_along(taps_t, 0, li * K + m, li * K + m + 1)  # [1, 1, C]
-                self._write_tap_row(dn.conv_states[m], c, slot)  # consumes c
+                self._write_tap_row(dn.conv_states[m], c, mask_t)  # consumes c
             if hist_t is not None and dn.conv_hist_packed is not None:
                 h = dn._slice_along(hist_t, 0, li, li + 1)  # [1, Nv*4, 32, 32]
                 B = dn.conv_hist_packed.shape[0]
@@ -1066,22 +1071,38 @@ class TracedGdnImporter:
                 ttnn.deallocate(h)  # dst is a reshape view: never deallocated
         ttnn.deallocate(rec_t)
         ttnn.deallocate(taps_t)
+        ttnn.deallocate(mask_t)
         if hist_t is not None:
             ttnn.deallocate(hist_t)
 
-    def _write_tap_row(self, conv_state, c, slot: int):
+    def _write_tap_row(self, conv_state, c, mask_t):
         """conv_state[0, slot, :] = c[0, 0, :] in place (conv_state: the layer's [1, B, C] TILE tap buffer whose address
-        the decode trace baked; c: a [1, 1, C] TILE row, consumed). One masked select with the buffer as its own output:
-        rows != slot are forwarded, row slot takes the broadcast tap row. Elementwise, tile by tile, so aliasing the
-        false-operand and the output is safe (the in-place binary ops work the same way)."""
-        assert 0 <= slot < self.B, f"slot {slot} out of range [0,{self.B})"
-        ttnn.where(self.masks[slot], c, conv_state, output_tensor=conv_state)
+        the decode trace baked; c: a [1, 1, C] TILE row, consumed; mask_t: the slot's one-hot [1, B, C] TILE rows). One
+        masked select with the buffer as its own output: rows != slot are forwarded, row slot takes the broadcast tap
+        row. Elementwise, tile by tile, so aliasing the false-operand and the output is safe (the in-place binary ops
+        work the same way)."""
+        ttnn.where(mask_t, c, conv_state, output_tensor=conv_state)
         ttnn.deallocate(c)
+
+    def _upload_mask(self, slot: int):
+        """Stage the slot's one-hot row mask (host prebuilt) into mask_rm; returns the host ref to keep alive."""
+        assert 0 <= slot < self.B, f"slot {slot} out of range [0,{self.B})"
+        h = ttnn.from_torch(
+            self._mask_host[slot],
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=None,
+            mesh_mapper=self._mask_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(h, self.mask_rm)
+        self._mask_slot = slot
+        return h
 
     def capture(self, slot: int):
         if slot in self.traces:
             return
         t0 = time.perf_counter()
+        _mref = self._upload_mask(slot)
         self._body(slot)  # compile pass (also a harmless write of the staged data into the slot)
         ttnn.synchronize_device(self.mesh)
         tid = ttnn.begin_trace_capture(self.mesh, cq_id=0)
@@ -1123,7 +1144,7 @@ class TracedGdnImporter:
             hist = prepared.hist[slot & 1] if self.with_hist else None
             if self.with_hist and hist is None:
                 hist = self._host_hist(taps, slot)
-        refs = [self._upload(rec_all, self.rec_rm), self._upload(taps_all, self.taps_rm)]
+        refs = [self._upload(rec_all, self.rec_rm), self._upload(taps_all, self.taps_rm), self._upload_mask(slot)]
         if self.with_hist:
             refs.append(self._upload(hist, self.hist_rm))
         t1 = time.perf_counter()
