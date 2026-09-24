@@ -19,6 +19,13 @@ gate 71.4/50.9, up 54.4/46.0, down 54.6/66.2 (in0 17 cores x 8 tiles; 8 cores x 
 86.8/62.8, out 34.8/27.5, attn_qkv 73.8/53.4 -> only the down projection wins; maxdiff vs 1D <= 0.016 (bf16 lsb),
 pcc_vs_1d >= 0.99999.
 
+RESULT 2026-09-24 (logs/itemA_bench2_w123.log, after the device.cpp fix that measures the hop distance on the
+mesh's first device): workers 2/3 run on the (1,4) mesh. Best traced us/op per matrix (1D = tuned default):
+gate 1D 50.7 | w1 71.1 | w2 50.3 | w3 43.5 (in0c32b5 pcn4); up 45.7 | 54.0 | 39.5 | 35.7 (in0c32b5 pcn4);
+down 66.1 | 54.2 | 82.4 | 60.1; qkvzab 62.6 | 86.6 | 65.2 | 60.1; out 27.2 | 34.7 | 32.6 | 27.5;
+attn_qkv 53.4 | 73.4 | 51.9 | 50.2. per_core_N values that give fewer output cores than 8*workers readers fail
+loudly ("Worker x-y has no storage area assigned"). Enabled in the model for gate/up (QWEN36_DECODE_DRAM_SHARDED=gateup).
+
 Run on half A:
   TT_VISIBLE_DEVICES=0,1,6,7 MESH_DEVICE=P150x4 ARCH_NAME=blackhole python_env/bin/python -m pytest \
   models/demos/blackhole/qwen36/tests/test_decode_proj_dram_sharded_bench_scratch.py -x -s

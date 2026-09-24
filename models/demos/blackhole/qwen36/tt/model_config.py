@@ -43,15 +43,55 @@ for _k, _v in _QWEN36_SERVING_OPT_DEFAULTS.items():
 GDN_CONV1D_L1_SMALL_SIZE = 24576
 
 # DRAM-sharded decode matmul tunables (27B TP=4 per-device shapes; see _init_tp_config):
-#   workers    = num_workers_per_dram_bank (1 only on a multi-device mesh, see _init_tp_config)
+#   workers    = num_workers_per_dram_bank (1-3; 2-3 need the tt-metal fix in
+#                tt_metal/impl/device/experimental/device.cpp that measures the reader NOC hop distance on the
+#                mesh's first device instead of asserting a unit mesh -- an older build TT_FATALs at program creation)
 #   in0_cores  = L1 width-shard grid of the activation (row-major cores of the compute grid)
-#   per_core_n = OUTPUT storage shard width in tiles (output grid = ceil(N_tiles / per_core_n) cores)
+#   per_core_n = OUTPUT storage shard width in tiles (output grid = ceil(N_tiles / per_core_n) cores; must give
+#                >= 8 * workers cores, every reader core has to own an output shard)
 #   in0_block_w (optional) = K block; default largest divisor <= 8 of the in0 shard width
+# Microbench (tests/test_decode_proj_dram_sharded_bench_scratch.py, P150x4, traced us/op, 2026-09-24
+# logs/itemA_bench2_w123.log; 1D = the tuned default):
+#   gate  1D 50.7 | w1 71.1 | w2 50.3 | w3 43.5 (in0 32x5, per_core_n 4)      -> gateup on w3
+#   up    1D 45.7 | w1 54.0 | w2 39.5 | w3 35.7 (in0 32x5, per_core_n 4)      -> gateup on w3
+#   down  1D 66.1 | w1 54.2 | w2 82.4 | w3 60.1                               -> stays w1
+#   qkvzab 1D 62.6 | w1 86.6 | w2 65.2 | w3 60.1;  attn_qkv 1D 53.4 | w1 73.4 | w2 51.9 | w3 50.2;
+#   out/wo 1D 27.2 | w1 34.7 | w2 32.6 | w3 27.5  -> not worth it: both in-projections feed ttnn.slice, which
+#   needs an interleaved re-layout of the width-sharded output (~3 us) that eats the 2.5-3 us standalone gain.
 DS_DECODE_CFG = {
     # down: K 4352 (136 tiles -> 17 cores x 8) N 5120 bfp8 LoFi; 32 storage cores x 5 tiles. Measured 54.6 us
     # (1D 33-core: 66.2); 34 cores x 4 tiles: 54.7; per_core_n 10: 54.7.
     "mlp_w2": {"workers": 1, "in0_cores": 17, "per_core_n": 5},
+    # gate/up: K 5120 (the ff-norm shard: 32 cores x 5 tiles, fed as-is) N 4352 bfp4 LoFi, 3 readers/bank
+    # (24 reader cores, per-bank storage 18 tiles -> 4608 padded columns, +6%); output 34 cores x 4 tiles.
+    "mlp_w13": {"workers": 3, "per_core_n": 4},
 }
+
+
+def decode_dram_sharded_matrices():
+    """QWEN36_DECODE_DRAM_SHARDED -> the set of decode projections that run on the DRAM-sharded kernel.
+
+    "0"/unset: none (default). "1": down only (the original opt-in). Otherwise a comma list of
+    down | gateup (aliases gate, up) | all, e.g. "gateup" or "down,gateup"."""
+    v = os.environ.get("QWEN36_DECODE_DRAM_SHARDED", "0").strip().lower()
+    if v in ("", "0"):
+        return set()
+    if v == "1":
+        return {"down"}
+    names = set()
+    for tok in v.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok == "all":
+            names |= {"down", "gateup"}
+        elif tok in ("gate", "up", "gateup", "gate_up", "w1", "w3"):
+            names.add("gateup")
+        elif tok in ("down", "w2"):
+            names.add("down")
+        else:
+            raise ValueError(f"QWEN36_DECODE_DRAM_SHARDED: unknown entry {tok!r} (down | gateup | all | 0 | 1)")
+    return names
 
 
 class Qwen36ModelArgs(ModelArgs):
@@ -267,12 +307,13 @@ class Qwen36ModelArgs(ModelArgs):
             M, self.gdn_value_dim_tp, self.dim, num_cores=33, grid_w=self.decode_grid_w
         )
 
-        # DRAM-sharded decode down-projection (OPT-IN: QWEN36_DECODE_DRAM_SHARDED=1). Item A findings (P150x4,
-        # TP=4, 2026-09-21):
+        # DRAM-sharded decode down-projection (OPT-IN: QWEN36_DECODE_DRAM_SHARDED=1 or ...,down). Item A findings
+        # (P150x4, TP=4, 2026-09-21):
         #  * The multi-reader kernel (MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig.num_workers_per_dram_bank
-        #    2-3, tt-metal #54242) is NOT reachable on a multi-device mesh: its reader placement calls
-        #    experimental::Device::get_worker_noc_hop_distance, which TT_FATALs "only supported on unit MeshDevice"
-        #    (tt_metal/impl/device/experimental/device.cpp:20) for the (1,4) mesh, so only workers=1 runs here.
+        #    2-3, tt-metal #54242) WAS unreachable on a multi-device mesh: its reader placement calls
+        #    experimental::Device::get_worker_noc_hop_distance, which TT_FATALed "only supported on unit MeshDevice"
+        #    for the (1,4) mesh. Fixed 2026-09-24 in tt_metal/impl/device/experimental/device.cpp (measures on the
+        #    mesh's first local device, best-effort under heterogeneous harvesting); DS_DECODE_CFG has the numbers.
         #  * Measured with tests/test_decode_proj_dram_sharded_bench_scratch.py (traced us/op, 1 worker vs the
         #    tuned 1D path): gate 71 vs 51, up 54 vs 46, gdn qkvzab 87 vs 63, out/wo 35 vs 28, attn qkv 74 vs 53
         #    -> those stay on the 1D kernels; down 54.6 vs 66.2 -> the 8 bank readers stream the 23.7 MB bfp8
@@ -288,7 +329,8 @@ class Qwen36ModelArgs(ModelArgs):
         # 2D kernel); in0 = silu(gate)*up resharded to 17 cores x 8 tiles (in0_block_w 8; 8 cores x 1-tile blocks
         # measured 144 us); the L1 width-sharded output is re-laid-out to L1 interleaved for the reduce-scatter.
         self.decode_grid_size = mesh_device.compute_with_storage_grid_size()
-        self.mlp_w2_ds_decode = is_blackhole() and os.environ.get("QWEN36_DECODE_DRAM_SHARDED", "0") == "1"
+        _ds = decode_dram_sharded_matrices()
+        self.mlp_w2_ds_decode = is_blackhole() and "down" in _ds
         c2 = DS_DECODE_CFG["mlp_w2"]
         self.mlp_w2_ds_workers = c2["workers"]
         self.mlp_w2_ds_memcfg = tpc.create_dram_sharded_mem_config(self.hidden_dim // tp, self.dim, c2["workers"])
@@ -299,6 +341,28 @@ class Qwen36ModelArgs(ModelArgs):
         )
         self.mlp_w2_ds_progcfg = tpc.create_dram_sharded_decode_progcfg(
             _hid_tiles // c2["in0_cores"], c2["per_core_n"], c2["workers"], in0_block_w=c2.get("in0_block_w")
+        )
+        # DRAM-sharded gate/up with 3 readers per bank (OPT-IN: QWEN36_DECODE_DRAM_SHARDED=gateup). in0 is the
+        # ff-norm width shard itself (act_shard_hidden: 32 cores x 5 tiles -> in0_block_w 5), so mlp.py feeds it
+        # without the interleave the 1D path needs; the L1 width-sharded outputs are multiplied shard-locally and
+        # re-laid out once for the down-proj input.
+        self.mlp_w13_ds_decode = is_blackhole() and "gateup" in _ds
+        c13 = DS_DECODE_CFG["mlp_w13"]
+        self.mlp_w13_ds_workers = c13["workers"]
+        self.mlp_w1_ds_memcfg = tpc.create_dram_sharded_mem_config(self.dim, self.hidden_dim // tp, c13["workers"])
+        self.mlp_w3_ds_memcfg = self.mlp_w1_ds_memcfg
+        _dim_tiles = self.dim // tpc.TILE_SIZE
+        _nr, _nc = tpc._find_grid(_dim_tiles)  # the act_shard_hidden grid (create_activation_shard_config)
+        assert _dim_tiles % (_nr * _nc) == 0, (_dim_tiles, _nr, _nc)
+        self.mlp_w1_ds_progcfg = tpc.create_dram_sharded_decode_progcfg(
+            _dim_tiles // (_nr * _nc),
+            c13["per_core_n"],
+            c13["workers"],
+            fused_activation=ttnn.UnaryOpType.SILU,
+            in0_block_w=c13.get("in0_block_w"),
+        )
+        self.mlp_w3_ds_progcfg = tpc.create_dram_sharded_decode_progcfg(
+            _dim_tiles // (_nr * _nc), c13["per_core_n"], c13["workers"], in0_block_w=c13.get("in0_block_w")
         )
 
         # Prefill matmul factory (M = seq_len)

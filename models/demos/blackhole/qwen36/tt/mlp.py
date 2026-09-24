@@ -19,6 +19,8 @@ class MLPWeights:
     w3: ttnn.Tensor  # up_proj [in, out], bfloat4_b
     w_gate_up: ttnn.Tensor = None  # TP prefill: tile-pair-interleaved packed [gate|up] for fused-swiglu AGMM
     w2_ds: ttnn.Tensor = None  # TP decode: DRAM WIDTH_SHARDED copy of down_proj for the multi-reader decode matmul
+    w1_ds: ttnn.Tensor = None  # TP decode: DRAM WIDTH_SHARDED copy of gate_proj (3 readers/bank), bfloat4_b
+    w3_ds: ttnn.Tensor = None  # TP decode: DRAM WIDTH_SHARDED copy of up_proj (3 readers/bank), bfloat4_b
 
 
 def _build_gate_up(gate_w, up_w, mesh, tp, cache_path):
@@ -93,6 +95,34 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
             if args is not None and getattr(args, "mlp_w2_ds_decode", False)
             else None
         )
+        # Decode-only DRAM WIDTH_SHARDED gate/up copies for the 3-readers-per-bank kernel (opt-in,
+        # QWEN36_DECODE_DRAM_SHARDED=gateup -> model_config.mlp_w13_ds_decode). The interleaved w1/w3 stay for the
+        # small-M prefill 1D matmuls (+2 x 12.5 MB/layer/device). Cache suffix = reader count (per-bank pad baked in).
+        _w13 = args is not None and getattr(args, "mlp_w13_ds_decode", False)
+        w1_ds = (
+            tpc.shard_w(
+                state_dict["gate_proj.weight"],
+                mesh_device,
+                dim=-1,
+                memory_config=args.mlp_w1_ds_memcfg,
+                cache_path=cache("gate_proj", f".ds{args.mlp_w13_ds_workers}"),
+                dtype=ttnn.bfloat4_b,
+            )
+            if _w13
+            else None
+        )
+        w3_ds = (
+            tpc.shard_w(
+                state_dict["up_proj.weight"],
+                mesh_device,
+                dim=-1,
+                memory_config=args.mlp_w3_ds_memcfg,
+                cache_path=cache("up_proj", f".ds{args.mlp_w13_ds_workers}"),
+                dtype=ttnn.bfloat4_b,
+            )
+            if _w13
+            else None
+        )
 
         if dram_sharded:
             return MLPWeights(
@@ -151,6 +181,8 @@ def load_mlp_weights(mesh_device, state_dict, tensor_cache_path=None, args=None)
             ),
             w_gate_up=wgu,
             w2_ds=w2_ds,
+            w1_ds=w1_ds,
+            w3_ds=w3_ds,
         )
 
     def load(name, dtype):
@@ -185,6 +217,8 @@ class Qwen36MLP:
         self._mlp_1d_decode = args is not None and getattr(args, "mlp_1d_decode", False)
         # DRAM-sharded decode DOWN matmul (opt-in; gate/up stay 1D). See model_config.mlp_w2_ds_decode.
         self._mlp_w2_ds_decode = args is not None and getattr(args, "mlp_w2_ds_decode", False)
+        # DRAM-sharded 3-readers-per-bank decode GATE/UP matmuls (opt-in). See model_config.mlp_w13_ds_decode.
+        self._mlp_w13_ds_decode = args is not None and getattr(args, "mlp_w13_ds_decode", False)
         # Match load_mlp_weights dram_sharded condition for layout consistency.
         self._dram_sharded = (
             self.num_devices > 1
@@ -243,6 +277,7 @@ class Qwen36MLP:
 
         mc = ttnn.DRAM_MEMORY_CONFIG
         _silu_fused = False
+        _ds_gateup = False
         # Prefill: x is K-sharded (ff_norm skipped AG); fused AG + [gate|up] + SwiGLU
         _fused_gu = self._fuse_gateup_agmm and x.shape[-2] > ttnn.TILE_SIZE and w.w_gate_up is not None
         if _fused_gu:
@@ -271,6 +306,30 @@ class Qwen36MLP:
             # Keep gate/up in L1 for mul → w2 (avoid L1→DRAM→L1).
             w1_out = ttnn.to_memory_config(w1_out, ttnn.L1_MEMORY_CONFIG)
             w3_out = ttnn.to_memory_config(w3_out, ttnn.L1_MEMORY_CONFIG)
+        elif self._mlp_w13_ds_decode and x.shape[-2] <= ttnn.TILE_SIZE and w.w1_ds is not None:
+            # DRAM-sharded gate/up with 3 readers per DRAM bank (QWEN36_DECODE_DRAM_SHARDED=gateup). The ff-norm
+            # width shard (32 cores x 5 tiles) is in0 as-is (in0_block_w 5), so x is not interleaved as on the 1D
+            # path. Outputs: L1 width shards on ceil(136 / 4) = 34 cores (the factory needs every one of the 24
+            # reader cores to own an output shard, hence per_core_N 4). silu is fused in the w1 progcfg.
+            x_sh = x if x.is_sharded() else ttnn.to_memory_config(x, args.act_shard_hidden)
+            w1_out = ttnn.linear(
+                x_sh,
+                w.w1_ds,
+                compute_kernel_config=ckc,
+                program_config=args.mlp_w1_ds_progcfg,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            )
+            w3_out = ttnn.linear(
+                x_sh,
+                w.w3_ds,
+                compute_kernel_config=ckc,
+                program_config=args.mlp_w3_ds_progcfg,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            )
+            if x_sh is not x:
+                ttnn.deallocate(x_sh)
+            _silu_fused = True
+            _ds_gateup = True
         elif self._mlp_1d_decode and x.shape[-2] <= ttnn.TILE_SIZE:
             # 1D mcast decode matmuls on a small explicit grid, silu fused in the w1 progcfg.
             # mcast_in0 needs interleaved in0, but ff-norm hands us a width-shard -> interleave first.
@@ -328,7 +387,8 @@ class Qwen36MLP:
             mc_out = ttnn.L1_MEMORY_CONFIG if x.shape[-2] <= ttnn.TILE_SIZE else mc
             # Standalone silu only on DRAM-sharded decode path (SILU not fused there).
             if _silu_fused:
-                hidden = ttnn.mul(w1_out, w3_out, memory_config=mc_out)
+                # DS gate/up: two identical 34-core width shards -> shard-local mul, re-laid out below for down.
+                hidden = ttnn.mul(w1_out, w3_out, memory_config=w1_out.memory_config() if _ds_gateup else mc_out)
                 ttnn.deallocate(w1_out)
             else:
                 w1_act = ttnn.silu(w1_out, memory_config=mc_out)
@@ -336,6 +396,17 @@ class Qwen36MLP:
                 hidden = ttnn.mul(w1_act, w3_out, memory_config=mc_out)
                 ttnn.deallocate(w1_act)
             ttnn.deallocate(w3_out)
+            if _ds_gateup:
+                # Down-proj input layout: the 17 x 8-tile shard the DS down kernel reads (one L1->L1 reshard) or L1
+                # interleaved for the 1D kernel (sharded_to_interleaved). The 1D gate/up path interleaved x twice.
+                _tgt = (
+                    args.act_shard_mlp_hidden
+                    if (self._mlp_w2_ds_decode and w.w2_ds is not None)
+                    else ttnn.L1_MEMORY_CONFIG
+                )
+                _h = ttnn.to_memory_config(hidden, _tgt)
+                ttnn.deallocate(hidden)
+                hidden = _h
         # Prefill w2: 2D progcfg on (8,10); decode (M<=32) keeps ttnn-auto.
         w2_pc = None
         if self._mlp_1d_decode and hidden.shape[-2] <= ttnn.TILE_SIZE:
