@@ -37,6 +37,9 @@ CONFIGS = [tuple(int(v) for v in c.split(",")) for c in os.environ.get("ATTN_CON
 DO_EXACT = os.environ.get("ATTN_EXACT", "1") == "1"
 N_REPLAYS = int(os.environ.get("ATTN_REPLAYS", "30"))
 N_STEPS = int(os.environ.get("ATTN_STEPS", "6"))
+MODES = [
+    m for m in os.environ.get("ATTN_MODES", "offsets,batched").split(",") if m
+]  # "batched" = no offsets body at all
 OUT_JSON = os.environ.get("ATTN_OUT", "/home/eslim/experiments/qwen36/logs/verify_attn_modes_result.json")
 CHUNK = 2048
 BPU = 8
@@ -176,8 +179,10 @@ def test_verify_attn_modes(mesh_device):
     exact_cfgs = [(w, T) for (w, T) in CONFIGS if w <= 8] if DO_EXACT else []
     try:
         for w, T in CONFIGS:
-            steps[(w, T, "offsets")] = _make_step(model, w, T, page_tables[:w], "offsets")
-            steps[(w, T, "batched")] = _make_step(model, w, T, page_tables[:w], "batched")
+            for mode in MODES:
+                steps[(w, T, mode)] = _make_step(model, w, T, page_tables[:w], mode)
+        if MODES != ["offsets", "batched"]:
+            exact_cfgs = []  # the mode comparison needs both modes
         if exact_cfgs:
             t0 = time.perf_counter()
             pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
@@ -291,13 +296,14 @@ def test_verify_attn_modes(mesh_device):
             results["timing"][f"decode_w{w}"] = {"median_ms": med, "min_ms": mn}
             logger.info(f"[attn] TIMING decode w={w} traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms")
         for w, T in CONFIGS:
-            for mode in ("offsets", "batched"):
+            for mode in MODES:
                 vs = steps[(w, T, mode)]
                 med, mn = vs.time_replays(N_REPLAYS)
                 results["timing"][f"verify_w{w}_T{T}_{mode}"] = {"median_ms": med, "min_ms": mn, "R": vs.plan.R}
                 logger.info(f"[attn] TIMING verify (w={w},T={T},R={vs.plan.R}) {mode}: med {med:.2f} min {mn:.2f} ms")
-            sec = steps[(w, T, "batched")].time_sections_traced(N_REPLAYS)
-            results["timing"][f"verify_w{w}_T{T}_batched"]["traced_sections_ms"] = sec
+            main = "batched" if "batched" in MODES else MODES[0]
+            sec = steps[(w, T, main)].time_sections_traced(N_REPLAYS, include_offsets="offsets" in MODES)
+            results["timing"][f"verify_w{w}_T{T}_{main}"]["traced_sections_ms"] = sec
             dec = results["timing"][f"decode_w{w}"]["median_ms"]
             logger.info(
                 f"[attn] SECTIONS traced (w={w},T={T}) ms/layer: attn offsets(T)={sec['attn_offsets_T']:.3f} "

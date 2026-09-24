@@ -579,7 +579,7 @@ class VerifyStep:
             out = layer.forward_verify(x, plan, accept_tt=plan.accept)
         return [out]
 
-    def time_sections_traced(self, n=50):
+    def time_sections_traced(self, n=50, include_offsets=True):
         """TRACED per-section times (ms, median of n replays) from sub-traces of the body run on persistent inputs:
         one attention layer in the plan's mode ("attn_T"), the same layer on the per-offset path with all T offsets
         ("attn_offsets_T") and with a single offset ("attn_1", ~ one decode attention pass at width w), the batched
@@ -590,8 +590,8 @@ class VerifyStep:
         res = {}
         n_attn = sum(1 for l in self.model.layers if l.is_full_attention)
         n_gdn = len(self.model.layers) - n_attn
-        sections = [("attn_offsets_T", "offsets", None), ("attn_1", "offsets", 1)]
-        if plan.attn_mode == "batched" or attn_multi_token_update_available():
+        sections = [("attn_offsets_T", "offsets", None), ("attn_1", "offsets", 1)] if include_offsets else []
+        if plan.attn_mode == "batched" or (include_offsets and attn_multi_token_update_available()):
             sections.append(("attn_batched", "batched", None))
         sections += [("gdn", None, None), ("embed", None, None), ("head", None, None)]
         for which, mode, n_off in sections:
@@ -621,6 +621,8 @@ class VerifyStep:
         T = plan.T
         res["attn_mode"] = plan.attn_mode
         res["attn_T"] = res["attn_batched"] if plan.attn_mode == "batched" else res["attn_offsets_T"]
+        if not include_offsets:  # batched-only timing (w=32 wedge isolation): no per-offset sub-traces at all
+            res["attn_offsets_T"] = res["attn_1"] = float("nan")
         per_off = (res["attn_offsets_T"] - res["attn_1"]) / max(1, T - 1)
         res["attn_layer_per_offset"] = per_off
         res["attn_layers_total"] = n_attn * res["attn_T"]
