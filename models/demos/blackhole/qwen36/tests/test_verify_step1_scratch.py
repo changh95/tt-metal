@@ -33,6 +33,11 @@ from models.demos.blackhole.qwen36.tt.verify_step import VerifyStep
 BMAX = 32
 W = int(os.environ.get("VERIFY_W", "32"))
 T = int(os.environ.get("VERIFY_T", "4"))
+PRE_STEPS = int(os.environ.get("VERIFY_PRE_STEPS", "46"))
+ORDER = os.environ.get("VERIFY_ORDER", "diag")  # "exact" = the exactness test's compile/capture order
+DECODE_AFTER = (
+    os.environ.get("VERIFY_DECODE_AFTER", "1") == "1"
+)  # a decode replay between the re-prefill and the verify
 
 
 @run_for_blackhole()
@@ -57,9 +62,13 @@ def test_step1(mesh_device):
     vs = ref = None
     try:
         vs = VerifyStep(model, W, T, page_tables[:W])
-        vs.compile()
         ref = DecodeRef(model, W, page_tables[:W])
-        ref.compile()
+        if ORDER == "exact":  # the exactness test's order: decode reference compiled / captured before the verify plan
+            ref.compile()
+            vs.compile()
+        else:
+            vs.compile()
+            ref.compile()
         pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
         prev = model._bind_gdn_prefill_scratch()
         try:
@@ -72,21 +81,69 @@ def test_step1(mesh_device):
                 layer.attention.warmup_hist_device_pack()
         ttnn.synchronize_device(device)
         _prefill(model, prompt_ids, page_tables, 1)
-        vs.capture()
-        ref.capture()
-        rng = random.Random(7)
+        if ORDER == "exact":
+            ref.capture()
+            vs.capture()
+        else:
+            vs.capture()
+            ref.capture()
+        rng = random.Random(int(os.environ.get("VERIFY_DRAFT_SEED", "7")))
         drafts = [[rng.randrange(model.vocab_size) for _ in range(T - 1)] for _ in range(W)]
+        # embedding-table sanity: non-finite rows would poison every row through the 0/1 gather/scatter matmuls (0*inf)
+        emb = (
+            ttnn.to_torch(ttnn.get_device_tensors(model.embd.weights)[0])
+            .float()
+            .reshape(-1, model.args.dim // model.num_devices)
+        )
+        bad_rows = (~torch.isfinite(emb)).any(-1).nonzero().reshape(-1)
+        big_rows = (emb.abs().max(-1).values > 1e3).nonzero().reshape(-1)
+        logger.info(
+            f"[step1] embedding shard: {emb.shape[0]} rows, non-finite rows {bad_rows.numel()} (first {bad_rows[:8].tolist()}), "
+            f"rows with |x|>1e3: {big_rows.numel()} (first {big_rows[:8].tolist()}); max|x| {emb.abs().max().item():.3g}"
+        )
+        flat = sorted(set(t for d in drafts for t in d))
+        hit_bad = [t for t in flat if t in set(bad_rows.tolist())]
+        hit_big = [t for t in flat if t in set(big_rows.tolist())]
+        logger.info(
+            f"[step1] drafts (seed {os.environ.get('VERIFY_DRAFT_SEED', '7')}): {len(flat)} ids, hitting non-finite rows {hit_bad}, big rows {hit_big}"
+        )
+        del emb
 
-        # plain decode next token per user (traced decode reference, one step)
+        # plain decode next token per user (traced decode reference, one step), then PRE_STEPS more decode steps so
+        # every slot / KV block is 'dirty' the way the exactness test leaves them before its re-prefills
         lens, first = _prefill(model, prompt_ids, page_tables, W)
         nxt = ref.step(first, lens)
         logger.info(f"[step1] decode next tokens: {nxt[:12]}...")
+        cur, pos = list(nxt), [p + 1 for p in lens]
+        for _ in range(PRE_STEPS):
+            cur = ref.step(cur, pos)
+            pos = [p + 1 for p in pos]
+        bad_d = []
+        if DECODE_AFTER:
+            # plain decode after a re-prefill of the dirty slots: must reproduce nxt
+            lens_r, first_r = _prefill(model, prompt_ids, page_tables, W)
+            assert first_r == first
+            nxt_r = ref.step(first, lens_r)
+            bad_d = [s for s in range(W) if nxt_r[s] != nxt[s]]
+            logger.info(
+                f"[step1] ({W},{T}) plain decode after {PRE_STEPS} steps + re-prefill != first decode for users {bad_d} ({len(bad_d)}/{W})"
+            )
 
         def run_verify(eager):
             lens2, first2 = _prefill(model, prompt_ids, page_tables, W)
             assert first2 == first
+            gdn0 = next(l.attention for l in model.layers if not l.is_full_attention)
+            logger.info(
+                f"[step1] before verify ({'eager' if eager else 'traced'}): gdn0._hist_packed_valid={gdn0._hist_packed_valid}"
+            )
             tokens = [[first[s]] + drafts[s] for s in range(W)]
+            logger.info(
+                f"[step1] inputs: positions={list(lens2)} tokens[:4]={[list(t) for t in tokens[:4]]} attn={vs.plan.attn_mode} kernel={vs.plan.gdn_kernel is not None}"
+            )
             rows = vs.run(tokens, lens2, [0] * W, eager=eager)
+            logger.info(
+                f"[step1] {'eager' if eager else 'traced'} row0 all users: {[int(rows[vg.row(s, 0, T)]) for s in range(W)]}"
+            )
             return [int(rows[vg.row(s, 0, T)]) for s in range(W)], rows
 
         row0_eager, rows_eager = run_verify(True)

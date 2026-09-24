@@ -224,3 +224,25 @@ program that is first compiled at request time on D (a new import bucket, a new 
 masked-bucket trace, a verify body added after the decode warm-up) re-creates this hazard: when the verify step is
 integrated it must be compiled inside the warm-up before `warmup_model_decode` captures. The proposed tracker run on
 the served D (previous section) is the cheap guard.
+
+## (32,4) exactness after the fix (2026-09-24 17:00-18:05): no wedge, but a FUNCTIONAL failure, unresolved
+
+With compile-first ordering the (32,4) exactness runs complete (no wedge) but the committed streams are wrong:
+`logs/verify_324_exact_kernel.log` (kernel GDN, batched attention), `verify_324_exact_offsets.log`,
+`verify_324_exact_stub.log` (stub GDN + per-offset attention), `verify_324_dbg*.log`. Facts:
+- Row 0 of the FIRST verify step is wrong for the same 20 of 32 users in every mode (kernel/stub GDN, batched/per-offset
+  attention): users {2,3,4,5,6,7,10,11,12,14,15,18,20,23,26,27,28,29,30,31}; every user with s % 8 in {0, 1} is right.
+  Deterministic within a process (3 repeats after re-prefills bitwise identical; eager == traced), wrong ids are a few
+  repeating values (124324, 159029, 184827, 69267, 86088: argmax of a corrupted row).
+- The plain decode after the same re-prefill is right for all 32 users, so KV / GDN state at the prompt positions is fine.
+- (8,4) [R=32, fused path] and (8,8) [R=64] are bitwise exact in the same flow; zeroing `qkv_prev` (kernel contract, now
+  `VerifyStep.reset_sequence()`) changes nothing.
+- The step-1 diagnostic `tests/test_verify_step1_scratch.py` (same model, same prompts, same page tables, same compile /
+  capture order, same 16-18 reference decode steps, same re-prefill, the SAME drafts (seed 1558) and positions) is
+  **correct for all 32 users**, eager and traced -- 5 runs. The two flows differ only in code the device never sees.
+So a w=32 verify body (R=128) produces row-position dependent garbage in one process flow and exact results in
+another with identical inputs -> device state that the verify reads but the plain decode does not, and that differs
+between the flows, or an allocation-dependent read (uninitialized memory / L1 CB overlap) in one of the R=128 ops.
+Next: bisect by adding the exactness test's steps to the diagnostic one at a time (the reference loop length, the
+controller, the debug wrapper), then dump the verify body's per-layer row-0 activations for a failing user vs a
+passing user (rowdiag hook) in the failing flow.

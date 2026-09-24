@@ -415,6 +415,19 @@ class VerifyPlan:
                 )
         self._host_refs = refs
 
+    def reset_qkv_prev(self):
+        """Zero every GDN layer's persistent qkv_prev (the multi-token kernel contract: zeros at the first step of a
+        sequence, where accept is 0). Call before the first verify step of a new batch (after its prefill). Values only
+        (copy_host_to_device_tensor into the trace-baked buffers), never a reallocation."""
+        refs = []
+        for buf in self.gdn_qkv_prev.values():
+            z = torch.zeros(1, self.R, buf.shape[-1], dtype=torch.bfloat16)
+            h = ttnn.from_torch(z, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=None, mesh_mapper=self._rep)
+            ttnn.copy_host_to_device_tensor(h, buf)
+            refs.append(h)
+        ttnn.synchronize_device(self.model.mesh_device)
+        del refs
+
     def release(self):
         if self.trace_id is not None:
             ttnn.release_trace(self.model.mesh_device, self.trace_id)
@@ -526,6 +539,10 @@ class VerifyStep:
         self.plan.release()
 
     # ------------------------------------------------------------------------------------------ one step
+    def reset_sequence(self):
+        """Host bookkeeping for a new batch of users: zero the GDN qkv_prev buffers (see VerifyPlan.reset_qkv_prev)."""
+        self.plan.reset_qkv_prev()
+
     def run(self, tokens, positions, accept_prev, eager=False):
         """Upload -> replay (or eager forward) -> per-row argmax [R] int64."""
         plan = self.plan

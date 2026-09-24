@@ -44,6 +44,7 @@ DO_TIMING = os.environ.get("VERIFY_TIMING", "1") == "1"
 DO_EXACT = os.environ.get("VERIFY_EXACT", "1") == "1"
 N_REPLAYS = int(os.environ.get("VERIFY_TIMING_REPLAYS", "50"))
 DECODE_WIDTHS = [int(v) for v in os.environ.get("VERIFY_DECODE_WIDTHS", "1,8,32").split(",") if v]
+DEBUG_EAGER = os.environ.get("VERIFY_DEBUG_EAGER", "0") == "1"
 OUT_JSON = os.environ.get("VERIFY_OUT", "/home/eslim/experiments/qwen36/logs/verify_step_result.json")
 CHUNK = 2048
 BPU = 8  # blocks per user (512 tokens: prompt <= 128 + <= ~3*MIN_TOKENS generated); multiple of 8 for the SDPA stick
@@ -280,7 +281,55 @@ def test_verify_step(mesh_device):
                 for policy in POLICIES:
                     lens, first = _prefill(model, prompt_ids, page_tables, w)
                     assert first == [ref_streams[s][0] for s in range(w)], "prefill first token not reproducible"
-                    ctrl = vg.VerifyController(T=T, run=vs.run, positions=lens, last=first)
+                    if DEBUG_EAGER:
+                        # is the state after this re-prefill good? one plain decode step must reproduce the reference
+                        chk = refs[w].step(first, lens)
+                        bad_c = [s_ for s_ in range(w) if chk[s_] != ref_streams[s_][1]]
+                        logger.info(f"[verify-dbg] plain decode after re-prefill != reference for users {bad_c}")
+                        lens, first = _prefill(model, prompt_ids, page_tables, w)
+                    vs.reset_sequence()  # qkv_prev := 0 for the new batch (kernel contract: zeros at the first step)
+                    if DEBUG_EAGER:
+                        q0 = ttnn.to_torch(
+                            ttnn.get_device_tensors(vs.plan.gdn_qkv_prev[next(iter(vs.plan.gdn_qkv_prev))])[0]
+                        ).float()
+                        logger.info(
+                            f"[verify-dbg] qkv_prev[layer0] after reset: max|x|={q0.abs().max().item():.3g} nonfinite={int((~torch.isfinite(q0)).sum())}"
+                        )
+                    run_fn = vs.run
+                    if DEBUG_EAGER:
+                        # diagnostic: run every step eagerly too and log where the traced argmax rows differ
+                        def run_fn(tokens, positions, accept_prev, _vs=vs, _w=w, _T=T, _ref=ref_streams):
+                            logger.info(
+                                f"[verify-dbg] inputs: positions={list(positions)} accept={list(accept_prev)} tokens[:4]={[list(t) for t in tokens[:4]]} attn={_vs.plan.attn_mode} kernel={_vs.plan.gdn_kernel is not None}"
+                            )
+                            eager_rows = _vs.run(tokens, positions, accept_prev, eager=True)
+                            logger.info(
+                                f"[verify-dbg] eager row0 all users: {[int(eager_rows[vg.row(s_, 0, _T)]) for s_ in range(_w)]}"
+                            )
+                            for rep in range(int(os.environ.get("VERIFY_DEBUG_REPEATS", "0"))):
+                                # determinism probe: re-prefill (same state) and run the same eager step again
+                                _prefill(model, prompt_ids, page_tables, _w)
+                                again = _vs.run(tokens, positions, accept_prev, eager=True)
+                                nd = [r for r in range(_vs.plan.R) if int(again[r]) != int(eager_rows[r])]
+                                logger.info(
+                                    f"[verify-dbg] eager repeat {rep + 1}: rows differing from the first eager run: {len(nd)} {nd[:16]}; row0: {[int(again[vg.row(s_, 0, _T)]) for s_ in range(_w)]}"
+                                )
+                            _prefill(model, prompt_ids, page_tables, _w)
+                            traced_rows = _vs.run(tokens, positions, accept_prev)
+                            diff = [r for r in range(_vs.plan.R) if int(eager_rows[r]) != int(traced_rows[r])]
+                            row0_e = [int(eager_rows[vg.row(s_, 0, _T)]) for s_ in range(_w)]
+                            exp = [
+                                _ref[s_][len(ctrl.committed[s_])] if len(ctrl.committed[s_]) < len(_ref[s_]) else -1
+                                for s_ in range(_w)
+                            ]
+                            bad_e = [s_ for s_ in range(_w) if row0_e[s_] != exp[s_]]
+                            logger.info(
+                                f"[verify-dbg] step {len(ctrl.accept_history) + 1}: eager vs traced rows differ at {len(diff)} rows "
+                                f"{diff[:12]}; eager row0 != plain decode for users {bad_e}"
+                            )
+                            return traced_rows
+
+                    ctrl = vg.VerifyController(T=T, run=run_fn, positions=lens, last=first)
                     n_steps = 0
                     t_start = time.perf_counter()
                     while min(len(c) for c in ctrl.committed) < MIN_TOKENS and n_steps < 4 * MIN_TOKENS:
