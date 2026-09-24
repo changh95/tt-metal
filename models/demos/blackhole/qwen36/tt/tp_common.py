@@ -693,6 +693,120 @@ def all_gather_then_matmul_prefill(x, weight, tt_ccl, compute_cfg, topology, clu
     return out
 
 
+# ---- Small-M prefill matmuls (item J) --------------------------------------------------------------------------
+# At M=128 rows (bucket 128) the fused all_gather_minimal_matmul_async pads M from 4 to 8 tiles
+# (in0_parallel_axis_cores = 8 in the nt11x8 layout: all_gather_minimal_matmul_async_program_factory.cpp
+# round_up(M_tiles, in0_parallel_axis_cores)), so half the 88 compute cores hold padding rows and every weight strip
+# is streamed once per M-row core; the 2D w2/wo configs (create_prefill_mlp_matmul_program_config) light only 4 grid
+# rows. A plain all_gather_async of the K-sharded norm output + the 1D mcast_in0 matmul (each core streams its own N
+# strip exactly once, in0 multicast) is weight-bandwidth-bound instead. Traced microbench, P150x4 TP=4, per-device
+# shapes (tests/test_smallm_prefill_matmul_bench_scratch.py, us incl. the all-gather where the path needs one):
+#            M=128: today -> AG+1D(88 cores)      M=256: today -> AG+1D
+#   gdn in    135.5 -> 93.7                        137.9 -> 144.4  (no win: 8 M tiles, no AGMM padding)
+#   attn qkv  127.6 -> 92.5                        127.7 -> 147.3  (no win)
+#   mlp g|u   303.6 -> 168.5 (w1 silu + w3 + mul)  303.7 -> 270.4
+#   mlp w2    123.4 -> 74.9  (no AG: row-parallel) 129.7 -> 96.9
+#   attn wo    52.1 -> 32.3                         53.4 -> 42.7
+#   gdn out    74.8 -> 101.5 (AGMM kept)            76.5 -> 162.6  (AGMM kept)
+# Hence: in-projections take the path for S <= 128 only; MLP gate/up, w2, wo (and the GDN row-parallel out arm) for
+# S <= QWEN36_PREFILL_SMALLM_MAX (serving default 128: the 256 bucket is faster on this path too, but its greedy-token
+# check failed, so 256 is opt-in). The GDN agmm out-proj stays fused. Numerics: same HiFi2/LoFi fp32-acc math
+# but a different K accumulation order -> not bit-identical to the AGMM (prefill logits PCC > 0.999, greedy tokens
+# identical: tests/test_prefill_smallm_ref_scratch.py). Trace-safe: the gathered activation is a per-call
+# temporary; the progcfgs are host objects; the CCL semaphores are the tt_ccl-cycled ones the decode trace uses.
+SMALL_M_IN_PROJ_MAX_ROWS = 128
+SMALL_M_MATMUL_CORES = 88  # 11x8 on BH P150 (<= 2 N tiles per core at these shapes); 44/66/110 measured within 1%
+
+
+def small_m_prefill_max():
+    """QWEN36_PREFILL_SMALLM_MAX: row count at or below which the prefill weight matmuls take the small-M path
+    (0 / unset = off, today's AGMM / 2D configs everywhere). model_config sets the serving default (128)."""
+    try:
+        return int(os.environ.get("QWEN36_PREFILL_SMALLM_MAX", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def small_m_rows(S):
+    """True for a PREFILL row count (> one tile) on the small-M path (MLP gate/up, w2, wo)."""
+    return TILE_SIZE < S <= small_m_prefill_max()
+
+
+def small_m_in_proj(S):
+    """True when a column-parallel in-projection (GDN qkvzab, attention qkv) should take all-gather + 1D matmul
+    instead of the fused AGMM: only at <= 4 M tiles, where the AGMM pads M (measured, see above)."""
+    return TILE_SIZE < S <= min(small_m_prefill_max(), SMALL_M_IN_PROJ_MAX_ROWS)
+
+
+def all_gather_prefill_small_m(x, tt_ccl, topology, cluster_axis=1, memory_config=ttnn.L1_MEMORY_CONFIG):
+    """Plain all_gather_async(dim=3) of a K-sharded prefill activation [.., S, K/tp] -> [1, 1, S, K] (bf16, L1 by
+    default: the 1D mcast matmul reads in0 interleaved). In-kernel entry barrier (barrier_semaphore) as
+    DistributedNorm's gather, so a device cannot write its shard into a peer's buffer before the peer entered.
+    Knobs from tests/test_smallm_ag_bench_scratch.py ([128,1280]->[128,5120]: 2 links 31.7 us, 1 link 40.5, 2 links x
+    4 workers / chunks_per_sync 10 / 2 buffers 28.6; DRAM output +1-3 us; the barrier costs ~1-3 us and stays)."""
+    S, K_local = x.shape[-2], x.shape[-1]
+    x4 = ttnn.reshape(x, (1, 1, S, K_local))
+    return ttnn.experimental.all_gather_async(
+        x4,
+        dim=3,
+        multi_device_global_semaphore=ag_semaphores(tt_ccl, cluster_axis),
+        num_links=2,
+        topology=topology,
+        cluster_axis=cluster_axis,
+        memory_config=memory_config,
+        barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+        chunks_per_sync=10,
+        num_workers_per_link=4,
+        num_buffers_per_channel=2,
+    )
+
+
+_SMALL_M_PROGCFG = {}
+
+
+def small_m_progcfg(m, k, n, fused_activation=None, grid_w=8):
+    """1D mcast_in0 matmul progcfg for an [m, k] x [k, n] prefill matmul on ~SMALL_M_MATMUL_CORES cores (per_core_M =
+    all m tiles, per_core_N = ceil(n_tiles / cores)); cached per shape. grid_w = the device worker-grid width (11 on
+    BH P150, 8 on WH); the core budget is clamped to grid_w x 8 rows so the grid always fits a 10-high device."""
+    key = (m, k, n, fused_activation, grid_w)
+    pc = _SMALL_M_PROGCFG.get(key)
+    if pc is None:
+        pc = create_matmul_1d_decode_progcfg(
+            m, k, n, num_cores=min(SMALL_M_MATMUL_CORES, grid_w * 8), fused_activation=fused_activation, grid_w=grid_w
+        )
+        _SMALL_M_PROGCFG[key] = pc
+    return pc
+
+
+def small_m_linear(x, weight, compute_cfg, fused_activation=None, out_memory_config=ttnn.L1_MEMORY_CONFIG, grid_w=8):
+    """ttnn.linear of an interleaved prefill activation x [.., S, K] with the interleaved weight [K, N] on the small-M
+    1D progcfg. fused_activation applied in the packer (e.g. ttnn.UnaryOpType.SILU for the MLP gate)."""
+    pc = small_m_progcfg(x.shape[-2], x.shape[-1], weight.shape[-1], fused_activation, grid_w)
+    return ttnn.linear(x, weight, compute_kernel_config=compute_cfg, program_config=pc, memory_config=out_memory_config)
+
+
+def all_gather_linear_small_m(
+    x,
+    weight,
+    tt_ccl,
+    compute_cfg,
+    topology,
+    cluster_axis=1,
+    out_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    fused_activation=None,
+    grid_w=8,
+):
+    """Un-fused small-M replacement for all_gather_matmul_prefill: all_gather_prefill_small_m (L1) + small_m_linear.
+    x: K-sharded [.., S, K/tp]; weight: [K, N_local] column shard. Returns [1, 1, S, N_local] bf16. The gathered
+    activation is freed before returning (per-call temporary: nothing new lives across a trace replay)."""
+    xg = all_gather_prefill_small_m(x, tt_ccl, topology, cluster_axis=cluster_axis)
+    out = small_m_linear(
+        xg, weight, compute_cfg, fused_activation=fused_activation, out_memory_config=out_memory_config, grid_w=grid_w
+    )
+    ttnn.deallocate(xg)
+    return out
+
+
 def mlp_gateup_agmm_enabled(num_devices):
     """Fuse the ff_norm all-gather into the MLP gate/up matmul (prefill). TP-only (needs the gather)."""
     return num_devices > 1

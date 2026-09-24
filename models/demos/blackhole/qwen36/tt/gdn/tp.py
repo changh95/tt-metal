@@ -864,6 +864,15 @@ class TPGatedDeltaNet:
                 x, weight, self.args.gdn_out_decode_1d_progcfg, self.cfg, out_memory_config=_out_mc
             )
         if not self._out_sharded:
+            if tpc.small_m_rows(x.shape[-2]):
+                # Small-M prefill: 1D mcast matmul (same shape as attn wo: 2D 52 -> 1D 32 us at 128 rows).
+                return tpc.small_m_linear(
+                    x,
+                    weight,
+                    self.cfg,
+                    out_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    grid_w=getattr(self.args, "decode_grid_w", 8),
+                )
             if x.shape[-2] > tpc.TILE_SIZE:
                 # Prefill non-fused arm (single device, or out-sharded): tuned 2D config vs ttnn-auto.
                 # fp32 [seq,dim] output too big for L1 (42MB) -> DRAM out; separate tt_all_reduce does the RS.
@@ -901,7 +910,15 @@ class TPGatedDeltaNet:
             # tile-padded weight (load_gdn_weights_tp), so gate on the actual weight width, not the
             # env alone: a stale unpadded cache must fall back to slicing rather than TT_FATAL.
             _ab_w = self.tw["qkvz"].shape[-1] - az  # 32 with the padded weight, 24 without
-            if self._proj_chunks and self._fuse_agmm and S > tpc.TILE_SIZE and _ab_w % tpc.TILE_SIZE == 0:
+            # (small-M prefill rows skip the chunked AGMM: they take the all-gather + 1D matmul below)
+            _small_m = self._fuse_agmm and tpc.small_m_in_proj(S)
+            if (
+                self._proj_chunks
+                and self._fuse_agmm
+                and S > tpc.TILE_SIZE
+                and _ab_w % tpc.TILE_SIZE == 0
+                and not _small_m
+            ):
                 # ONE memory config covers every chunk (compute_output_specs builds all chunk specs
                 # from attributes.output_mem_config), so all three land where the widest/longest-lived
                 # consumer needs them: z spans the chunk kernel, so DRAM (mode 2 forces L1 for A/B).
@@ -925,8 +942,22 @@ class TPGatedDeltaNet:
                 b = ttnn.slice(ab, (0, 0, Nv), (1, S, 2 * Nv), memory_config=out_mc)
                 ttnn.deallocate(ab)
                 return qkv, z, a, b
+            if _small_m:
+                # Small-M prefill (bucket 128): plain all-gather of the K-sharded norm output + 1D mcast matmul on
+                # the interleaved fused weight (tp_common "Small-M prefill matmuls": AGMM 135 -> 94 us at 128 rows).
+                # One wide [1,S,4128] output in L1, sliced below exactly like the un-chunked AGMM output.
+                qkvzab = tpc.all_gather_linear_small_m(
+                    x,
+                    self.tw["qkvz"],
+                    self.tt_ccl,
+                    self.cfg,
+                    self.args.ccl_topology(),
+                    out_memory_config=_proj_mc,
+                    grid_w=getattr(self.args, "decode_grid_w", 8),
+                )
+                qkvzab = ttnn.reshape(qkvzab, (1, S, qkvzab.shape[-1]))
             # Prefill: x is K-sharded (norm skipped its AG) -> fused all-gather + qkvzab matmul.
-            if self._fuse_agmm and S > tpc.TILE_SIZE:
+            elif self._fuse_agmm and S > tpc.TILE_SIZE:
                 qkvzab = tpc.all_gather_matmul_prefill(
                     x,
                     self.tw["qkvz"],

@@ -35,6 +35,12 @@ _QWEN36_SERVING_OPT_DEFAULTS = {
     "QWEN36_PREFILL_LOGITS_FAST": "1",
     "QWEN36_PREFILL_BUCKET_TRACE": "1",
     "QWEN_SDPA_BF8": "1",
+    # Small-M prefill matmuls (tp_common "Small-M prefill matmuls"): buckets <= 128 rows run all-gather + 1D mcast
+    # matmuls instead of the M-padding AGMM / 4-row 2D configs. "0" = old path. 256 is measured faster too (-5 ms)
+    # but its greedy-token check failed (tests/test_prefill_smallm_ref_scratch.py, logs/itemJ_ref_check.log), so the
+    # 256 bucket stays on the AGMM/2D path until a passing check exists; the 128 bucket passed (PCC >= 0.9995, greedy
+    # identical over 8 steps).
+    "QWEN36_PREFILL_SMALLM_MAX": "128",
 }
 for _k, _v in _QWEN36_SERVING_OPT_DEFAULTS.items():
     os.environ.setdefault(_k, _v)

@@ -280,7 +280,26 @@ class Qwen36MLP:
         _ds_gateup = False
         # Prefill: x is K-sharded (ff_norm skipped AG); fused AG + [gate|up] + SwiGLU
         _fused_gu = self._fuse_gateup_agmm and x.shape[-2] > ttnn.TILE_SIZE and w.w_gate_up is not None
-        if _fused_gu:
+        # Small-M prefill (rows <= QWEN36_PREFILL_SMALLM_MAX): plain all-gather + 1D mcast w1 (silu fused) and w3 on
+        # the interleaved decode weights, then the mul (tp_common "Small-M prefill matmuls": 304 -> 168 us at 128 rows,
+        # 304 -> 270 at 256). Replaces the fused-swiglu AGMM, whose M padding streams the 25 MB bfp4 weight per M row.
+        _small_m = self._fuse_gateup_agmm and tpc.small_m_rows(x.shape[-2])
+        if _small_m:
+            _gw = getattr(args, "decode_grid_w", 8)
+            xg = tpc.all_gather_prefill_small_m(x, self.tt_ccl, args.ccl_topology())
+            w1_out = tpc.small_m_linear(
+                xg,
+                w.w1,
+                ckc,
+                fused_activation=ttnn.UnaryOpType.SILU,
+                out_memory_config=ttnn.L1_MEMORY_CONFIG,
+                grid_w=_gw,
+            )
+            w3_out = tpc.small_m_linear(xg, w.w3, ckc, out_memory_config=ttnn.L1_MEMORY_CONFIG, grid_w=_gw)
+            ttnn.deallocate(xg)
+            _fused_gu = False
+            _silu_fused = True
+        elif _fused_gu:
             hidden = tpc.all_gather_swiglu_prefill(
                 x, w.w_gate_up, self.tt_ccl, self.compute_kernel_config_agmm, args.ccl_topology()
             )
@@ -412,6 +431,12 @@ class Qwen36MLP:
         if self._mlp_1d_decode and hidden.shape[-2] <= ttnn.TILE_SIZE:
             # 1D mcast decode down-proj on a small explicit grid (~16 cores).
             w2_pc = args.mlp_w2_decode_1d_progcfg
+        elif self.num_devices > 1 and tpc.small_m_rows(hidden.shape[-2]):
+            # Small-M prefill down-proj: 1D mcast config (the 2D config lights only M_tiles grid rows at these row
+            # counts: 123 -> 75 us at 128 rows, 130 -> 97 at 256).
+            w2_pc = tpc.small_m_progcfg(
+                hidden.shape[-2], hidden.shape[-1], w.w2.shape[-1], grid_w=getattr(args, "decode_grid_w", 8)
+            )
         elif hidden.shape[-2] > ttnn.TILE_SIZE:
             # Prefill down-proj: subblock-tuned 2D config with the wide grid (max_cols=device width),
             # off the generic 8-wide prefill_progcfg. Output L1 via mc_w2_out below.

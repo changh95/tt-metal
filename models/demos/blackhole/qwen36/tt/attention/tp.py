@@ -194,7 +194,19 @@ class TPAttention:
         gate_dim = self.NH * self.HD
         # Prefill: x is K-sharded (norm skipped its AG) -> fused all-gather + QKV matmul. Output stays
         # DRAM: L1 clashes with a downstream matmul's CBs (verified; full-attn has more L1 pressure here).
-        if self._fuse_agmm and x.shape[-2] > tpc.TILE_SIZE:
+        if self._fuse_agmm and tpc.small_m_in_proj(x.shape[-2]):
+            # Small-M prefill (bucket 128): plain all-gather + 1D mcast matmul on the interleaved fused weight
+            # (tp_common "Small-M prefill matmuls": AGMM 128 -> 93 us at 128 rows). DRAM output, sliced below.
+            qkv = tpc.all_gather_linear_small_m(
+                x,
+                tw["wqkv_fused"],
+                self.tt_ccl,
+                self.compute_cfg,
+                self.args.ccl_topology(),
+                out_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                grid_w=getattr(self.args, "decode_grid_w", 8),
+            )
+        elif self._fuse_agmm and x.shape[-2] > tpc.TILE_SIZE:
             # QWEN36_GDN_PROJ_CHUNKS: both split widths are multiples of HD (=128), so the AGMM can
             # write qkv3 and gate directly and the two ttnn.slice ops below disappear. No weight
             # padding is needed here (qkv3_dim + gate_dim == attn_qkv_fused_dim_tp exactly), but the
@@ -278,6 +290,16 @@ class TPAttention:
                 out_memory_config=_out_mc,
             )
         if not self._wo_sharded:
+            if tpc.small_m_rows(x.shape[-2]):
+                # Small-M prefill: 1D mcast config (2D 52 -> 1D 32 us at 128 rows, 53 -> 43 at 256); L1 output
+                # feeds the separate RS as below.
+                return tpc.small_m_linear(
+                    x,
+                    weight,
+                    self.compute_cfg,
+                    out_memory_config=ttnn.L1_MEMORY_CONFIG,
+                    grid_w=getattr(self.args, "decode_grid_w", 8),
+                )
             if x.shape[-2] > tpc.TILE_SIZE:
                 # Prefill: FPU-tuned 2D config beats ttnn-auto's 1x1 stall; L1 output (gated stays DRAM)
                 # feeds the separate RS. max_cols = device width (11 on BH): wide grid (~10-wide) + the
