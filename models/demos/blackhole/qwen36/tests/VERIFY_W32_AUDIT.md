@@ -148,3 +148,23 @@ report), or simply re-allocate them before the prefill warm-up and re-run E6.
 
 Test-flow rule until (b) is settled: for (32,*) exactness, do ALL prefills / slot duplication BEFORE capturing the decode
 and verify traces and never replay a prefill trace afterwards (one policy per process, reference streams saved to disk).
+
+## E7 (2026-09-24 16:23) -- (b) the SERVED-D import pattern reproduces the wedge: served-integration bug
+
+`logs/verify_iso_E7.log`: decode w32 + verify (32,4) traces parked; round 1 = 8 x {`import_gdn_slot(mode=fillcache)`
+(the eager in-place fill_cache slot write + tap row writes + packed-history repack) + eager `import_kv_blocks`} into
+slots 8..15 (2.27 s), then 10 decode w32 replays (34.6 ms, fine) and 10 verify (32,4) replays (77.7 ms, fine) -- round 1
+completed; the process went silent in **round 2** (no round-2 line; PCIe ID 0 reads 0xffffffff). No prefill trace was
+replayed in this process. E8 (traced importers) could not start (board down).
+
+So the wedge is reproduced by GDN slot writes + KV block imports interleaved with w=32 decode/verify trace replays --
+exactly what the served D engine does between decode replays (pd_transfer import_slot / import_kv_blocks). Together
+with E6 (prefill-trace replays) the common factor is "eager device ops or other traces' replays that write the GDN
+slots / KV blocks / their scratch while w=32 decode + verify traces are parked". The w<=8 equivalents were clean
+(3 x 8-user prefill_paged_slots between (8,8) replays). The decode w32 trace ALONE with 32-user prefills was the very
+first wedge pattern (verify_full_stub), so the verify trace is not required either.
+
+Priority: the address audit with ttnn's trace allocation tracker (`TT_METAL_TRACE_ALLOC_TRACKING=1
+TT_METAL_TRACE_ALLOC_TRACEBACKS=1`: `execute_trace` raises BEFORE the replay with the list of live buffers allocated
+while a trace was active that the replay would corrupt, so it cannot wedge) on the E7 flow, then fix by allocating those
+buffers before the captures. Run: `VERIFY_ISO=E7 TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1`.
