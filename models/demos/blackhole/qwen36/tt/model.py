@@ -99,8 +99,10 @@ class Qwen36Model:
 
             # vocab/num_devices isn't a power of 2; the multi-device TopK kernel needs it padded.
             args.pad_logits_to_power_of_2 = True
-            # force_argmax (the cheap 1-all-gather greedy path) is enabled on the base
-            # SAMPLING_AG_CONFIG in model_config.py and runs IN-TRACE (faster than eager). Decode
+            # Greedy requests take the multi-chip top-k path by default (local top-k on the vocab shard,
+            # two 1-tile gathers, tie-break glue, ttnn.sampling); QWEN36_SAMPLING_FORCE_ARGMAX=1 in
+            # model_config.py restores the full-vocab all-gather + argmax sampler (3.0-3.4 ms/step on the
+            # 1x4 mesh; perf_plan_r4 rank 1). Either path runs IN-TRACE (faster than eager). Decode
             # bucketing is made compatible with the in-trace sampler by namespacing the sampling
             # trace per bucket width (SamplingGenerator.set_trace_bucket, driven from
             # qwen36_vllm.decode_forward) — see generator._validate_trace_inputs.
