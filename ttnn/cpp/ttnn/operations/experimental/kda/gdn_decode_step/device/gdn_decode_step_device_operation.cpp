@@ -71,10 +71,57 @@ void GdnDecodeStepOperation::validate_on_program_cache_miss(const operation_attr
     TT_FATAL(std::isfinite(a.scale) && a.l2_epsilon > 0.0f && a.norm_epsilon > 0.0f, "{}: bad scale/epsilon", kOp);
     const auto& qs = in.qkv.logical_shape();
     const uint32_t C = 2 * Nk * Dk + Nv * Dv;
+    const bool mt = a.num_tokens > 1;
+    if (mt) {
+        TT_FATAL(a.fuse_conv, "{}: num_tokens > 1 (multi-token verify mode) needs the fused-conv mode", kOp);
+        TT_FATAL(
+            in.qkv_prev.has_value() && in.accept.has_value(),
+            "{}: num_tokens > 1 needs qkv_prev (previous step's projection rows) and accept",
+            kOp);
+        TT_FATAL(
+            a.num_tokens <= tt::constants::TILE_HEIGHT, "{}: num_tokens must be <= 32 (got {})", kOp, a.num_tokens);
+        const auto& acc = *in.accept;
+        check_allocated_device_tensor(acc, kOp, "accept");
+        check_layout(acc, Layout::ROW_MAJOR, kOp, "accept");
+        check_interleaved(acc, kOp, "accept");
+        check_same_device(in.qkv, acc, kOp, "accept");
+        TT_FATAL(
+            acc.dtype() == DataType::UINT32 || acc.dtype() == DataType::INT32,
+            "{}: accept must be UINT32 or INT32 (got {})",
+            kOp,
+            acc.dtype());
+        const uint32_t B = static_cast<uint32_t>(acc.logical_volume());
+        TT_FATAL(
+            B >= 1 && acc.logical_shape()[-1] == B,
+            "{}: accept must be a single row [B] or [1, B] (got {})",
+            kOp,
+            acc.logical_shape());
+        TT_FATAL(
+            (qs.rank() == 4 && qs[0] == 1 && qs[1] == 1) || (qs.rank() == 3 && qs[0] == 1),
+            "{}: multi-token qkv must be [1, 1, R, W] or [1, R, W] (got {})",
+            kOp,
+            qs);
+        const uint32_t R = qs[-2];
+        TT_FATAL(
+            R >= B * a.num_tokens && qs[-1] >= a.qkvz_dim + 2 * Nv,
+            "{}: multi-token qkv needs R >= B*T rows ({} < {}*{}) and W >= qkvz_dim + 2*Nv",
+            kOp,
+            R,
+            B,
+            a.num_tokens);
+        check_tiled(*in.qkv_prev, "qkv_prev", {DataType::BFLOAT16});
+        check_same_device(in.qkv, *in.qkv_prev, kOp, "qkv_prev");
+        TT_FATAL(
+            in.qkv_prev->logical_shape() == qs && in.qkv_prev->padded_shape() == in.qkv.padded_shape(),
+            "{}: qkv_prev must have qkv's shape (got {} vs {})",
+            kOp,
+            in.qkv_prev->logical_shape(),
+            qs);
+    }
     if (a.fuse_conv) {
         TT_FATAL(
-            qs.rank() == 3 && qs[0] == 1 && qs[1] >= 1 && qs[1] <= tt::constants::TILE_HEIGHT &&
-                qs[2] >= a.qkvz_dim + 2 * Nv,
+            mt || (qs.rank() == 3 && qs[0] == 1 && qs[1] >= 1 && qs[1] <= tt::constants::TILE_HEIGHT &&
+                   qs[2] >= a.qkvz_dim + 2 * Nv),
             "{}: fused-conv qkv (projection rows) must be [1, B <= 32, W >= qkvz_dim + 2*Nv] (got {})",
             kOp,
             qs);
@@ -91,8 +138,9 @@ void GdnDecodeStepOperation::validate_on_program_cache_miss(const operation_attr
         check_same_device(in.qkv, *in.conv_taps, kOp, "conv_taps");
         const auto& hs = in.conv_hist->logical_shape();
         const auto& ts = in.conv_taps->logical_shape();
+        const uint32_t users = mt ? static_cast<uint32_t>(in.accept->logical_volume()) : static_cast<uint32_t>(qs[1]);
         TT_FATAL(
-            hs.rank() == 5 && hs[0] >= qs[1] && hs[1] == Nv && hs[2] == 4 && hs[3] == tt::constants::TILE_HEIGHT &&
+            hs.rank() == 5 && hs[0] >= users && hs[1] == Nv && hs[2] == 4 && hs[3] == tt::constants::TILE_HEIGHT &&
                 hs[4] == tt::constants::TILE_WIDTH,
             "{}: conv_hist must be packed [Bmax >= B, Nv, 4, 32, 32] (got {})",
             kOp,
@@ -128,7 +176,8 @@ void GdnDecodeStepOperation::validate_on_program_cache_miss(const operation_attr
         }
     }
     const auto& ss = in.state.logical_shape();
-    const uint32_t rows = static_cast<uint32_t>(in.qkv.logical_shape()[-2]);
+    const uint32_t rows =
+        mt ? static_cast<uint32_t>(in.accept->logical_volume()) : static_cast<uint32_t>(in.qkv.logical_shape()[-2]);
     TT_FATAL(
         ss.rank() == 4 && ss[0] >= rows && (a.fuse_conv || ss[0] == 1) && ss[1] == Nv && ss[2] == Dk && ss[3] == Dv,
         "{}: state must be [Bmax >= B, Nv, Dk, Dv] (got {}, B = {})",
@@ -140,9 +189,11 @@ void GdnDecodeStepOperation::validate_on_program_cache_miss(const operation_attr
 
 GdnDecodeStepOperation::spec_return_value_t GdnDecodeStepOperation::compute_output_specs(
     const operation_attributes_t& a, const tensor_args_t& in) {
-    return TensorSpec(
-        Shape({1, in.qkv.logical_shape()[-2], a.num_value_heads * a.value_dim}),
-        TensorLayout(a.output_dtype, PageConfig(Layout::TILE), a.output_mem_config));
+    // [1, R, Nv*Dv] for the one-token op ([1, B, W] qkv); the multi-token op keeps qkv's rank ([1, 1, R, W] -> [1, 1,
+    // R, Nv*Dv])
+    auto shape = in.qkv.logical_shape();
+    shape[-1] = a.num_value_heads * a.value_dim;
+    return TensorSpec(shape, TensorLayout(a.output_dtype, PageConfig(Layout::TILE), a.output_mem_config));
 }
 
 GdnDecodeStepOperation::tensor_return_value_t GdnDecodeStepOperation::create_output_tensors(
@@ -168,7 +219,10 @@ Tensor gdn_decode_step(
     DataType output_dtype,
     const std::optional<Tensor>& conv_hist,
     const std::optional<Tensor>& conv_taps,
-    uint32_t qkvz_dim) {
+    uint32_t qkvz_dim,
+    uint32_t num_tokens,
+    const std::optional<Tensor>& qkv_prev,
+    const std::optional<Tensor>& accept) {
     return ttnn::device_operation::launch<GdnDecodeStepOperation>(
         GdnDecodeStepParams{
             .num_value_heads = num_value_heads,
@@ -183,6 +237,7 @@ Tensor gdn_decode_step(
             .compute_kernel_config = compute_kernel_config,
             .fuse_conv = conv_hist.has_value(),
             .qkvz_dim = qkvz_dim,
+            .num_tokens = num_tokens,
         },
         GdnDecodeStepInputs{
             .qkv = qkv,
@@ -191,7 +246,9 @@ Tensor gdn_decode_step(
             .state = state,
             .weight = weight,
             .conv_hist = conv_hist,
-            .conv_taps = conv_taps});
+            .conv_taps = conv_taps,
+            .qkv_prev = qkv_prev,
+            .accept = accept});
 }
 
 }  // namespace ttnn::experimental::prim

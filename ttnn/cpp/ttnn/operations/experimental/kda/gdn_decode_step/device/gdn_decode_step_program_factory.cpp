@@ -52,6 +52,8 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const auto& device = qkv.device();
     const auto arch = device.arch();
     const bool fused = a.fuse_conv;
+    const bool mt = a.num_tokens > 1;  // multi-token verify mode (fused only): the *_mt kernel sources
+    const uint32_t T = mt ? a.num_tokens : 1u;
 
     const uint32_t Kt = a.key_dim / TILE_WIDTH;
     const uint32_t Vt = a.value_dim / TILE_WIDTH;
@@ -64,7 +66,9 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const uint32_t num_cores_avail = grid.x * grid.y;
     // work items: plain variant = one value head per core (B = 1); fused variant = (head, user group) with the smallest
     // even group size (1 for B = 1) that fits the grid -> B=32: 12 heads x 8 groups of 4 users on 96 cores.
-    const uint32_t B = fused ? static_cast<uint32_t>(in.qkv.logical_shape()[-2]) : 1u;
+    const uint32_t B = mt      ? static_cast<uint32_t>(in.accept->logical_volume())
+                       : fused ? static_cast<uint32_t>(in.qkv.logical_shape()[-2])
+                               : 1u;
     uint32_t gs = (B == 1) ? 1u : 2u;
     while (Nv * ((B + gs - 1) / gs) > num_cores_avail) {
         gs += 2;
@@ -73,6 +77,17 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const uint32_t num_items = Nv * ugroups;
     TT_FATAL(
         num_items <= num_cores_avail, "gdn_decode_step: {} work items exceed {} cores", num_items, num_cores_avail);
+    // multi-token: a group's output rows (gs users x T offsets) are accumulated in one L1 tile row block
+    TT_FATAL(
+        gs * T <= TILE_HEIGHT,
+        "gdn_decode_step: {} users per core x {} tokens exceed one tile row; reduce B or num_tokens",
+        gs,
+        T);
+    const uint32_t BT = B * T;                                                    // valid output rows
+    const uint32_t Rp = mt ? static_cast<uint32_t>(qkv.padded_shape()[-2]) : 0u;  // padded rows (multiple of 32)
+    const uint32_t Wt = mt ? static_cast<uint32_t>(qkv.padded_shape()[-1]) / TILE_WIDTH : 0u;  // qkv tiles per tile row
+    const uint32_t HCAP = 2 * T + 2;  // history window entries per user: 3 slots + up to 2T-1 tokens
+    const uint32_t acc_bytes = mt ? ((B * 4 + 63) / 64) * 64 : 0u;                // accept page read, 64 B aligned
     auto dist = kda_factory_detail::distribute_prep(grid, num_items, num_items);  // one item per core
     const auto& cores = dist.core_set;
 
@@ -87,6 +102,8 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const m2::TensorParamName OUT{"out"};
     const m2::TensorParamName HIST{"hist"};
     const m2::TensorParamName TAPS{"taps"};
+    const m2::TensorParamName QKV_PREV{"qkv_prev"};
+    const m2::TensorParamName ACCEPT{"accept"};
 
     const auto fp32 = tt::DataFormat::Float32;
     const auto bf16 = tt::DataFormat::Float16_b;
@@ -96,7 +113,21 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
 
     // ---- dataflow buffers: {name, tiles, format}; producer/consumer roles listed per kernel below
     std::vector<Dfb> reader_out;  // produced by reader, consumed by compute
-    if (fused) {
+    if (mt) {
+        // hist = per-user linear window [slot1, slot2, slot3, tok0, tok1, ...]: each user consumes exactly HCAP entries
+        // (dummy pushes pad the rest) so with 2*HCAP entries the windows never wrap; sel/mask/a|b double-buffered per
+        // token; ctl = the group's accept counts for the compute kernel; stage = reader-local parity-move staging.
+        reader_out = {
+            {"hist", 2 * HCAP, bf16},
+            {"taps", 4, bf16},
+            {"sel", 2 * Ct, bf16},
+            {"z_in", Vt, in_fmt},
+            {"a_s", 2, fp32},
+            {"b_s", 2, fp32},
+            {"dtb_s", 1, fp32},
+            {"nea_s", 1, fp32},
+            {"ctl", 1, fp32}};
+    } else if (fused) {
         reader_out = {
             {"hist", 3, bf16},
             {"taps", 4, bf16},
@@ -117,9 +148,13 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
         {"scaler", 1, fp32},
         {"eps_l2", 1, bf16},
         {"eps_norm", 1, bf16},
-        {"mask", 1, bf16}};
+        {"mask", mt ? 2u : 1u, bf16}};
     for (const auto& d : common_in) {
         reader_out.push_back(d);
+    }
+    std::vector<Dfb> reader_local;
+    if (mt) {
+        reader_local = {{"stage", 2, bf16}};
     }
     std::vector<Dfb> compute_local = {
         {"tmp", tmp_tiles, fp32},
@@ -153,13 +188,16 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     }
     const std::vector<Dfb> compute_out = {{"hnew", KV, fp32}, {"out", Vt, out_fmt}};
     std::vector<Dfb> writer_local;
-    if (fused) {
+    if (mt) {
+        writer_local = {{"wshift", 4, bf16}, {"wstage", 2, bf16}, {"wctl", 1, fp32}, {"zero_t", 1, out_fmt}};
+    } else if (fused) {
         writer_local = {{"wshift", 4, bf16}};
     }
 
     m2::Group<m2::DataflowBufferSpec> dfbs;
     std::vector<Dfb> all;
-    const std::vector<const std::vector<Dfb>*> groups = {&reader_out, &compute_local, &compute_out, &writer_local};
+    const std::vector<const std::vector<Dfb>*> groups = {
+        &reader_out, &reader_local, &compute_local, &compute_out, &writer_local};
     for (const auto* v : groups) {
         for (const auto& d : *v) {
             all.push_back(d);
@@ -177,8 +215,9 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     // ---- reader
     m2::KernelSpec reader{
         .unique_id = READER,
-        .source = std::string(kDir) +
-                  (fused ? "dataflow/reader_gdn_decode_step_conv.cpp" : "dataflow/reader_gdn_decode_step.cpp"),
+        .source = std::string(kDir) + (mt      ? "dataflow/reader_gdn_decode_step_conv_mt.cpp"
+                                       : fused ? "dataflow/reader_gdn_decode_step_conv.cpp"
+                                               : "dataflow/reader_gdn_decode_step.cpp"),
         .runtime_arg_schema =
             {.runtime_arg_names =
                  (fused ? std::vector<std::string>{"head", "u0", "nu"}
@@ -187,6 +226,10 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     };
     for (const auto& d : reader_out) {
         reader.dfb_bindings.push_back(bind(d.name, EP::PRODUCER));
+    }
+    for (const auto& d : reader_local) {
+        reader.dfb_bindings.push_back(bind(d.name, EP::PRODUCER));
+        reader.dfb_bindings.push_back(bind(d.name, EP::CONSUMER));
     }
     reader.tensor_bindings = {
         m2::TensorBinding{QKV, "qkv"},
@@ -208,6 +251,14 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
             {"nea_fp32", in.g.dtype() == DataType::FLOAT32 ? 1u : 0u},
             {"l2_eps_bits", float_bits(a.l2_epsilon)},
             {"norm_eps_bits", float_bits(a.norm_epsilon)}};
+        if (mt) {
+            reader.tensor_bindings.push_back(m2::TensorBinding{QKV_PREV, "qkv_prev"});
+            reader.tensor_bindings.push_back(m2::TensorBinding{ACCEPT, "accept"});
+            for (const auto& [k, v] : std::vector<std::pair<std::string, uint32_t>>{
+                     {"T", T}, {"HCAP", HCAP}, {"WT", Wt}, {"ACC_BYTES", acc_bytes}}) {
+                reader.compile_time_args.insert({k, v});
+            }
+        }
     } else {
         reader.compile_time_args = {
             {"Kt", Kt},
@@ -223,14 +274,16 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     // ---- writer
     m2::KernelSpec writer{
         .unique_id = WRITER,
-        .source = std::string(kDir) +
-                  (fused ? "dataflow/writer_gdn_decode_step_conv.cpp" : "dataflow/writer_gdn_decode_step.cpp"),
+        .source = std::string(kDir) + (mt      ? "dataflow/writer_gdn_decode_step_conv_mt.cpp"
+                                       : fused ? "dataflow/writer_gdn_decode_step_conv.cpp"
+                                               : "dataflow/writer_gdn_decode_step.cpp"),
         .dfb_bindings = {bind("hnew", EP::CONSUMER), bind("out", EP::CONSUMER)},
         .tensor_bindings = {m2::TensorBinding{STATE, "state_out"}, m2::TensorBinding{OUT, "out"}},
         .runtime_arg_schema =
             {.runtime_arg_names =
-                 (fused ? std::vector<std::string>{"head", "u0", "nu"}
-                        : std::vector<std::string>{"wi_start", "wi_count"})},
+                 (mt      ? std::vector<std::string>{"head", "u0", "nu", "zero_pad"}
+                  : fused ? std::vector<std::string>{"head", "u0", "nu"}
+                          : std::vector<std::string>{"wi_start", "wi_count"})},
         .hw_config = ttnn::create_writer_datamovement_config(arch),
     };
     if (fused) {
@@ -241,6 +294,14 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
         writer.tensor_bindings.push_back(m2::TensorBinding{QKV, "qkv_w"});
         writer.tensor_bindings.push_back(m2::TensorBinding{HIST, "hist_w"});
         writer.compile_time_args = {{"Kt", Kt}, {"Vt", Vt}, {"Nk", Nk}, {"Nv", Nv}};
+        if (mt) {
+            writer.tensor_bindings.push_back(m2::TensorBinding{QKV_PREV, "qkv_prev_w"});
+            writer.tensor_bindings.push_back(m2::TensorBinding{ACCEPT, "accept_w"});
+            for (const auto& [k, v] : std::vector<std::pair<std::string, uint32_t>>{
+                     {"T", T}, {"WT", Wt}, {"OWT", Nv * Vt}, {"BT", BT}, {"RP", Rp}, {"ACC_BYTES", acc_bytes}}) {
+                writer.compile_time_args.insert({k, v});
+            }
+        }
     } else {
         writer.compile_time_args = {{"Kt", Kt}, {"Vt", Vt}};
     }
@@ -248,14 +309,19 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     // ---- compute
     auto compute_hw = ttnn::to_compute_hardware_config(arch, a.compute_kernel_config);
     auto& unpack_modes = m2::unpack_modes(compute_hw);
-    for (const auto& d : all) {
-        if (d.fmt == fp32) {
-            unpack_modes[m2::DFBSpecName{d.name}] = UnpackMode::UnpackToSrc;
+    const std::vector<const std::vector<Dfb>*> compute_bound = {&reader_out, &compute_local, &compute_out};
+    for (const auto* v : compute_bound) {  // only the DFBs the compute kernel binds
+        for (const auto& d : *v) {
+            if (d.fmt == fp32) {
+                unpack_modes[m2::DFBSpecName{d.name}] = UnpackMode::UnpackToSrc;
+            }
         }
     }
     m2::KernelSpec compute{
         .unique_id = COMPUTE,
-        .source = std::string(kDir) + (fused ? "compute/gdn_decode_step_conv.cpp" : "compute/gdn_decode_step.cpp"),
+        .source = std::string(kDir) + (mt      ? "compute/gdn_decode_step_conv_mt.cpp"
+                                       : fused ? "compute/gdn_decode_step_conv.cpp"
+                                               : "compute/gdn_decode_step.cpp"),
         .compiler_options = {.opt_level = fused ? KernelBuildOptLevel::O2 : KernelBuildOptLevel::O3},
         .compile_time_args =
             {{"Kt", Kt},
@@ -276,6 +342,10 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     for (const auto& d : compute_out) {
         compute.dfb_bindings.push_back(bind(d.name, EP::PRODUCER));
     }
+    if (mt) {
+        compute.compile_time_args.insert({"T", T});
+        compute.compile_time_args.insert({"HCAP", HCAP});
+    }
 
     // ---- runtime args
     m2::KernelRunArgs reader_args{.kernel = READER};
@@ -290,7 +360,17 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
             const uint32_t u0 = g * gs;
             const uint32_t nu = std::min(gs, B - u0);
             m2::AddRuntimeArgsForNode(reader_args.runtime_arg_values, core, {{"head", head}, {"u0", u0}, {"nu", nu}});
-            m2::AddRuntimeArgsForNode(writer_args.runtime_arg_values, core, {{"head", head}, {"u0", u0}, {"nu", nu}});
+            if (mt) {
+                // the head's last group also zero-fills the output padding rows [B*T, Rp)
+                const uint32_t zero_pad = (g == ugroups - 1 && BT < Rp) ? 1u : 0u;
+                m2::AddRuntimeArgsForNode(
+                    writer_args.runtime_arg_values,
+                    core,
+                    {{"head", head}, {"u0", u0}, {"nu", nu}, {"zero_pad", zero_pad}});
+            } else {
+                m2::AddRuntimeArgsForNode(
+                    writer_args.runtime_arg_values, core, {{"head", head}, {"u0", u0}, {"nu", nu}});
+            }
             m2::AddRuntimeArgsForNode(compute_args.runtime_arg_values, core, {{"nu", nu}});
         } else {
             m2::AddRuntimeArgsForNode(
@@ -319,9 +399,19 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
         run_args.tensor_args.emplace(HIST, in.conv_hist->mesh_tensor());
         run_args.tensor_args.emplace(TAPS, in.conv_taps->mesh_tensor());
     }
+    if (mt) {
+        tensor_parameters.push_back(
+            m2::TensorParameter{.unique_id = QKV_PREV, .spec = in.qkv_prev->mesh_tensor().tensor_spec()});
+        tensor_parameters.push_back(
+            m2::TensorParameter{.unique_id = ACCEPT, .spec = in.accept->mesh_tensor().tensor_spec()});
+        run_args.tensor_args.emplace(QKV_PREV, in.qkv_prev->mesh_tensor());
+        run_args.tensor_args.emplace(ACCEPT, in.accept->mesh_tensor());
+    }
 
     m2::ProgramSpec spec{
-        .name = fused ? "gdn_decode_step_conv" : "gdn_decode_step",
+        .name = mt      ? "gdn_decode_step_conv_mt"
+                : fused ? "gdn_decode_step_conv"
+                        : "gdn_decode_step",
         .kernels = {std::move(reader), std::move(writer), std::move(compute)},
         .dataflow_buffers = std::move(dfbs),
         .tensor_parameters = std::move(tensor_parameters),

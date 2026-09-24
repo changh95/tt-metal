@@ -26,7 +26,10 @@ ttnn::Tensor gdn_decode_step(
     DataType output_dtype,
     const std::optional<ttnn::Tensor>& conv_hist,
     const std::optional<ttnn::Tensor>& conv_taps,
-    uint32_t qkvz_dim) {
+    uint32_t qkvz_dim,
+    uint32_t num_tokens,
+    const std::optional<ttnn::Tensor>& qkv_prev,
+    const std::optional<ttnn::Tensor>& accept) {
     TT_FATAL(
         qkv.storage_type() == StorageType::DEVICE && qkv.buffer() != nullptr,
         "gdn_decode_step: qkv must be an allocated device tensor");
@@ -57,7 +60,10 @@ ttnn::Tensor gdn_decode_step(
         output_dtype,
         conv_hist,
         conv_taps,
-        qkvz_dim);
+        qkvz_dim,
+        num_tokens,
+        qkv_prev,
+        accept);
 }
 
 }  // namespace ttnn::experimental::kda

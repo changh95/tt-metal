@@ -26,6 +26,9 @@ struct GdnDecodeStepParams {
     // fused-conv mode: qkv is the full projection row [q|k|v|z|a|b]; conv + gates computed in-kernel
     bool fuse_conv = false;
     uint32_t qkvz_dim = 0;  // column offset of the a|b block (= 2*Nk*Dk + 2*Nv*Dv)
+    // multi-token (speculative-verify) mode of the fused-conv op: T = k + 1 projection rows per user (row s*T + j =
+    // user s, offset j); 1 = today's one-token step. Needs qkv_prev + accept.
+    uint32_t num_tokens = 1;
 };
 
 struct GdnDecodeStepInputs {
@@ -37,6 +40,10 @@ struct GdnDecodeStepInputs {
     std::optional<Tensor>
         conv_hist;  // fused-conv mode: packed history [Nv, 4, 32, 32] bf16 (slot 3 newest), shifted in place
     std::optional<Tensor> conv_taps;  // fused-conv mode: packed taps [Nv, 4, 32, 32] bf16 (row c = channel chunk c)
+    // multi-token mode: the previous step's projection rows (same grid as qkv) and the per-user number of drafts
+    // accepted last step, accept[s] in [0, T-1] (uint32/int32 ROW_MAJOR [B] or [1, B])
+    std::optional<Tensor> qkv_prev;
+    std::optional<Tensor> accept;
 };
 
 }  // namespace ttnn::experimental::prim

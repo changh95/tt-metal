@@ -42,6 +42,9 @@ Tensor gdn_decode_step(
     tt::tt_metal::DataType output_dtype,
     const std::optional<Tensor>& conv_hist = std::nullopt,
     const std::optional<Tensor>& conv_taps = std::nullopt,
-    uint32_t qkvz_dim = 0);
+    uint32_t qkvz_dim = 0,
+    uint32_t num_tokens = 1,
+    const std::optional<Tensor>& qkv_prev = std::nullopt,
+    const std::optional<Tensor>& accept = std::nullopt);
 
 }  // namespace ttnn::experimental::prim

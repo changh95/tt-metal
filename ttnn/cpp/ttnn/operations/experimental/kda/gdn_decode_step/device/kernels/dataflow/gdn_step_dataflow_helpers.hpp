@@ -357,4 +357,153 @@ inline void write_rows(
     dfb.pop_front(count);
 }
 
+// ---- multi-token (speculative-verify) mode
+// ---------------------------------------------------------------------------
+
+// Rows [lo, hi) of `count` consecutive tiles at pages first_page.. -> the same rows of the reserved L1 tiles of `dfb`
+// (from its write pointer). lo must be even so every face-row span starts 64 B aligned. No barrier / push.
+template <typename Accessor>
+inline void read_rows_span(
+    const Accessor& acc, DataflowBuffer& dfb, Noc& noc, uint32_t first_page, uint32_t count, uint32_t lo, uint32_t hi) {
+    const uint32_t entry = dfb.get_entry_size();
+    const uint32_t esz = entry / 1024;
+    const uint32_t seg = entry / 64;  // one face row
+    for (uint32_t t = 0; t < count; ++t) {
+        const uint32_t base = t * entry;
+        for (uint32_t l = lo; l < hi;) {
+            const uint32_t h = (l < 16) ? (hi < 16 ? hi : 16) : hi;
+            for (uint32_t half = 0; half < 2; ++half) {
+                const uint32_t off = tile_elem_index(l, half * 16) * esz;
+                noc.async_read(
+                    acc,
+                    dfb,
+                    seg * (h - l),
+                    {.page_id = first_page + t, .offset_bytes = off},
+                    {.offset_bytes = base + off});
+            }
+            l = h;
+        }
+    }
+}
+
+// Rows [lo, hi) of the `count` front tiles of `dfb` (read pointer; tile 0 for every destination tile when `same_src`)
+// -> the same rows of the tiles at first_page... lo even. No wait / barrier / pop (unlike write_rows).
+template <typename Accessor>
+inline void write_rows_span(
+    const Accessor& acc,
+    DataflowBuffer& dfb,
+    Noc& noc,
+    uint32_t first_page,
+    uint32_t count,
+    uint32_t lo,
+    uint32_t hi,
+    bool same_src = false) {
+    const uint32_t entry = dfb.get_entry_size();
+    const uint32_t esz = entry / 1024;
+    const uint32_t seg = entry / 64;
+    for (uint32_t t = 0; t < count; ++t) {
+        const uint32_t base = same_src ? 0u : t * entry;
+        for (uint32_t l = lo; l < hi;) {
+            const uint32_t h = (l < 16) ? (hi < 16 ? hi : 16) : hi;
+            for (uint32_t half = 0; half < 2; ++half) {
+                const uint32_t off = tile_elem_index(l, half * 16) * esz;
+                noc.async_write(
+                    dfb,
+                    acc,
+                    seg * (h - l),
+                    {.offset_bytes = base + off},
+                    {.page_id = first_page + t, .offset_bytes = off});
+            }
+            l = h;
+        }
+    }
+}
+
+// Selector tiles of one token: sel[c] = 1.0 at (row d, col 2c + par) so sel[c] @ P moves packed row 2c + par of P into
+// row d; mask = e_d. Slots reserved and zero-filled by the caller. (T=1: d = b, par = b & 1 -> set_user_selector_bits.)
+inline void set_token_selector_bits(DataflowBuffer& sel, DataflowBuffer& mask, uint32_t d, uint32_t par, uint32_t Ct) {
+    {
+        auto lock = sel.scoped_write_lock(Ct);
+        auto p16 = lock.template get_ptr<volatile uint16_t>();
+        for (uint32_t c = 0; c < Ct; ++c) {
+            p16[c * 1024 + tile_elem_index(d, 2 * c + par)] = 0x3F80;
+        }
+    }
+    {
+        auto lock = mask.scoped_write_lock(1);
+        auto p16 = lock.template get_ptr<volatile uint16_t>();
+        p16[tile_elem_index(d, 0)] = 0x3F80;
+    }
+}
+
+// Pack row `src_row` (0..31) of the head's [q | k | v] tiles of the tile row whose first page is `page_base` into the
+// reserved, zero-filled tile `dst_tile` of `dfb` at parity `par` (chunk c -> row 2c + par). A DRAM -> L1 face-row
+// segment must keep its 64 B alignment class (= the row parity), so a source row of the other parity is first packed
+// at its own parity into staging tile `src_row & 1` of `stage` (two reserved tiles whose other-parity rows stay zero)
+// and then moved by four local L1 -> L1 face-span copies: in a face the chunk rows sit at a 64 B pitch, so one span
+// per face carries all of them together with the zero rows in between. Pure data movement (bit-exact); ends with a
+// read barrier.
+template <uint32_t Kt, uint32_t Vt, uint32_t Nk, typename Accessor>
+inline void pack_head_tile_row_parity(
+    const Accessor& acc,
+    DataflowBuffer& dfb,
+    uint32_t dst_tile,
+    DataflowBuffer& stage,
+    Noc& noc,
+    uint32_t hk,
+    uint32_t h,
+    uint32_t page_base,
+    uint32_t src_row,
+    uint32_t par) {
+    constexpr uint32_t Ct = 2 * Kt + Vt;
+    const uint32_t p = src_row & 1u;
+    auto pack_into = [&](DataflowBuffer& d, uint32_t tile, uint32_t q) {
+        for (uint32_t c = 0; c < Kt; ++c) {
+            pack_row_from_row(acc, d, noc, page_base + hk * Kt + c, src_row, tile, 2 * c + q);
+            pack_row_from_row(acc, d, noc, page_base + Nk * Kt + hk * Kt + c, src_row, tile, 2 * (Kt + c) + q);
+        }
+        for (uint32_t c = 0; c < Vt; ++c) {
+            pack_row_from_row(acc, d, noc, page_base + 2 * Nk * Kt + h * Vt + c, src_row, tile, 2 * (2 * Kt + c) + q);
+        }
+    };
+    if (p == par) {
+        pack_into(dfb, dst_tile, par);
+        noc.async_read_barrier();
+        return;
+    }
+    pack_into(stage, p, p);
+    noc.async_read_barrier();
+    const uint32_t entry = dfb.get_entry_size();  // bf16 tile: face = entry / 4, face row 32 B, chunk pitch 64 B
+    const uint32_t face = entry / 4;
+    const uint32_t src = stage.get_write_ptr() + p * entry + 32 * p;
+    const uint32_t dst = dfb.get_write_ptr() + dst_tile * entry + 32 * par;
+    constexpr uint32_t c_lo = Ct < 8 ? Ct : 8;      // chunk rows in faces 0 / 1 (tile rows 0..15)
+    constexpr uint32_t c_hi = Ct > 8 ? Ct - 8 : 0;  // chunk rows in faces 2 / 3
+    const uint8_t noc_id = noc.get_noc_id();
+    for (uint32_t f = 0; f < 2; ++f) {
+        noc_async_read(get_noc_addr(src + f * face, noc_id), dst + f * face, (c_lo - 1) * 64 + 32, noc_id);
+    }
+    if constexpr (c_hi > 0) {
+        for (uint32_t f = 2; f < 4; ++f) {
+            noc_async_read(get_noc_addr(src + f * face, noc_id), dst + f * face, (c_hi - 1) * 64 + 32, noc_id);
+        }
+    }
+    noc.async_read_barrier();
+}
+
+// The group's accept counts: page 0 of the ROW_MAJOR accept tensor (ACC_BYTES = B*4 rounded up to 64 B, within the
+// buffer's aligned page) into the reserved slot of `dfb`, then out[i] = min(accept[u0 + i], T - 1) for i < nu
+// (uint32 words; an INT32 negative clamps to T - 1 as well).
+template <uint32_t ACC_BYTES, uint32_t T, typename Accessor>
+inline void load_accept(const Accessor& acc, DataflowBuffer& dfb, Noc& noc, uint32_t u0, uint32_t nu, uint32_t* out) {
+    noc.async_read(acc, dfb, ACC_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    auto lock = dfb.scoped_write_lock(1);
+    auto p = lock.template get_ptr<volatile uint32_t>();
+    for (uint32_t i = 0; i < nu; ++i) {
+        const uint32_t v = p[u0 + i];
+        out[i] = v > T - 1 ? T - 1 : v;
+    }
+}
+
 }  // namespace gdn_step_df

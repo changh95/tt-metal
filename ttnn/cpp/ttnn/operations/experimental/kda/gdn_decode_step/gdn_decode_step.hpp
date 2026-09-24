@@ -34,6 +34,9 @@ ttnn::Tensor gdn_decode_step(
     ttnn::DataType output_dtype = ttnn::DataType::BFLOAT16,
     const std::optional<ttnn::Tensor>& conv_hist = std::nullopt,
     const std::optional<ttnn::Tensor>& conv_taps = std::nullopt,
-    uint32_t qkvz_dim = 0);
+    uint32_t qkvz_dim = 0,
+    uint32_t num_tokens = 1,
+    const std::optional<ttnn::Tensor>& qkv_prev = std::nullopt,
+    const std::optional<ttnn::Tensor>& accept = std::nullopt);
 
 }  // namespace ttnn::experimental::kda
