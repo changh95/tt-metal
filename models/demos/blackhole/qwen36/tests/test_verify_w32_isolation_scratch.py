@@ -39,6 +39,11 @@ N = int(os.environ.get("VERIFY_ISO_REPLAYS", "50"))
 # buffer id, with the allocating op and the Python allocation site) and SKIP that replay (no device corruption, so the
 # whole flow can be audited in one process; the skipped replays leave stale values, irrelevant for an allocation audit).
 TRACKER_AUDIT = os.environ.get("VERIFY_ISO_TRACKER_AUDIT", "0") == "1"
+# VERIFY_ISO_COMPILE_FIRST=1 (default): compile EVERY program the process will run (decode w32 body, verify (32,4)
+# body, the slot/KV import programs) eagerly BEFORE the prefill warm-up captures, and capture the decode / verify
+# traces after the warm prefill without compiling anything new -- the fix under test (VERIFY_W32_AUDIT.md: programs
+# compiled after a capture own buffers in that trace's freed-intermediate range). 0 = the previous order.
+COMPILE_FIRST = os.environ.get("VERIFY_ISO_COMPILE_FIRST", "1") == "1"
 _AUDIT = {"reports": [], "seen": set(), "phase": "init"}
 
 
@@ -146,6 +151,26 @@ def test_w32_isolation(mesh_device):
         if ISO in ("E2", "E3", "E6", "E7", "E8"):
             vs = VerifyStep(model, 32, 4, page_tables[:32])
             logger.info("[iso] VerifyPlan(32,4) allocated before the prefill captures")
+        if COMPILE_FIRST:
+            from models.demos.blackhole.qwen36.tt import pd_transfer as pdt
+
+            if vs is not None:
+                vs.compile()
+            ref = (DecodeRefHarness if ISO == "E1b" else DecodeRef)(model, 32, page_tables[:32])
+            ref.compile()
+            if ISO in ("E7", "E8"):
+                # import programs: KV import (eager, or the traced importer's warm-up) + the GDN slot write on zeros
+                pdt.import_warmup(model, max_bucket=8)
+                if ISO == "E8":
+                    pdt.get_traced_importer(model)
+                n_dev, L, K, (Nv, Dk, Dv), C, _, _ = pdt.gdn_snapshot_dims(model)
+                zr = torch.zeros(n_dev, L, Nv, Dk, Dv, dtype=torch.float32)
+                zt = torch.zeros(n_dev, L, K, C, dtype=torch.bfloat16)
+                pdt.import_gdn_slot(model, 31, zr, zt, mode="fillcache" if ISO == "E7" else "trace")
+            ttnn.synchronize_device(device)
+            logger.info(
+                "[iso] COMPILE-FIRST: decode w32, verify (32,4) and import programs compiled before any capture"
+            )
         pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
         prev = model._bind_gdn_prefill_scratch()
         try:
@@ -164,7 +189,7 @@ def test_w32_isolation(mesh_device):
         if ISO in ("E7", "E8"):
             from models.demos.blackhole.qwen36.tt import pd_transfer as pdt
 
-            if ISO == "E8":
+            if ISO == "E8" and not COMPILE_FIRST:
                 pdt.import_warmup(model, max_bucket=64)  # traced KV importer: staging buffers + per-bucket traces
                 pdt.get_traced_importer(model)  # traced GDN importer (per-slot traces)
                 logger.info("[iso] traced importers warmed (served D engine pattern)")
@@ -177,10 +202,11 @@ def test_w32_isolation(mesh_device):
             kv0 = pdt.export_kv_blocks(model, page_tables[0].tolist())
             logger.info(f"[iso] slot-0 GDN snapshot + {len(page_tables[0])} KV blocks exported for re-import")
         if vs is not None:
-            vs.compile()
+            if not COMPILE_FIRST:
+                vs.compile()
             vs.capture()
             logger.info(
-                f"[iso] verify (32,4) compiled + captured (R={vs.plan.R}, gdn={'kernel' if vs.plan.gdn_kernel else 'stub'})"
+                f"[iso] verify (32,4) captured (R={vs.plan.R}, gdn={'kernel' if vs.plan.gdn_kernel else 'stub'})"
             )
         if ISO in ("E4", "E5"):
             # two decode traces, w=8 then w=32; E4 keeps both alive and interleaves their replays, E5 releases w8 first
@@ -210,8 +236,10 @@ def test_w32_isolation(mesh_device):
                 ref8.release()
             print(f"ISO_RESULT {ISO} completed")
             return
-        ref = (DecodeRefHarness if ISO == "E1b" else DecodeRef)(model, 32, page_tables[:32])
-        ref.setup()
+        if not COMPILE_FIRST:
+            ref = (DecodeRefHarness if ISO == "E1b" else DecodeRef)(model, 32, page_tables[:32])
+            ref.compile()
+        ref.capture()
         logger.info(f"[iso] DecodeRef(32) captured ({type(ref).__name__})")
         if ISO in ("E6", "E7", "E8"):
             for rnd in range(5 if not TRACKER_AUDIT else 2):

@@ -73,18 +73,27 @@ class DecodeRef:
         ttnn.deallocate(logits)
         return idx, val
 
-    def setup(self):
+    def compile(self):
+        """Allocate the device inputs and compile the decode programs eagerly (BEFORE any trace capture: a program
+        compiled after a capture owns buffers in that trace's freed range, tests/VERIFY_W32_AUDIT.md)."""
         toks = torch.full((self.w, 1), 1, dtype=torch.int32)
         pos = torch.full((self.w,), 8, dtype=torch.int32)
         self.dev = self.model.prepare_inputs_decode(toks, pos, self.pt)
-        idx, val = self._fwd(self.dev)  # compile
+        idx, val = self._fwd(self.dev)
         ttnn.synchronize_device(self.mesh)
         ttnn.deallocate(idx)
         ttnn.deallocate(val)
+
+    def capture(self):
+        assert self.dev is not None, "compile() first"
         self.tid = ttnn.begin_trace_capture(self.mesh, cq_id=0)
         self.out = self._fwd(self.dev)
         ttnn.end_trace_capture(self.mesh, self.tid, cq_id=0)
         ttnn.synchronize_device(self.mesh)
+
+    def setup(self):
+        self.compile()
+        self.capture()
 
     def step(self, tokens, positions):
         host = self.model.prepare_decode_inputs_host(
