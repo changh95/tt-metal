@@ -115,9 +115,16 @@ TT_KERNEL void reader(uint32_t head, uint32_t u0, uint32_t nu) {
     }
     noc.async_read_barrier();
     z_in.push_back(Vt);
-    // parity-move staging tiles (one per source parity), zeroed once: their other-parity rows are never written
-    stage.reserve_back(2);
-    zero_reserved(stage, noc, 2);
+    // staging tiles, zeroed once: entries 0 / 1 = parity moves (one per source parity; their other-parity rows are
+    // never written), entry 2 = the token's a|b tile. The a_s / b_s scalar tiles are consumed through element (0, 0)
+    // only (reduced-lane gates + mul_tiles_bcast_scalar in the compute kernel): both ring entries zeroed once, one word
+    // per token.
+    stage.reserve_back(3);
+    zero_reserved(stage, noc, 3);
+    a_s.reserve_back(2);
+    zero_reserved(a_s, noc, 2);
+    b_s.reserve_back(2);
+    zero_reserved(b_s, noc, 2);
 
     for (uint32_t ui = 0; ui < nu; ++ui) {
         const uint32_t s = u0 + ui;
@@ -137,6 +144,21 @@ TT_KERNEL void reader(uint32_t head, uint32_t u0, uint32_t nu) {
             const uint32_t rr = r % 32;
             const uint32_t page_base = (r / 32) * WT;
             const auto& src = prev ? prev_acc : qkv_acc;
+#if defined(GDN_MT_PROBE) && GDN_MT_PROBE == 2
+            // probe: hand the compute kernel whatever is in L1 (no DRAM traffic, no fills)
+            (void)src;
+            (void)page_base;
+            hist.reserve_back(1);
+            hist.push_back(1);
+            sel.reserve_back(Ct);
+            sel.push_back(Ct);
+            mask.reserve_back(1);
+            mask.push_back(1);
+            a_s.reserve_back(1);
+            a_s.push_back(1);
+            b_s.reserve_back(1);
+            b_s.push_back(1);
+#else
             // the token's packed tile, appended to the window
             hist.reserve_back(1);
             zero_reserved(hist, noc, 1);
@@ -151,17 +173,34 @@ TT_KERNEL void reader(uint32_t head, uint32_t u0, uint32_t nu) {
             set_token_selector_bits(sel, mask, rr, par, Ct);
             sel.push_back(Ct);
             mask.push_back(1);
-            // a[r, h], b[r, h]: row rr of the tile row's a|b tile, columns h and Nv + h
-            a_s.reserve_back(1);
-            noc.async_read(src, a_s, 2048, {.page_id = page_base + ab_page, .offset_bytes = 0}, {.offset_bytes = 0});
+            // a[r, h], b[r, h]: row rr of the tile row's a|b tile, columns h and Nv + h -> element (0, 0) of a_s / b_s
+            noc.async_read(
+                src,
+                stage,
+                2048,
+                {.page_id = page_base + ab_page, .offset_bytes = 0},
+                {.offset_bytes = 2 * stage.get_entry_size()});
             noc.async_read_barrier();
-            const uint32_t a_bits = tile_scalar_bits<false>(a_s, rr, h);
-            const uint32_t b_bits = tile_scalar_bits<false>(a_s, rr, Nv + h);
-            fill_scalar_tile_fast(a_s, a_bits);
+            uint32_t a_bits, b_bits;
+            {
+                auto lock = stage.scoped_write_lock(3);
+                auto p16 = lock.template get_ptr<volatile uint16_t>();
+                a_bits = static_cast<uint32_t>(p16[2 * 1024 + tile_elem_index(rr, h)]) << 16;
+                b_bits = static_cast<uint32_t>(p16[2 * 1024 + tile_elem_index(rr, Nv + h)]) << 16;
+            }
+            a_s.reserve_back(1);
+            {
+                auto lock = a_s.scoped_write_lock(1);
+                lock.template get_ptr<volatile uint32_t>()[0] = a_bits;
+            }
             a_s.push_back(1);
             b_s.reserve_back(1);
-            fill_scalar_tile_fast(b_s, b_bits);
+            {
+                auto lock = b_s.scoped_write_lock(1);
+                lock.template get_ptr<volatile uint32_t>()[0] = b_bits;
+            }
             b_s.push_back(1);
+#endif
             if (t == 0) {
                 read_tiles(state_acc, state_in, noc, bh * KV, KV);  // once per (user, head)
             }

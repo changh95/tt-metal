@@ -3,6 +3,7 @@
 #include "ttnn/operations/experimental/kda/gdn_decode_step/device/gdn_decode_step_program_factory.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -88,6 +89,14 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const uint32_t Wt = mt ? static_cast<uint32_t>(qkv.padded_shape()[-1]) / TILE_WIDTH : 0u;  // qkv tiles per tile row
     const uint32_t HCAP = 2 * T + 2;  // history window entries per user: 3 slots + up to 2T-1 tokens
     const uint32_t acc_bytes = mt ? ((B * 4 + 63) / 64) * 64 : 0u;                // accept page read, 64 B aligned
+    // timing-only probes of the multi-token kernels (numerics garbage): 1 = compute does no math (reader / writer
+    // floor), 2 = reader issues no DRAM reads / fills (compute floor). Never set in production.
+    const char* probe_env = std::getenv("QWEN36_GDN_MT_PROBE");
+    const uint32_t probe = (mt && probe_env != nullptr) ? static_cast<uint32_t>(std::atoi(probe_env)) : 0u;
+    m2::KernelSpec::CompilerOptions::Defines probe_defines;
+    if (probe != 0) {
+        probe_defines.insert({"GDN_MT_PROBE", std::to_string(probe)});
+    }
     auto dist = kda_factory_detail::distribute_prep(grid, num_items, num_items);  // one item per core
     const auto& cores = dist.core_set;
 
@@ -154,7 +163,7 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     }
     std::vector<Dfb> reader_local;
     if (mt) {
-        reader_local = {{"stage", 2, bf16}};
+        reader_local = {{"stage", 3, bf16}};  // 2 parity-move tiles + the token's a|b tile
     }
     std::vector<Dfb> compute_local = {
         {"tmp", tmp_tiles, fp32},
@@ -252,6 +261,7 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
             {"l2_eps_bits", float_bits(a.l2_epsilon)},
             {"norm_eps_bits", float_bits(a.norm_epsilon)}};
         if (mt) {
+            reader.compiler_options.defines = probe_defines;
             reader.tensor_bindings.push_back(m2::TensorBinding{QKV_PREV, "qkv_prev"});
             reader.tensor_bindings.push_back(m2::TensorBinding{ACCEPT, "accept"});
             for (const auto& [k, v] : std::vector<std::pair<std::string, uint32_t>>{
@@ -343,6 +353,7 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
         compute.dfb_bindings.push_back(bind(d.name, EP::PRODUCER));
     }
     if (mt) {
+        compute.compiler_options.defines = probe_defines;
         compute.compile_time_args.insert({"T", T});
         compute.compile_time_args.insert({"HCAP", HCAP});
     }
