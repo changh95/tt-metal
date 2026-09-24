@@ -331,29 +331,30 @@ def test_verify_step(mesh_device):
                     f"[verify] ({w},{T}) RESULT mechanism_identical={mech_ok} exact_vs_plain_decode={cfg_res['exact_vs_decode']}"
                 )
 
-        # --- timing ---
+        # --- timing (decode widths and the sub-trace sections FIRST: a w=32 verify replay has wedged the half) ---
         if DO_TIMING:
-            for (w, T), vs in steps.items():
-                med, mn = vs.time_replays(N_REPLAYS)
-                results["timing"][f"verify_w{w}_T{T}"] = {"median_ms": med, "min_ms": mn, "R": vs.plan.R}
-                logger.info(
-                    f"[verify] TIMING verify (w={w},T={T},R={vs.plan.R}) traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms"
-                )
             for w in DECODE_WIDTHS:
                 med, mn = refs[w].time_replays(N_REPLAYS)
                 results["timing"][f"decode_w{w}"] = {"median_ms": med, "min_ms": mn}
                 logger.info(f"[verify] TIMING decode w={w} traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms")
             for (w, T), vs in steps.items():
                 sec = vs.time_sections_traced(N_REPLAYS)  # TRACED sub-traces (one layer of each kind, embed, head)
-                results["timing"][f"verify_w{w}_T{T}"]["traced_sections_ms"] = sec
-                tot = results["timing"][f"verify_w{w}_T{T}"]["median_ms"]
+                results["timing"][f"verify_w{w}_T{T}"] = {"R": vs.plan.R, "traced_sections_ms": sec}
                 logger.info(
                     f"[verify] SECTIONS traced (w={w},T={T},R={vs.plan.R}) ms: attn_layer(T)={sec['attn_T']:.2f} "
                     f"attn_layer(1 offset)={sec['attn_1']:.2f} per_offset={sec['attn_layer_per_offset']:.3f} "
                     f"gdn_layer={sec['gdn']:.2f} embed={sec['embed']:.2f} head={sec['head']:.2f} | "
-                    f"x{sec['n_attn']} attn={sec['attn_layers_total']:.1f} (offset loop {sec['attn_offset_loop_total']:.1f} = "
-                    f"{100 * sec['attn_offset_loop_total'] / tot:.0f}% of step) x{sec['n_gdn']} gdn={sec['gdn_layers_total']:.1f} "
-                    f"| step {tot:.1f}"
+                    f"x{sec['n_attn']} attn={sec['attn_layers_total']:.1f} (offset loop {sec['attn_offset_loop_total']:.1f}) "
+                    f"x{sec['n_gdn']} gdn={sec['gdn_layers_total']:.1f}"
+                )
+            for (w, T), vs in steps.items():
+                med, mn = vs.time_replays(N_REPLAYS)
+                results["timing"][f"verify_w{w}_T{T}"].update({"median_ms": med, "min_ms": mn})
+                sec = results["timing"][f"verify_w{w}_T{T}"]["traced_sections_ms"]
+                logger.info(
+                    f"[verify] TIMING verify (w={w},T={T},R={vs.plan.R}) traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms "
+                    f"| attention offset loop {100 * sec['attn_offset_loop_total'] / med:.0f}% of step, "
+                    f"attn layers {100 * sec['attn_layers_total'] / med:.0f}%, gdn layers {100 * sec['gdn_layers_total'] / med:.0f}%"
                 )
     finally:
         for vs in steps.values():
