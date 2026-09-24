@@ -8,6 +8,12 @@ VERIFY_ISO = E1  : DecodeRef(32) with the test's traced argmax tail, capture + 5
              E3  : E2 + 50 verify replays (QWEN36_SDPA_DEC_MAX_CORES_PER_HEAD may be set by the caller).
              E4  : two live decode traces (w=8 then w=32), replays interleaved, no verify code.
              E5  : E4 with release_trace of the w=8 trace before the w=32 capture (the harness discipline).
+             E6  : (a) prefill-TRACE replays interleaved with decode w32 / verify (32,4) replays: 5 rounds of
+                   {8 x prefill_traced_chunked into the B=1 scratch (masked-bucket trace replay + KV fill, NO slot write),
+                    10 decode replays, 10 verify replays}.
+             E7  : (b) served-D pattern, eager: GDN slot writes (import_gdn_slot mode=fillcache) + KV block imports
+                   (eager import_kv_blocks) into 8 slots interleaved with the same replays, no prefill trace replays.
+             E8  : (b) with the traced importers the served D engine uses (import_gdn_slot mode=trace, traced KV import).
 """
 import os
 import time
@@ -77,7 +83,7 @@ def test_w32_isolation(mesh_device):
     model.allocate_kv_caches(kv_shape, ttnn.bfloat16, batch_size=BMAX)
     vs = ref = None
     try:
-        if ISO in ("E2", "E3"):
+        if ISO in ("E2", "E3", "E6", "E7", "E8"):
             vs = VerifyStep(model, 32, 4, page_tables[:32])
             logger.info("[iso] VerifyPlan(32,4) allocated before the prefill captures")
         pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
@@ -93,8 +99,21 @@ def test_w32_isolation(mesh_device):
         ttnn.synchronize_device(device)
         logger.info("[iso] prefill warm-up done")
         ids = torch.randint(1000, 100000, (1, 40), dtype=torch.int32)
+        snap = kv0 = None
+        if ISO in ("E7", "E8"):
+            from models.demos.blackhole.qwen36.tt import pd_transfer as pdt
+
+            if ISO == "E8":
+                pdt.import_warmup(model, max_bucket=64)  # traced KV importer: staging buffers + per-bucket traces
+                pdt.get_traced_importer(model)  # traced GDN importer (per-slot traces)
+                logger.info("[iso] traced importers warmed (served D engine pattern)")
+            model.pd_gdn_capture = {}
         _prefill(model, [ids], page_tables, 1)
         logger.info("[iso] warm 1-user prefill done")
+        if ISO in ("E7", "E8"):
+            snap = model.pd_gdn_capture.pop(0)  # (rec_snap, conv_snap) of slot 0, host device-major
+            kv0 = pdt.export_kv_blocks(model, page_tables[0].tolist())
+            logger.info(f"[iso] slot-0 GDN snapshot + {len(page_tables[0])} KV blocks exported for re-import")
         if vs is not None:
             vs.compile()
             vs.capture()
@@ -132,6 +151,33 @@ def test_w32_isolation(mesh_device):
         ref = (DecodeRefHarness if ISO == "E1b" else DecodeRef)(model, 32, page_tables[:32])
         ref.setup()
         logger.info(f"[iso] DecodeRef(32) captured ({type(ref).__name__})")
+        if ISO in ("E6", "E7", "E8"):
+            for rnd in range(5):
+                t0 = time.perf_counter()
+                if ISO == "E6":
+                    prev = model._bind_gdn_prefill_scratch()
+                    try:
+                        for u in range(8):
+                            model.prefill_traced_chunked(ids, page_tables[u : u + 1], actual_len=ids.shape[1])
+                    finally:
+                        model._unbind_gdn_prefill_scratch(prev)
+                    ttnn.synchronize_device(device)
+                    what = "8 x prefill-trace replays (no slot write)"
+                else:
+                    mode = "fillcache" if ISO == "E7" else "trace"
+                    for u in range(8, 16):
+                        pdt.import_gdn_slot(model, u, snap[0], snap[1], mode=mode)
+                        pdt.import_kv_blocks(model, page_tables[u].tolist(), kv0)
+                    ttnn.synchronize_device(device)
+                    what = f"8 x GDN slot write ({mode}) + KV block import ({'traced' if ISO == 'E8' else 'eager'})"
+                t1 = time.perf_counter()
+                med32, _ = ref.time_replays(10)
+                medv, _ = vs.time_replays(10)
+                logger.info(
+                    f"[iso] round {rnd + 1}: {what} {1e3 * (t1 - t0):.0f} ms, then decode w32 {med32:.2f} ms, verify (32,4) {medv:.2f} ms"
+                )
+            print(f"ISO_RESULT {ISO} completed")
+            return
         for chunk in range(N // 10):
             med, mn = ref.time_replays(10)
             logger.info(f"[iso] decode w32 replays {10 * (chunk + 1)}/{N}: med {med:.2f} min {mn:.2f} ms")

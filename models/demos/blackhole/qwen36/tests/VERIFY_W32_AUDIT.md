@@ -122,3 +122,29 @@ one trace alive at a time (capture -> time -> release, `b0fe5f2c7b3`) and both t
 decode trace + one verify trace + re-prefill of 8 users between replay bursts (fresh process); E7 = E6 with the
 slot-write path forced to the host repack + `QWEN36_PREFILL_BUCKET_TRACE=0` (eager masked prefill, no prefill trace
 replays) to separate "prefill-trace replay while other traces are parked" from "slot write".
+
+## E6 / E7 (2026-09-24 16:13) -- (a) reproduces, (b) not yet run
+
+- **E6 = (a)** (`logs/verify_iso_E6.log`): one decode w32 trace + one verify (32,4) trace parked, then round 1: 8 x
+  `prefill_traced_chunked` into the B=1 scratch (masked-bucket prefill-trace replays + KV fill, NO GDN slot write),
+  followed by 10 decode + 10 verify replays: **wedged inside round 1** (no round line logged; PCIe ID 1 reads
+  0xffffffff). Prefill-TRACE replays while w=32 decode/verify traces are parked reproduce the wedge on their own.
+  The same pattern with w=8 traces parked (the (8,8) exactness runs: 3 x 8-user prefill_paged_slots between replays)
+  was clean 3/3, so it is w=32-specific.
+- **E7 = (b)** (served-D pattern: `import_gdn_slot(mode=fillcache)` + eager `import_kv_blocks` into 8 slots between
+  replays, no prefill-trace replay) and **E8** (traced importers): not run -- the board was down after E6 (E7's pytest
+  errored at mesh open). Both are implemented in `test_verify_w32_isolation_scratch.py` (VERIFY_ISO=E7 needs
+  `QWEN36_PD_KV_IMPORT_TRACE=0`; E8 warms the traced importers before the captures) and are the next runs.
+
+Interpretation so far: the wedge needs (i) a w=32 decode and/or verify trace parked and (ii) prefill-trace replays
+(masked-bucket traces captured BEFORE those traces) executed afterwards. The one no-prefill wedge
+(`verify_timing18_88_kernel`, decode w8 replays after a decode w32 capture) does not fit (ii) and stays unexplained.
+Candidate mechanism for (i)+(ii): a persistent buffer of the w=32 body allocated lazily at its compile/capture (after
+the prefill captures) landing in a prefill trace's freed-intermediate range -- e.g. per-chunk virtual page tables of the
+batched attention path, or a kernel-side constant -- clobbered by the prefill replay; a garbage page table then sends
+paged_update_cache / SDPA at out-of-range blocks. Check: dump `buffer_address()` of every device tensor the (32,4) plan
+and the decode w32 inputs own after capture, and compare with the prefill traces' intermediate ranges (allocator
+report), or simply re-allocate them before the prefill warm-up and re-run E6.
+
+Test-flow rule until (b) is settled: for (32,*) exactness, do ALL prefills / slot duplication BEFORE capturing the decode
+and verify traces and never replay a prefill trace afterwards (one policy per process, reference streams saved to disk).
