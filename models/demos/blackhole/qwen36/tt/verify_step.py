@@ -189,6 +189,17 @@ class VerifyPlan:
         self.trace_id = None
         self.out_idx = self.out_val = None
         self._host_refs = []
+        self.debug_attn_offsets = None  # timing only, see attention.forward_verify
+        # persistent residual-shaped inputs of the per-section sub-traces (time_sections_traced); allocated NOW
+        self.sec_x_frac = self._up(
+            torch.zeros(1, 1, R, self.dim // args.num_devices, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
+        )
+        self.sec_x_rep = None
+        if self.fused_ar:
+            act = args.get_norm_config("attn", Mode.DECODE)["sharded_output_config"]
+            self.sec_x_rep = ttnn.to_memory_config(
+                self._up(torch.zeros(1, 1, R, self.dim, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT), act
+            )
         logger.info(
             f"[verify] plan w={self.w} T={self.T} R={R} fused_ar={self.fused_ar} "
             f"gdn={'multi-token kernel' if self.gdn_kernel else 'per-token STUB'}"
@@ -482,6 +493,82 @@ class VerifyStep:
             out = combine_sharded_argmax(self.mesh, plan.out_idx, plan.out_val, plan.R, self.per_shard)
         plan._host_refs = []
         return out
+
+    def _section_body(self, which):
+        """One section of the body on the persistent residual-shaped input (values irrelevant for timing)."""
+        model, plan = self.model, self.plan
+        x = plan.sec_x_rep if plan.fused_ar else plan.sec_x_frac
+        if plan.fused_ar:
+            model.tt_ccl.decode_all_reduce.begin_step()
+        if which == "head":
+            R = plan.R
+            if plan.fused_ar:
+                y = model._final_norm_decode(x)
+            elif R <= ttnn.TILE_SIZE:
+                y = model._final_norm_decode(x)
+            else:
+                nc = model.args.get_norm_config("lm_head", Mode.DECODE)
+                y_n = model.layers[0]._verify_norm_blocks(model.norm, x, nc, plan)
+                y = ttnn.to_memory_config(y_n, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(y_n)
+            logits = ttnn.linear(y, model.lm_head_weight)
+            ttnn.deallocate(y)
+            idx, val = argmax_sharded_rows(logits)
+            ttnn.deallocate(logits)
+            return [idx, val]
+        if which == "embed":
+            e = model.embd(plan.tokens)
+            e = ttnn.reshape(e, (1, 1, plan.R, e.shape[-1]))
+            e = model._decode_residual_in(e) if plan.fused_ar else ttnn.to_memory_config(e, ttnn.DRAM_MEMORY_CONFIG)
+            return [e]
+        layer = next(l for l in model.layers if l.is_full_attention == (which.startswith("attn")))
+        if which.startswith("attn"):
+            out = layer.forward_verify(
+                x, plan, cur_pos_list=plan.cur_pos, cos_list=plan.cos, sin_list=plan.sin, page_table=plan.page_table
+            )
+        else:
+            out = layer.forward_verify(x, plan, accept_tt=plan.accept)
+        return [out]
+
+    def time_sections_traced(self, n=50):
+        """TRACED per-section times (ms, median of n replays) from sub-traces of the body run on persistent inputs:
+        one attention layer (all T offsets), the same layer with a single offset, one GDN layer, the embedding and the
+        head (final norm + LM head + argmax). Each sub-trace is compiled eagerly first, captured, replayed n times, and
+        released. Derived: per-offset attention cost = (attn_T - attn_1) / (T - 1)."""
+        plan = self.plan
+        res = {}
+        n_attn = sum(1 for l in self.model.layers if l.is_full_attention)
+        n_gdn = len(self.model.layers) - n_attn
+        for which, n_off in (("attn_T", None), ("attn_1", 1), ("gdn", None), ("embed", None), ("head", None)):
+            plan.debug_attn_offsets = n_off
+            self.plan.upload(*self._dummy_inputs())
+            outs = self._section_body(which)  # compile
+            ttnn.synchronize_device(self.mesh)
+            for o in outs:
+                ttnn.deallocate(o)
+            tid = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+            outs = self._section_body(which)
+            ttnn.end_trace_capture(self.mesh, tid, cq_id=0)
+            ttnn.synchronize_device(self.mesh)
+            ms = []
+            for _ in range(n):
+                t0 = time.perf_counter()
+                ttnn.execute_trace(self.mesh, tid, cq_id=0, blocking=False)
+                ttnn.synchronize_device(self.mesh)
+                ms.append(1e3 * (time.perf_counter() - t0))
+            ttnn.release_trace(self.mesh, tid)
+            self.plan._host_refs = []
+            ms.sort()
+            res[which] = ms[len(ms) // 2]
+        plan.debug_attn_offsets = None
+        T = plan.T
+        per_off = (res["attn_T"] - res["attn_1"]) / max(1, T - 1)
+        res["attn_layer_per_offset"] = per_off
+        res["attn_layers_total"] = n_attn * res["attn_T"]
+        res["attn_offset_loop_total"] = n_attn * T * per_off
+        res["gdn_layers_total"] = n_gdn * res["gdn"]
+        res["n_attn"], res["n_gdn"] = n_attn, n_gdn
+        return res
 
     def time_replays(self, n=50):
         """Traced step time (upload + replay + sync) over n replays with refreshed inputs; returns (median, min) ms."""

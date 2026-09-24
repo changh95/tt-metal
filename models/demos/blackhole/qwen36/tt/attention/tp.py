@@ -860,7 +860,10 @@ class TPAttention:
             x, tw["wqkv_fused"], plan.attn_qkv_progcfg, self.compute_cfg, out_memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
         acc = None
-        for j in range(T):
+        # plan.debug_attn_offsets (timing only): run the per-offset middle for the first n offsets, so the traced
+        # per-offset cost is (t[T] - t[1]) / (T - 1); the un-run rows of the output stay zero.
+        n_off = T if plan.debug_attn_offsets is None else plan.debug_attn_offsets
+        for j in range(n_off):
             qkv_j = plan.gather(j, qkv)  # [1,1,w,W] L1
             sh = list(qkv_j.shape)
             qkv3_j = ttnn.slice(qkv_j, (0, 0, 0, 0), (sh[0], sh[1], sh[2], qkv3_dim), memory_config=_L1)

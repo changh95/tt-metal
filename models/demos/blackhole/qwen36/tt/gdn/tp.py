@@ -2341,8 +2341,14 @@ class TPGatedDeltaNet:
             self._decode_fused_conv and self._fuse_ab
         ), "verify needs the fused-conv GDN decode path (QWEN36_GDN_DECODE_FUSED=2)"
         self._ensure_conv_hist_packed()  # eager no-op when already current (it is, after prefill / sync_gdn_decode_state)
+        # kernel mode: qkv_cur must live where qkv_prev lives (DRAM) -- the multi-token dataflow kernel uses one
+        # TensorAccessor type for both (static_assert "qkv / qkv_prev accessor types differ" otherwise).
         qkvzab = tpc.matmul_1d_decode(
-            x, self.tw["qkvz"], plan.gdn_qkvz_progcfg, self.cfg, out_memory_config=ttnn.L1_MEMORY_CONFIG
+            x,
+            self.tw["qkvz"],
+            plan.gdn_qkvz_progcfg,
+            self.cfg,
+            out_memory_config=ttnn.DRAM_MEMORY_CONFIG if plan.gdn_kernel is not None else ttnn.L1_MEMORY_CONFIG,
         )
         if plan.gdn_kernel is not None:
             gated = plan.gdn_kernel(self, qkvzab, qkv_prev, accept_tt)

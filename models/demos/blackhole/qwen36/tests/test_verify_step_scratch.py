@@ -126,6 +126,8 @@ class DecodeRef:
 # VERIFY_POST_PREFILL_SLEEP_MS (default 600) after every prefill before any trace replays.
 AICLK_MHZ = int(os.environ.get("VERIFY_FORCE_AICLK_MHZ", "1200"))
 POST_PREFILL_SLEEP_MS = float(os.environ.get("VERIFY_POST_PREFILL_SLEEP_MS", "600"))
+PREFILL_GROUP = int(os.environ.get("VERIFY_PREFILL_GROUP", "8"))
+PREFILL_GROUP_IDLE_S = float(os.environ.get("VERIFY_PREFILL_GROUP_IDLE_S", "1.0"))
 
 
 def _pin_aiclk(mhz):
@@ -146,8 +148,15 @@ def _prefill(model, prompt_ids, page_tables, w):
     """prefill_paged_slots of users 0..w-1 (user s -> prompt s % 3); returns (positions [w], first tokens [w])."""
     ids = [prompt_ids[s % len(prompt_ids)] for s in range(w)]
     lens = [t.shape[1] for t in ids]
-    logits = model.prefill_paged_slots(ids, page_tables[:w], list(range(w)), valid_lens=lens)
-    ttnn.synchronize_device(model.mesh_device)
+    # groups of <= PREFILL_GROUP users with an idle between groups: a 32-user prefill_paged_slots burst followed by a
+    # trace replay wedged half A three times (the served monolithic server also prefills in small groups; D never does)
+    logits = []
+    for g0 in range(0, w, PREFILL_GROUP):
+        g1 = min(w, g0 + PREFILL_GROUP)
+        if g0 > 0:
+            time.sleep(PREFILL_GROUP_IDLE_S)
+        logits += model.prefill_paged_slots(ids[g0:g1], page_tables[g0:g1], list(range(g0, g1)), valid_lens=lens[g0:g1])
+        ttnn.synchronize_device(model.mesh_device)
     if POST_PREFILL_SLEEP_MS > 0:
         time.sleep(POST_PREFILL_SLEEP_MS / 1e3)
     first = [int(lg.reshape(-1)[: model.vocab_size].float().argmax()) for lg in logits]
@@ -335,11 +344,16 @@ def test_verify_step(mesh_device):
                 results["timing"][f"decode_w{w}"] = {"median_ms": med, "min_ms": mn}
                 logger.info(f"[verify] TIMING decode w={w} traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms")
             for (w, T), vs in steps.items():
-                vs.compile(profile=True)  # eager per-section breakdown (sync per section; dispatch-inflated)
-                sec = {k_: 1e3 * v for k_, v in vs.section_times.items()}
-                results["timing"][f"verify_w{w}_T{T}"]["eager_sections_ms"] = sec
+                sec = vs.time_sections_traced(N_REPLAYS)  # TRACED sub-traces (one layer of each kind, embed, head)
+                results["timing"][f"verify_w{w}_T{T}"]["traced_sections_ms"] = sec
+                tot = results["timing"][f"verify_w{w}_T{T}"]["median_ms"]
                 logger.info(
-                    f"[verify] SECTIONS (w={w},T={T}) eager ms: " + " ".join(f"{k_}={v:.1f}" for k_, v in sec.items())
+                    f"[verify] SECTIONS traced (w={w},T={T},R={vs.plan.R}) ms: attn_layer(T)={sec['attn_T']:.2f} "
+                    f"attn_layer(1 offset)={sec['attn_1']:.2f} per_offset={sec['attn_layer_per_offset']:.3f} "
+                    f"gdn_layer={sec['gdn']:.2f} embed={sec['embed']:.2f} head={sec['head']:.2f} | "
+                    f"x{sec['n_attn']} attn={sec['attn_layers_total']:.1f} (offset loop {sec['attn_offset_loop_total']:.1f} = "
+                    f"{100 * sec['attn_offset_loop_total'] / tot:.0f}% of step) x{sec['n_gdn']} gdn={sec['gdn_layers_total']:.1f} "
+                    f"| step {tot:.1f}"
                 )
     finally:
         for vs in steps.values():
