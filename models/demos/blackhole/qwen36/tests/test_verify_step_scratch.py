@@ -119,12 +119,37 @@ class DecodeRef:
             self.tid = None
 
 
+# Hang mitigations (2026-09-24, run verify_smoke3: the FIRST decode-trace replay after an 8-user prefill_paged_slots
+# wedged chip 0 of half A -- PCIe reads 0xffffffff, board reset needed; the signature of the documented burst-prefill ->
+# decode-trace SDPA wedge, root-caused to AICLK throttling steps mid-kernel and fixed in serving by pinning the clock,
+# qwen36_vllm._pin_aiclk). The test pins the clock itself (VERIFY_FORCE_AICLK_MHZ, default 1200, 0 = off) and idles
+# VERIFY_POST_PREFILL_SLEEP_MS (default 600) after every prefill before any trace replays.
+AICLK_MHZ = int(os.environ.get("VERIFY_FORCE_AICLK_MHZ", "1200"))
+POST_PREFILL_SLEEP_MS = float(os.environ.get("VERIFY_POST_PREFILL_SLEEP_MS", "600"))
+
+
+def _pin_aiclk(mhz):
+    if mhz <= 0:
+        return
+    try:
+        import pyluwen
+
+        chips = pyluwen.detect_chips()
+        for chip in chips:
+            chip.arc_msg(0x33, wait_for_done=True, arg0=mhz, arg1=0, timeout=2.0)  # FORCE_AICLK
+        logger.info(f"[verify] pinned {len(chips)} chip(s) AICLK to {mhz} MHz (FORCE_AICLK; persists until reset / 0)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[verify] AICLK pin {mhz} MHz failed: {e!r}")
+
+
 def _prefill(model, prompt_ids, page_tables, w):
     """prefill_paged_slots of users 0..w-1 (user s -> prompt s % 3); returns (positions [w], first tokens [w])."""
     ids = [prompt_ids[s % len(prompt_ids)] for s in range(w)]
     lens = [t.shape[1] for t in ids]
     logits = model.prefill_paged_slots(ids, page_tables[:w], list(range(w)), valid_lens=lens)
     ttnn.synchronize_device(model.mesh_device)
+    if POST_PREFILL_SLEEP_MS > 0:
+        time.sleep(POST_PREFILL_SLEEP_MS / 1e3)
     first = [int(lg.reshape(-1)[: model.vocab_size].float().argmax()) for lg in logits]
     return lens, first
 
@@ -146,6 +171,7 @@ def test_verify_step(mesh_device):
         pytest.skip("TP path only")
     device = mesh_device
     device.enable_program_cache()
+    _pin_aiclk(AICLK_MHZ)
     results = {
         "configs": {},
         "timing": {},
