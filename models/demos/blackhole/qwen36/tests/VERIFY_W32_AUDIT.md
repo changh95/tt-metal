@@ -191,3 +191,36 @@ requests (bucket-32 decode trace live) with a continuous stream of new short req
 prefills of new requests between decode replays. The engine raises (request error, no wedge) at the first replay
 that would corrupt a live buffer and names it; no raise over ~10 minutes = the served traces allocate safely and the
 verify-step body is what introduces the corruptible buffer. Cheap to run and decisive.
+
+## Root cause and fix (2026-09-24 16:40-16:55)
+
+**Tracker audit** (`VERIFY_ISO_TRACKER_AUDIT=1`, `logs/tracker_audit_E7.txt`, program-cache buffers skipped): the only
+non-program-cache buffers a replay would corrupt are the decode w32 reference's own tensors (its 4 inputs from
+`prepare_inputs_decode`, allocated after the verify capture and refreshed before every decode replay, plus its trace
+outputs) -- benign by construction. With program-cache buffers INCLUDED (`logs/verify_iso_E7_tracker.log`) the first
+prefill-trace replay already flags 126 program-cache buffers of programs compiled after the prefill captures
+(the served warm-up order compiles the slot-write set after the prefill captures too, so that pattern is tolerated in
+practice). The decisive difference of every wedged process vs every clean one: **programs compiled AFTER a trace
+capture whose replays the process then interleaves with those programs' eager use** -- the (32,*) verify body compiled
+after the decode capture (or vice versa), the decode w32 body compiled after a w8 capture (timing18_88), the slot/KV
+import programs compiled in round 1 after both captures (E7: round-1 replays, round-2 imports hang), the verify/decode
+bodies compiled after the prefill captures (E6 and every exactness-flow wedge). A program compiled after a capture owns
+device buffers (its kernel binaries / config buffers via the program cache) in that trace's freed-intermediate range;
+the replay overwrites them and the next launch of that program -- eager (imports, slot writes) or via another trace --
+hangs the device. Whether a given placement overlaps is size dependent, which is why only the w=32 (large) bodies and
+the 4-plan processes hit it.
+
+**Fix (test discipline, the same rule the served path applies with `warmup_decode_buckets`: "compile every decode width
+before capturing any bucket trace")**: compile EVERY program the process will ever run before capturing ANY trace --
+decode bodies at all reference widths, verify bodies of all plans, the import / slot-write programs, the prefill
+programs -- then capture (`VERIFY_ISO_COMPILE_FIRST=1`, `DecodeRef.compile()/capture()`, and the exactness test's
+compile-all block before the prefill warm-up). Verified: E7 (`logs/verify_fix_E7.log`) and E6 (`logs/verify_fix_E6.log`)
+both **clean over 5 rounds** (slot/KV imports resp. prefill-trace replays interleaved with decode w32 + verify (32,4)
+replays), where the same flows wedged before.
+
+**Served-D implication**: the D engine's warm-up order already compiles its decode buckets before capturing and warms
+the importers (`import_warmup`, traced importer) before the decode capture, which is why v5-v7 ran for hours. Any
+program that is first compiled at request time on D (a new import bucket, a new prefill length bucket without the
+masked-bucket trace, a verify body added after the decode warm-up) re-creates this hazard: when the verify step is
+integrated it must be compiled inside the warm-up before `warmup_model_decode` captures. The proposed tracker run on
+the served D (previous section) is the cheap guard.
