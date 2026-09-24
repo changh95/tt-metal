@@ -168,3 +168,26 @@ Priority: the address audit with ttnn's trace allocation tracker (`TT_METAL_TRAC
 TT_METAL_TRACE_ALLOC_TRACEBACKS=1`: `execute_trace` raises BEFORE the replay with the list of live buffers allocated
 while a trace was active that the replay would corrupt, so it cannot wedge) on the E7 flow, then fix by allocating those
 buffers before the captures. Run: `VERIFY_ISO=E7 TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1`.
+
+## Tracker audit (ttnn UnsafeAllocationTracker)
+
+`TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1` makes `ttnn.execute_trace` raise before a replay
+that would corrupt a live buffer allocated while a trace was active. First run on the E7 flow
+(`logs/verify_iso_E7_tracker.log`): it raised at the very first prefill-trace replay (the warm 1-user
+`prefill_paged_slots`, i.e. the SERVED warm-up order itself) with 126 buffers, all `program_cache:` entries of
+`warmup_gdn_slot_write` (ConcatDeviceOperation x32, TilizeWithValPadding x30, UntilizeWithUnpadding x31 tap-row programs,
+UpdateKVCache FILL, Clone) -- program-cache buffers, benign per the tracker's own hint (skip with
+`TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=1`); the served path runs this exact order for hours.
+`VERIFY_ISO_TRACKER_AUDIT=1` (test_verify_w32_isolation_scratch.py) turns the raise into log-and-SKIP so one process
+audits every replay of the flow; results in `logs/tracker_audit_<ISO>.txt`.
+
+## Proposed served-D check (run on all 8 chips by the coordinator)
+
+Start the P/D stack's D engine (or the standalone TP=4 vLLM server on a half) with
+`TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1 TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=1` in the
+engine's environment (read once at import). Then drive the E7 pattern through the served path: 32 concurrent
+requests (bucket-32 decode trace live) with a continuous stream of new short requests so that P/D imports
+(`import_gdn_slot` + `import_kv_blocks`) land between decode-trace replays (D side), or, on the monolithic server,
+prefills of new requests between decode replays. The engine raises (request error, no wedge) at the first replay
+that would corrupt a live buffer and names it; no raise over ~10 minutes = the served traces allocate safely and the
+verify-step body is what introduces the corruptible buffer. Cheap to run and decisive.

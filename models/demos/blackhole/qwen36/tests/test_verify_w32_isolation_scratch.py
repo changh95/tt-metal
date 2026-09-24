@@ -34,6 +34,64 @@ from models.tt_transformers.tt.common import copy_host_to_device
 BMAX = 32
 ISO = os.environ.get("VERIFY_ISO", "E1")
 N = int(os.environ.get("VERIFY_ISO_REPLAYS", "50"))
+# VERIFY_ISO_TRACKER_AUDIT=1 (with TT_METAL_TRACE_ALLOC_TRACKING=1 [TRACEBACKS=1, SKIP_PROGRAM_CACHE=1]): instead of
+# raising at the first corrupting replay, log every replay's list of live buffers the replay would corrupt (dedup by
+# buffer id, with the allocating op and the Python allocation site) and SKIP that replay (no device corruption, so the
+# whole flow can be audited in one process; the skipped replays leave stale values, irrelevant for an allocation audit).
+TRACKER_AUDIT = os.environ.get("VERIFY_ISO_TRACKER_AUDIT", "0") == "1"
+_AUDIT = {"reports": [], "seen": set(), "phase": "init"}
+
+
+def _install_tracker_audit(device):
+    from ttnn.unsafe_allocation_tracker import UnsafeAllocationTracker
+
+    real = ttnn._ttnn.operations.trace.execute_trace if hasattr(ttnn._ttnn.operations.trace, "execute_trace") else None
+    import ttnn._ttnn.operations.trace as _tr
+
+    real = _tr.execute_trace
+
+    def audited_execute_trace(dev, trace_id, *, cq_id=None, blocking=True):
+        try:
+            UnsafeAllocationTracker(dev).verify_before_replay(trace_id)
+        except RuntimeError as e:
+            text = str(e)
+            ids = sorted(
+                set(int(x) for x in __import__("re").findall(r"^Buffer (\d+)", text, flags=__import__("re").M))
+            )
+            new_ids = [i for i in ids if i not in _AUDIT["seen"]]
+            _AUDIT["seen"].update(ids)
+            head = text.split("\n")[0]
+            logger.warning(
+                f"[audit] phase={_AUDIT['phase']} trace {trace_id}: {head} ({len(new_ids)} new buffer ids); replay SKIPPED"
+            )
+            _AUDIT["reports"].append((_AUDIT["phase"], trace_id, ids, text))
+            return None
+        return real(dev, trace_id, cq_id=cq_id, blocking=blocking)
+
+    ttnn.execute_trace = audited_execute_trace
+    logger.info("[audit] tracker audit installed: corrupting replays are logged and skipped")
+
+
+def _audit_dump(path):
+    import re
+
+    with open(path, "w") as f:
+        for phase, tid, ids, text in _AUDIT["reports"]:
+            f.write(f"\n===== phase {phase} trace {tid}: {len(ids)} buffers\n")
+            # per buffer: op context + the deepest non-library frame of the allocation stack
+            for m in re.finditer(
+                r"Buffer (\d+)( \[op: ([^\]]*)\])?\n(  allocated at:\n((?:.*\n)*?))?(?=E?\s*Buffer |\n---|\nUse )", text
+            ):
+                bid, op = m.group(1), (m.group(3) or "")[:140]
+                frames = re.findall(r'File "([^"]*qwen36[^"]*)", line (\d+), in (\w+)', m.group(5) or "")
+                site = (
+                    "; ".join(f"{os.path.basename(a)}:{b} {c}" for a, b, c in frames[-3:])
+                    if frames
+                    else "(no qwen36 frame)"
+                )
+                f.write(f"  {bid}: {op} | {site}\n")
+            f.write(text[text.find("--- Python referrer analysis") :][:4000] + "\n")
+    logger.info(f"[audit] {len(_AUDIT['reports'])} replay reports, {len(_AUDIT['seen'])} distinct buffers -> {path}")
 
 
 class DecodeRefHarness(DecodeRef):
@@ -76,6 +134,8 @@ def test_w32_isolation(mesh_device):
     device = mesh_device
     device.enable_program_cache()
     _pin_aiclk(int(os.environ.get("VERIFY_FORCE_AICLK_MHZ", "1200")))
+    if TRACKER_AUDIT:
+        _install_tracker_audit(device)
     model = Qwen36Model.from_pretrained(device, max_batch_size=BMAX, max_seq_len=BPU * BLOCK_SIZE * 2)
     page_tables = torch.stack([torch.arange(u * BPU, (u + 1) * BPU, dtype=torch.int32) for u in range(BMAX)])
     kv_shape = [BMAX * BPU, model.args.n_local_kv_heads, BLOCK_SIZE, model.args.head_dim]
@@ -98,6 +158,7 @@ def test_w32_isolation(mesh_device):
                 layer.attention.warmup_hist_device_pack()
         ttnn.synchronize_device(device)
         logger.info("[iso] prefill warm-up done")
+        _AUDIT["phase"] = "warm_prefill"
         ids = torch.randint(1000, 100000, (1, 40), dtype=torch.int32)
         snap = kv0 = None
         if ISO in ("E7", "E8"):
@@ -110,6 +171,7 @@ def test_w32_isolation(mesh_device):
             model.pd_gdn_capture = {}
         _prefill(model, [ids], page_tables, 1)
         logger.info("[iso] warm 1-user prefill done")
+        _AUDIT["phase"] = "captures"
         if ISO in ("E7", "E8"):
             snap = model.pd_gdn_capture.pop(0)  # (rec_snap, conv_snap) of slot 0, host device-major
             kv0 = pdt.export_kv_blocks(model, page_tables[0].tolist())
@@ -152,7 +214,8 @@ def test_w32_isolation(mesh_device):
         ref.setup()
         logger.info(f"[iso] DecodeRef(32) captured ({type(ref).__name__})")
         if ISO in ("E6", "E7", "E8"):
-            for rnd in range(5):
+            for rnd in range(5 if not TRACKER_AUDIT else 2):
+                _AUDIT["phase"] = f"round{rnd + 1}_writes"
                 t0 = time.perf_counter()
                 if ISO == "E6":
                     prev = model._bind_gdn_prefill_scratch()
@@ -171,8 +234,10 @@ def test_w32_isolation(mesh_device):
                     ttnn.synchronize_device(device)
                     what = f"8 x GDN slot write ({mode}) + KV block import ({'traced' if ISO == 'E8' else 'eager'})"
                 t1 = time.perf_counter()
-                med32, _ = ref.time_replays(10)
-                medv, _ = vs.time_replays(10)
+                _AUDIT["phase"] = f"round{rnd + 1}_decode_replays"
+                med32, _ = ref.time_replays(10 if not TRACKER_AUDIT else 2)
+                _AUDIT["phase"] = f"round{rnd + 1}_verify_replays"
+                medv, _ = vs.time_replays(10 if not TRACKER_AUDIT else 2)
                 logger.info(
                     f"[iso] round {rnd + 1}: {what} {1e3 * (t1 - t0):.0f} ms, then decode w32 {med32:.2f} ms, verify (32,4) {medv:.2f} ms"
                 )
@@ -187,6 +252,10 @@ def test_w32_isolation(mesh_device):
                 logger.info(f"[iso] verify (32,4) replays {10 * (chunk + 1)}/{N}: med {med:.2f} min {mn:.2f} ms")
         print(f"ISO_RESULT {ISO} completed")
     finally:
+        if TRACKER_AUDIT:
+            _audit_dump(
+                os.environ.get("VERIFY_ISO_AUDIT_OUT", f"/home/eslim/experiments/qwen36/logs/tracker_audit_{ISO}.txt")
+            )
         if vs is not None:
             vs.release()
         if ref is not None:
