@@ -22,6 +22,10 @@ class MeshCoordinate;
 namespace tt::tt_metal::experimental::Device {
 
 // Returns the hop distance between two logical worker coordinates on a given NOC
+// `device` may be a Device or a MeshDevice. A multi-device MeshDevice is measured on the first device this
+// rank drives (best-effort: exact only when the mesh is homogeneously harvested; see the MeshCoordinate
+// overload to pick the chip). A MeshDevice with no local device falls back to the wrap-free Manhattan
+// distance of the logical coordinates instead of throwing.
 // This API is experimental and may evolve into a stable Device API in the future
 uint32_t get_worker_noc_hop_distance(
     IDevice* device, const CoreCoord& logical_src, const CoreCoord& logical_dst, NOC noc);

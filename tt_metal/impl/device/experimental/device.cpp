@@ -15,11 +15,24 @@ uint32_t get_worker_noc_hop_distance(
     IDevice* device, const CoreCoord& logical_src, const CoreCoord& logical_dst, NOC noc) {
     TT_FATAL(device != nullptr, "Device pointer cannot be null");
 
-    // Check if it's a MeshDevice and handle appropriately
+    // A MeshDevice measures on one of its chips. For a unit mesh that is exact. For a multi-device mesh the
+    // program is built once for every chip, so there is a single answer to give: measure on the first device
+    // this rank drives, the same convention MeshDevice::get_optimal_dram_bank_to_logical_worker_assignment(NOC)
+    // uses for the primary DRAM readers this distance places secondary readers next to. This is best-effort:
+    // logical->physical worker translation comes from each chip's SoC descriptor, so it is exact only when
+    // the mesh is homogeneously harvested (a differently harvested chip may see a route one hop longer).
+    // Callers that know which chip they mean should use the MeshCoordinate overload below.
     if (auto* mesh = dynamic_cast<distributed::MeshDevice*>(device)) {
-        TT_FATAL(mesh->num_devices() == 1, "get_worker_noc_hop_distance() is only supported on unit MeshDevice.");
-        // Delegate to the underlying device
-        return get_worker_noc_hop_distance(mesh->get_devices().front(), logical_src, logical_dst, noc);
+        const auto local_devices = mesh->get_devices();
+        if (!local_devices.empty()) {
+            return get_worker_noc_hop_distance(local_devices.front(), logical_src, logical_dst, noc);
+        }
+        // No local device to measure on (a submesh this rank drives none of): fall back to the wrap-free
+        // Manhattan distance between the logical coordinates rather than asserting. Untranslated logical
+        // coordinates keep the relative ordering the callers use (nearest free core to a primary reader).
+        const auto& s = logical_src;
+        const auto& d = logical_dst;
+        return (s.x >= d.x ? s.x - d.x : d.x - s.x) + (s.y >= d.y ? s.y - d.y : d.y - s.y);
     }
 
     // Handle regular Device - cast to access internal physical_worker_core_from_logical_core
