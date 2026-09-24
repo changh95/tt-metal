@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SCRATCH: bit-exact regression of ttnn.experimental.kda.gdn_decode_step (fused-conv batched + plain variants).
 
-Modes, selected by ``QWEN36_GDN_REF=save|check|compare`` (``QWEN36_GDN_REF_DIR`` = output dir):
+Modes, selected by ``QWEN36_GDN_REF=save|check|compare`` (``QWEN36_GDN_REF_DIR`` = output dir). The default is
+``check``: a run without the variable can never overwrite a saved reference. Saving is always explicit and refuses to
+overwrite an existing reference file unless ``QWEN36_GDN_REF_OVERWRITE=1`` is also set.
 
 * ``save``  -- run on the REFERENCE kernel sources, dump every output (out, state, packed history) per step.
 * ``check`` -- run on the changed tree, assert every saved tensor is reproduced EXACTLY (torch.equal on the raw bits).
@@ -37,7 +39,9 @@ from models.demos.blackhole.qwen36.tests.test_gdn_decode_step_scratch import (
     _reference_conv,
 )
 
-MODE = os.environ.get("QWEN36_GDN_REF", "save")
+MODE = os.environ.get("QWEN36_GDN_REF", "check")
+assert MODE in ("save", "check", "compare"), f"QWEN36_GDN_REF must be save|check|compare, got {MODE!r}"
+OVERWRITE = os.environ.get("QWEN36_GDN_REF_OVERWRITE", "0") == "1"
 REF_DIR = os.environ.get("QWEN36_GDN_REF_DIR", "/home/eslim/experiments/qwen36/logs/itemC_ref")
 BS = [int(b) for b in os.environ.get("QWEN36_GDN_REF_BS", "1,2,8,32").split(",")]
 STEPS = int(os.environ.get("QWEN36_GDN_REF_STEPS", "3"))
@@ -48,6 +52,9 @@ def _save_or_check(name, tensors):
     os.makedirs(REF_DIR, exist_ok=True)
     path = os.path.join(REF_DIR, f"{name}.pt")
     if MODE == "save":
+        assert OVERWRITE or not os.path.exists(
+            path
+        ), f"{path} exists; refusing to overwrite a saved reference (set QWEN36_GDN_REF_OVERWRITE=1 to replace it)"
         torch.save({k: v.clone().contiguous() for k, v in tensors.items()}, path)
         logger.info(f"[ref] saved {len(tensors)} tensors -> {path}")
         return
