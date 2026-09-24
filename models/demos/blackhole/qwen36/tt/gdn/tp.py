@@ -2228,6 +2228,139 @@ class TPGatedDeltaNet:
         ttnn.deallocate(gated)
         return self._decode_out_all_reduce(partial, B)
 
+    # ------------------------------------------------------------------------------------------------ #
+    # Speculative-decoding VERIFY step (tt/verify_step.py): R = w*T rows, row s*T+j = user s, token offset j.
+    # ------------------------------------------------------------------------------------------------ #
+    def _verify_kernel_args(self):
+        """Common keyword arguments of ttnn.experimental.kda.gdn_decode_step on this layer's fused-conv state."""
+        return dict(
+            scale=self.scale,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            output_dtype=ttnn.bfloat16,
+            conv_taps=self._conv_taps_packed_t(),
+            qkvz_dim=self.qkvz_dim_tp,
+        )
+
+    def _verify_kernel_once(self, rows, state, hist):
+        """Today's fused-conv op on rows [1,B<=32,W] (one token per user row s): commits every row to state/hist
+        rows 0..B-1 IN PLACE and returns the gated output [1,B,Nv*Dv] (L1)."""
+        return ttnn.experimental.kda.gdn_decode_step(
+            rows,
+            self.tw["dt_bias"],
+            self.tw["neg_exp_A"],
+            state,
+            self._norm_weight_1d(),
+            self.Nv,
+            self.Nk,
+            self.Dk,
+            self.Dv,
+            conv_hist=hist,
+            **self._verify_kernel_args(),
+        )
+
+    def _verify_stub(self, qkv, plan, qkv_prev):
+        """Multi-token GDN verify built from today's ONE-token fused-conv op (correct, slow; the multi-token kernel
+        replaces it, see forward_verify). Trace-safe: fixed op sequence, the accept counts enter only as the 0/1
+        one-hot masks plan.mask_f32 / plan.mask_bf16 ([Bmax, T, 1, 1], mask[s, j] = 1 iff a_s == j).
+
+        State contract (the same the kernel implements): on entry rec_state / conv_hist_packed of user s reflect
+        every committed token through the PREVIOUS step's row 0. This step
+          1. commits prev rows 1..a_s from qkv_prev: the commit chain S_j (rows 1..j applied on a scratch copy) is
+             run for j = 1..k and the state each user keeps is S_{a_s} = sum_j onehot(a_s == j) * S_j -- a masked
+             select that is bit-exact (x*1.0 + 0.0), including the untouched idle slots (their mask is onehot(0));
+          2. commits the current row 0 on the real state (all users) -> its output;
+          3. evaluates current rows 1..k read-only: a chain on a scratch copy of the state after step 2.
+        Per-row outputs are scattered back to rows s*T+j with 0/1 matmuls (exact). Returns [1, R, Nv*Dv]."""
+        T, w, R = plan.T, plan.w, plan.R
+        k = T - 1
+        S, H = self.rec_state, self.conv_hist_packed
+        scr_S, scr_H = plan.gdn_scratch(S, H)  # persistent scratch (allocated before any capture)
+        _L1 = ttnn.L1_MEMORY_CONFIG
+
+        def rows_of(src, j):
+            return ttnn.reshape(plan.gather(j, src), (1, w, src.shape[-1]))
+
+        if k > 0:
+            # 1. lazy commit of prev rows 1..a_s
+            ttnn.copy(S, scr_S)
+            ttnn.copy(H, scr_H)
+            S_acc = ttnn.multiply(scr_S, plan.mask(0, ttnn.float32))
+            H_acc = ttnn.multiply(scr_H, plan.mask(0, ttnn.bfloat16))
+            for j in range(1, T):
+                r = rows_of(qkv_prev, j)
+                o = self._verify_kernel_once(r, scr_S, scr_H)
+                ttnn.deallocate(o)
+                ttnn.deallocate(r)
+                tS = ttnn.multiply(scr_S, plan.mask(j, ttnn.float32))
+                S_acc2 = ttnn.add(S_acc, tS)
+                ttnn.deallocate(tS)
+                ttnn.deallocate(S_acc)
+                S_acc = S_acc2
+                tH = ttnn.multiply(scr_H, plan.mask(j, ttnn.bfloat16))
+                H_acc2 = ttnn.add(H_acc, tH)
+                ttnn.deallocate(tH)
+                ttnn.deallocate(H_acc)
+                H_acc = H_acc2
+            ttnn.copy(S_acc, S)
+            ttnn.copy(H_acc, H)
+            ttnn.deallocate(S_acc)
+            ttnn.deallocate(H_acc)
+        # 2. current row 0 on the real state
+        r0 = rows_of(qkv, 0)
+        o0 = self._verify_kernel_once(r0, S, H)
+        ttnn.deallocate(r0)
+        acc = plan.scatter_accumulate(0, o0, None)  # consumes o0
+        # 3. current rows 1..k read-only on a scratch chain
+        if k > 0:
+            ttnn.copy(S, scr_S)
+            ttnn.copy(H, scr_H)
+            for j in range(1, T):
+                r = rows_of(qkv, j)
+                oj = self._verify_kernel_once(r, scr_S, scr_H)
+                ttnn.deallocate(r)
+                acc = plan.scatter_accumulate(j, oj, acc)
+        return ttnn.reshape(acc, (1, R, self.value_dim_tp))
+
+    def forward_verify(self, x, plan, accept_tt, qkv_prev):
+        """Verify step of one GDN layer over the R = w*T row grid.
+
+        x: replicated norm output [1,1,R,dim]. accept_tt: [w] int32 device tensor of the previous step's accept
+        counts (the multi-token kernel's `accept`); qkv_prev: this layer's persistent [1,R,W] projection buffer
+        (the previous step's qkv_cur; zeros before the first step), refreshed here AFTER the kernel.
+
+        Multi-token kernel contract (built concurrently; the call is routed through verify_step.gdn_multi_token_kernel):
+          out = gdn_decode_step(qkv_cur [1,R,W], dt_bias, neg_exp_A, state, norm_w, Nv, Nk, Dk, Dv, ..., conv_hist,
+                                conv_taps, qkvz_dim, num_tokens=T, qkv_prev=qkv_prev, accept=accept_tt) -> [1,R,Nv*Dv]
+          commits prev rows 1..a_s and cur row 0 to the per-user state/history, evaluates cur rows 1..k read-only.
+        Until it lands (or with QWEN36_VERIFY_GDN_STUB=1) the per-token stub above runs the same contract."""
+        R = plan.R
+        if len(x.shape) == 4:
+            x = ttnn.reshape(x, (1, x.shape[-2], x.shape[-1]))
+        assert x.shape[-2] == R, (x.shape, R)
+        assert (
+            self._decode_fused_conv and self._fuse_ab
+        ), "verify needs the fused-conv GDN decode path (QWEN36_GDN_DECODE_FUSED=2)"
+        self._ensure_conv_hist_packed()  # eager no-op when already current (it is, after prefill / sync_gdn_decode_state)
+        qkvzab = tpc.matmul_1d_decode(
+            x, self.tw["qkvz"], plan.gdn_qkvz_progcfg, self.cfg, out_memory_config=ttnn.L1_MEMORY_CONFIG
+        )
+        if plan.gdn_kernel is not None:
+            gated = plan.gdn_kernel(self, qkvzab, qkv_prev, accept_tt)
+        else:
+            gated = self._verify_stub(qkvzab, plan, qkv_prev)
+        # this step's projections become next step's prev rows (rows 1..a_s of them get committed then)
+        ttnn.copy(qkvzab, qkv_prev)
+        ttnn.deallocate(qkvzab)
+        if plan.fused_ar:
+            partial = self._row_proj(gated, self.tw["out"])  # the decode 1D path (L1 out for the fused all-reduce)
+        else:
+            partial = tpc.matmul_1d_decode(
+                gated, self.tw["out"], plan.gdn_out_progcfg, self.cfg, out_memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+        ttnn.deallocate(gated)
+        partial = ttnn.reshape(partial, (1, 1, R, partial.shape[-1]))
+        return plan.all_reduce(partial, self.tt_ccl, self.mesh, self.args)
+
     def _decode_out_all_reduce(self, partial, B):
         """Decode out-proj partial [1,B,dim] -> the layer's residual contribution: fused all_reduce_async (replicated
         [1,1,B,dim], decode norm layout) when the model's CCL carries it, else reduce-scatter (fractured, DRAM)."""

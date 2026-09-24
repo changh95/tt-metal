@@ -150,6 +150,41 @@ class Qwen36DecoderLayer:
             )
         return norm
 
+    def forward_verify(self, x, plan, cur_pos_list=None, cos_list=None, sin_list=None, page_table=None, accept_tt=None):
+        """Speculative-decoding verify step of this layer over the R = w*T row grid (tt/verify_step.py). TP only.
+
+        x is the residual stream at R rows: on the fused decode all-reduce path (R <= 32) the REPLICATED L1
+        width-sharded [1,1,R,dim] the decode step uses, otherwise the FRACTURED DRAM [1,1,R,dim/TP] of the
+        reduce-scatter path. Norms: the decode configs at R <= 32 (block_h 1), plan.norm_attn (block_h R/32) above;
+        the fractured path goes through DistributedNorm (all-gather into the R-row shard, then the sharded norm),
+        exactly the non-fused decode path at R rows. The sub-layer forwards are the modules' forward_verify."""
+        assert self.num_devices > 1, "verify step is TP only"
+        replicated = x.shape[-1] == self.args.dim
+        norm_cfg = plan.norm_attn if plan.norm_attn is not None else self.args.get_norm_config("attn", Mode.DECODE)
+        if replicated:
+            attn_input = self.attention_norm.norm(
+                x, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=norm_cfg
+            )
+        else:
+            attn_input = self.attention_norm(x, mode=Mode.DECODE, norm_config=norm_cfg)
+        if self.is_full_attention:
+            attn_output = self.attention.forward_verify(attn_input, plan, cur_pos_list, cos_list, sin_list, page_table)
+        else:
+            attn_output = self.attention.forward_verify(attn_input, plan, accept_tt, plan.gdn_qkv_prev[self.layer_num])
+        ttnn.deallocate(attn_input)
+        h = ttnn.add(x, attn_output)
+        ttnn.deallocate(attn_output)
+        if replicated:
+            ff_input = self.ffn_norm.norm(h, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=norm_cfg)
+        else:
+            ff_input = self.ffn_norm(h, mode=Mode.DECODE, norm_config=norm_cfg)
+        ff_output = self.feed_forward.forward_verify(ff_input, plan)
+        ttnn.deallocate(ff_input)
+        output = ttnn.add(h, ff_output)
+        ttnn.deallocate(h)
+        ttnn.deallocate(ff_output)
+        return output
+
     def forward(
         self,
         x,

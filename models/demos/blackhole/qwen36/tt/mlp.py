@@ -265,6 +265,45 @@ class Qwen36MLP:
         ttnn.deallocate(hidden)
         return output
 
+    def forward_verify(self, x, plan):
+        """Speculative-decoding verify step at R = plan.R rows (tt/verify_step.py). x: replicated ff-norm output
+        [1,1,R,dim] (L1 width-sharded). R <= 32 on the fused-AR residual: exactly the decode forward. Above: the
+        item-J small-M 1D mcast matmuls at M=R on the interleaved decode weights (w1 with fused SILU, w3, mul, w2),
+        then the reduce-scatter (fractured [1,1,R,dim/TP] DRAM) like the non-fused decode path."""
+        if plan.fused_ar:
+            return self.forward(x)
+
+        w = self.weights
+        ckc = self.compute_kernel_config_decode
+        x_il = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)  # mcast_in0 reads interleaved in0
+        w1_out = ttnn.linear(
+            x_il,
+            w.w1,
+            compute_kernel_config=ckc,
+            program_config=plan.mlp_w1_progcfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        w3_out = ttnn.linear(
+            x_il,
+            w.w3,
+            compute_kernel_config=ckc,
+            program_config=plan.mlp_w3_progcfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(x_il)
+        hidden = ttnn.mul(w1_out, w3_out, memory_config=ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(w1_out)
+        ttnn.deallocate(w3_out)
+        partial = ttnn.linear(
+            hidden,
+            w.w2,
+            compute_kernel_config=ckc,
+            program_config=plan.mlp_w2_progcfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(hidden)
+        return plan.all_reduce(partial, self.tt_ccl, self.device, self.args)
+
     def _forward_tp(self, x):
         """TP forward: replicated input; reduce-scatter output fractured on hidden dim."""
         from models.demos.blackhole.qwen36.tt import tp_common as tpc
