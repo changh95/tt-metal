@@ -104,3 +104,21 @@ trace + at most one never-replayed verify trace); (ii) the w=32 verify trace REP
 32-user prefill paths (3/6). Next experiments (fresh processes): E3 = E2 + 50 verify (32,4) replays; E4 = E1 + a second
 DecodeRef(8) captured before it and replayed after it (two live decode traces, no verify code at all); E5 = E4 +
 `release_trace` between widths (the harness discipline).
+
+## E3 / E4 / E5 (2026-09-24 15:56-16:01) -- all clean
+
+- E3 (`logs/verify_iso_E3.log`): E2 + 50 verify (32,4) replays (per-offset attention, kernel GDN, SDPA cores unrestricted):
+  clean, verify (32,4) 85.2 ms, decode w32 34.7 ms.
+- E4 (`logs/verify_iso_E4.log`): decode w8 and w32 traces both alive, replays interleaved 5 x (10 + 10): clean (28.9 / 34.6 ms).
+- E5 (`logs/verify_iso_E5.log`): w8 trace released before the w32 capture: clean (34.7 ms).
+
+None of the isolated factors reproduces the wedge: not the argmax tail at B=32 (E1), not the w=32 verify body's
+allocations/capture (E2) nor its replays (E3), not two live decode traces with interleaved replays (E4). What every wedged
+process had and no clean one did: the EXACTNESS phase's interleaving of trace replays with re-prefills of the same
+slots (`prefill_paged_slots` replays of the masked-bucket prefill traces + slot writes between decode / verify replays),
+or, in the two no-prefill wedges, >= 3 decode traces + >= 2 verify traces alive at once. The timing test now keeps exactly
+one trace alive at a time (capture -> time -> release, `b0fe5f2c7b3`) and both timing processes (`logs/verify_timing_A.log`,
+`verify_timing_B.log`) ran clean, including (32,4) and (32,8) replays. Next isolation for the exactness flow: E6 = one
+decode trace + one verify trace + re-prefill of 8 users between replay bursts (fresh process); E7 = E6 with the
+slot-write path forced to the host repack + `QWEN36_PREFILL_BUCKET_TRACE=0` (eager masked prefill, no prefill trace
+replays) to separate "prefill-trace replay while other traces are parked" from "slot write".
