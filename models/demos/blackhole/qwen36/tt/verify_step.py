@@ -136,9 +136,10 @@ class VerifyPlan:
             )
             self.mlp_w3_progcfg = tpc.small_m_progcfg(R, self.dim, hid, grid_w=gw)
             self.mlp_w2_progcfg = tpc.small_m_progcfg(R, hid, self.dim, grid_w=gw)
-            self.norm_attn = self._norm_config(args.attn_input_grid, R)
-            self.norm_lm = self._norm_config(args.lm_head_core_grid, R)
-            self.norm_lm["output_mem_config"] = ttnn.DRAM_MEMORY_CONFIG
+            # norms run the decode (block_h 1) configs per 32-row block (layer._verify_norm_blocks): the sharded
+            # LayerNorm kernel at block_h > 1 is row-position dependent on the attn grid (test_verify_rowpos_probe_scratch).
+            self.norm_attn = None
+            self.norm_lm = None
 
         # --- 0/1 gather / scatter constants ---
         sel_h, selT_h = vg.select_matrices(self.w, self.T, R)
@@ -283,18 +284,40 @@ class VerifyPlan:
 
     def all_reduce(self, partial, tt_ccl, mesh, args):
         """The sub-layer all-reduce: fused all_reduce_async (replicated, decode norm layout) on the fused-AR path,
-        else the reduce-scatter (fractured [1,1,R,dim/TP] DRAM)."""
+        else the reduce-scatter (fractured [1,1,R,dim/TP] DRAM).
+
+        Above one tile row the reduce-scatter runs in FP32: the bf16 reduce_scatter_minimal_async sums the TP partials
+        in a different order per TILE ROW (deterministic; rows 32..63 of identical data differ from rows 0..31,
+        tests/test_verify_rs_probe_scratch.py), so a user's logits would depend on its grid row. Summing bf16 partials
+        in fp32 is order independent (tile rows equal in the probe); the result is cast back to bf16 for the residual.
+        (The fused decode all_reduce_async is a pairwise fp32-accumulated reduction and matches neither bitwise.)"""
         if self.fused_ar:
             return tt_ccl.decode_all_reduce(partial)
-        return tt_all_reduce(
-            partial,
+        if self.R <= tpc.TILE_SIZE:
+            return tt_all_reduce(
+                partial,
+                mesh,
+                tt_ccl,
+                cluster_axis=0,
+                dim=3,
+                topology=args.ccl_topology(),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        p32 = ttnn.typecast(partial, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(partial)
+        out32 = tt_all_reduce(
+            p32,
             mesh,
             tt_ccl,
             cluster_axis=0,
             dim=3,
             topology=args.ccl_topology(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.float32,
         )
+        out = ttnn.typecast(out32, ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(out32)
+        return out
 
     # ------------------------------------------------------------------------------------------ per-step upload
     def upload(self, tokens, positions, accept_prev):
@@ -354,8 +377,9 @@ class VerifyStep:
         self.section_times = None
 
     # ------------------------------------------------------------------------------------------ forward body
-    def forward(self, profile=False):
-        """The traced body: reads only the plan's persistent buffers; returns (idx, val) device tensors."""
+    def forward(self, profile=False, row_check=None):
+        """The traced body: reads only the plan's persistent buffers; returns (idx, val) device tensors.
+        row_check(name, tensor): eager-only diagnostic hook called after the embedding and every layer."""
         model, plan = self.model, self.plan
         R = plan.R
         t = {} if profile else None
@@ -375,7 +399,9 @@ class VerifyStep:
         else:
             x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
         t0 = tick("embed", t0)
-        for layer in model.layers:
+        if row_check is not None:
+            row_check("embed", x)
+        for li, layer in enumerate(model.layers):
             if layer.is_full_attention:
                 x_new = layer.forward_verify(
                     x, plan, cur_pos_list=plan.cur_pos, cos_list=plan.cos, sin_list=plan.sin, page_table=plan.page_table
@@ -386,14 +412,18 @@ class VerifyStep:
                 t0 = tick("gdn_layers", t0)
             ttnn.deallocate(x)
             x = x_new
+            if row_check is not None:
+                row_check(f"layer{li}_{'attn' if layer.is_full_attention else 'gdn'}", x)
         if plan.fused_ar:
             x = model._final_norm_decode(x)
+        elif R <= ttnn.TILE_SIZE:
+            x = model._final_norm_decode(x)  # the non-fused decode path (DistributedNorm, lm_head config)
         else:
-            nc = plan.norm_lm
-            if nc is None:
-                nc = dict(model.args.get_norm_config("lm_head", Mode.DECODE))
-                nc["output_mem_config"] = ttnn.DRAM_MEMORY_CONFIG
-            x = model.norm(x, mode=Mode.DECODE, norm_config=nc)
+            nc = model.args.get_norm_config("lm_head", Mode.DECODE)
+            x_n = model.layers[0]._verify_norm_blocks(model.norm, x, nc, plan)  # L1 interleaved [1,1,R,dim]
+            ttnn.deallocate(x)
+            x = ttnn.to_memory_config(x_n, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(x_n)
         t0 = tick("final_norm", t0)
         logits = ttnn.linear(x, model.lm_head_weight)  # vocab-sharded [1,1,R,V/TP]
         ttnn.deallocate(x)

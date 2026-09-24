@@ -150,23 +150,67 @@ class Qwen36DecoderLayer:
             )
         return norm
 
+    def _verify_norm_blocks(self, norm, x, norm_cfg, plan):
+        """Decode RMSNorm of a FRACTURED [1,1,R,dim/TP] residual at R > 32 rows: one all-gather (DRAM interleaved), then
+        the decode sharded norm (block_h 1) on every 32-row block, re-assembled along the rows (L1 interleaved).
+
+        Why per block: the sharded LayerNorm kernel with block_h = R/32 > 1 is ROW-POSITION dependent on the decode attn
+        grid (rows of the 2nd+ block differ from the same rows in block 0, which equals the block_h 1 result;
+        tests/test_verify_rowpos_probe_scratch.py), so a user's logits would depend on its grid row. Per block it is the
+        exact decode norm. Costs R/32 x (slice, i2s, norm, s2i) + 1 concat per norm."""
+        R = plan.R
+        args = self.args
+        ag_key = norm.ag_config_key
+        mc = args.model_config.get(ag_key) if ag_key else None  # the decode all-gather tuning DistributedNorm uses
+        g = ttnn.experimental.all_gather_async(
+            x,
+            persistent_output_buffer=None,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+            num_links=mc["num_links"] if mc else self.tt_ccl.get_num_links(1),
+            topology=args.ccl_topology(),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+            chunks_per_sync=mc["chunks_per_sync"] if mc else 10,
+            num_workers_per_link=mc["num_workers_per_link"] if mc else 2,
+            num_buffers_per_channel=2,
+        )
+        shard_cfg = norm_cfg["sharded_output_config"]
+        blocks = []
+        for b in range(R // ttnn.TILE_SIZE):
+            blk = ttnn.slice(g, (0, 0, b * ttnn.TILE_SIZE, 0), (1, 1, (b + 1) * ttnn.TILE_SIZE, g.shape[-1]))
+            blk_sh = ttnn.to_memory_config(blk, shard_cfg)
+            ttnn.deallocate(blk)
+            y = norm.norm(blk_sh, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=norm_cfg)
+            ttnn.deallocate(blk_sh)
+            y_il = ttnn.sharded_to_interleaved(y, ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(y)
+            blocks.append(y_il)
+        ttnn.deallocate(g)
+        out = ttnn.concat(blocks, dim=-2, memory_config=ttnn.L1_MEMORY_CONFIG)
+        for y_il in blocks:
+            ttnn.deallocate(y_il)
+        return out
+
     def forward_verify(self, x, plan, cur_pos_list=None, cos_list=None, sin_list=None, page_table=None, accept_tt=None):
         """Speculative-decoding verify step of this layer over the R = w*T row grid (tt/verify_step.py). TP only.
 
         x is the residual stream at R rows: on the fused decode all-reduce path (R <= 32) the REPLICATED L1
         width-sharded [1,1,R,dim] the decode step uses, otherwise the FRACTURED DRAM [1,1,R,dim/TP] of the
-        reduce-scatter path. Norms: the decode configs at R <= 32 (block_h 1), plan.norm_attn (block_h R/32) above;
-        the fractured path goes through DistributedNorm (all-gather into the R-row shard, then the sharded norm),
-        exactly the non-fused decode path at R rows. The sub-layer forwards are the modules' forward_verify."""
+        reduce-scatter path. Norms always run the decode config (block_h 1): directly on the replicated residual, or
+        (fractured) after one all-gather per 32-row block via _verify_norm_blocks. The sub-layer forwards are the
+        modules' forward_verify."""
         assert self.num_devices > 1, "verify step is TP only"
         replicated = x.shape[-1] == self.args.dim
-        norm_cfg = plan.norm_attn if plan.norm_attn is not None else self.args.get_norm_config("attn", Mode.DECODE)
+        norm_cfg = self.args.get_norm_config("attn", Mode.DECODE)
         if replicated:
             attn_input = self.attention_norm.norm(
                 x, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=norm_cfg
             )
+        elif plan.R <= ttnn.TILE_SIZE:
+            attn_input = self.attention_norm(x, mode=Mode.DECODE, norm_config=norm_cfg)  # the non-fused decode path
         else:
-            attn_input = self.attention_norm(x, mode=Mode.DECODE, norm_config=norm_cfg)
+            attn_input = self._verify_norm_blocks(self.attention_norm, x, norm_cfg, plan)
         if self.is_full_attention:
             attn_output = self.attention.forward_verify(attn_input, plan, cur_pos_list, cos_list, sin_list, page_table)
         else:
@@ -176,8 +220,10 @@ class Qwen36DecoderLayer:
         ttnn.deallocate(attn_output)
         if replicated:
             ff_input = self.ffn_norm.norm(h, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=norm_cfg)
-        else:
+        elif plan.R <= ttnn.TILE_SIZE:
             ff_input = self.ffn_norm(h, mode=Mode.DECODE, norm_config=norm_cfg)
+        else:
+            ff_input = self._verify_norm_blocks(self.ffn_norm, h, norm_cfg, plan)
         ff_output = self.feed_forward.forward_verify(ff_input, plan)
         ttnn.deallocate(ff_input)
         output = ttnn.add(h, ff_output)

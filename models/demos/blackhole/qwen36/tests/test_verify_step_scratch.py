@@ -219,7 +219,10 @@ def test_verify_step(mesh_device):
         # untimed warm prefill (lazy allocations happen here, not inside a measured / compared region)
         _prefill(model, prompt_ids, page_tables, 1)
 
-        # --- compile + capture every verify trace and the decode references (state is scratch until re-prefilled) ---
+        # --- served order (qwen36_vllm: prefill warm-up -> decode trace capture), then the verify traces ---
+        for w in sorted(set([w for w, _ in CONFIGS] + (DECODE_WIDTHS if DO_TIMING else []))):
+            refs[w] = DecodeRef(model, w, page_tables[:w])
+            refs[w].setup()
         for (w, T), vs in steps.items():
             t0 = time.perf_counter()
             vs.compile()
@@ -228,9 +231,6 @@ def test_verify_step(mesh_device):
             logger.info(
                 f"[verify] ({w},{T}) R={vs.plan.R} compile {t1 - t0:.1f}s capture {time.perf_counter() - t1:.1f}s"
             )
-        for w in sorted(set([w for w, _ in CONFIGS] + (DECODE_WIDTHS if DO_TIMING else []))):
-            refs[w] = DecodeRef(model, w, page_tables[:w])
-            refs[w].setup()
 
         # --- exactness per config ---
         if DO_EXACT:
