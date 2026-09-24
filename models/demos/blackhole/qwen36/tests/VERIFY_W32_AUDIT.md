@@ -86,3 +86,21 @@ Differences that matter:
 - E3: E2 + 50 verify replays with `QWEN36_SDPA_DEC_MAX_CORES_PER_HEAD=1`.
 
 Runner: `scripts/verify_step_chain.sh "<tag>|TEST=models/demos/blackhole/qwen36/tests/test_verify_w32_isolation_scratch.py VERIFY_ISO=E1"`.
+
+## Isolation outcomes (2026-09-24 15:48-15:52, kernel-mode GDN, per-offset attention)
+
+- E1 (`logs/verify_iso_E1.log`): harness flow + DecodeRef(32) with the traced argmax tail, 50 replays: **clean**,
+  decode w32 31.5 ms (harness 30.7 + the argmax/readback tail). Hypothesis 1 (argmax tail at B=32) is refuted as a
+  poison-by-presence.
+- E2 (`logs/verify_iso_E2.log`): + VerifyPlan(32,4) allocated before the prefill captures, compiled and captured (no
+  verify replay), then DecodeRef(32) 50 replays: **clean**. A w=32 verify body's allocation/compile/capture does not
+  poison the process either (hypotheses 3/4 as presence effects refuted). Side finding: with the (32,4) plan resident the
+  decode w32 replay costs 34.6 ms vs 31.5 ms without it (E1) -- the plan's ~80 MB of DRAM (qkv_prev, scratch) shifts the
+  decode buffers' placement; worth a look when the verify step is integrated.
+
+Revised ranking: (i) interaction of several live traces / interleaved replays and re-prefills in one process
+(hypothesis 2; every wedge process had >= 2 decode traces or a verify trace replayed alongside; E1/E2 each had one decode
+trace + at most one never-replayed verify trace); (ii) the w=32 verify trace REPLAY itself (E3 never ran); (iii) the
+32-user prefill paths (3/6). Next experiments (fresh processes): E3 = E2 + 50 verify (32,4) replays; E4 = E1 + a second
+DecodeRef(8) captured before it and replayed after it (two live decode traces, no verify code at all); E5 = E4 +
+`release_trace` between widths (the harness discipline).
