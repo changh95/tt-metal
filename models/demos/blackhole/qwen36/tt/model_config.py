@@ -77,8 +77,8 @@ DS_DECODE_CFG = {
 def decode_dram_sharded_matrices():
     """QWEN36_DECODE_DRAM_SHARDED -> the set of decode projections that run on the DRAM-sharded kernel.
 
-    "0"/unset: none (default). "1": down only (the original opt-in). Otherwise a comma list of
-    down | gateup (aliases gate, up) | all, e.g. "gateup" or "down,gateup"."""
+    Unset: "all" (the default since 2026-09-24). "0": none (the 1D mcast path). "1": down only (the original opt-in).
+    Otherwise a comma list of down | gateup (aliases gate, up) | all, e.g. "gateup" or "down,gateup"."""
     # Default "all" since the 2026-09-24 P/D-stack gate: gateup GSM8K-200 0.835, all 0.82 (baseline 0.825 +- 0.027), zero
     # degenerate answers, greedy deterministic; b1 TPOT 29.4 -> 27.2 ms, 32 users 128/128 591 -> 648 t/s. "0" restores the
     # 1D mcast path byte-for-byte.
