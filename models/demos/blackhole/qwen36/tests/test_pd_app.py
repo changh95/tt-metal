@@ -158,3 +158,18 @@ def test_pure_helpers():
 def test_fanout_knob(value, expected):
     env = {"QWEN36_PD_PROXY_FANOUT": value} if value else {}
     assert pd_app.BundleConfig.from_env(env).proxy_fanout is expected
+
+
+def test_weight_cache_is_warm_only_with_a_marker_for_this_code(tmp_path):
+    """An existing cache directory from an older image is cold (new code may add weight files; two halves converting
+    the same missing files at once corrupt each other); the marker written at READY makes it warm."""
+    cache = tmp_path / "cache"
+    (cache / "P150x4" / "tensor_cache_bfp8_mesh1x4" / "layers.0").mkdir(parents=True)
+    (cache / "P150x4" / "tensor_cache_bfp8_mesh1x4" / "layers.0" / "x.tensorbin").write_bytes(b"1")
+    env = {"TT_CACHE_PATH": str(cache)}
+    assert pd_app.weight_cache_is_warm(env) is False
+    pd_app.mark_weight_cache_warm(env)
+    assert pd_app.weight_cache_is_warm(env) is True
+    assert (cache / f".qwen36_pd_warm_{pd_app.model_code_fingerprint()}").is_file()
+    assert pd_app.weight_cache_is_warm({"TT_CACHE_PATH": str(tmp_path / "missing")}) is False
+    assert pd_app.weight_cache_is_warm({}) is False

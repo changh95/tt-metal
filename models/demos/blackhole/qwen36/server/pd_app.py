@@ -268,17 +268,48 @@ def vllm_env(config: BundleConfig, role: str, base: Mapping[str, str] | None = N
     return env
 
 
-def weight_cache_is_warm(env: Mapping[str, str] | None = None) -> bool:
-    """Whether a converted 1x4 weight cache already exists under TT_CACHE_PATH (the model writes
-    ``.../tensor_cache_<dtype>_mesh1x4``).  On a cold cache P and D must not both convert at once."""
-    env = os.environ if env is None else env
+def model_code_fingerprint() -> str:
+    """sha256 (12 hex) over the model's Python sources (models/demos/blackhole/qwen36/tt/**/*.py): the set of weight
+    cache files the model reads and writes is a function of this code, not of the checkpoint alone."""
+    import hashlib
+
+    root = Path(__file__).resolve().parent.parent / "tt"
+    h = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        h.update(str(path.relative_to(root)).encode())
+        h.update(path.read_bytes())
+    return h.hexdigest()[:12]
+
+
+def _warm_marker(env: Mapping[str, str]) -> Path | None:
     root = env.get("TT_CACHE_PATH")
-    if not root or not Path(root).is_dir():
-        return False
-    for path in Path(root).rglob("tensor_cache_*_mesh1x4"):
-        if path.is_dir() and any(path.iterdir()):
-            return True
-    return False
+    if not root:
+        return None
+    return Path(root) / f".qwen36_pd_warm_{model_code_fingerprint()}"
+
+
+def weight_cache_is_warm(env: Mapping[str, str] | None = None) -> bool:
+    """Whether a converted 1x4 weight cache for THIS model code already exists under TT_CACHE_PATH: the marker
+    ``.qwen36_pd_warm_<code fingerprint>`` that mark_weight_cache_warm writes once a boot reached READY.  A cache
+    directory from an older image is not warm: new code may add weight files (2026-09-24: the DRAM-sharded decode
+    copies), and two halves converting the same missing files at once read each other's half-written tensors -- the
+    decode half failed at layer 29 and took the stack down.  On a cold cache P converts first, then D boots."""
+    env = os.environ if env is None else env
+    marker = _warm_marker(env)
+    return marker is not None and marker.is_file()
+
+
+def mark_weight_cache_warm(env: Mapping[str, str] | None = None) -> None:
+    """Record that the weight cache under TT_CACHE_PATH is complete for this model code (called once READY)."""
+    env = os.environ if env is None else env
+    marker = _warm_marker(env)
+    if marker is None:
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError as error:
+        _log("warm_marker_failed", path=str(marker), error=repr(error))
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -538,6 +569,7 @@ def create_app():
             await client.aclose()
             raise
         stack.boot["ready_seconds"] = round(time.monotonic() - t0, 1)
+        mark_weight_cache_warm()
         _log("stack_ready", **stack.boot)
         app.state.config = config
         app.state.stack = stack
