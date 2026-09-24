@@ -228,18 +228,20 @@ def test_verify_step(mesh_device):
         # untimed warm prefill (lazy allocations happen here, not inside a measured / compared region)
         _prefill(model, prompt_ids, page_tables, 1)
 
-        # --- served order (qwen36_vllm: prefill warm-up -> decode trace capture), then the verify traces ---
-        for w in sorted(set([w for w, _ in CONFIGS] + (DECODE_WIDTHS if DO_TIMING else []))):
-            refs[w] = DecodeRef(model, w, page_tables[:w])
-            refs[w].setup()
-        for (w, T), vs in steps.items():
-            t0 = time.perf_counter()
-            vs.compile()
-            t1 = time.perf_counter()
-            vs.capture()
-            logger.info(
-                f"[verify] ({w},{T}) R={vs.plan.R} compile {t1 - t0:.1f}s capture {time.perf_counter() - t1:.1f}s"
-            )
+        # --- served order (qwen36_vllm: prefill warm-up -> decode trace capture), then the verify traces. Only for
+        # the exactness phase: the timing phase captures/releases one trace at a time (see below) ---
+        if DO_EXACT:
+            for w in sorted(set(w for w, _ in CONFIGS)):
+                refs[w] = DecodeRef(model, w, page_tables[:w])
+                refs[w].setup()
+            for (w, T), vs in steps.items():
+                t0 = time.perf_counter()
+                vs.compile()
+                t1 = time.perf_counter()
+                vs.capture()
+                logger.info(
+                    f"[verify] ({w},{T}) R={vs.plan.R} compile {t1 - t0:.1f}s capture {time.perf_counter() - t1:.1f}s"
+                )
 
         # --- exactness per config ---
         if DO_EXACT:
@@ -331,30 +333,48 @@ def test_verify_step(mesh_device):
                     f"[verify] ({w},{T}) RESULT mechanism_identical={mech_ok} exact_vs_plain_decode={cfg_res['exact_vs_decode']}"
                 )
 
-        # --- timing (decode widths and the sub-trace sections FIRST: a w=32 verify replay has wedged the half) ---
+        # --- timing: exactly ONE trace alive at a time (the harness discipline; see tests/VERIFY_W32_AUDIT.md):
+        # decode width -> time -> release; per plan: sub-trace sections (each released), capture, time, release ---
         if DO_TIMING:
+            for r in refs.values():
+                r.release()
+            refs.clear()
+            for vs in steps.values():
+                vs.release()
             for w in DECODE_WIDTHS:
-                med, mn = refs[w].time_replays(N_REPLAYS)
+                r = DecodeRef(model, w, page_tables[:w])
+                r.setup()
+                med, mn = r.time_replays(N_REPLAYS)
+                r.release()
                 results["timing"][f"decode_w{w}"] = {"median_ms": med, "min_ms": mn}
                 logger.info(f"[verify] TIMING decode w={w} traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms")
             for (w, T), vs in steps.items():
                 sec = vs.time_sections_traced(N_REPLAYS)  # TRACED sub-traces (one layer of each kind, embed, head)
-                results["timing"][f"verify_w{w}_T{T}"] = {"R": vs.plan.R, "traced_sections_ms": sec}
-                logger.info(
-                    f"[verify] SECTIONS traced (w={w},T={T},R={vs.plan.R}) ms: attn_layer(T)={sec['attn_T']:.2f} "
-                    f"attn_layer(1 offset)={sec['attn_1']:.2f} per_offset={sec['attn_layer_per_offset']:.3f} "
-                    f"gdn_layer={sec['gdn']:.2f} embed={sec['embed']:.2f} head={sec['head']:.2f} | "
-                    f"x{sec['n_attn']} attn={sec['attn_layers_total']:.1f} (offset loop {sec['attn_offset_loop_total']:.1f}) "
-                    f"x{sec['n_gdn']} gdn={sec['gdn_layers_total']:.1f}"
-                )
-            for (w, T), vs in steps.items():
+                vs.compile()
+                vs.capture()
                 med, mn = vs.time_replays(N_REPLAYS)
-                results["timing"][f"verify_w{w}_T{T}"].update({"median_ms": med, "min_ms": mn})
-                sec = results["timing"][f"verify_w{w}_T{T}"]["traced_sections_ms"]
+                vs.release()
+                results["timing"][f"verify_w{w}_T{T}"] = {
+                    "R": vs.plan.R,
+                    "median_ms": med,
+                    "min_ms": mn,
+                    "traced_sections_ms": sec,
+                }
+                dec = results["timing"].get(f"decode_w{w}", {}).get("median_ms")
                 logger.info(
-                    f"[verify] TIMING verify (w={w},T={T},R={vs.plan.R}) traced x{N_REPLAYS}: med {med:.2f} min {mn:.2f} ms "
-                    f"| attention offset loop {100 * sec['attn_offset_loop_total'] / med:.0f}% of step, "
-                    f"attn layers {100 * sec['attn_layers_total'] / med:.0f}%, gdn layers {100 * sec['gdn_layers_total'] / med:.0f}%"
+                    f"[verify] TIMING verify (w={w},T={T},R={vs.plan.R}) attn={sec['attn_mode']} traced x{N_REPLAYS}: "
+                    f"med {med:.2f} min {mn:.2f} ms" + (f" = {med / dec:.2f}x decode w{w} ({dec:.2f})" if dec else "")
+                )
+                logger.info(
+                    f"[verify] SECTIONS traced (w={w},T={T}) ms: attn_layer[{sec['attn_mode']}]={sec['attn_T']:.2f} "
+                    f"attn_offsets_T={sec['attn_offsets_T']:.2f} attn_1={sec['attn_1']:.2f} "
+                    f"per_offset={sec['attn_layer_per_offset']:.3f}"
+                    + (f" attn_batched={sec['attn_batched']:.2f}" if "attn_batched" in sec else "")
+                    + f" gdn_layer={sec['gdn']:.2f} embed={sec['embed']:.2f} head={sec['head']:.2f} | "
+                    f"x{sec['n_attn']} attn={sec['attn_layers_total']:.1f} ({100 * sec['attn_layers_total'] / med:.0f}%), "
+                    f"x{sec['n_gdn']} gdn={sec['gdn_layers_total']:.1f} ({100 * sec['gdn_layers_total'] / med:.0f}%), "
+                    f"embed+head={sec['embed'] + sec['head']:.1f}, "
+                    f"per-offset loop would be {sec['attn_offset_loop_total']:.1f} ({100 * sec['attn_offset_loop_total'] / med:.0f}%)"
                 )
     finally:
         for vs in steps.values():

@@ -6,6 +6,8 @@ VERIFY_ISO = E1  : DecodeRef(32) with the test's traced argmax tail, capture + 5
              E1b : DecodeRef(32) with the harness output path (replicated logits, no argmax ops), capture + 50 replays.
              E2  : VerifyPlan(32,4) allocation + compile + capture (no verify replay), then DecodeRef(32) capture + 50 replays.
              E3  : E2 + 50 verify replays (QWEN36_SDPA_DEC_MAX_CORES_PER_HEAD may be set by the caller).
+             E4  : two live decode traces (w=8 then w=32), replays interleaved, no verify code.
+             E5  : E4 with release_trace of the w=8 trace before the w=32 capture (the harness discipline).
 """
 import os
 import time
@@ -99,6 +101,34 @@ def test_w32_isolation(mesh_device):
             logger.info(
                 f"[iso] verify (32,4) compiled + captured (R={vs.plan.R}, gdn={'kernel' if vs.plan.gdn_kernel else 'stub'})"
             )
+        if ISO in ("E4", "E5"):
+            # two decode traces, w=8 then w=32; E4 keeps both alive and interleaves their replays, E5 releases w8 first
+            ref8 = DecodeRef(model, 8, page_tables[:8])
+            ref8.setup()
+            logger.info("[iso] DecodeRef(8) captured")
+            if ISO == "E5":
+                med, mn = ref8.time_replays(N)
+                logger.info(f"[iso] decode w8 replays {N}: med {med:.2f} ms; releasing its trace")
+                ref8.release()
+            ref = DecodeRef(model, 32, page_tables[:32])
+            ref.setup()
+            logger.info("[iso] DecodeRef(32) captured")
+            for rnd in range(N // 10):
+                if ISO == "E4":
+                    med8, _ = ref8.time_replays(10)
+                    med32, _ = ref.time_replays(10)
+                    logger.info(
+                        f"[iso] round {rnd + 1}: decode w8 {med8:.2f} ms, w32 {med32:.2f} ms (both traces alive)"
+                    )
+                else:
+                    med32, _ = ref.time_replays(10)
+                    logger.info(
+                        f"[iso] decode w32 replays {10 * (rnd + 1)}/{N}: med {med32:.2f} ms (w8 trace released)"
+                    )
+            if ISO == "E4":
+                ref8.release()
+            print(f"ISO_RESULT {ISO} completed")
+            return
         ref = (DecodeRefHarness if ISO == "E1b" else DecodeRef)(model, 32, page_tables[:32])
         ref.setup()
         logger.info(f"[iso] DecodeRef(32) captured ({type(ref).__name__})")
