@@ -24,7 +24,8 @@ ttnn::Tensor paged_update_cache(
     const std::optional<const std::set<ttnn::MeshCoordinate>>& mesh_coords,
     std::optional<uint32_t> block_size_override,
     std::optional<uint32_t> num_kv_heads_override,
-    std::optional<uint32_t> cache_position_modulo) {
+    std::optional<uint32_t> cache_position_modulo,
+    std::optional<uint32_t> num_tokens) {
     return ttnn::prim::paged_update_cache(
         cache_tensor,
         input_tensor,
@@ -37,7 +38,8 @@ ttnn::Tensor paged_update_cache(
         mesh_coords,
         block_size_override,
         num_kv_heads_override,
-        cache_position_modulo);
+        cache_position_modulo,
+        num_tokens);
 }
 
 std::tuple<ttnn::Tensor, ttnn::Tensor> paged_fused_update_cache(

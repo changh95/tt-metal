@@ -49,6 +49,12 @@ void bind_experimental_paged_cache_operations(nb::module_& mod) {
          without it, positions past the bounded capacity collapse onto block 0
          and silently corrupt the cache. Must be a multiple of the effective
          ``block_size`` and ≤ ``page_table.shape[1] * block_size``.
+         ``num_tokens`` (optional, default 1) writes T consecutive positions per user in one
+         call (speculative-decoding verify step): core b writes positions update_idxs[b] ..
+         update_idxs[b] + T - 1 from the untilized rows ``h * T + j`` (kv head h, token j) of its
+         [32, head_dim] input shard; the span may cross a 32-row tile / block boundary. Bit-exact
+         with T sequential single-row calls. Requires ``update_idxs_tensor`` and
+         ``num_kv_heads * T <= 32``.
         )doc";
 
     ttnn::bind_function<"paged_update_cache", "ttnn.experimental.">(
@@ -67,7 +73,8 @@ void bind_experimental_paged_cache_operations(nb::module_& mod) {
         nb::arg("mesh_coords").noconvert() = nb::none(),
         nb::arg("block_size") = nb::none(),
         nb::arg("num_kv_heads") = nb::none(),
-        nb::arg("cache_position_modulo") = nb::none());
+        nb::arg("cache_position_modulo") = nb::none(),
+        nb::arg("num_tokens") = nb::none());
 
     const auto* paged_fused_update_cache_doc =
         R"doc(

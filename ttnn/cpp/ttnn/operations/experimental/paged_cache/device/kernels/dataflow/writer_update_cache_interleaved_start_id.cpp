@@ -52,6 +52,22 @@ void kernel_main() {
 
     constexpr uint32_t TILE_HEIGHT = 32;
 
+    // Multi-token (speculative-verify) mode, see the reader: T = UPDATE_CACHE_NUM_TOKENS consecutive positions per
+    // user from the input shard's untilized rows h*T + j; per head two RMW segments (tile of update_idx, and the tile
+    // of update_idx + rows_in_tile0 when the span crosses a 32-row boundary). Rows of a segment are contiguous both in
+    // the input and in the untilized cache tile, so each segment is one L1->L1 copy of rows*Wbytes.
+#ifdef UPDATE_CACHE_NUM_TOKENS
+    constexpr uint32_t num_tokens = UPDATE_CACHE_NUM_TOKENS;
+#else
+    constexpr uint32_t num_tokens = 1;
+#endif
+    constexpr uint32_t num_segments = num_tokens > 1 ? 2 : 1;
+    // per segment: number of token rows, first row inside the cache tile, first token index
+    uint32_t seg_rows[2] = {1, 0};
+    uint32_t seg_first_row[2] = {0, 0};
+    uint32_t seg_first_token[2] = {0, 0};
+    uint32_t cache_id_seg1 = 0;
+
     const auto s0 = TensorAccessor(s0_args, cache_addr);
 
     CircularBuffer cb_cache(cache_cb_id);
@@ -96,14 +112,43 @@ void kernel_main() {
                 const uint32_t block_offset = block_row_tile * Wt;
                 cache_id = block_start_id + block_offset;
 
+                if constexpr (num_tokens > 1) {
+                    const uint32_t rows_in_tile0 = TILE_HEIGHT - (update_idx % TILE_HEIGHT);
+                    if (rows_in_tile0 < num_tokens) {
+                        uint32_t update_idx1 = update_idx + rows_in_tile0;
+                        if (cache_position_modulo > 0 && update_idx1 >= cache_position_modulo) {
+                            update_idx1 -= cache_position_modulo;
+                        }
+                        const uint32_t physical_block_id1 = page_table_ptr[update_idx1 / block_size];
+                        cache_id_seg1 = physical_block_id1 * num_heads * block_size_t * Wt +
+                                        ((update_idx1 % block_size) / TILE_HEIGHT) * Wt;
+                    }
+                }
+
                 // Page-table value consumed; pop to balance the wait above.
                 cb_page_table.pop_front(1);
             } else {
                 const uint32_t cache_batch_tile_offset = my_batch_idx * cache_batch_num_tiles;
                 const uint32_t cache_start_id = cache_batch_tile_offset + (update_idx / TILE_HEIGHT) * Wt;
                 cache_id = cache_start_id;
+                if constexpr (num_tokens > 1) {
+                    const uint32_t rows_in_tile0 = TILE_HEIGHT - (update_idx % TILE_HEIGHT);
+                    if (rows_in_tile0 < num_tokens) {
+                        cache_id_seg1 = cache_batch_tile_offset + ((update_idx + rows_in_tile0) / TILE_HEIGHT) * Wt;
+                    }
+                }
             }
             cache_tile_offset_B = update_idx % TILE_HEIGHT * Wbytes;
+            if constexpr (num_tokens > 1) {
+                const uint32_t first_row = update_idx % TILE_HEIGHT;
+                const uint32_t rows_in_tile0 = TILE_HEIGHT - first_row;
+                seg_first_row[0] = first_row;
+                seg_rows[0] = rows_in_tile0 < num_tokens ? rows_in_tile0 : num_tokens;
+                seg_first_token[0] = 0;
+                seg_first_row[1] = 0;
+                seg_rows[1] = num_tokens - seg_rows[0];  // 0 when the span does not cross
+                seg_first_token[1] = seg_rows[0];
+            }
         }
         // The index value is consumed on both the skip and update paths; the reader pushes
         // cb_index unconditionally, so pop it here (outside the skip branch) to balance the wait.
@@ -118,43 +163,60 @@ void kernel_main() {
     UnicastEndpoint local_src;
 
     for (uint32_t cur_head = 0; cur_head < num_heads; ++cur_head) {
-        // Wait on compute to untilize a block. Update that block in L1.
-        cb_untilized_cache.wait_front(Wt);
-        cb_untilized_cache2.reserve_back(Wt);
+        for (uint32_t seg = 0; seg < num_segments; ++seg) {
+            // Wait on compute to untilize a block. Update that block in L1.
+            cb_untilized_cache.wait_front(Wt);
+            cb_untilized_cache2.reserve_back(Wt);
 
-        uint32_t cache_l1_write_addr = cb_untilized_cache.get_read_ptr() + cache_tile_offset_B;
-        noc.async_read(
-            local_src,
-            CoreLocalMem<uint32_t>(cache_l1_write_addr),
-            Wbytes,
-            {.noc_x = my_noc_x, .noc_y = my_noc_y, .addr = input_l1_read_addr},
-            {});
-        noc.async_read_barrier();
-        cb_untilized_cache2.push_back(Wt);
-        cb_untilized_cache.pop_front(Wt);  // NEW
-
-        // Wait on compute to tilize an updated block. Write that block to DRAM
-        cb_cache.wait_front(Wt);
-        if (!skip_update) {
-            uint32_t out_l1_read_addr = cb_cache.get_read_ptr();
-            for (uint32_t curr_cache_id = cache_id; curr_cache_id < cache_id + Wt; ++curr_cache_id) {
-                noc.async_write(
-                    CoreLocalMem<uint32_t>(out_l1_read_addr), s0, cache_tile_bytes, {}, {.page_id = curr_cache_id});
-                out_l1_read_addr += cache_tile_bytes;
+            if constexpr (num_tokens == 1) {
+                uint32_t cache_l1_write_addr = cb_untilized_cache.get_read_ptr() + cache_tile_offset_B;
+                noc.async_read(
+                    local_src,
+                    CoreLocalMem<uint32_t>(cache_l1_write_addr),
+                    Wbytes,
+                    {.noc_x = my_noc_x, .noc_y = my_noc_y, .addr = input_l1_read_addr},
+                    {});
+                noc.async_read_barrier();
+            } else if (seg_rows[seg] > 0) {
+                // rows seg_first_row..+rows of the untilized cache tile <- input rows h*T + seg_first_token..+rows
+                uint32_t cache_l1_write_addr = cb_untilized_cache.get_read_ptr() + seg_first_row[seg] * Wbytes;
+                noc.async_read(
+                    local_src,
+                    CoreLocalMem<uint32_t>(cache_l1_write_addr),
+                    seg_rows[seg] * Wbytes,
+                    {.noc_x = my_noc_x, .noc_y = my_noc_y, .addr = input_l1_read_addr + seg_first_token[seg] * Wbytes},
+                    {});
+                noc.async_read_barrier();
             }
+            cb_untilized_cache2.push_back(Wt);
+            cb_untilized_cache.pop_front(Wt);  // NEW
 
-            noc.async_writes_flushed();
-        }
-        cb_cache.pop_front(Wt);
+            const bool seg_write = num_tokens == 1 || seg_rows[seg] > 0;
+            const uint32_t seg_cache_id = seg == 0 ? cache_id : cache_id_seg1;
+            // Wait on compute to tilize an updated block. Write that block to DRAM
+            cb_cache.wait_front(Wt);
+            if (!skip_update && seg_write) {
+                uint32_t out_l1_read_addr = cb_cache.get_read_ptr();
+                for (uint32_t curr_cache_id = seg_cache_id; curr_cache_id < seg_cache_id + Wt; ++curr_cache_id) {
+                    noc.async_write(
+                        CoreLocalMem<uint32_t>(out_l1_read_addr), s0, cache_tile_bytes, {}, {.page_id = curr_cache_id});
+                    out_l1_read_addr += cache_tile_bytes;
+                }
 
-        if (!skip_update) {
-            // Delay syncing the writes to maximize perf.
-            noc.async_write_barrier();
+                noc.async_writes_flushed();
+            }
+            cb_cache.pop_front(Wt);
+
+            if (!skip_update && seg_write) {
+                // Delay syncing the writes to maximize perf.
+                noc.async_write_barrier();
+            }
         }
 
         // read from next head
-        input_l1_read_addr += Wbytes;
+        input_l1_read_addr += num_tokens * Wbytes;
         cache_id += head_offset_t;
+        cache_id_seg1 += head_offset_t;
     }
 
     cb_untilized_input.pop_front(Wt);

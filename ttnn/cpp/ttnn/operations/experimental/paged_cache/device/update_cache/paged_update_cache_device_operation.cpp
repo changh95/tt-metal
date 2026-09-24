@@ -297,6 +297,27 @@ void PagedUpdateCacheDeviceOperation::validate_on_program_cache_miss(
         "cache dtype and should not receive low-precision packed input");
 
     TT_FATAL(operation_attributes.batch_offset == 0, "batch_offset must be 0");
+
+    // Multi-token (speculative verify) mode
+    const uint32_t num_tokens = operation_attributes.num_tokens;
+    TT_FATAL(num_tokens >= 1, "num_tokens must be >= 1, got {}", num_tokens);
+    if (num_tokens > 1) {
+        TT_FATAL(
+            update_idxs_tensor.has_value(), "num_tokens > 1 requires update_idxs_tensor (positions read on device)");
+        TT_FATAL(!operation_attributes.share_cache, "num_tokens > 1 is not supported with share_cache");
+        TT_FATAL(
+            num_tokens <= tt::constants::TILE_HEIGHT,
+            "num_tokens ({}) must be <= TILE_HEIGHT ({}): a span touches at most two KV tile rows",
+            num_tokens,
+            tt::constants::TILE_HEIGHT);
+        const uint32_t num_heads = operation_attributes.num_kv_heads_override.value_or(cache_tensor.padded_shape()[1]);
+        TT_FATAL(
+            num_heads * num_tokens <= tt::constants::TILE_HEIGHT,
+            "num_kv_heads ({}) * num_tokens ({}) must fit the {}-row input shard (rows h*num_tokens + j)",
+            num_heads,
+            num_tokens,
+            tt::constants::TILE_HEIGHT);
+    }
 }
 
 PagedUpdateCacheDeviceOperation::spec_return_value_t PagedUpdateCacheDeviceOperation::compute_output_specs(
@@ -326,6 +347,7 @@ ttsl::hash::hash_t PagedUpdateCacheDeviceOperation::compute_program_hash(
     // - block_size_override: enters compile-time args
     // - num_kv_heads_override: enters compile-time args
     // - cache_position_modulo: enters compile-time args
+    // - num_tokens: enters the kernels' defines (multi-token verify mode)
     return operation::hash_operation<PagedUpdateCacheDeviceOperation>(
         args.compute_kernel_config,
         args.share_cache,
@@ -333,6 +355,7 @@ ttsl::hash::hash_t PagedUpdateCacheDeviceOperation::compute_program_hash(
         args.block_size_override,
         args.num_kv_heads_override,
         args.cache_position_modulo,
+        args.num_tokens,
         tensor_args,
         program_factory.index());
 }
@@ -353,7 +376,8 @@ ttnn::experimental::prim::PagedUpdateCacheDeviceOperation::tensor_return_value_t
     const std::optional<const std::set<ttnn::MeshCoordinate>>& mesh_coords,
     std::optional<uint32_t> block_size_override,
     std::optional<uint32_t> num_kv_heads_override,
-    std::optional<uint32_t> cache_position_modulo) {
+    std::optional<uint32_t> cache_position_modulo,
+    std::optional<uint32_t> num_tokens) {
     using OperationType = ttnn::experimental::prim::PagedUpdateCacheDeviceOperation;
 
     auto kernel_config_val = init_device_compute_kernel_config(input_tensor.device()->arch(), compute_kernel_config);
@@ -367,7 +391,8 @@ ttnn::experimental::prim::PagedUpdateCacheDeviceOperation::tensor_return_value_t
         .mesh_coords = mesh_coords,
         .block_size_override = block_size_override,
         .num_kv_heads_override = num_kv_heads_override,
-        .cache_position_modulo = cache_position_modulo};
+        .cache_position_modulo = cache_position_modulo,
+        .num_tokens = num_tokens.value_or(1)};
 
     auto tensor_args = OperationType::tensor_args_t{
         .cache_tensor = cache_tensor,

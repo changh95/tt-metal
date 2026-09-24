@@ -345,6 +345,12 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
         num_heads,
     };
 
+    // Multi-token verify mode: the kernels read UPDATE_CACHE_NUM_TOKENS as a define (absent = 1 = the decode path).
+    KernelDescriptor::Defines kernel_defines;
+    if (operation_attributes.num_tokens > 1) {
+        kernel_defines.emplace_back("UPDATE_CACHE_NUM_TOKENS", std::to_string(operation_attributes.num_tokens));
+    }
+
     KernelDescriptor reader_desc;
     reader_desc.kernel_source =
         "ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/"
@@ -352,6 +358,7 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
     reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     reader_desc.core_ranges = all_cores;
     reader_desc.compile_time_args = std::move(reader_compile_time_args);
+    reader_desc.defines = kernel_defines;
     reader_desc.config = ReaderConfigDescriptor{};
 
     KernelDescriptor writer_desc;
@@ -361,6 +368,7 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
     writer_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     writer_desc.core_ranges = all_cores;
     writer_desc.compile_time_args = std::move(writer_compile_time_args);
+    writer_desc.defines = kernel_defines;
     writer_desc.config = WriterConfigDescriptor{};
 
     KernelDescriptor compute_desc;
@@ -369,6 +377,7 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
     compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     compute_desc.core_ranges = all_cores;
     compute_desc.compile_time_args = std::move(compute_kernel_args);
+    compute_desc.defines = kernel_defines;
     compute_desc.config = ComputeConfigDescriptor{.fp32_dest_acc_en = fp32_dest_acc_en};
 
     Buffer* const index_buffer_for_rt = use_index_tensor ? update_idxs_tensor.value().buffer() : nullptr;

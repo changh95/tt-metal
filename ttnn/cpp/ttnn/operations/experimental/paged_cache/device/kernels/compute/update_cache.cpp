@@ -44,7 +44,16 @@ void kernel_main() {
         compute_kernel_lib::untilize_config::WaitMode::WaitBlock,
         compute_kernel_lib::untilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
 
-    for (uint32_t cur_head = 0; cur_head < num_heads; ++cur_head) {
+    // Multi-token mode (UPDATE_CACHE_NUM_TOKENS > 1, see the dataflow kernels): two read-modify-write segments per
+    // head (the token span may cross a 32-row tile boundary); the dataflow kernels keep the handshake for an inactive
+    // second segment, so the loop count is static.
+#ifdef UPDATE_CACHE_NUM_TOKENS
+    constexpr uint32_t num_segments = (UPDATE_CACHE_NUM_TOKENS > 1) ? 2 : 1;
+#else
+    constexpr uint32_t num_segments = 1;
+#endif
+
+    for (uint32_t cur_head = 0; cur_head < num_heads * num_segments; ++cur_head) {
         compute_kernel_lib::untilize<Wt, cache_cb, untilized_cache_cb>(1);
 
         // Wait on writer to update block, then tilize back

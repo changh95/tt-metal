@@ -51,6 +51,20 @@ void kernel_main() {
 
     constexpr uint32_t head_offset_t = Wt * St;
 
+    // Multi-token (speculative-verify) mode, UPDATE_CACHE_NUM_TOKENS = T > 1 (host: paged_update_cache(num_tokens=T)):
+    // one core writes T consecutive positions update_idx..update_idx+T-1 of its user from the input shard's untilized
+    // rows h*T + j (head h, token j). The span covers one KV tile row, or two when it crosses a 32-row tile boundary
+    // (possibly into another physical block), so every head is read-modify-written as two SEGMENTS: segment 0 at
+    // update_idx, segment 1 at update_idx + (32 - update_idx % 32), the latter active only when the span crosses.
+    // Inactive segments keep the CB handshake with compute (push without a NoC read) so the compute loop stays static.
+    // T == 1 (no define) is the original single-row path, op for op.
+#ifdef UPDATE_CACHE_NUM_TOKENS
+    constexpr uint32_t num_tokens = UPDATE_CACHE_NUM_TOKENS;
+#else
+    constexpr uint32_t num_tokens = 1;
+#endif
+    constexpr uint32_t num_segments = num_tokens > 1 ? 2 : 1;
+
     CircularBuffer cb_cache(cache_cb_id);
     CircularBuffer cb_input(input_cb_id);
     CircularBuffer cb_index(cb_index_id);
@@ -65,6 +79,10 @@ void kernel_main() {
     constexpr uint32_t TILE_HEIGHT = 32;
 
     uint32_t cache_id = cache_start_id;
+    // segment 1 (multi-token mode only): tile row of update_idx + (32 - update_idx % 32); inactive unless the span
+    // crosses
+    uint32_t cache_id_seg1 = 0;
+    bool seg1_active = false;
 
     const auto s0 = TensorAccessor(s0_args, cache_addr);
 
@@ -113,10 +131,30 @@ void kernel_main() {
                 const uint32_t block_offset = block_row_tile * Wt;
                 cache_id = block_start_id + block_offset;
 
+                if constexpr (num_tokens > 1) {
+                    const uint32_t rows_in_tile0 = TILE_HEIGHT - (update_idx % TILE_HEIGHT);
+                    if (rows_in_tile0 < num_tokens) {
+                        seg1_active = true;
+                        uint32_t update_idx1 = update_idx + rows_in_tile0;
+                        if (cache_position_modulo > 0 && update_idx1 >= cache_position_modulo) {
+                            update_idx1 -= cache_position_modulo;
+                        }
+                        const uint32_t physical_block_id1 = page_table_ptr[update_idx1 / block_size];
+                        cache_id_seg1 = physical_block_id1 * num_heads * block_size_t * Wt +
+                                        ((update_idx1 % block_size) / TILE_HEIGHT) * Wt;
+                    }
+                }
             } else {
                 const uint32_t cache_batch_tile_offset = my_batch_idx * cache_batch_num_tiles;
                 const uint32_t cache_start_id = cache_batch_tile_offset + (update_idx / TILE_HEIGHT) * Wt;
                 cache_id = cache_start_id;
+                if constexpr (num_tokens > 1) {
+                    const uint32_t rows_in_tile0 = TILE_HEIGHT - (update_idx % TILE_HEIGHT);
+                    if (rows_in_tile0 < num_tokens) {
+                        seg1_active = true;
+                        cache_id_seg1 = cache_batch_tile_offset + ((update_idx + rows_in_tile0) / TILE_HEIGHT) * Wt;
+                    }
+                }
             }
         }
     }
@@ -129,19 +167,28 @@ void kernel_main() {
     }
 
     for (uint32_t cur_head = 0; cur_head < num_heads; ++cur_head) {
-        cb_cache.reserve_back(Wt);
-        if (!skip_update) {
-            uint32_t cache_l1_write_addr = cb_cache.get_write_ptr();
-            for (uint32_t curr_cache_id = cache_id; curr_cache_id < cache_id + Wt; ++curr_cache_id) {
-                noc.async_read(
-                    s0, CoreLocalMem<uint32_t>(cache_l1_write_addr), cache_tile_bytes, {.page_id = curr_cache_id}, {});
-                cache_l1_write_addr += cache_tile_bytes;
-            }
+        for (uint32_t seg = 0; seg < num_segments; ++seg) {
+            const bool seg_active = seg == 0 || seg1_active;
+            const uint32_t seg_cache_id = seg == 0 ? cache_id : cache_id_seg1;
+            cb_cache.reserve_back(Wt);
+            if (!skip_update && seg_active) {
+                uint32_t cache_l1_write_addr = cb_cache.get_write_ptr();
+                for (uint32_t curr_cache_id = seg_cache_id; curr_cache_id < seg_cache_id + Wt; ++curr_cache_id) {
+                    noc.async_read(
+                        s0,
+                        CoreLocalMem<uint32_t>(cache_l1_write_addr),
+                        cache_tile_bytes,
+                        {.page_id = curr_cache_id},
+                        {});
+                    cache_l1_write_addr += cache_tile_bytes;
+                }
 
-            noc.async_read_barrier();
+                noc.async_read_barrier();
+            }
+            cb_cache.push_back(Wt);
         }
-        cb_cache.push_back(Wt);
 
         cache_id += head_offset_t;
+        cache_id_seg1 += head_offset_t;
     }
 }

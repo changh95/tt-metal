@@ -47,6 +47,13 @@ def gdn_multi_token_kernel_available():
     return all(k in doc for k in ("num_tokens", "qkv_prev", "accept"))
 
 
+def attn_multi_token_update_available():
+    """True when ttnn.experimental.paged_update_cache exposes num_tokens (the T-row KV write of the batched verify
+    attention middle, attention/tp.py _attend_paged_verify_batched)."""
+    doc = getattr(ttnn.experimental.paged_update_cache, "__doc__", None) or ""
+    return "num_tokens" in doc
+
+
 def gdn_multi_token_kernel(T, layer, qkv_cur, qkv_prev, accept_tt):
     """The multi-token GDN verify kernel call (interface contract with the kernel being built concurrently):
     qkv_cur [1,R,W] bf16 TILE (this step's [q|k|v|z|a|b] rows), qkv_prev [1,R,W] (the previous step's, zeros at the
@@ -186,6 +193,40 @@ class VerifyPlan:
                 for j in range(T)
             ]
             self._ensure_gdn_scratch()
+        # --- attention middle: "batched" (one T-row KV write + one virtual-user SDPA per layer) or "offsets" (T
+        # per-offset decode passes, the reference). QWEN36_VERIFY_ATTN overrides; batched needs the multi-token
+        # paged_update_cache build and one local KV head.
+        attn0 = next((l.attention for l in model.layers if l.is_full_attention), None)
+        batched_ok = attn_multi_token_update_available() and attn0 is not None and attn0.NKV == 1
+        self.attn_mode = os.environ.get("QWEN36_VERIFY_ATTN", "batched" if batched_ok else "offsets")
+        assert self.attn_mode in ("batched", "offsets"), self.attn_mode
+        if self.attn_mode == "batched":
+            assert batched_ok, "QWEN36_VERIFY_ATTN=batched needs paged_update_cache(num_tokens=) and NKV == 1"
+        self.debug_attn_mode = None  # timing only: force a mode for one sub-trace
+        self.exact_mm = _EXACT_MM
+        # 0/1 spread [w*32, R]: row s*32+j <- row s*T+j (the KV update input: user s's shard row j = token j)
+        spread = torch.zeros(1, 1, self.w * tpc.TILE_SIZE, R, dtype=torch.float32)
+        for s_ in range(self.w):
+            for j in range(T):
+                spread[0, 0, s_ * tpc.TILE_SIZE + j, vg.row(s_, j, T)] = 1.0
+        self.spread = self._up(spread, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        # per-ROW rope cos/sin [1,1,R,rd] (row s*T+j = position P_s+j) and the virtual-user SDPA inputs: cur_pos
+        # [R] (P_s+j) and page table [R, blocks] (row s*T+j = pt[s]), in row chunks of <= the core count
+        self.cos_rows = self._up(torch.zeros(1, 1, R, rd, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        self.sin_rows = self._up(torch.zeros(1, 1, R, rd, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        grid = mesh.compute_with_storage_grid_size()
+        n_cores = grid.x * grid.y
+        n_split = int(os.environ.get("QWEN36_VERIFY_SDPA_SPLIT", "0")) or -(-R // n_cores)
+        per = -(-R // n_split)
+        pt_rows = pt.to(torch.int32).repeat_interleave(self.T, dim=0).contiguous()  # [R, blocks]
+        self.sdpa_chunks = []  # (row a, row b, page_table [b-a, blocks], cur_pos [b-a])
+        for c in range(n_split):
+            a, b = c * per, min(R, (c + 1) * per)
+            if a >= b:
+                break
+            pt_c = self._up(pt_rows[a:b].contiguous(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            pos_c = self._up(torch.zeros(b - a, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            self.sdpa_chunks.append((a, b, pt_c, pos_c))
         self.trace_id = None
         self.out_idx = self.out_val = None
         self._host_refs = []
@@ -202,7 +243,8 @@ class VerifyPlan:
             )
         logger.info(
             f"[verify] plan w={self.w} T={self.T} R={R} fused_ar={self.fused_ar} "
-            f"gdn={'multi-token kernel' if self.gdn_kernel else 'per-token STUB'}"
+            f"gdn={'multi-token kernel' if self.gdn_kernel else 'per-token STUB'} attn={self.attn_mode} "
+            f"(sdpa chunks {[(a, b) for a, b, _, _ in self.sdpa_chunks]})"
         )
 
     # ------------------------------------------------------------------------------------------ helpers
@@ -351,6 +393,13 @@ class VerifyPlan:
             cos, sin = vg.rope_cos_sin(pj + rope_delta, args.rope_head_dim, args.rope_theta)
             dma(cos, self.cos[j], ttnn.bfloat16, ttnn.TILE_LAYOUT)
             dma(sin, self.sin[j], ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        # batched attention middle: per-row positions / rope
+        rows_pos = vg.row_positions(positions, T, R)
+        cos_r, sin_r = vg.rope_cos_sin(rows_pos + rope_delta, args.rope_head_dim, args.rope_theta)
+        dma(cos_r, self.cos_rows, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        dma(sin_r, self.sin_rows, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        for a, b, _, pos_c in self.sdpa_chunks:
+            dma(rows_pos[a:b].contiguous(), pos_c, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         acc = torch.tensor([int(a) for a in accept_prev], dtype=torch.int32)
         assert acc.shape[0] == w and int(acc.min()) >= 0 and int(acc.max()) < T, acc
         dma(acc, self.accept, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
@@ -532,14 +581,21 @@ class VerifyStep:
 
     def time_sections_traced(self, n=50):
         """TRACED per-section times (ms, median of n replays) from sub-traces of the body run on persistent inputs:
-        one attention layer (all T offsets), the same layer with a single offset, one GDN layer, the embedding and the
-        head (final norm + LM head + argmax). Each sub-trace is compiled eagerly first, captured, replayed n times, and
-        released. Derived: per-offset attention cost = (attn_T - attn_1) / (T - 1)."""
+        one attention layer in the plan's mode ("attn_T"), the same layer on the per-offset path with all T offsets
+        ("attn_offsets_T") and with a single offset ("attn_1", ~ one decode attention pass at width w), the batched
+        layer ("attn_batched", when built), one GDN layer, the embedding and the head (final norm + LM head + argmax).
+        Each sub-trace is compiled eagerly first, captured, replayed n times, and released. Derived: per-offset
+        attention cost = (attn_offsets_T - attn_1) / (T - 1); attn_layers_total = n_attn * attn_T."""
         plan = self.plan
         res = {}
         n_attn = sum(1 for l in self.model.layers if l.is_full_attention)
         n_gdn = len(self.model.layers) - n_attn
-        for which, n_off in (("attn_T", None), ("attn_1", 1), ("gdn", None), ("embed", None), ("head", None)):
+        sections = [("attn_offsets_T", "offsets", None), ("attn_1", "offsets", 1)]
+        if plan.attn_mode == "batched" or attn_multi_token_update_available():
+            sections.append(("attn_batched", "batched", None))
+        sections += [("gdn", None, None), ("embed", None, None), ("head", None, None)]
+        for which, mode, n_off in sections:
+            plan.debug_attn_mode = mode
             plan.debug_attn_offsets = n_off
             self.plan.upload(*self._dummy_inputs())
             outs = self._section_body(which)  # compile
@@ -561,8 +617,11 @@ class VerifyStep:
             ms.sort()
             res[which] = ms[len(ms) // 2]
         plan.debug_attn_offsets = None
+        plan.debug_attn_mode = None
         T = plan.T
-        per_off = (res["attn_T"] - res["attn_1"]) / max(1, T - 1)
+        res["attn_mode"] = plan.attn_mode
+        res["attn_T"] = res["attn_batched"] if plan.attn_mode == "batched" else res["attn_offsets_T"]
+        per_off = (res["attn_offsets_T"] - res["attn_1"]) / max(1, T - 1)
         res["attn_layer_per_offset"] = per_off
         res["attn_layers_total"] = n_attn * res["attn_T"]
         res["attn_offset_loop_total"] = n_attn * T * per_off

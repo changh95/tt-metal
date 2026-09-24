@@ -17,6 +17,8 @@ from models.tt_transformers.tt.ccl import tt_all_reduce
 
 _SDPA_DEC_K_CHUNK = int(os.environ.get("QWEN36_SDPA_DEC_K_CHUNK", "0"))  # 0 = ttnn DYNAMIC_CHUNK_SIZE (default)
 _SDPA_DEC_MAX_CORES_PER_HEAD = int(os.environ.get("QWEN36_SDPA_DEC_MAX_CORES_PER_HEAD", "0"))  # 0 = factory default
+# Verify step (batched attention middle) only: cap on SDPA cores per virtual user; 0 = the decode knob / factory default
+_VERIFY_SDPA_MAX_CORES = int(os.environ.get("QWEN36_VERIFY_SDPA_MAX_CORES", "0"))
 
 
 def load_attention_weights_tp(mesh, state_dict, args, cache_dir=None):
@@ -833,6 +835,118 @@ class TPAttention:
         ttnn.deallocate(gate_flat)
         return ttnn.reshape(gated, (1, B, NH * HD), memory_config=_L1)
 
+    def _verify_sdpa_cfg(self):
+        _sdpa_grid = self.mesh.compute_with_storage_grid_size()
+        kw = {}
+        mc = _VERIFY_SDPA_MAX_CORES or _SDPA_DEC_MAX_CORES_PER_HEAD
+        if mc:
+            kw["max_cores_per_head_batch"] = mc
+        return ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=(_sdpa_grid.x, _sdpa_grid.y),
+            exp_approx_mode=False,
+            q_chunk_size=0,
+            k_chunk_size=_SDPA_DEC_K_CHUNK,
+            **kw,
+        )
+
+    def _attend_paged_verify_batched(self, qkv, plan, page_table):
+        """BATCHED verify attention middle: ONE KV write and ONE SDPA per layer for all R = w*T rows (vs T per-offset
+        passes of _attend_paged_decode). qkv [1,1,R,qkv3_dim+gate_dim] DRAM (row s*T+j = user s, token offset j).
+        Returns gated [1,R,NH*HD] (L1). Consumes qkv.
+
+        * Q: the R rows' [q|...] columns -> [1,R,NH,HD] (row-major round trip, exact) -> QK-norm -> partial RoPE with
+          the per-ROW cos/sin (plan.cos_rows/sin_rows, row (s,j) = position P_s+j). The per-row ops are the decode
+          ops on a different row count, bit-identical per row (tests/test_verify_attn_batched_scratch.py).
+        * K/V: [1,1,R,HD] -> K-norm + RoPE (prefill-shaped rope: one head, R rows) -> 0/1 spread matmul (exact) to
+          [1,w,32,HD] with row j of user s's shard = token j -> ONE paged_update_cache(num_tokens=T) per cache: core s
+          read-modify-writes the tile row(s) holding positions P_s..P_s+T-1 (bit-exact with T single-row calls; the
+          T-row RMW is what removes the same-tile race of T 'virtual users' in one call).
+        * SDPA: paged decode SDPA with B' = R VIRTUAL USERS (row (s,j) is a user at cur_pos P_s+j reading user s's page
+          table row) -> [1,R,NH,HD]; one call when R <= the core count, else ceil(R/110) calls over row chunks. Row
+          (s,j) sees exactly the K/V rows <= P_s+j (rows j' > j of the same user are masked by its own cur_pos). At a
+          single K chunk (context < 256 with the dynamic chunk) the result is bit-identical to the per-offset call at
+          B=w; with more chunks the core count per user differs (110/R vs 110/w) and so does the flash accumulation
+          order across chunks: PCC >= 0.9998 vs the per-offset path (both ~0.9998 vs an fp32 host reference).
+        * concat heads (row-major round trip) -> sigmoid gate."""
+        tw, NH, NKV, HD = self.tw, self.NH, self.NKV, self.HD
+        R, T, w = plan.R, plan.T, plan.w
+        assert NKV == 1, "batched verify attention assumes one local KV head (rows j of a user's shard = token j)"
+        _L1 = ttnn.L1_MEMORY_CONFIG
+        qkv3_dim = NH * HD + 2 * NKV * HD
+        gate_dim = NH * HD
+        q_flat = ttnn.slice(qkv, (0, 0, 0, 0), (1, 1, R, NH * HD), memory_config=_L1)
+        k_flat = ttnn.slice(qkv, (0, 0, 0, NH * HD), (1, 1, R, NH * HD + HD), memory_config=_L1)
+        v_flat = ttnn.slice(qkv, (0, 0, 0, NH * HD + HD), (1, 1, R, NH * HD + 2 * HD), memory_config=_L1)
+        gate = ttnn.slice(qkv, (0, 0, 0, qkv3_dim), (1, 1, R, qkv3_dim + gate_dim), memory_config=_L1)
+        ttnn.deallocate(qkv)
+        # --- Q heads: [1,1,R,NH*HD] -> [1,R,NH,HD] (exact row-major round trip) -> norm -> rope (per-row cos/sin)
+        q_rm = ttnn.to_layout(q_flat, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(q_flat)
+        q_rm4 = ttnn.reshape(q_rm, (1, R, NH, HD))
+        q = ttnn.to_layout(q_rm4, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(q_rm4)
+        if q_rm4 is not q_rm:
+            ttnn.deallocate(q_rm)
+        q = ttnn.multiply(ttnn.rms_norm(q, epsilon=1e-6, memory_config=_L1), tw["q_norm"], memory_config=_L1)
+        q = apply_partial_rope_decode(q, plan.cos_rows, plan.sin_rows, NH, R, self.rope_dim)  # DRAM [1,R,NH,HD]
+        # --- K: norm -> rope (one head, R rows) -> spread to (user, token) rows -> one T-row KV update
+        k = ttnn.multiply(ttnn.rms_norm(k_flat, epsilon=1e-6, memory_config=_L1), tw["k_norm"], memory_config=_L1)
+        ttnn.deallocate(k_flat)
+        k = apply_partial_rope_prefill(k, plan.cos_rows, plan.sin_rows, 1, self.rope_dim)  # L1 [1,1,R,HD]
+        keys, values = self.paged_k, self.paged_v
+        _kv_cfg = self._kv_shard_cfg(w)
+        pos0 = plan.cur_pos[0]  # [w] = P_s (token offset 0)
+        for cache, src in ((keys, k), (values, v_flat)):
+            sp = ttnn.matmul(plan.spread, src, compute_kernel_config=plan.exact_mm, memory_config=_L1)  # [1,1,w*32,HD]
+            ttnn.deallocate(src)
+            sp4 = ttnn.reshape(sp, (1, w, ttnn.TILE_SIZE, HD))
+            sh = ttnn.to_memory_config(sp4, _kv_cfg)
+            ttnn.deallocate(sp4)
+            if sp4 is not sp:
+                ttnn.deallocate(sp)
+            ttnn.experimental.paged_update_cache(
+                cache, sh, update_idxs_tensor=pos0, page_table=page_table, num_tokens=T
+            )
+            ttnn.deallocate(sh)
+        # --- SDPA over B' = R virtual users (row chunks of <= 110 users)
+        cfg = self._verify_sdpa_cfg()
+        outs = []
+        for a, b, pt_c, pos_c in plan.sdpa_chunks:
+            q_c = q if (a == 0 and b == R) else ttnn.slice(q, (0, a, 0, 0), (1, b, NH, HD))
+            outs.append(
+                ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                    q_c,
+                    keys,
+                    values,
+                    page_table_tensor=pt_c,
+                    cur_pos_tensor=pos_c,
+                    scale=self.scale,
+                    program_config=cfg,
+                    memory_config=_L1,
+                )
+            )
+            if q_c is not q:
+                ttnn.deallocate(q_c)
+        ttnn.deallocate(q)
+        if len(outs) == 1:
+            attn = outs[0]
+        else:
+            attn = ttnn.concat(outs, dim=1, memory_config=_L1)
+            for o in outs:
+                ttnn.deallocate(o)
+        # --- concat heads: [1,R,NH(pad 32),HD] -> [1,1,R,NH*HD] (exact row-major round trip) -> gate
+        a_rm = ttnn.to_layout(attn, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(attn)
+        a_rm2 = ttnn.reshape(a_rm, (1, 1, R, NH * HD))
+        attn_flat = ttnn.to_layout(a_rm2, ttnn.TILE_LAYOUT, memory_config=_L1)
+        ttnn.deallocate(a_rm2)
+        if a_rm2 is not a_rm:
+            ttnn.deallocate(a_rm)
+        gated = ttnn.multiply(attn_flat, ttnn.sigmoid(gate, memory_config=_L1), memory_config=_L1)
+        ttnn.deallocate(attn_flat)
+        ttnn.deallocate(gate)
+        return ttnn.reshape(gated, (1, R, NH * HD), memory_config=_L1)
+
     def forward_verify(self, x, plan, cur_pos_list, cos_list, sin_list, page_table):
         """Verify step of one attention layer over the R = w*T row grid.
 
@@ -840,12 +954,15 @@ class TPAttention:
         R-row matmul configs + the 0/1 gather/scatter constants). cur_pos_list[j] [w] int32 = P_s + j; cos/sin_list[j]
         [1,1,w,rope_dim]; page_table [w, blocks] (the REAL per-user rows, never duplicated).
 
-        In-projection once at R rows; then per token offset j: gather the w rows s*T+j (0/1 matmul, exact), run the
-        decode attention middle for w users at their own cur_pos (row j's K/V lands at P_s+j before its SDPA; rows
-        j' < j of the same user were written by the earlier iterations, so causality within the block holds and
-        rejected rows' K/V are simply overwritten next step); scatter the gated rows back. Out-projection once at R
-        rows, then the all-reduce: the fused decode all_reduce_async when x is the fused-AR residual (R <= 32), else
-        the reduce-scatter (fractured [1,1,R,dim/TP])."""
+        In-projection once at R rows; then the attention middle in plan.attn_mode:
+          * "batched" (default when the multi-token paged_update_cache is built): ONE T-row KV write per cache and ONE
+            virtual-user SDPA for all R rows (_attend_paged_verify_batched).
+          * "offsets" (reference / fallback): per token offset j, gather the w rows s*T+j (0/1 matmul, exact), run the
+            decode attention middle for w users at their own cur_pos (row j's K/V lands at P_s+j before its SDPA; rows
+            j' < j of the same user were written by the earlier iterations, so causality within the block holds and
+            rejected rows' K/V are simply overwritten next step); scatter the gated rows back.
+        Out-projection once at R rows, then the all-reduce: the fused decode all_reduce_async when x is the fused-AR
+        residual (R <= 32), else the reduce-scatter (fractured [1,1,R,dim/TP])."""
         tw, NH, HD = self.tw, self.NH, self.HD
         R, T, w = plan.R, plan.T, plan.w
         assert x.shape[-2] == R, (x.shape, R)
@@ -859,22 +976,26 @@ class TPAttention:
         qkv = tpc.matmul_1d_decode(
             x, tw["wqkv_fused"], plan.attn_qkv_progcfg, self.compute_cfg, out_memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
-        acc = None
-        # plan.debug_attn_offsets (timing only): run the per-offset middle for the first n offsets, so the traced
-        # per-offset cost is (t[T] - t[1]) / (T - 1); the un-run rows of the output stay zero.
-        n_off = T if plan.debug_attn_offsets is None else plan.debug_attn_offsets
-        for j in range(n_off):
-            qkv_j = plan.gather(j, qkv)  # [1,1,w,W] L1
-            sh = list(qkv_j.shape)
-            qkv3_j = ttnn.slice(qkv_j, (0, 0, 0, 0), (sh[0], sh[1], sh[2], qkv3_dim), memory_config=_L1)
-            gate_j = ttnn.slice(qkv_j, (0, 0, 0, qkv3_dim), (sh[0], sh[1], sh[2], qkv3_dim + gate_dim))
-            ttnn.deallocate(qkv_j)
-            gated_j = self._attend_paged_decode(
-                qkv3_j, gate_j, cur_pos_list[j], cos_list[j], sin_list[j], page_table, w
-            )
-            acc = plan.scatter_accumulate(j, gated_j, acc)  # consumes gated_j
-        ttnn.deallocate(qkv)
-        gated = ttnn.reshape(acc, (1, R, NH * HD))
+        mode = plan.attn_mode if plan.debug_attn_mode is None else plan.debug_attn_mode
+        if mode == "batched":
+            gated = self._attend_paged_verify_batched(qkv, plan, page_table)  # consumes qkv; [1,R,NH*HD] L1
+        else:
+            acc = None
+            # plan.debug_attn_offsets (timing only): run the per-offset middle for the first n offsets, so the traced
+            # per-offset cost is (t[T] - t[1]) / (T - 1); the un-run rows of the output stay zero.
+            n_off = T if plan.debug_attn_offsets is None else plan.debug_attn_offsets
+            for j in range(n_off):
+                qkv_j = plan.gather(j, qkv)  # [1,1,w,W] L1
+                sh = list(qkv_j.shape)
+                qkv3_j = ttnn.slice(qkv_j, (0, 0, 0, 0), (sh[0], sh[1], sh[2], qkv3_dim), memory_config=_L1)
+                gate_j = ttnn.slice(qkv_j, (0, 0, 0, qkv3_dim), (sh[0], sh[1], sh[2], qkv3_dim + gate_dim))
+                ttnn.deallocate(qkv_j)
+                gated_j = self._attend_paged_decode(
+                    qkv3_j, gate_j, cur_pos_list[j], cos_list[j], sin_list[j], page_table, w
+                )
+                acc = plan.scatter_accumulate(j, gated_j, acc)  # consumes gated_j
+            ttnn.deallocate(qkv)
+            gated = ttnn.reshape(acc, (1, R, NH * HD))
         if plan.fused_ar:
             wo_partial = self._wo_proj(gated, tw["wo"])  # the decode 1D path (L1 out for the fused all-reduce)
         else:

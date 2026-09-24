@@ -46,6 +46,14 @@ struct PagedUpdateCacheParams {
     // and the kernel can't address it. Paged-mode only (validated in
     // validate_on_program_cache_miss).
     const std::optional<uint32_t> cache_position_modulo;
+    // Number of consecutive token positions written per user in one call (default 1: the decode update).
+    // num_tokens = T > 1 (speculative-decoding verify step): core i writes positions update_idxs[i] ..
+    // update_idxs[i] + T - 1 of user i from the untilized rows h*T + j (kv head h, token j) of its [32, head_dim]
+    // input shard, read-modify-writing the one or two KV tile rows the span touches (a span may cross a 32-row tile
+    // boundary and hence a block boundary). Bit-exact with T sequential single-row calls (a bf8 row's shared
+    // exponents are per row, so the repack of a row depends only on that row). Requires the index tensor,
+    // num_kv_heads * T <= TILE_HEIGHT, no share_cache. Enters the program hash and the kernels' defines.
+    const uint32_t num_tokens;
 };
 
 struct PagedUpdateCacheInputs {
