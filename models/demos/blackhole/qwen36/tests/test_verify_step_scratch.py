@@ -45,6 +45,10 @@ DO_EXACT = os.environ.get("VERIFY_EXACT", "1") == "1"
 N_REPLAYS = int(os.environ.get("VERIFY_TIMING_REPLAYS", "50"))
 DECODE_WIDTHS = [int(v) for v in os.environ.get("VERIFY_DECODE_WIDTHS", "1,8,32").split(",") if v]
 DEBUG_EAGER = os.environ.get("VERIFY_DEBUG_EAGER", "0") == "1"
+# VERIFY_TRACKER_AUDIT=1 (+ TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1): log-and-skip every replay
+# that would corrupt a live buffer (see test_verify_w32_isolation_scratch._install_tracker_audit); the dump lists the
+# programs compiled after a capture (program-cache buffers) with their allocation sites.
+TRACKER_AUDIT = os.environ.get("VERIFY_TRACKER_AUDIT", "0") == "1"
 OUT_JSON = os.environ.get("VERIFY_OUT", "/home/eslim/experiments/qwen36/logs/verify_step_result.json")
 CHUNK = 2048
 BPU = 8  # blocks per user (512 tokens: prompt <= 128 + <= ~3*MIN_TOKENS generated); multiple of 8 for the SDPA stick
@@ -191,6 +195,11 @@ def test_verify_step(mesh_device):
     device = mesh_device
     device.enable_program_cache()
     _pin_aiclk(AICLK_MHZ)
+    if TRACKER_AUDIT:
+        from models.demos.blackhole.qwen36.tests import test_verify_w32_isolation_scratch as iso
+
+        iso._install_tracker_audit(device)
+        _audit = iso._AUDIT
     results = {
         "configs": {},
         "timing": {},
@@ -221,6 +230,22 @@ def test_verify_step(mesh_device):
             steps[(w, T)] = VerifyStep(model, w, T, page_tables[:w])
         logger.info(f"[verify] plans allocated {time.perf_counter() - t0:.1f}s")
 
+        # --- COMPILE EVERYTHING FIRST (VERIFY_W32_AUDIT.md): every program this process will run -- the decode bodies
+        # at the reference widths and the verify bodies -- is compiled eagerly BEFORE any trace capture, so no
+        # program-cache buffer lands inside a parked trace's freed-intermediate range. The captures below compile
+        # nothing new. (The served slot-write set is compiled by the prefill warm-up, as in the served order.) ---
+        if DO_EXACT:
+            for w in sorted(set(w for w, _ in CONFIGS)):
+                refs[w] = DecodeRef(model, w, page_tables[:w])
+                refs[w].compile()
+            for (w, T), vs in steps.items():
+                t0 = time.perf_counter()
+                vs.compile()
+                logger.info(
+                    f"[verify] ({w},{T}) R={vs.plan.R} compiled in {time.perf_counter() - t0:.1f}s (before any capture)"
+                )
+            ttnn.synchronize_device(device)
+
         # --- prefill warmup (chunk trace + masked buckets + slot write + hist pack), as the served path ---
         t0 = time.perf_counter()
         pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
@@ -236,29 +261,32 @@ def test_verify_step(mesh_device):
         ttnn.synchronize_device(device)
         logger.info(f"[verify] prefill warmup {time.perf_counter() - t0:.1f}s")
         # untimed warm prefill (lazy allocations happen here, not inside a measured / compared region)
+        if TRACKER_AUDIT:
+            _audit["phase"] = "warm_prefill_1user"
         _prefill(model, prompt_ids, page_tables, 1)
+        if TRACKER_AUDIT:
+            _audit["phase"] = "captures"
 
         # --- served order (qwen36_vllm: prefill warm-up -> decode trace capture), then the verify traces. Only for
         # the exactness phase: the timing phase captures/releases one trace at a time (see below) ---
         if DO_EXACT:
-            for w in sorted(set(w for w, _ in CONFIGS)):
-                refs[w] = DecodeRef(model, w, page_tables[:w])
-                refs[w].setup()
+            for w in sorted(refs):
+                refs[w].capture()
             for (w, T), vs in steps.items():
-                t0 = time.perf_counter()
-                vs.compile()
                 t1 = time.perf_counter()
                 vs.capture()
-                logger.info(
-                    f"[verify] ({w},{T}) R={vs.plan.R} compile {t1 - t0:.1f}s capture {time.perf_counter() - t1:.1f}s"
-                )
+                logger.info(f"[verify] ({w},{T}) R={vs.plan.R} captured in {time.perf_counter() - t1:.1f}s")
 
         # --- exactness per config ---
         if DO_EXACT:
             for (w, T), vs in steps.items():
                 k = T - 1
                 rng = random.Random(1234 + w * 10 + T)
+                if TRACKER_AUDIT:
+                    _audit["phase"] = f"prefill_{w}users_for_reference"
                 lens, first = _prefill(model, prompt_ids, page_tables, w)
+                if TRACKER_AUDIT:
+                    _audit["phase"] = "reference_decode_replays"
                 n_ref = MIN_TOKENS + 3 * T + 2
                 ref_streams = [[first[s]] for s in range(w)]
                 pos = list(lens)
@@ -279,8 +307,14 @@ def test_verify_step(mesh_device):
                 cfg_res = {"R": vs.plan.R, "ref_same_prompt_identical": same_prompt_ok, "policies": {}}
                 streams_by_policy = {}
                 for policy in POLICIES:
+                    if TRACKER_AUDIT:
+                        _audit["phase"] = f"prefill_{w}users_for_{policy}"
                     lens, first = _prefill(model, prompt_ids, page_tables, w)
-                    assert first == [ref_streams[s][0] for s in range(w)], "prefill first token not reproducible"
+                    if TRACKER_AUDIT:
+                        _audit["phase"] = f"verify_replays_{policy}"
+                    assert (
+                        first == [ref_streams[s][0] for s in range(w)] or TRACKER_AUDIT
+                    ), "prefill first token not reproducible"
                     if DEBUG_EAGER:
                         # is the state after this re-prefill good? one plain decode step must reproduce the reference
                         chk = refs[w].step(first, lens)
@@ -302,6 +336,98 @@ def test_verify_step(mesh_device):
                             logger.info(
                                 f"[verify-dbg] inputs: positions={list(positions)} accept={list(accept_prev)} tokens[:4]={[list(t) for t in tokens[:4]]} attn={_vs.plan.attn_mode} kernel={_vs.plan.gdn_kernel is not None}"
                             )
+                            if os.environ.get("VERIFY_DEBUG_ROWDIAG", "0") == "1" and len(ctrl.accept_history) == 0:
+                                # per-layer row diagnostic on the FAILING flow: users of the same prompt (s % 3) must have
+                                # bitwise identical T-row blocks after every layer; log the layers where one differs
+                                npr = len(PROMPTS)
+
+                                def row_check(name, x):
+                                    ttnn.synchronize_device(device)
+                                    h = (
+                                        ttnn.to_torch(ttnn.get_device_tensors(x)[0])
+                                        .float()
+                                        .reshape(-1, x.shape[-1])[: _vs.plan.R]
+                                    )
+                                    diffs = []
+                                    for s_ in range(npr, _w):
+                                        b = s_ % npr
+                                        # row 0 only: rows 1..k carry per-user random drafts and legitimately differ
+                                        blk, base = h[s_ * _T], h[b * _T]
+                                        if not torch.equal(blk, base):
+                                            diffs.append(
+                                                (
+                                                    s_,
+                                                    round(float((blk - base).abs().max()), 4),
+                                                    int((blk != base).sum()),
+                                                )
+                                            )
+                                    if diffs:
+                                        logger.info(
+                                            f"[verify-rowdiag] {name}: users differing from their prompt's first user: {diffs[:10]}"
+                                        )
+                                    else:
+                                        logger.info(f"[verify-rowdiag] {name}: all same-prompt users identical")
+
+                                def debug_head(logits, idx_t, val_t):
+                                    ttnn.synchronize_device(device)
+                                    nd = model.num_devices
+                                    R_ = _vs.plan.R
+                                    lg = ttnn.to_torch(
+                                        logits, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0)
+                                    ).float()
+                                    lg = lg.reshape(nd, -1, lg.shape[-1])[:, :R_]  # [nd, R, V/nd]
+                                    idxs = (
+                                        ttnn.to_torch(idx_t, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))
+                                        .reshape(nd, -1)[:, :R_]
+                                        .to(torch.int64)
+                                    )
+                                    vals = (
+                                        ttnn.to_torch(val_t, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))
+                                        .float()
+                                        .reshape(nd, -1)[:, :R_]
+                                    )
+                                    host_idx = lg.argmax(-1)
+                                    host_val = lg.max(-1).values
+                                    bad_idx = [
+                                        (d, r)
+                                        for d in range(nd)
+                                        for r in range(R_)
+                                        if int(host_idx[d, r]) != int(idxs[d, r])
+                                    ]
+                                    bad_val = [
+                                        (d, r)
+                                        for d in range(nd)
+                                        for r in range(R_)
+                                        if float(host_val[d, r]) != float(vals[d, r])
+                                    ]
+                                    # logits row-0 consistency across same-prompt users (rows s*T)
+                                    npr_ = len(PROMPTS)
+                                    lg_diff = [
+                                        s_
+                                        for s_ in range(npr_, _w)
+                                        if not torch.equal(lg[:, s_ * _T], lg[:, (s_ % npr_) * _T])
+                                    ]
+                                    logger.info(
+                                        f"[verify-head] logits row0 differs from prompt's first user for users {lg_diff}; "
+                                        f"device argmax != host argmax at (dev,row) {bad_idx[:12]} ({len(bad_idx)} total); "
+                                        f"device max != host max at {bad_val[:12]} ({len(bad_val)} total)"
+                                    )
+                                    per_shard_ = model.args.vocab_size // nd
+                                    d_win = torch.argmax(vals, dim=0)
+                                    dev_tok = (d_win * per_shard_ + idxs[d_win, torch.arange(R_)]).tolist()
+                                    h_win = torch.argmax(host_val, dim=0)
+                                    host_tok = (h_win * per_shard_ + host_idx[h_win, torch.arange(R_)]).tolist()
+                                    logger.info(
+                                        f"[verify-head] row0 tokens device={[dev_tok[s_ * _T] for s_ in range(_w)]} host={[host_tok[s_ * _T] for s_ in range(_w)]}"
+                                    )
+
+                                _vs.plan.upload(tokens, positions, accept_prev)
+                                idx_d, val_d = _vs.forward(row_check=row_check, debug_head=debug_head)
+                                ttnn.synchronize_device(device)
+                                ttnn.deallocate(idx_d)
+                                ttnn.deallocate(val_d)
+                                _vs.plan._host_refs = []
+                                _prefill(model, prompt_ids, page_tables, _w)
                             eager_rows = _vs.run(tokens, positions, accept_prev, eager=True)
                             logger.info(
                                 f"[verify-dbg] eager row0 all users: {[int(eager_rows[vg.row(s_, 0, _T)]) for s_ in range(_w)]}"
@@ -435,6 +561,10 @@ def test_verify_step(mesh_device):
                     f"per-offset loop would be {sec['attn_offset_loop_total']:.1f} ({100 * sec['attn_offset_loop_total'] / med:.0f}%)"
                 )
     finally:
+        if TRACKER_AUDIT:
+            iso._audit_dump(
+                os.environ.get("VERIFY_AUDIT_OUT", "/home/eslim/experiments/qwen36/logs/tracker_audit_exactness.txt")
+            )
         for vs in steps.values():
             vs.release()
         for r in refs.values():

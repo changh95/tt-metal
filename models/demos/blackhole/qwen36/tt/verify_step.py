@@ -77,13 +77,40 @@ def gdn_multi_token_kernel(T, layer, qkv_cur, qkv_prev, accept_tt):
     )
 
 
+_MAXVAL_C = 32
+
+
+def max_rows_tile_parallel(logits):
+    """Per-row max of [1,1,R,V] TILE logits as a two-stage reduce over a [1,R,ceil(V/32)->tile,32] view (the
+    text_demo `_maxval_dev_b` formulation). The plain `ttnn.max(logits, dim=-1)` over a 62080-wide row returned WRONG
+    values for every row of a [1,1,128,V/TP] tensor in the (32,4) exactness flow while `ttnn.argmax` on the same logits
+    was right (logs/verify_324_head.log: 512/512 (device,row) maxima wrong, host recompute matches argmax) -- the
+    winning shard was then mis-selected and the committed token was garbage for the users whose max sat on another
+    shard. The two-stage form reduces a 32-wide last dim twice and was exact in every run."""
+    R, V = logits.shape[-2], logits.shape[-1]
+    n_rows = -(-V // _MAXVAL_C)
+    n_rows_t = -(-n_rows // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
+    padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, 0), (0, n_rows_t * _MAXVAL_C - V)], value=-1e30)
+    grid = ttnn.reshape(padded, (1, R, n_rows_t, _MAXVAL_C))
+    part = ttnn.max(grid, dim=-1)  # [1, R, n_rows_t]
+    part_row = ttnn.reshape(part, (1, 1, R, n_rows_t))
+    val = ttnn.max(part_row, dim=-1)  # [1, 1, R]
+    for t in (padded, grid, part, part_row):
+        ttnn.deallocate(t)
+    return val
+
+
 def argmax_sharded_rows(logits):
     """Per-device (argmax, max) of vocab-sharded logits [1,1,R,V/TP] over the local shard -> ([1,1,R] uint32, [1,1,R]
-    bf16) device tensors. Stage 1 of the two-stage argmax; stage 2 is combine_sharded_argmax on the host."""
+    bf16) device tensors. Stage 1 of the two-stage argmax; stage 2 is combine_sharded_argmax on the host.
+    QWEN36_VERIFY_MAX=plain restores the single ttnn.max (see max_rows_tile_parallel for why it is not the default)."""
     rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     idx = ttnn.argmax(rm, dim=-1, keepdim=False)
     ttnn.deallocate(rm)
-    val = ttnn.max(logits, dim=-1)
+    if os.environ.get("QWEN36_VERIFY_MAX", "tile") == "plain":
+        val = ttnn.max(logits, dim=-1)
+    else:
+        val = max_rows_tile_parallel(logits)
     return idx, val
 
 
@@ -450,7 +477,7 @@ class VerifyStep:
         self.section_times = None
 
     # ------------------------------------------------------------------------------------------ forward body
-    def forward(self, profile=False, row_check=None):
+    def forward(self, profile=False, row_check=None, debug_head=None):
         """The traced body: reads only the plan's persistent buffers; returns (idx, val) device tensors.
         row_check(name, tensor): eager-only diagnostic hook called after the embedding and every layer."""
         model, plan = self.model, self.plan
@@ -502,6 +529,8 @@ class VerifyStep:
         ttnn.deallocate(x)
         t0 = tick("lm_head", t0)
         idx, val = argmax_sharded_rows(logits)
+        if debug_head is not None:  # eager-only diagnostic hook: (final-norm output x is gone; logits + device argmax)
+            debug_head(logits, idx, val)
         ttnn.deallocate(logits)
         tick("argmax", t0)
         if profile:
