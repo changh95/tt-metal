@@ -66,15 +66,49 @@ ttnn::device_operation::ProgramArtifacts GdnDecodeStepProgramFactory::create_pro
     const auto grid = device.compute_with_storage_grid_size();
     const uint32_t num_cores_avail = grid.x * grid.y;
     // work items: plain variant = one value head per core (B = 1); fused variant = (head, user group) with the smallest
-    // even group size (1 for B = 1) that fits the grid -> B=32: 12 heads x 8 groups of 4 users on 96 cores.
+    // group size that fits the grid (below) -> B <= 9: one user per core; B=32: 12 heads x 8 groups of 4 users on 96
+    // cores.
     const uint32_t B = mt      ? static_cast<uint32_t>(in.accept->logical_volume())
                        : fused ? static_cast<uint32_t>(in.qkv.logical_shape()[-2])
                                : 1u;
-    uint32_t gs = (B == 1) ? 1u : 2u;
-    while (Nv * ((B + gs - 1) / gs) > num_cores_avail) {
-        gs += 2;
+    // Group size: the SMALLEST gs whose Nv x ceil(B / gs) items fit the grid -- gs = 1 (one user per core, the B = 1
+    // per-core schedule) whenever Nv * B <= cores (B <= 9 on the 110-core P150 grid), else 2, 3, ... The T = 1 writer
+    // writes a group's output rows exactly (32 B face-row segments from any start row, write_rows), so odd group sizes
+    // / odd start rows are fine; the multi-token writer rounds the group's row span up to an even count
+    // (write_rows_span), so with an odd T the group size stays even (gs * T even). A user's arithmetic never depends
+    // on its grouping (rows are independent, the group accumulator adds exact zeros): bit-identical to any other gs.
+    // (Until 2026-09-24 the policy was "even gs starting at 2": B = 8 ran two users per core on 48 cores with 96 free,
+    // B = 8 x T = 8 multi-token 582 us vs 232 us at B = 1.) QWEN36_GDN_GS=old restores that policy, =<n> forces gs = n
+    // (timing experiments only).
+    const bool odd_t = mt && (T % 2 != 0);
+    auto fits = [&](uint32_t g) { return Nv * ((B + g - 1) / g) <= num_cores_avail; };
+    uint32_t gs = 1;
+    if (B > 1 && (odd_t || !fits(1))) {
+        gs = 2;
+        while (!fits(gs) || (odd_t && gs % 2 != 0)) {
+            ++gs;
+        }
+    }
+    if (const char* gs_env = std::getenv("QWEN36_GDN_GS"); gs_env != nullptr && B > 1) {
+        if (std::strcmp(gs_env, "old") == 0) {
+            gs = 2;
+            while (!fits(gs)) {
+                gs += 2;
+            }
+        } else if (const uint32_t forced = static_cast<uint32_t>(std::atoi(gs_env)); forced >= 1 && fits(forced)) {
+            gs = forced;
+        }
     }
     const uint32_t ugroups = (B + gs - 1) / gs;
+    log_debug(
+        tt::LogOp,
+        "gdn_decode_step: B={} T={} -> group size {} ({} groups) on {} of {} cores",
+        B,
+        T,
+        gs,
+        ugroups,
+        Nv * ugroups,
+        num_cores_avail);
     const uint32_t num_items = Nv * ugroups;
     TT_FATAL(
         num_items <= num_cores_avail, "gdn_decode_step: {} work items exceed {} cores", num_items, num_cores_avail);

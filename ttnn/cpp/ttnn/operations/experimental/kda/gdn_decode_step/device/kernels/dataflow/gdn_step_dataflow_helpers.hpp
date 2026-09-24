@@ -325,9 +325,11 @@ inline void build_user_selectors(DataflowBuffer& sel, DataflowBuffer& mask, Noc&
     mask.push_back(1);
 }
 
-// Write rows [r0, r0 + nr) of `count` consecutive L1 tiles to the same rows of the destination tiles. Rows are written
-// as whole face-row spans; r0 must be even and nr even (or r0 == 0, nr == 1 -> rows 0..1, row 1 being zero padding),
-// so every DRAM destination address is 64 B aligned.
+// Write rows [r0, r0 + nr) of `count` consecutive L1 tiles to the same rows of the destination tiles, exactly (no
+// rounding to an even row count: with one user per core -- group size 1, B <= 9 -- the next row belongs to another
+// core). Rows are written as face-row spans (32 B per row per face half); the L1 source and DRAM destination offsets
+// are equal, so every transfer keeps its 64 B alignment class from any start row, the rule the readers' odd-row
+// segment reads (pack_row_from_row) rely on.
 template <typename Accessor>
 inline void write_rows(
     const Accessor& acc, DataflowBuffer& dfb, Noc& noc, uint32_t first_page, uint32_t count, uint32_t r0, uint32_t nr) {
@@ -335,7 +337,7 @@ inline void write_rows(
     const uint32_t entry = dfb.get_entry_size();
     const uint32_t esz = entry / 1024;
     const uint32_t seg = entry / 64;  // one face row
-    const uint32_t r1 = (nr == 1) ? r0 + 2 : r0 + nr;
+    const uint32_t r1 = r0 + nr;
     for (uint32_t t = 0; t < count; ++t) {
         const uint32_t base = t * entry;
         // rows below 16 live in faces 0/1, rows >= 16 in faces 2/3; write each face span separately
