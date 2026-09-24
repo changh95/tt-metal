@@ -246,3 +246,29 @@ between the flows, or an allocation-dependent read (uninitialized memory / L1 CB
 Next: bisect by adding the exactness test's steps to the diagnostic one at a time (the reference loop length, the
 controller, the debug wrapper), then dump the verify body's per-layer row-0 activations for a failing user vs a
 passing user (rowdiag hook) in the failing flow.
+
+## (32,4) row-0 failure: cause found (2026-09-24 18:45)
+
+Tracker run of the failing exactness flow with program-cache buffers included (`logs/tracker_audit_exactness.txt`):
+the only programs first compiled after a capture are the per-slot `_write_index` Concat programs of the 32-user
+prefill's slot writes (31 of them, one per slot; the served path warms them for all 32 slots in
+`warmup_gdn_slot_write`; the host-repack variant is not warmed) -- and the decode reference / verify bodies, because
+the compile-first block had been LOST from the exactness test (a failed edit; restored in `3a0d3ef7a03`). Neither
+explained the pattern: with the device pack (`QWEN36_GDN_HIST_DEVICE_PACK=1`) the failure was bit-identical.
+
+Bisect (`logs/verify_324_rowdiag_flow3.log`, `verify_324_head.log`): the per-layer row-0 activations of same-prompt
+users are bitwise identical through all 64 layers and the LM-head logits too; the device `ttnn.argmax` matches the
+host argmax on every (device, row); but **`ttnn.max(logits, dim=-1)` on the `[1,1,128,62080]` bf16 TILE logits returned
+a wrong maximum for all 512 (device, row) pairs**, so `combine_sharded_argmax` picked the wrong shard for every user
+whose true maximum sits on another shard -- exactly the users `s % 8 in {2..7}` here, an artifact of which shard holds
+each prompt's top token. The same op was right in the step-1 diagnostic process and at R <= 64; text_demo already
+avoids the plain row max with a padded two-stage `[1,B,ceil(V/32),32]` reduce (`_maxval_dev_b`). Fix: that formulation
+in `verify_step.max_rows_tile_parallel` (default; `QWEN36_VERIFY_MAX=plain` restores the single reduce for a repro).
+The wide single-row `ttnn.max` misbehaving only in some processes is a ttnn reduce_w bug worth filing (reproducer:
+this flow with `QWEN36_VERIFY_MAX=plain`).
+
+Status: the (32,4) rerun with the fix could not open the mesh twice ("waiting for physical cores to finish: 13-3 ...
+Try resetting the board", `risc_firmware_initializer.cpp:1542`, `logs/verify_324_exact_fix2/3.log`): a Tensix core
+left running by the previous watchdog-killed run (`verify_324_exact_fix.log`, hung after the verify capture);
+tt-smi still lists 8 devices. Needs a half-A reset, then: (32,4) and (32,8) exactness, and the timing table's head
+section re-measured with the two-stage max.
