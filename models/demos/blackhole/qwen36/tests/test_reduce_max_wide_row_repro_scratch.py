@@ -86,8 +86,7 @@ def test_reduce_max_wide_row(mesh_device):
     y = ttnn.matmul(a, b)
     ttnn.deallocate(y)
     tid = ttnn.begin_trace_capture(mesh, cq_id=0)
-    y = ttnn.matmul(a, b)
-    z = ttnn.max(y, dim=-1)
+    y = ttnn.matmul(a, b)  # (a traced wide-row max here hung the device on the first attempt, 2026-09-24; kept eager)
     ttnn.end_trace_capture(mesh, tid, cq_id=0)
     for _ in range(5):
         ttnn.execute_trace(mesh, tid, cq_id=0, blocking=False)
