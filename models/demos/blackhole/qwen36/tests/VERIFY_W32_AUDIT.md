@@ -272,3 +272,12 @@ Try resetting the board", `risc_firmware_initializer.cpp:1542`, `logs/verify_324
 left running by the previous watchdog-killed run (`verify_324_exact_fix.log`, hung after the verify capture);
 tt-smi still lists 8 devices. Needs a half-A reset, then: (32,4) and (32,8) exactness, and the timing table's head
 section re-measured with the two-stage max.
+
+## (32,4) and (32,8) exactness: PASS (2026-09-24 19:05, `logs/verify_324_exact_final.log`, `verify_328_exact_final.log`)
+
+Kernel GDN (e0d682902da), batched attention, compile-first, tile-parallel max, flow rule (8-user prefill groups; all
+traces captured after the warm-up, before the users' prefill). Reference decode 46 steps at width 32, users of the same
+prompt identical. (32,4): random 31 steps / 0 accepted, oracle 8 steps / 768 of 768 drafts accepted (4 tok/user/step),
+mixed 15 steps / 751 accepted -> committed streams identical across policies and bitwise equal to the plain decode for
+all 32 users over >= 32 tokens. (32,8): random 31 / 0, oracle 4 steps / 896 of 896 (8 tok/user/step), mixed 11 / 1143 ->
+identical and bitwise equal for all 32 users. With (1,8), (8,4) and (8,8) this completes the M2 oracle-exactness proof.
