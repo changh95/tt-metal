@@ -281,3 +281,18 @@ prompt identical. (32,4): random 31 steps / 0 accepted, oracle 8 steps / 768 of 
 mixed 15 steps / 751 accepted -> committed streams identical across policies and bitwise equal to the plain decode for
 all 32 users over >= 32 tokens. (32,8): random 31 / 0, oracle 4 steps / 896 of 896 (8 tok/user/step), mixed 11 / 1143 ->
 identical and bitwise equal for all 32 users. With (1,8), (8,4) and (8,8) this completes the M2 oracle-exactness proof.
+
+## Final timing table (2026-09-24 19:00, kernel e0d682902da, batched attention, tile-parallel max; one live trace at a
+time; traced, 50 replays incl. per-step host upload + readback; `logs/verify_timing_final_A.log`, `_B.log`)
+
+| config | R | verify ms | decode ms (in-process ref) | ratio | traced sections: attn layer / GDN layer / head | shares: attn x16 / GDN x48 / embed+head |
+|---|---|---|---|---|---|---|
+| (1,8)  | 8   | 37.7  | w1 24.9  | 1.51x | 0.48 / 0.58 / 1.43 | 20% / 73% / 4% |
+| (8,8)  | 64  | 55.0  | w8 26.6  | 2.07x | 0.70 / 0.79 / 3.24 | 20% / 69% / 6% |
+| (32,4) | 128 | 79.1  | w32 34.4 | 2.30x | 0.97 / 1.17 / 5.27 | 20% / 71% / 7% |
+| (32,8) | 256 | 145.4 | w32 34.4 | 4.23x | 1.58 / 2.04 / 9.55 | 17% / 67% / 7% |
+
+Per-offset attention (the replaced path) would have been 1.31 / 1.74 / 1.45 / 2.69 ms per layer (16-42% of the step).
+The gs-lever kernel cut the (8,8) GDN layer 0.94 -> 0.79 ms (step 66.3 -> 55.0 ms); the tile-parallel max costs the
+head +0.2 to +3 ms (1.43 / 3.24 / 5.27 / 9.55 vs 2.11 / 3.02 / 4.12 / 6.41 before) -- a 32-wide two-stage reduce over
+1940 tile columns; worth a cheaper exact formulation later (or a fixed reduce_w).
