@@ -126,7 +126,21 @@ class Qwen36ModelArgs(ModelArgs):
             os.environ["HF_MODEL"] = snapshot_download(hf_model, local_files_only=offline)
         super().__init__(mesh_device, max_batch_size=max_batch_size, max_seq_len=max_seq_len, **kwargs)
         if mesh_device is not None:
-            self.model_config["SAMPLING_AG_CONFIG"]["allow_force_argmax"] = True
+            # Greedy (k=1/p=0/temp=1, what vLLM sends for temperature 0) on-device sampling path.
+            # QWEN36_SAMPLING_FORCE_ARGMAX=1 restores the full-vocab argmax sampler (#50783): a 1-link
+            # all_gather of the full [32, 4 x 62080] bf16 logits (~1.54 ms on the 1x4 mesh), an untilize of
+            # the 16 MB row (~0.29 ms) and ttnn.argmax over [32, 248320] RM (~1.39 ms) = 3.0-3.4 ms per decode
+            # step at every batch width (12% of TPOT@1, 8% @32; logs/perf_plan_r4.md rank 1). Default OFF
+            # takes the tt_transformers multi-chip default (models/tt_transformers/tt/model_config.py
+            # default_sampling_force_argmax): local top-k (k=32) on the 62080-wide shard (~0.32 ms), two
+            # 1-tile all_gathers, the _adjust_values_for_tiebreak glue and ttnn.sampling. Greedy tokens are
+            # identical except at exact bf16 logit ties, where the top-k path deterministically picks the
+            # lowest token id (see tests/test_sampling_topk_vs_argmax.py). Single-chip meshes keep the base
+            # default (argmax is faster there and the TP sampler is not used).
+            if self.num_devices > 1:
+                self.model_config["SAMPLING_AG_CONFIG"]["allow_force_argmax"] = os.environ.get(
+                    "QWEN36_SAMPLING_FORCE_ARGMAX", "0"
+                ).strip().lower() in ("1", "true", "yes", "on")
 
         # Mirror CKPT_DIR -> checkpoint_dir for weight_cache_path / load_state_dict.
         self.checkpoint_dir = self.CKPT_DIR

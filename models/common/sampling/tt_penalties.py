@@ -226,12 +226,21 @@ class TTPenalties(LightweightModule):
         presence_tensor = self._pad_params(presence)
         frequency_tensor = self._pad_params(frequency)
         repetition_tensor = self._pad_params(repetition)
+        # No-change guard: SamplingGenerator.reset_sampling_params calls this on every decode step whenever
+        # the sampler is not on the force-argmax path, so unchanged penalties would otherwise cost four small
+        # host->device copies per step. The device buffers start as zeros (an invalid repetition penalty),
+        # so the first call always uploads.
+        params_key = (presence_tensor, frequency_tensor, repetition_tensor)
+        uploaded = getattr(self, "_uploaded_params_key", None)
+        if uploaded is not None and all(torch.equal(new, old) for new, old in zip(params_key, uploaded)):
+            return
         inverse_repetition_tensor = 1 / repetition_tensor
 
         self._copy_host_to_device(self.presence_penalties, presence_tensor)
         self._copy_host_to_device(self.frequency_penalties, frequency_tensor)
         self._copy_host_to_device(self.repetition_penalties, repetition_tensor)
         self._copy_host_to_device(self.inverse_repetition_penalties, inverse_repetition_tensor)
+        self._uploaded_params_key = params_key
 
     def _pad_params(self, values: List[float]) -> torch.Tensor:
         tensor = torch.tensor(values, dtype=torch.float32)

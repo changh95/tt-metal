@@ -324,6 +324,10 @@ class TTSampling(LightweightModule):
             ),
         )
 
+        # Host copy of the (k, p, temp) rows the device tensors currently hold, so reset_params can skip
+        # the per-step re-uploads when the parameters did not change (see _params_key).
+        self._uploaded_params_key = self._params_key(k, p, temp)
+
         # Create device offset indices for global indexing
         self._create_indices_tensors()
         self._create_invalid_vocab_mask()
@@ -599,9 +603,15 @@ class TTSampling(LightweightModule):
         num_logprobs: int | list[int] = None,
         empty_slots: list[int] | None = None,
     ):
-        """Update sampling parameters (k, p, temperature, logprobs) dynamically."""
+        """Update sampling parameters (k, p, temperature, logprobs) dynamically.
+
+        The k/p/temp (and greedy tie-break mask) uploads are skipped when the rows equal what the device
+        already holds: vLLM calls this on every decode step with unchanged parameters, and on the top-k
+        path (force_argmax off) each call otherwise costs four small host->device copies per step.
+        """
         self._force_argmax_sampling = self._is_force_argmax_sampling(k, p, temp)
-        if not self._force_argmax_sampling:
+        params_key = self._params_key(k, p, temp)
+        if not self._force_argmax_sampling and params_key != self._uploaded_params_key:
             # When _sampling_dp > 1, create multi-device host tensors so
             # copy_host_to_device_tensor writes per-row shards correctly.
             if self._sampling_dp > 1:
@@ -650,10 +660,18 @@ class TTSampling(LightweightModule):
                 ),
             )
             ttnn.copy_host_to_device_tensor(self._greedy_col_new, self._greedy_col)
+            self._uploaded_params_key = params_key
 
         self.log_probs_calculator.set_log_probs_mode(
             enable_log_probs, num_logprobs=num_logprobs, empty_slots=empty_slots
         )
+
+    @staticmethod
+    def _params_key(k, p, temp):
+        """Hashable host view of one (k, p, temp) parameter set, for the reset_params no-change guard.
+        Values are compared as Python numbers, so an int 1 and a float 1.0 for k compare equal, exactly as
+        the uint32/bfloat16 device tensors built from them would."""
+        return tuple(torch.as_tensor(v).reshape(-1).tolist() for v in (k, p, temp))
 
     def _greedy_col_dims(self):
         """Map the 1-D k_tensor shard dims (self._param_dims, batch on dim0) to the [1,1,N,1] greedy
