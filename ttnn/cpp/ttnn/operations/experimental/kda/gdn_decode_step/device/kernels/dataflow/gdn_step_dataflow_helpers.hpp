@@ -72,6 +72,38 @@ inline void fill_scalar_tile(DataflowBuffer& dfb, uint32_t value) {
     }
 }
 
+// Same fill, 8x unrolled (the loop overhead, not the store, bounds a volatile fill: ~5 us less per user at B=1).
+// Used only on single-user cores: on the 96-core width-32 launch the denser L1 store burst measured slightly slower
+// in the served step (+0.1..0.2 ms) although faster in isolation.
+inline void fill_scalar_tile_fast(DataflowBuffer& dfb, uint32_t value) {
+    auto lock = dfb.scoped_write_lock(1);
+    auto p32 = lock.template get_ptr<volatile uint32_t>();
+    for (uint32_t i = 0; i < 1024; i += 8) {
+        p32[i] = value;
+        p32[i + 1] = value;
+        p32[i + 2] = value;
+        p32[i + 3] = value;
+        p32[i + 4] = value;
+        p32[i + 5] = value;
+        p32[i + 6] = value;
+        p32[i + 7] = value;
+    }
+}
+
+// Element (row, col) of the tile already read into the reserved slot of `dfb`, as fp32 bits (bf16 source widened).
+template <bool src_fp32>
+FORCE_INLINE uint32_t tile_scalar_bits(DataflowBuffer& dfb, uint32_t row, uint32_t col) {
+    auto lock = dfb.scoped_write_lock(1);
+    const uint32_t idx = tile_elem_index(row, col);
+    if constexpr (src_fp32) {
+        auto p = lock.template get_ptr<volatile uint32_t>();
+        return p[idx];
+    } else {
+        auto p16 = lock.template get_ptr<volatile uint16_t>();
+        return static_cast<uint32_t>(p16[idx]) << 16;
+    }
+}
+
 // Read tile `page` of a tensor and return element (row 0, col) as fp32 bits (bf16 source is widened).
 template <bool src_fp32, typename Accessor>
 FORCE_INLINE uint32_t
@@ -267,9 +299,8 @@ inline void pack_head_tile(
 
 // Selector tiles for user row b: sel[c] has a single 1.0 at (row b, col 2c + parity(b)), so sel[c] @ P puts packed row
 // 2c + parity(b) of P into row b. Also the row mask e_b (1.0 at (row b, col 0)).
-inline void build_user_selectors(DataflowBuffer& sel, DataflowBuffer& mask, Noc& noc, uint32_t b, uint32_t Ct) {
-    sel.reserve_back(Ct);
-    zero_reserved(sel, noc, Ct);
+// The 1.0 entries of the selector / mask tiles (slots reserved and already zero-filled by the caller).
+inline void set_user_selector_bits(DataflowBuffer& sel, DataflowBuffer& mask, uint32_t b, uint32_t Ct) {
     {
         auto lock = sel.scoped_write_lock(Ct);
         auto p16 = lock.template get_ptr<volatile uint16_t>();
@@ -277,14 +308,20 @@ inline void build_user_selectors(DataflowBuffer& sel, DataflowBuffer& mask, Noc&
             p16[c * 1024 + tile_elem_index(b, 2 * c + (b & 1u))] = 0x3F80;
         }
     }
-    sel.push_back(Ct);
-    mask.reserve_back(1);
-    zero_reserved(mask, noc, 1);
     {
         auto lock = mask.scoped_write_lock(1);
         auto p16 = lock.template get_ptr<volatile uint16_t>();
         p16[tile_elem_index(b, 0)] = 0x3F80;
     }
+}
+
+inline void build_user_selectors(DataflowBuffer& sel, DataflowBuffer& mask, Noc& noc, uint32_t b, uint32_t Ct) {
+    sel.reserve_back(Ct);
+    zero_reserved(sel, noc, Ct);
+    mask.reserve_back(1);
+    zero_reserved(mask, noc, 1);
+    set_user_selector_bits(sel, mask, b, Ct);
+    sel.push_back(Ct);
     mask.push_back(1);
 }
 

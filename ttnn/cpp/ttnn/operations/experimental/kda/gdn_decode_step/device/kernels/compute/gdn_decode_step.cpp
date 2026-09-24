@@ -43,6 +43,7 @@ TT_KERNEL void compute(uint32_t wi_count) {
     DataflowBuffer out(dfb::out);
 
     compute_kernel_hw_startup(dfb::q_in, dfb::state_in, dfb::out);
+    note_formats(dfb::q_in, dfb::state_in, dfb::out);
     scaler.wait_front(1);
     eps_l2.wait_front(1);
     eps_norm.wait_front(1);
@@ -59,9 +60,7 @@ TT_KERNEL void compute(uint32_t wi_count) {
 
         // qn = l2norm(q) * scale (rows 1..31 -> 0 through the mask)
         square_tiles(dfb::q_in, dfb::tmp, tmp, Kt);
-        compute_kernel_lib::
-            reduce<ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW, dfb::tmp, dfb::scaler, dfb::stats>(
-                compute_kernel_lib::ReduceInputBlockShape::of(1, Kt));
+        row_sum<dfb::tmp, dfb::scaler, dfb::stats>(Kt);
         stats.wait_front(1);
         inverse_l2(dfb::stats, dfb::eps_l2, dfb::mask, dfb::scratch, scratch, dfb::inv, inv, scale_bits);
         stats.pop_front(1);
@@ -72,9 +71,7 @@ TT_KERNEL void compute(uint32_t wi_count) {
 
         // kn = l2norm(k)
         square_tiles(dfb::k_in, dfb::tmp, tmp, Kt);
-        compute_kernel_lib::
-            reduce<ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW, dfb::tmp, dfb::scaler, dfb::stats>(
-                compute_kernel_lib::ReduceInputBlockShape::of(1, Kt));
+        row_sum<dfb::tmp, dfb::scaler, dfb::stats>(Kt);
         stats.wait_front(1);
         inverse_l2(dfb::stats, dfb::eps_l2, dfb::mask, dfb::scratch, scratch, dfb::inv, inv, one_bits);
         stats.pop_front(1);
@@ -133,9 +130,7 @@ TT_KERNEL void compute(uint32_t wi_count) {
 
         // out = rmsnorm(o) * w
         square_tiles(dfb::o, dfb::tmp, tmp, Vt);
-        compute_kernel_lib::
-            reduce<ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW, dfb::tmp, dfb::scaler, dfb::stats>(
-                compute_kernel_lib::ReduceInputBlockShape::of(1, Vt));
+        row_sum<dfb::tmp, dfb::scaler, dfb::stats>(Vt);
         stats.wait_front(1);
         inverse_rms(dfb::stats, dfb::eps_norm, dfb::scratch, scratch, dfb::inv, inv, inv_dv_bits);
         stats.pop_front(1);
