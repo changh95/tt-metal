@@ -144,6 +144,50 @@ def test_rowpos_probes(mesh_device):
     res["lm_head_auto_M64_rows_equal"] = _same(y64)
     res["lm_head_auto_M64_vs_M32"] = torch.equal(y64[:32], y32)
 
+    # --- LM head auto config and the 1D configs at M=128 / 256 vs M=32 (rows 8..15 duplicated into every 32-row block)
+    for M in (128, 256):
+        xx = torch.randn(M, dim).to(torch.bfloat16)
+        for b in range(1, M // 32):
+            xx[b * 32 + 8 : b * 32 + 16] = xx[8:16]
+        y = _t0(ttnn.linear(_rep(mesh, xx.reshape(1, 1, M, dim), ttnn.bfloat16), wgt)).reshape(M, V)
+        y32 = _t0(ttnn.linear(_rep(mesh, xx[:32].reshape(1, 1, 32, dim), ttnn.bfloat16), wgt)).reshape(32, V)
+        res[f"lm_head_auto_M{M}_rows_equal"] = all(
+            torch.equal(y[b * 32 + 8 : b * 32 + 16], y[8:16]) for b in range(1, M // 32)
+        )
+        res[f"lm_head_auto_M{M}_vs_M32"] = torch.equal(y[:32], y32)
+        for name, K, N, wdt, act, dec_cfg in (
+            ("gdn_qkvz", dim, 4128, ttnn.bfloat8_b, None, args.gdn_qkvz_decode_1d_progcfg),
+            ("mlp_w1", dim, args.hidden_dim // 4, ttnn.bfloat4_b, ttnn.UnaryOpType.SILU, args.mlp_w1_decode_1d_progcfg),
+        ):
+            xk = torch.randn(M, K).to(torch.bfloat16)
+            for b in range(1, M // 32):
+                xk[b * 32 + 8 : b * 32 + 16] = xk[8:16]
+            wk = _rep(mesh, torch.randn(K, N).to(torch.bfloat16), wdt)
+            ck = cfg if name.startswith("mlp") else tpc.COMPUTE_HIFI2
+            pc = tpc.small_m_progcfg(M, K, N, fused_activation=act, grid_w=gw)
+            ym = _t0(
+                ttnn.linear(
+                    _rep(mesh, xk.reshape(1, 1, M, K), ttnn.bfloat16, mem=ttnn.L1_MEMORY_CONFIG),
+                    wk,
+                    compute_kernel_config=ck,
+                    program_config=pc,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+            ).reshape(M, N)
+            y3 = _t0(
+                ttnn.linear(
+                    _rep(mesh, xk[:32].reshape(1, 1, 32, K), ttnn.bfloat16, mem=ttnn.L1_MEMORY_CONFIG),
+                    wk,
+                    compute_kernel_config=ck,
+                    program_config=dec_cfg,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+            ).reshape(32, N)
+            res[f"mm1d_{name}_M{M}_rows_equal"] = all(
+                torch.equal(ym[b * 32 + 8 : b * 32 + 16], ym[8:16]) for b in range(1, M // 32)
+            )
+            res[f"mm1d_{name}_M{M}_vs_decodecfg_M32"] = torch.equal(ym[:32], y3)
+
     # --- to_layout + argmax / max at 64 rows vs 32 ---
     lg = _dup_rows(R, V, seed=3)
     lt = _rep(mesh, lg.reshape(1, 1, R, V), ttnn.bfloat16)
