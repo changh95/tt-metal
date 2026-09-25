@@ -20,6 +20,7 @@ Env: MTP_CONFIGS ("1,1;1,2;1,3;8,1;8,2;32,1" as w,k), MTP_MIN_TOKENS (64), MTP_W
 """
 import json
 import os
+import random
 import time
 
 import pytest
@@ -57,6 +58,12 @@ DO_PCC = os.environ.get("MTP_PCC", "1") == "1"
 DO_TIMING = os.environ.get("MTP_TIMING", "1") == "1"
 N_REPLAYS = int(os.environ.get("MTP_TIMING_REPLAYS", "50"))
 OUT_JSON = os.environ.get("MTP_OUT", "/home/eslim/experiments/qwen36/logs/mtp_spec_result.json")
+# Extra draft sources run after the MTP run of every config (each re-prefills): "oracle" (the plain decode's
+# continuation) and/or "random" -- the committed streams must be identical across sources (draft independence).
+MECH_POLICIES = [p for p in os.environ.get("MTP_MECH_POLICIES", "").split(",") if p]
+# Near-tie probe (default on): at every divergence from the plain decode, the PLAIN decode path's logit gap between
+# its own token and the committed one (an eager decode forward at that position).
+DO_NEARTIE = os.environ.get("MTP_NEARTIE", "1") == "1"
 GSM8K_PARQUET = os.environ.get(
     "MTP_GSM8K_PARQUET",
     "/home/eslim/.cache/huggingface/hub/datasets--openai--gsm8k/snapshots/740312add88f781978c0658806c59bc2815b9866/main/test-00000-of-00001.parquet",
@@ -144,16 +151,35 @@ def _reference_stream(ref, first, lens, n_ref):
     return streams, time.perf_counter() - t0
 
 
-def _spec_loop(vs, head, w, k, lens, first, min_tokens, observer=None, max_steps=None):
-    """Draft (MTP) -> verify -> commit until every user has >= min_tokens committed tokens. Returns a dict."""
+def _spec_loop(vs, head, w, k, lens, first, min_tokens, observer=None, max_steps=None, policy="mtp", ref_streams=None):
+    """Draft -> verify -> commit until every user has >= min_tokens committed tokens. policy: "mtp" (the head),
+    "oracle" (the plain decode's continuation ref_streams) or "random" (rejected drafts). Returns a dict."""
     T = k + 1
     ctrl = vg.VerifyController(T=T, run=vs.run, positions=list(lens), last=list(first))
     vs.reset_sequence()
-    head.begin_batch(w, list(range(w)))
+    rng = random.Random(4321 + w * 10 + k)
+
+    def make_drafts():
+        if policy == "mtp":
+            return head.draft(w, k, ctrl.last, ctrl.positions, observer=observer)
+        out = []
+        for s in range(w):
+            n_done = len(ctrl.committed[s])
+            if policy == "oracle":
+                d = list(ref_streams[s][n_done : n_done + k])
+                while len(d) < k:
+                    d.append(rng.randrange(1000))
+            else:
+                d = [rng.randrange(1000) for _ in range(k)]
+            out.append(d)
+        return out
+
+    if policy == "mtp":
+        head.begin_batch(w, list(range(w)))
     t_draft = t_verify = t_select = 0.0
     t_all = time.perf_counter()
     t0 = time.perf_counter()
-    drafts = head.draft(w, k, ctrl.last, ctrl.positions, observer=observer)
+    drafts = make_drafts()
     t_draft += time.perf_counter() - t0
     n_steps = 0
     limit = max_steps if max_steps is not None else 4 * min_tokens
@@ -161,9 +187,10 @@ def _spec_loop(vs, head, w, k, lens, first, min_tokens, observer=None, max_steps
         t0 = time.perf_counter()
         accepts = ctrl.step(drafts)
         t1 = time.perf_counter()
-        head.select_hidden(vs.plan, accepts)
+        if policy == "mtp":
+            head.select_hidden(vs.plan, accepts)
         t2 = time.perf_counter()
-        drafts = head.draft(w, k, ctrl.last, ctrl.positions, observer=observer)
+        drafts = make_drafts()
         t3 = time.perf_counter()
         t_verify += t1 - t0
         t_select += t2 - t1
@@ -186,6 +213,62 @@ def _spec_loop(vs, head, w, k, lens, first, min_tokens, observer=None, max_steps
         "streams": [list(c) for c in ctrl.committed],
         "accept_history": ctrl.accept_history,
     }
+
+
+def _neartie_probe(model, ref, w, ids, page_tables, users, ref_streams, mism, prefill_fn):
+    """For every divergence (user s, token index i, got, exp): re-prefill the w users, replay the plain decode up to
+    the step that produced token i and run that step EAGERLY on the same decode programs to read the full logits ->
+    the plain path's logit of its own token (exp, its argmax) minus the committed token's (got), plus got's rank.
+    A gap of a few bf16 ulps of the logit magnitude is a greedy near-tie the R>32 verify numerics may flip."""
+    from models.demos.blackhole.qwen36.tt.generator_interface import unpack_rope
+    from models.tt_transformers.tt.common import copy_host_to_device
+
+    lens, first = prefill_fn(model, ids, page_tables, users)
+    by_step = {}
+    for s, i, got, exp in mism:
+        by_step.setdefault(i - 1, []).append((s, i, got, exp))  # token i is produced by decode step i-1
+    out = []
+    pos, cur = list(lens), list(first)
+    comp = ttnn.ConcatMeshToTensor(model.mesh_device, dim=3)
+    for t in range(max(by_step) + 1):
+        if t in by_step:
+            host = model.prepare_decode_inputs_host(
+                torch.tensor(cur, dtype=torch.int32).reshape(w, 1),
+                torch.tensor(pos, dtype=torch.int32),
+                page_tables[:w],
+            )
+            copy_host_to_device(host_tensors=host, device_tensors=ref.dev)
+            cos, sin = unpack_rope(ref.dev[2])
+            logits = model._forward_decode(ref.dev[0], cos, sin, ref.dev[1], ref.dev[3], sharded_lm_head=True)
+            ttnn.synchronize_device(model.mesh_device)
+            lg = ttnn.to_torch(logits, mesh_composer=comp).float().reshape(-1, model.vocab_size)[:w]
+            ttnn.deallocate(logits)
+            nxt = lg.argmax(-1).tolist()
+            for s, i, got, exp in by_step[t]:
+                row = lg[s]
+                top2 = torch.topk(row, 2).values
+                rank_got = int((row > row[got]).sum())
+                out.append(
+                    {
+                        "user": s,
+                        "token_index": i,
+                        "got": got,
+                        "exp": exp,
+                        "decode_argmax_here": nxt[s],
+                        "logit_exp": float(row[exp]),
+                        "logit_got": float(row[got]),
+                        "gap": float(row[exp] - row[got]),
+                        "top2_gap": float(top2[0] - top2[1]),
+                        "rank_got": rank_got,
+                    }
+                )
+        else:
+            nxt = ref.step(cur, pos)
+        for s in range(w):
+            assert nxt[s] == ref_streams[s][t + 1] or (t in by_step), (s, t, nxt[s], ref_streams[s][t + 1])
+        pos = [p + 1 for p in pos]
+        cur = nxt
+    return out
 
 
 @run_for_blackhole()
@@ -392,11 +475,42 @@ def test_mtp_spec(mesh_device):
                     "select_ms_per_step": 1e3 * res["select_s"] / max(1, res["steps"]),
                     "draft_ms_per_step": 1e3 * res["draft_s"] / max(1, res["steps"] + 1),
                     "by_type": by_type,
-                    **{kk: v for kk, v in res.items() if kk not in ("streams", "accept_history")},
+                    **{kk: v for kk, v in res.items() if kk not in ("streams",)},
                     "streams": res["streams"],
                     "ref_streams": ref_streams,
                     "text_user0": tok.decode(res["streams"][0][:40]),
                 }
+                if mism and DO_NEARTIE:
+                    probe_rows = _neartie_probe(model, refs[w], w, ids, page_tables, users, ref_streams, mism, _prefill)
+                    run["neartie"] = probe_rows
+                    logger.info(
+                        f"[mtp] ({w},k={k}) NEAR-TIE probe (plain decode logits at each divergence): "
+                        + "; ".join(
+                            f"u{r['user']}@{r['token_index']}: exp {r['exp']} {r['logit_exp']:.3f} vs got {r['got']} "
+                            f"{r['logit_got']:.3f} gap {r['gap']:.3f} (rank of got {r['rank_got']})"
+                            for r in probe_rows
+                        )
+                    )
+                for pol in MECH_POLICIES:
+                    lens3, first3 = _prefill(model, ids, page_tables, users)
+                    res_p = _spec_loop(vs, head, w, k, lens3, first3, MIN_TOKENS, policy=pol, ref_streams=ref_streams)
+                    ident = all(_stream_compare(res_p["streams"][s], res["streams"][s])[0] is None for s in range(w))
+                    mism_p = [
+                        (s,) + tuple(_stream_compare(res_p["streams"][s], ref_streams[s])[:1])
+                        for s in range(w)
+                        if _stream_compare(res_p["streams"][s], ref_streams[s])[0] is not None
+                    ]
+                    run[f"policy_{pol}"] = {
+                        "steps": res_p["steps"],
+                        "accept_len_mean": res_p["accept_len_mean"],
+                        "identical_to_mtp_stream": ident,
+                        "mismatch_vs_decode": mism_p,
+                        "streams": res_p["streams"],
+                    }
+                    logger.info(
+                        f"[mtp] ({w},k={k}) drafts={pol}: {res_p['steps']} steps, accept len {res_p['accept_len_mean']:.2f}; "
+                        f"committed streams identical to the MTP-draft run: {ident}; mismatches vs decode: {len(mism_p)}"
+                    )
                 cfg["runs"].append(run)
                 logger.info(
                     f"[mtp] ({w},k={k}) prompts {users_prompts if w <= 8 else 'all 14 (mod)'}: {res['steps']} steps, "
