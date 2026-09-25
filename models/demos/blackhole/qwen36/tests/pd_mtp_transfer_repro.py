@@ -17,7 +17,8 @@ w=1, k=2), one 8k prompt (4 chunks, w=1, k=2). Cost lines: the connector's own "
 and PDMTP_COST summaries (bytes, export / import ms) + PDMTP_PREFILL (MTP prefill ms on P).
 
 Run (half A):  scripts/pd_mtp_run.sh <tag> PDMTP_ROLE=P   then   scripts/pd_mtp_run.sh <tag> PDMTP_ROLE=D
-Env: PDMTP_DIR (payload dir), PDMTP_MIN_TOKENS (48), PDMTP_CASES ("a,b,c").
+Env: PDMTP_DIR (payload dir), PDMTP_MIN_TOKENS (48), PDMTP_CASES ("a,b,c"); PDMTP_BASELINE=1 (role P only): no MTP
+head / hook -- the plain 16-layer producer, for the cost baseline of the same blocks (its payloads carry no mtp field).
 """
 import json
 import os
@@ -52,6 +53,7 @@ ROLE = os.environ.get("PDMTP_ROLE", "P").upper()
 PAYLOAD_DIR = os.environ.get("PDMTP_DIR", "/home/eslim/experiments/qwen36/logs/pdmtp_payload")
 MIN_TOKENS = int(os.environ.get("PDMTP_MIN_TOKENS", "48"))
 CASES = [c for c in os.environ.get("PDMTP_CASES", "a,b,c").split(",") if c]
+BASELINE = os.environ.get("PDMTP_BASELINE", "0") == "1"
 BMAX = 8
 BPU = 136  # blocks per user = 8704 positions (8k prompt + generation)
 CHUNK = 2048
@@ -176,14 +178,17 @@ def run_producer(device):
     manifest = {"cases": [], "buckets": buckets}
     head = None
     try:
-        # prefill-only head (a P instance never drafts), programs compiled before any capture
-        head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=BPU)
-        for b in buckets:
-            head.compile_prefill(b)
+        if not BASELINE:
+            # prefill-only head (a P instance never drafts), programs compiled before any capture
+            head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=BPU)
+            for b in buckets:
+                head.compile_prefill(b)
         _prefill_warmup(model, device, page_tables)
-        model.prefill_hidden_hook = head.prefill_hook
+        if head is not None:
+            model.prefill_hidden_hook = head.prefill_hook
         _prefill(model, [prompts[CASES[0]][0]], page_tables, [0])  # warm 1-user prefill (lazy allocations)
-        head.pending_rows.clear()
+        if head is not None:
+            head.pending_rows.clear()
         # the producer role as the connector's bind_runner sets it, then its export warm-up (post_warmup)
         model.pd_gdn_capture = {}
         model.pd_skip_gdn_slot_write = True
@@ -194,12 +199,13 @@ def run_producer(device):
             name, n_users, T, wdt, k = CASE_DEFS[c]
             ids = prompts[c]
             users = list(range(n_users))
-            calls0, wall0 = head.stats["prefill_calls"], head.stats["prefill_wall"]
+            st = head.stats if head is not None else {"prefill_calls": 0, "prefill_wall": 0.0}
+            calls0, wall0 = st["prefill_calls"], st["prefill_wall"]
             t0 = time.perf_counter()
             lens, first = _prefill(model, ids, page_tables, users)
             t_pf = time.perf_counter() - t0
-            mtp_calls = head.stats["prefill_calls"] - calls0
-            mtp_ms = 1e3 * (head.stats["prefill_wall"] - wall0) / n_users
+            mtp_calls = st["prefill_calls"] - calls0
+            mtp_ms = 1e3 * (st["prefill_wall"] - wall0) / n_users
             print(
                 f"PDMTP_PREFILL case={name} T={T} users={n_users}: prefill_paged_slots {1e3 * t_pf / n_users:.1f} ms/req "
                 f"incl. MTP prefill {mtp_ms:.1f} ms/req ({mtp_calls // n_users} hook call(s)/req, eager)",
@@ -231,7 +237,10 @@ def run_producer(device):
                 w.pool.release(st.buf)
                 hdr = st.header
                 assert hdr["version"] == 2 and hdr["n_attn_layers"] == N_MAIN_LAYERS, hdr
-                assert hdr["mtp"] == {"n_layers": 1, "hidden": True}, hdr.get("mtp")
+                if BASELINE:
+                    assert "mtp" not in hdr, hdr.get("mtp")
+                else:
+                    assert hdr["mtp"] == {"n_layers": 1, "hidden": True}, hdr.get("mtp")
                 case["reqs"].append(
                     {
                         "req_id": rid,
