@@ -2354,6 +2354,7 @@ class TPGatedDeltaNet:
             gated = plan.gdn_kernel(self, qkvzab, qkv_prev, accept_tt)
         else:
             gated = self._verify_stub(qkvzab, plan, qkv_prev)
+        gated = plan.keep_rows(gated, "gdn")  # pad_safe plans: padding users' rows -> exact zeros (no-op otherwise)
         # this step's projections become next step's prev rows (rows 1..a_s of them get committed then)
         ttnn.copy(qkvzab, qkv_prev)
         ttnn.deallocate(qkvzab)

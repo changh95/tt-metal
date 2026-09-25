@@ -119,16 +119,38 @@ def accept_onehot_masks(accept_prev: Sequence[int], users: int, T: int, bmax: in
     return m
 
 
-def commit(argmax_rows: torch.Tensor, tokens: Sequence[Sequence[int]], T: int):
+def commit(argmax_rows: torch.Tensor, tokens: Sequence[Sequence[int]], T: int, n_drafts: Sequence[int] = None):
     """The accept/commit of one step. argmax_rows: [R] ints (row order). tokens[s] = [x_0, d_1..d_k].
-    Returns (accepts [w], committed [w] lists) with committed[s] = argmax[s, 0..a_s]."""
+    Returns (accepts [w], committed [w] lists) with committed[s] = argmax[s, 0..a_s].
+
+    n_drafts[s] (optional) = the number of REAL drafts of user s (K_s <= k): rows K_s+1..k carry padding drafts
+    that are never accepted, so a_s <= K_s (a user without drafts, K_s = 0, commits exactly its row-0 token)."""
     accepts, committed = [], []
     for s, toks in enumerate(tokens):
         am = [int(argmax_rows[row(s, j, T)]) for j in range(T)]
-        a = accept_drafts(am, list(toks[1:]))
+        ks = T - 1 if n_drafts is None else int(n_drafts[s])
+        assert 0 <= ks <= T - 1, f"user {s}: {ks} real drafts outside [0, {T - 1}]"
+        a = accept_drafts(am[: ks + 1], list(toks[1 : ks + 1]))
         accepts.append(a)
         committed.append(am[: a + 1])
     return accepts, committed
+
+
+def migration_matrix(w_old: int, T_old: int, R_old: int, w_new: int, T_new: int, R_new: int, keep=None):
+    """[R_new, R_old] 0/1 float32 that carries the lazy GDN prefix rows of one (w, T) grid into another.
+
+    Row s*T_new + j <- row s*T_old + j for every user s < min(w_old, w_new) with keep[s] (default: all) and every
+    offset j < min(T_old, T_new); every other new row is zero. ``M @ qkv_prev_old`` (exact 0/1 matmul) is the
+    new plan's qkv_prev: the pending rows 1..a_s of a continuing user keep their offsets (the kernel commits prev
+    rows 1..a_s, which must satisfy a_s <= T_new - 1 -- the caller checks), new / padding users get zero rows
+    (the kernel reads no prev row of a user with accept 0)."""
+    m = torch.zeros(R_new, R_old, dtype=torch.float32)
+    for s in range(min(w_old, w_new)):
+        if keep is not None and not keep[s]:
+            continue
+        for j in range(min(T_old, T_new)):
+            m[row(s, j, T_new), row(s, j, T_old)] = 1.0
+    return m
 
 
 @dataclass
@@ -215,7 +237,9 @@ class CpuGreedyOracle:
         return out
 
 
-def chain_drafts(run_step: Callable, w: int, k: int, last: Sequence[int], positions: Sequence[int], observer=None):
+def chain_drafts(
+    run_step: Callable, w: int, k: int, last: Sequence[int], positions: Sequence[int], observer=None, pad=None
+):
     """The MTP drafter's chained schedule (host logic of tt/mtp_head.py MTPHead.draft), ttnn-free.
 
     ``run_step(tokens [w], positions [w]) -> next tokens [w]`` is one MTP step for w users: it consumes the token at
@@ -224,19 +248,24 @@ def chain_drafts(run_step: Callable, w: int, k: int, last: Sequence[int], positi
     With ``last[s]`` = the user's row-0 token t'_s (the token at its committed position P_s, not yet fed to the main
     model) and ``positions[s]`` = P_s, step j (0-based) runs at KV position P_s - 1 + j with token d_j (d_0 = t'_s):
     the drafts d_1..d_k are the verify grid's rows 1..k. observer(phase, j, tokens, positions, drafts_j) is called
-    with phase "pre" before and "post" after each step. Returns drafts [w][k]."""
+    with phase "pre" before and "post" after each step. Returns drafts [w][k].
+
+    pad[s] (optional): user s is a PADDING row of the batch (no live request): it runs every step with token 0 at
+    position -1 (the paged KV update and the SDPA skip a user at -1) and its drafts are returned as zeros."""
     drafts = [[] for _ in range(w)]
-    tok = [int(t) for t in last]
-    pos = [int(p) - 1 for p in positions]
+    pad = [False] * w if pad is None else [bool(p) for p in pad]
+    tok = [0 if pad[s] else int(t) for s, t in enumerate(last)]
+    pos = [-1 if pad[s] else int(p) - 1 for s, p in enumerate(positions)]
     for j in range(k):
         if observer is not None:
             observer("pre", j, list(tok), list(pos), None)
         d = [int(v) for v in run_step(tok, pos)]
         assert len(d) == w
+        d = [0 if pad[s] else d[s] for s in range(w)]
         if observer is not None:
             observer("post", j, list(tok), list(pos), list(d))
         for s in range(w):
             drafts[s].append(d[s])
         tok = d
-        pos = [p + 1 for p in pos]
+        pos = [p if pad[s] else p + 1 for s, p in enumerate(pos)]
     return drafts

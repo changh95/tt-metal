@@ -128,7 +128,7 @@ def combine_sharded_argmax(mesh, idx_t, val_t, R, per_shard):
 class VerifyPlan:
     """Everything a (w, T) verify step needs on device, allocated before any trace capture."""
 
-    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False):
+    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False, pad_safe=False):
         self.model = model
         mesh = model.mesh_device
         args = model.args
@@ -137,6 +137,12 @@ class VerifyPlan:
         # [1,1,R,dim] replicated DRAM) as a third trace output, ``out_hidden`` -- the MTP drafter (tt/mtp_head.py)
         # selects each user's accepted row from it on device. False = the M2 body byte-for-byte.
         self.keep_hidden = bool(keep_hidden)
+        # pad_safe (served grids, tt/spec_serving.py): grid users may be PADDING rows (decode slots without a live
+        # request, ``upload(positions[s] = -1)``): token 0, KV update / SDPA skipped at -1, accept 0, and the
+        # attention / GDN sub-layer outputs of their rows forced to exact zeros through ``keep_attn`` / ``keep_gdn``
+        # (ttnn.where on a 0/1 row mask) so a stale state slot's NaN can never reach the body's row-mixing 0/1
+        # matmuls (the KV spread, the MTP hidden select, the qkv_prev migration). Real rows: where(1, x, 0) = x.
+        self.pad_safe = bool(pad_safe)
         self.R = vg.grid_rows(self.w, self.T)
         assert (
             self.w * self.T == self.R
@@ -262,6 +268,20 @@ class VerifyPlan:
         self.out_idx = self.out_val = None
         self.out_hidden = None  # keep_hidden: [1,1,R,dim] post-final-norm rows (trace output / last eager run)
         self._host_refs = []
+        # pad_safe: the per-row keep masks (1.0 = live row) of the attention and GDN sub-layer outputs
+        self.keep_attn = self.keep_gdn = None
+        self._keep_live = None  # host copy of the live pattern the masks hold
+        self._pt_host = pt.to(torch.int32).clone()  # host copy of the uploaded page table (upload skips a no-change)
+        if self.pad_safe:
+            attn0 = next(l.attention for l in model.layers if l.is_full_attention)
+            gdn0 = next(l.attention for l in model.layers if not l.is_full_attention)
+            self.keep_attn = self._up(
+                torch.ones(1, R, attn0.NH * attn0.HD, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
+            )
+            self.keep_gdn = self._up(
+                torch.ones(1, R, gdn0.Nv * gdn0.Dv, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
+            )
+            self._keep_live = [True] * self.w
         self.debug_attn_offsets = None  # timing only, see attention.forward_verify
         # persistent residual-shaped inputs of the per-section sub-traces (time_sections_traced); allocated NOW
         self.sec_x_frac = self._up(
@@ -405,9 +425,15 @@ class VerifyPlan:
         return out
 
     # ------------------------------------------------------------------------------------------ per-step upload
-    def upload(self, tokens, positions, accept_prev):
+    def upload(self, tokens, positions, accept_prev, page_table=None):
         """DMA one step's values into the persistent inputs. tokens[s] = [x_0, d_1..d_k]; positions[s] = P_s;
-        accept_prev[s] = the previous step's a_s. Host tensors are kept alive until the caller synchronizes."""
+        accept_prev[s] = the previous step's a_s. Host tensors are kept alive until the caller synchronizes.
+
+        positions[s] = -1 marks a PADDING user (pad_safe plans): its rows carry token 0, every KV-update position is
+        -1 (the paged update skips the user), its SDPA rows read position 0 of its (zeroed -> null block 0) page
+        table row, accept 0, and its attention / GDN outputs are masked to zero. page_table [w, blocks] (optional):
+        the users' current block rows (served block tables change as blocks are allocated); uploaded when it differs
+        from the last one."""
         w, T, R = self.w, self.T, self.R
         args = self.model.args
         refs = []
@@ -417,16 +443,27 @@ class VerifyPlan:
             ttnn.copy_host_to_device_tensor(h, dst)
             refs.append(h)
 
+        live = [int(p) >= 0 for p in positions]
+        if not all(live):
+            assert self.pad_safe, "padding users (position -1) need a pad_safe plan"
+            tokens = [list(t) if live[s] else [0] * T for s, t in enumerate(tokens)]
+            accept_prev = [int(a) if live[s] else 0 for s, a in enumerate(accept_prev)]
+        pos_live = [int(p) if live[s] else 0 for s, p in enumerate(positions)]  # the rope / SDPA positions of pads
         dma(vg.row_tokens(tokens, T, R).reshape(1, R), self.tokens, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         rope_delta = int(getattr(self.model.rope, "rope_delta", 0) or 0)
         for j in range(T):
-            pj = vg.offset_positions(positions, j)
-            dma(pj, self.cur_pos[j], ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            pj = vg.offset_positions(pos_live, j)
+            pj_upd = torch.where(torch.tensor(live), pj, torch.full_like(pj, -1))  # -1: skip the KV update
+            dma(pj_upd, self.cur_pos[j], ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             cos, sin = vg.rope_cos_sin(pj + rope_delta, args.rope_head_dim, args.rope_theta)
             dma(cos, self.cos[j], ttnn.bfloat16, ttnn.TILE_LAYOUT)
             dma(sin, self.sin[j], ttnn.bfloat16, ttnn.TILE_LAYOUT)
-        # batched attention middle: per-row positions / rope
-        rows_pos = vg.row_positions(positions, T, R)
+        # batched attention middle: per-row positions / rope (pads: position 0 on every row -> a finite read of the
+        # zero null block; their KV update is skipped through cur_pos[0] = -1 above)
+        rows_pos = vg.row_positions(pos_live, T, R)
+        for s in range(w):
+            if not live[s]:
+                rows_pos[s * T : (s + 1) * T] = 0
         cos_r, sin_r = vg.rope_cos_sin(rows_pos + rope_delta, args.rope_head_dim, args.rope_theta)
         dma(cos_r, self.cos_rows, ttnn.bfloat16, ttnn.TILE_LAYOUT)
         dma(sin_r, self.sin_rows, ttnn.bfloat16, ttnn.TILE_LAYOUT)
@@ -435,6 +472,34 @@ class VerifyPlan:
         acc = torch.tensor([int(a) for a in accept_prev], dtype=torch.int32)
         assert acc.shape[0] == w and int(acc.min()) >= 0 and int(acc.max()) < T, acc
         dma(acc, self.accept, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        if page_table is not None:
+            pt = page_table if isinstance(page_table, torch.Tensor) else torch.as_tensor(page_table)
+            pt = pt.to(torch.int32)
+            assert tuple(pt.shape) == tuple(self._pt_host.shape), (tuple(pt.shape), tuple(self._pt_host.shape))
+            if not torch.equal(pt, self._pt_host):
+                self._pt_host = pt.clone()
+                dma(pt.contiguous(), self.page_table, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+                pt_rows = pt.repeat_interleave(T, dim=0)
+                for a, b, pt_c, _ in self.sdpa_chunks:
+                    dma(pt_rows[a:b].contiguous(), pt_c, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        if self.pad_safe and live != self._keep_live:
+            self._keep_live = list(live)
+            keep = torch.zeros(R, 1, dtype=torch.bfloat16)
+            for s in range(w):
+                if live[s]:
+                    keep[s * T : (s + 1) * T] = 1.0
+            dma(
+                keep.expand(R, self.keep_attn.shape[-1]).reshape(1, R, -1).contiguous(),
+                self.keep_attn,
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            )
+            dma(
+                keep.expand(R, self.keep_gdn.shape[-1]).reshape(1, R, -1).contiguous(),
+                self.keep_gdn,
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            )
         if self.gdn_kernel is None:
             m = vg.accept_onehot_masks(accept_prev, w, T, self.bmax)
             for j in range(T):
@@ -460,10 +525,69 @@ class VerifyPlan:
         ttnn.synchronize_device(self.model.mesh_device)
         del refs
 
+    def keep_rows(self, x, which):
+        """pad_safe: zero the padding users' rows of a sub-layer output (``which`` = "attn" | "gdn", x [1,R,W] or
+        [1,1,R,W]); an exact no-op on live rows and on plans without pad support."""
+        mask = self.keep_attn if which == "attn" else self.keep_gdn
+        if mask is None:
+            return x
+        m = mask if len(x.shape) == 3 else ttnn.reshape(mask, (1, 1, self.R, mask.shape[-1]))
+        y = ttnn.where(m, x, 0.0, memory_config=x.memory_config())
+        ttnn.deallocate(x)
+        return y
+
+    def migrate_qkv_prev_from(self, src, live=None):
+        """Carry the lazy GDN prefix rows of plan ``src`` into this plan's qkv_prev buffers (eager, exact): per GDN
+        layer ``self.qkv_prev = M @ src.qkv_prev`` with M = verify_grid.migration_matrix (0/1, HiFi4 fp32-acc:
+        one 1.0*x term per row), rows of users beyond either grid / non-live users zero. Legal iff every pending
+        a_s <= self.T - 1 (the caller checks; tt/spec_serving.py). Programs must be compiled at warm-up
+        (``compile_migration``)."""
+        m_tt = spec_migration_buffer(self.model, self.R, src.R)
+        m_host = vg.migration_matrix(src.w, src.T, src.R, self.w, self.T, self.R, keep=live)
+        h = ttnn.from_torch(
+            m_host.reshape(1, 1, self.R, src.R),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=None,
+            mesh_mapper=self._rep,
+        )
+        ttnn.copy_host_to_device_tensor(h, m_tt)
+        for ln, dst in self.gdn_qkv_prev.items():
+            src_t = src.gdn_qkv_prev[ln]
+            src4 = ttnn.reshape(src_t, (1, 1, src.R, src_t.shape[-1]))
+            moved = ttnn.matmul(m_tt, src4, compute_kernel_config=_EXACT_MM, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            moved3 = ttnn.reshape(moved, (1, self.R, moved.shape[-1]))
+            ttnn.copy(moved3, dst)
+            ttnn.deallocate(moved)
+        ttnn.synchronize_device(self.model.mesh_device)
+        del h
+
+    def compile_migration(self, src):
+        """Compile the migration programs for a (src -> self) plan pair (before any trace capture)."""
+        self.migrate_qkv_prev_from(src)
+
     def release(self):
         if self.trace_id is not None:
             ttnn.release_trace(self.model.mesh_device, self.trace_id)
             self.trace_id = None
+
+
+def spec_migration_buffer(model, R_new, R_old):
+    """Persistent [1,1,R_new,R_old] bf16 0/1 buffer per row-count pair (allocated once, BEFORE any capture)."""
+    store = getattr(model, "_spec_migration_store", None)
+    if store is None:
+        store = model._spec_migration_store = {}
+    key = (int(R_new), int(R_old))
+    if key not in store:
+        store[key] = ttnn.from_torch(
+            torch.zeros(1, 1, R_new, R_old, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=model.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(model.mesh_device),
+        )
+    return store[key]
 
 
 class VerifyStep:
@@ -474,10 +598,12 @@ class VerifyStep:
         argmax_rows = vs.run(tokens [w][T], positions [w], accept_prev [w])            # -> [R] int64 per step
     """
 
-    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False):
+    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False, pad_safe=False):
         self.model = model
         self.mesh = model.mesh_device
-        self.plan = VerifyPlan(model, w, T, page_table, use_kernel=use_kernel, keep_hidden=keep_hidden)
+        self.plan = VerifyPlan(
+            model, w, T, page_table, use_kernel=use_kernel, keep_hidden=keep_hidden, pad_safe=pad_safe
+        )
         self.per_shard = model.args.vocab_size // model.num_devices
         self.section_times = None
         self._last_hidden = None  # keep_hidden: the hidden tensor of the most recent forward()
@@ -590,10 +716,10 @@ class VerifyStep:
         """Host bookkeeping for a new batch of users: zero the GDN qkv_prev buffers (see VerifyPlan.reset_qkv_prev)."""
         self.plan.reset_qkv_prev()
 
-    def run(self, tokens, positions, accept_prev, eager=False):
-        """Upload -> replay (or eager forward) -> per-row argmax [R] int64."""
+    def run(self, tokens, positions, accept_prev, eager=False, page_table=None):
+        """Upload -> replay (or eager forward) -> per-row argmax [R] int64 (page_table / -1 positions: see upload)."""
         plan = self.plan
-        plan.upload(tokens, positions, accept_prev)
+        plan.upload(tokens, positions, accept_prev, page_table=page_table)
         if eager or plan.trace_id is None:
             idx, val = self.forward()
             ttnn.synchronize_device(self.mesh)

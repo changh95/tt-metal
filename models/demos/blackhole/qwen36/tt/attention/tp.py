@@ -996,6 +996,7 @@ class TPAttention:
                 acc = plan.scatter_accumulate(j, gated_j, acc)  # consumes gated_j
             ttnn.deallocate(qkv)
             gated = ttnn.reshape(acc, (1, R, NH * HD))
+        gated = plan.keep_rows(gated, "attn")  # pad_safe plans: padding users' rows -> exact zeros (no-op otherwise)
         if plan.fused_ar:
             wo_partial = self._wo_proj(gated, tw["wo"])  # the decode 1D path (L1 out for the fused all-reduce)
         else:

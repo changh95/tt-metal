@@ -93,11 +93,15 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     # the plugin pins each request to one decode row (== its state slot) for its whole lifetime
     # and leaves finished rows as pad rows (token 0, position -1) instead of condensing the batch.
     # It then never issues a slot_remap, so _remap_gdn_slots below is not reached from that plugin.
+    # supports_speculative_mtp: the plugin may run vLLM speculative decoding (speculative_config method "mtp") through
+    # this class's served draft -> verify -> commit loop (tt/spec_decoder.py, docs/SPECULATIVE.md in the plugin);
+    # active only with QWEN36_SPEC_MTP=1 AND a speculative_config (the runner sets ``tt_speculative_k``).
     model_capabilities = {
         "supports_prefix_caching": False,
         "supports_async_decode": False,
         "supports_sample_on_device": True,
         "stable_decode_slots": True,
+        "supports_speculative_mtp": True,
     }
 
     def _validate_device_sampling_request(self, requested):
@@ -207,7 +211,66 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # QWEN_SDPA_BF8: bf8 paged KV (model.allocate_kv_caches also promotes this internally; wired explicitly here so
         # the caller's intent is visible and a future refactor that drops the model-side override stays correct).
         kv_dtype = ttnn.bfloat8_b if os.environ.get("QWEN_SDPA_BF8", "0") == "1" else ttnn.bfloat16
-        return model.allocate_kv_caches(shape, kv_dtype, batch_size=batch_size)
+        caches = model.allocate_kv_caches(shape, kv_dtype, batch_size=batch_size)
+        self._build_mtp_head_if_enabled(caches)
+        return caches
+
+    # ------------------------------------------------------------------------------------------ speculative decoding
+    def _build_mtp_head_if_enabled(self, kv_cache):
+        """QWEN36_SPEC_MTP=1: build the MTP head right after the main KV caches (its KV is the 17th attention layer of
+        the P/D transfer, the pools of pd_transfer bake the cache list) -- prefill buckets for the prefill hook
+        (installed by _install_mtp_prefill_hook), no draft widths yet (the decode warm-up adds the ladder's, with the
+        served block-table width). Idempotent; the plain path never reaches it."""
+        from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead, spec_mtp_enabled
+
+        model = self.model[0]
+        if not spec_mtp_enabled() or getattr(model, "mtp_head", None) is not None:
+            return
+        if model.num_devices <= 1 or model.args.max_batch_size <= 1:
+            return  # the prefill-hook installer logs the reason
+        buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
+        num_blocks = math.ceil(int(kv_cache[0][0].shape[0]) / 32) * 32
+        MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=num_blocks)
+        logger.info(
+            f"[spec] MTP head built with the KV caches (prefill buckets {buckets}, sdpa page table {num_blocks})"
+        )
+
+    def _spec_prepare(self, max_batch_size, num_blocks):
+        """Decode warm-up phase 1 (no trace captured yet): the served speculative decoder -- ladder plans, draft-step
+        buffers at the served block-table width, every program compiled. Needs ``tt_speculative_k`` (the runner sets
+        it from vLLM's speculative_config) and the MTP head; no-op otherwise or when already built."""
+        from models.demos.blackhole.qwen36.tt.mtp_head import spec_mtp_enabled
+        from models.demos.blackhole.qwen36.tt.spec_decoder import SpecDecoder
+        from models.demos.blackhole.qwen36.tt.spec_serving import DEFAULT_LADDER, Ladder
+
+        k = getattr(self, "tt_speculative_k", None)
+        if not spec_mtp_enabled() or not k or getattr(self, "_spec", None) is not None:
+            return
+        model = self.model[0]
+        head = getattr(model, "mtp_head", None)
+        if head is None:
+            logger.warning("[spec] speculative decoding requested but the model has no MTP head; running plain decode")
+            return
+        allow_fractured = os.environ.get("QWEN36_SPEC_ALLOW_FRACTURED", "0") == "1"
+        ladder = Ladder.from_spec(
+            os.environ.get("QWEN36_SPEC_LADDER", DEFAULT_LADDER), int(k), int(max_batch_size), allow_fractured
+        )
+        self._spec = SpecDecoder(model, head, ladder, int(max_batch_size), int(num_blocks))
+        self._spec.compile()
+
+    def _spec_capture(self):
+        spec = getattr(self, "_spec", None)
+        if spec is not None:
+            spec.capture()
+
+    def spec_hold_info(self):
+        """The runner -> scheduler admission-hold sidecar after a decode step (tt/spec_serving.py HoldInfo) or None."""
+        spec = getattr(self, "_spec", None)
+        return spec.hold_info() if spec is not None else None
+
+    def spec_stats(self):
+        spec = getattr(self, "_spec", None)
+        return dict(spec.state.stats) if spec is not None else None
 
     @staticmethod
     def _has_visual(kwargs, pixel_key):
@@ -368,6 +431,26 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             self._decode_logged = True
             logger.info("Decode trace replay active (Qwen)")
         model = self.model[0]
+        # Speculative decoding (vllm_tt_plugin: TTModelInput.spec, docs/SPECULATIVE.md): the plugin's per-row request
+        # ids / scheduled drafts / eligibility / flush request. The decoder runs draft -> verify -> commit and returns
+        # a SpecStepResult (variable tokens per row); None = this step runs as the plain traced decode below.
+        spec_step = kwargs.pop("spec_step", None)
+        spec = getattr(self, "_spec", None)
+        if spec_step is not None and spec is not None:
+            tokens_in = kwargs["tokens"] if "tokens" in kwargs else args[0]
+            start_pos_in = kwargs["start_pos"] if "start_pos" in kwargs else args[1]
+            page_table_in = kwargs["page_table"] if "page_table" in kwargs else args[2]
+            res = spec.step(
+                tokens_in,
+                start_pos_in,
+                page_table_in,
+                spec_step.row_req_ids,
+                spec_step.drafts,
+                eligible=spec_step.eligible,
+                flush=spec_step.flush,
+            )
+            if res is not None:
+                return res
         # Batched serving: apply a plugin slot_remap to the per-slot GDN recurrent/conv state BEFORE
         # the decode trace reads it. A plugin that honours ``stable_decode_slots`` keeps every
         # request on its own row and never sends one; an older plugin condenses its batch and does,
@@ -548,4 +631,13 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # Drop stale `non_greedy_decoding_on_device` from the old vLLM plugin; no-op for Qwen.
         kwargs.pop("non_greedy_decoding_on_device", None)
         self._validate_device_sampling_request(kwargs.get("can_sample_on_device", False))
+        # Speculative decoding: phase 1 (enable_trace=False) builds + compiles the ladder's verify / draft programs
+        # BEFORE any capture, phase 2 captures them BEFORE the decode-bucket captures (tests/VERIFY_W32_AUDIT.md rule:
+        # every program compiled before the first trace; the plugin's warm-up runs the two phases in this order).
+        if kwargs.get("enable_trace", False):
+            self._spec_capture()
+        else:
+            self._spec_prepare(
+                kwargs.get("max_batch_size", self.model[0].args.max_batch_size), kwargs.get("num_blocks")
+            )
         return warmup_decode_buckets(self, super().warmup_model_decode, *args, **kwargs)

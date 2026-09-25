@@ -85,6 +85,7 @@ class _StepBufs:
 
     def __init__(self):
         self.tok = self.pos = self.cos = self.sin = self.pt = self.hidden_in = None
+        self.pt_host = None  # host copy of the uploaded page table (set_page_table skips a no-change)
         self.trace_id = None
         self.out_idx = self.out_val = self.out_logits = self.out_hidden = None
 
@@ -236,21 +237,10 @@ class MTPHead:
         self.act_memcfg = self.nc_dec["sharded_output_config"]
         rd = args.rope_head_dim
 
-        # --- per-width draft-step buffers ---
+        # --- per-width draft-step buffers (more widths / the served page-table width: build_step_buffers) ---
         self.sb = {}
-        for w in widths:
-            assert 1 <= w <= self.page_tables.shape[0]
-            b = _StepBufs()
-            b.tok = self._up(torch.zeros(1, w, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-            b.pos = self._up(torch.zeros(w, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-            cos0, sin0 = vg.rope_cos_sin(torch.zeros(w, dtype=torch.int32), rd, args.rope_theta)
-            b.cos = self._up(cos0, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-            b.sin = self._up(sin0, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-            b.pt = self._up(self.page_tables[:w].contiguous(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-            b.hidden_in = self._up(
-                torch.zeros(1, 1, w, args.dim, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
-            )
-            self.sb[w] = b
+        if widths:
+            self.build_step_buffers(widths, self.page_tables)
 
         # --- per-bucket prefill buffers (values per request/segment: tokens, fill page table, cos/sin of the
         # segment's positions, the one-hot row selector of the hidden-row readback) ---
@@ -351,6 +341,35 @@ class MTPHead:
     def pop_hidden_in(self, slot):
         """P side: take the row of a request whose state is being exported (None when no prefill stored one)."""
         return self.pending_rows.pop(int(slot), None)
+
+    def build_step_buffers(self, widths, page_tables):
+        """Allocate the draft-step inputs / chain buffer of every width in ``widths`` (BEFORE any trace capture).
+        page_tables: torch [BMAX, blocks] int32 -- the decode page tables' WIDTH is what matters (the served block
+        table width, refreshed per step with ``set_page_table``); its rows are the initial values. A D instance
+        whose head was built prefill-only (widths=()) calls this from the decode warm-up."""
+        args = self.args
+        rd = args.rope_head_dim
+        pt = page_tables if isinstance(page_tables, torch.Tensor) else torch.as_tensor(page_tables)
+        pt = pt.to(torch.int32)
+        assert pt.shape[1] % 8 == 0, "page-table stick must be a multiple of 8 blocks"
+        if self.page_tables is None:
+            self.page_tables = pt
+        for w in sorted(set(int(v) for v in widths)):
+            if w in self.sb:
+                continue
+            assert 1 <= w <= pt.shape[0]
+            b = _StepBufs()
+            b.tok = self._up(torch.zeros(1, w, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+            b.pos = self._up(torch.zeros(w, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            cos0, sin0 = vg.rope_cos_sin(torch.zeros(w, dtype=torch.int32), rd, args.rope_theta)
+            b.cos = self._up(cos0, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            b.sin = self._up(sin0, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            b.pt = self._up(pt[:w].contiguous(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            b.pt_host = pt[:w].clone()
+            b.hidden_in = self._up(
+                torch.zeros(1, 1, w, args.dim, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
+            )
+            self.sb[w] = b
 
     # ------------------------------------------------------------------------------------------ helpers
     def _up(self, t, dtype, layout):
@@ -570,16 +589,39 @@ class MTPHead:
         return idx, val, logits, h_out
 
     def _upload_step(self, w, tokens, positions):
+        """positions[s] = -1 marks a PADDING row (no live request at slot s): the layer's paged KV update and SDPA
+        skip a user at -1 (its outputs are garbage rows nothing mixes across users; the next select overwrites its
+        hidden_in row)."""
         b = self.sb[w]
         tok = torch.tensor([int(t) for t in tokens], dtype=torch.int32).reshape(1, w)
         pos = torch.tensor([int(p) for p in positions], dtype=torch.int32)
-        assert int(pos.min()) >= 0
+        assert int(pos.min()) >= -1
         self._dma(tok, b.tok, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self._dma(pos, b.pos, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         rope_delta = int(getattr(self.model.rope, "rope_delta", 0) or 0)
-        cos, sin = vg.rope_cos_sin(pos + rope_delta, self.args.rope_head_dim, self.args.rope_theta)
+        cos, sin = vg.rope_cos_sin(pos.clamp(min=0) + rope_delta, self.args.rope_head_dim, self.args.rope_theta)
         self._dma(cos, b.cos, ttnn.bfloat16, ttnn.TILE_LAYOUT)
         self._dma(sin, b.sin, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+
+    def set_page_table(self, w, page_table):
+        """Refresh the draft step's page table [w, blocks] (the users' current block rows); skipped when unchanged.
+        Row s of a padding user should be zeros (the null block)."""
+        b = self.sb[w]
+        pt = page_table if isinstance(page_table, torch.Tensor) else torch.as_tensor(page_table)
+        pt = pt.to(torch.int32)
+        assert tuple(pt.shape) == tuple(b.pt_host.shape), (tuple(pt.shape), tuple(b.pt_host.shape))
+        if not torch.equal(pt, b.pt_host):
+            b.pt_host = pt.clone()
+            self._dma(pt.contiguous(), b.pt, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+
+    def upload_hidden_rows(self, w, rows_by_slot):
+        """hidden_in[s] <- rows_by_slot[s] (bf16 [dim]) for the given slots, zeros elsewhere: the FIRST draft step of
+        freshly admitted users (their imported / prefilled hidden row, ``set_hidden_in``) while the other rows are
+        padding for that step."""
+        rows = torch.zeros(w, self.dim, dtype=torch.bfloat16)
+        for s, r in rows_by_slot.items():
+            rows[int(s)] = torch.as_tensor(r).reshape(self.dim).to(torch.bfloat16)
+        self._dma(rows.reshape(1, 1, w, self.dim).contiguous(), self.sb[w].hidden_in, ttnn.bfloat16, ttnn.TILE_LAYOUT)
 
     def compile_step(self, w):
         """Eager draft step (compiles every program; writes garbage KV at position 8 of users 0..w-1)."""
@@ -679,14 +721,14 @@ class MTPHead:
         self.stats["select_calls"] += 1
         self.stats["select_wall"] += time.perf_counter() - t0
 
-    def draft(self, w, k, last, positions, observer=None):
+    def draft(self, w, k, last, positions, observer=None, pad=None):
         """k chained drafts per user (schedule: verify_grid.chain_drafts). last[s] = the user's row-0 token (t'_s),
         positions[s] = P_s (the verify grid's committed position); hidden_in holds h at position P_s - 1
         (select_hidden / begin_batch). Step j writes the head's KV at P_s - 1 + j. observer(phase, j, tokens,
         positions, drafts_j) is called with phase "pre" before each step (hidden_in still holds the step's input) and
-        "post" after it (probe)."""
+        "post" after it (probe). pad[s]: padding row (token 0 at position -1 every step, drafts zero)."""
         t0 = time.perf_counter()
-        drafts = vg.chain_drafts(lambda tok, pos: self.run_step(w, tok, pos), w, k, last, positions, observer)
+        drafts = vg.chain_drafts(lambda tok, pos: self.run_step(w, tok, pos), w, k, last, positions, observer, pad=pad)
         self.stats["draft_steps"] += k
         self.stats["draft_wall"] += time.perf_counter() - t0
         return drafts
