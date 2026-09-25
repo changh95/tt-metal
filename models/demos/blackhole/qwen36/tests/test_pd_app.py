@@ -173,3 +173,23 @@ def test_weight_cache_is_warm_only_with_a_marker_for_this_code(tmp_path):
     assert (cache / f".qwen36_pd_warm_{pd_app.model_code_fingerprint()}").is_file()
     assert pd_app.weight_cache_is_warm({"TT_CACHE_PATH": str(tmp_path / "missing")}) is False
     assert pd_app.weight_cache_is_warm({}) is False
+
+
+def test_vllm_argv_speculative_mtp_only_on_the_decode_half():
+    """QWEN36_SPEC_MTP=1 adds vLLM's speculative_config (MTP, QWEN36_SPEC_K drafts) and --no-async-scheduling to the
+    decode half only; the prefill half's argv is unchanged (it reads the env itself for the MTP prefill/export)."""
+    base = {"HF_MODEL": "Qwen/Qwen3.8-27B", "HF_HUB_OFFLINE": "1"}
+    off = pd_app.BundleConfig.from_env(base)
+    on = pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_MTP": "1", "QWEN36_SPEC_K": "2"})
+    assert off.speculative_mtp is False and on.speculative_mtp is True and on.speculative_k == 2
+    assert (
+        pd_app.vllm_argv(off, "decode")
+        == [a for a in pd_app.vllm_argv(on, "decode") if a not in ("--no-async-scheduling",)][
+            : len(pd_app.vllm_argv(off, "decode"))
+        ]
+    )
+    argv = pd_app.vllm_argv(on, "decode")
+    i = argv.index("--speculative-config")
+    assert argv[i + 1] == '{"method": "mtp", "num_speculative_tokens": 2}'
+    assert "--no-async-scheduling" in argv
+    assert pd_app.vllm_argv(on, "prefill") == pd_app.vllm_argv(off, "prefill")

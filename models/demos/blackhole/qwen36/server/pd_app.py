@@ -132,6 +132,11 @@ class BundleConfig:
     # post to D concurrently with P (the proxy picks the transfer_id); off = P first, then D with P's params
     proxy_fanout: bool = True
     extra_vllm_args: tuple[str, ...] = ()
+    # Speculative decoding with the checkpoint's MTP head (QWEN36_SPEC_MTP=1, QWEN36_SPEC_K drafts per step, default 3):
+    # both halves see the env (P runs the MTP prefill and ships the head's KV + last hidden row with the GDN snapshot; D
+    # drafts with the head and verifies); only D's vLLM needs the speculative_config for its token bookkeeping.
+    speculative_mtp: bool = False
+    speculative_k: int = 3
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "BundleConfig":
@@ -166,6 +171,8 @@ class BundleConfig:
             serial_cold_boot=env.get("QWEN36_PD_SERIAL_COLD_BOOT", "1") not in ("0", "false", "False"),
             proxy_fanout=env.get("QWEN36_PD_PROXY_FANOUT", "1") not in ("0", "false", "False"),
             extra_vllm_args=tuple(extra),
+            speculative_mtp=env.get("QWEN36_SPEC_MTP", "0") in ("1", "true", "True"),
+            speculative_k=int(env.get("QWEN36_SPEC_K", "3")),
         )
 
 
@@ -220,6 +227,12 @@ def vllm_argv(config: BundleConfig, role: str) -> list[str]:
         "--port",
         str(port),
     ]
+    if role == "decode" and config.speculative_mtp:
+        argv += [
+            "--speculative-config",
+            json.dumps({"method": "mtp", "num_speculative_tokens": config.speculative_k}),
+            "--no-async-scheduling",
+        ]
     argv += list(config.extra_vllm_args)
     return argv
 
