@@ -488,8 +488,8 @@ class MTPHead:
         user_ctx: ``(u, slot)`` or ``(u, slot, page_table_row)`` (model.prefill_paged_slots passes the request's own
         [1, blocks] row; without one the head's ``page_tables[slot]`` is used). hidden: the segment's pre-final-norm
         residual [1,1,bucket,dim/TP] (traced-bucket / chunk-trace output or eager tensor). token_buf [1, >= n]: the
-        segment's n = actual_len real tokens (then bucket padding) -- or, for a chunk followed by more prompt, n + 1
-        tokens whose extra one is the next chunk's first token (model.py's chunked paths pass it): the head then
+        segment's n = actual_len real tokens (then bucket padding) -- or, for a FULL chunk followed by more prompt,
+        bucket + 1 tokens whose extra one is the next chunk's first token (model.py's chunked paths pass it): the head then
         fills ALL n positions of the segment; a final segment fills n - 1 and stores the main hidden row n - 1 for
         the first draft step (``pending_rows[slot]``). chunk_start: the segment's absolute position."""
         if user_ctx is None:
@@ -500,7 +500,9 @@ class MTPHead:
         slot = int(user_ctx[1])
         pt_row = user_ctx[2] if len(user_ctx) > 2 and user_ctx[2] is not None else self.page_tables[slot]
         pt_row = torch.as_tensor(pt_row).reshape(1, -1).to(torch.int32)
-        has_next = int(token_buf.shape[1]) > n
+        # a chunk followed by more prompt carries bucket + 1 tokens; a final segment's token_buf is at most the
+        # bucket wide (the masked bucket pads it to the bucket, so `> n` would misread a padded tail as non-final)
+        has_next = int(token_buf.shape[1]) > bucket
         t0 = time.perf_counter()
         # tokens shifted by one: x_{cs+1}.. at positions cs.. (a final segment's row n-1 = the first draft step)
         n_fill = n if has_next else n - 1
