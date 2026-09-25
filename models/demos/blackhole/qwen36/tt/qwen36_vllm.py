@@ -32,6 +32,7 @@ from models.tt_transformers.tt.generator import Generator
 _PREFILL_WARMUP_CHUNK = 2048
 _PREFILL_WARMUP_BUCKET = 4096
 _BLOCK_SIZE = 64
+_SDPA_PT_DEFAULT_BLOCKS = 64  # MTP prefill SDPA page-table width without a KV cache to size it from
 
 
 class TT_Qwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
@@ -447,7 +448,52 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                     _sm.set_trace_bucket(B)
         return super().decode_forward(*args, **kwargs)
 
+    def _install_mtp_prefill_hook(self, kv_cache):
+        """Speculative decoding, PREFILL side (QWEN36_SPEC_MTP=1; tt/mtp_head.py): make every served prefill also run
+        the MTP head's prefill, so the head's KV (pd_transfer's 17th attention layer) and the request's hidden row
+        exist for the drafter -- on this instance, or on the D instance the connector ships them to.
+
+        Runs once, at the start of the FIRST warm-up phase (compile, no trace captured yet): the head is a set of
+        persistent buffers and its prefill programs are compiled eagerly per bucket here (compile-first rule,
+        tests/VERIFY_W32_AUDIT.md), which must precede the chunk/bucket captures below and the decode captures. If
+        the decode side already built the head (`model.mtp_head`, with its draft-step widths), only the prefill
+        buckets are compiled and the hook installed; otherwise a prefill-only head is built (no draft widths --
+        a P instance never drafts; `pd_skip_gdn_slot_write` marks the connector's producer role, and a D-side
+        builder that runs later would find `model.mtp_head` set and reuse it). The SDPA page table of the head's
+        prefill is sized like the chunk trace's (the whole KV cache in blocks, rounded to 32). Buckets: every
+        masked bucket + the 2048 chunk (long prompts are prefilled chunk by chunk, hook per chunk)."""
+        from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead, spec_mtp_enabled
+
+        if not spec_mtp_enabled() or getattr(self, "_mtp_prefill_hook_installed", False):
+            return
+        model = self.model[0]
+        if model.num_devices <= 1 or model.args.max_batch_size <= 1:
+            logger.warning("QWEN36_SPEC_MTP=1 ignored: the MTP prefill hook needs the TP batched (max_num_seqs>1) path")
+            return
+        self._mtp_prefill_hook_installed = True
+        t0 = time.perf_counter()
+        buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
+        head = getattr(model, "mtp_head", None)
+        if head is None:
+            num_blocks = math.ceil(int(kv_cache[0][0].shape[0]) / 32) * 32 if kv_cache else _SDPA_PT_DEFAULT_BLOCKS
+            role = "producer" if getattr(model, "pd_skip_gdn_slot_write", False) else "standalone"
+            head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=num_blocks)
+            logger.info(f"[mtp] prefill-only head built ({role}; sdpa page table {num_blocks} blocks)")
+        else:
+            missing = [b for b in buckets if b not in head.pf]
+            assert not missing, f"the decode side's MTP head lacks prefill buckets {missing} (have {sorted(head.pf)})"
+        for b in buckets:
+            head.compile_prefill(b)
+        ttnn.synchronize_device(self.mesh_device)
+        model.prefill_hidden_hook = head.prefill_hook
+        logger.info(
+            f"[mtp] prefill hook installed: buckets {buckets} compiled in {time.perf_counter() - t0:.1f}s "
+            f"(every served prefill now fills the head's KV + stores the request's hidden row)"
+        )
+
     def warmup_model_prefill(self, kv_cache, enable_trace, *args, **kwargs):
+        # Speculative decoding (QWEN36_SPEC_MTP=1): the MTP prefill hook, before any capture (no-op otherwise).
+        self._install_mtp_prefill_hook(kv_cache)
         # Capture the chunk-prefill trace + warm the masked-bucket set so requests only replay
         # pre-compiled programs (compile-clobbers-trace fix). Guard name must match the plugin's reset.
         if not enable_trace:

@@ -248,8 +248,12 @@ class Qwen36Model:
         # the masked-bucket prefill calls ``hook(user_ctx, hidden, token_buf, actual_len, bucket, chunk_start)`` with
         # the pre-final-norm residual of the whole bucket ([1,1,bucket,dim/TP], fractured; the traced path's output
         # buffer or the eager path's tensor, still alive) BEFORE the logits select, so the MTP head can fill its own KV
-        # over the prompt. ``_prefill_hook_user`` = (request index, decode slot) of the request being prefilled by
-        # prefill_paged_slots (None outside it). Both None by default: the single-token serving path is unchanged.
+        # over the prompt; the chunked long-prompt paths (_prefill_traced_chunked_tp / _prefill_chunked_eager_tp) call
+        # it once per full 2048-token chunk with the chunk's residual, chunk_start = its position and token_buf = the
+        # chunk's tokens PLUS the next chunk's first token (so the head can fill every position of the chunk), then
+        # the masked tail fires it as usual. ``_prefill_hook_user`` = (request index, decode slot, the request's
+        # [1, blocks] page-table row) of the request being prefilled by prefill_paged_slots (None outside it). Both
+        # None by default: the single-token serving path is unchanged.
         self.prefill_hidden_hook = None
         self._prefill_hook_user = None
 
@@ -1941,7 +1945,8 @@ class Qwen36Model:
                 # Trace-safe prefill into the B=1 scratch: prefill_traced_chunked runs short prompts in
                 # one masked-bucket forward and chunks longer ones; GDN state carries + is snapshotted below.
                 if self.prefill_hidden_hook is not None:
-                    self._prefill_hook_user = (u, int(empty_slots[u]))  # speculative decoding: who is being prefilled
+                    # speculative decoding: who is being prefilled (user, decode slot, its own page-table row)
+                    self._prefill_hook_user = (u, int(empty_slots[u]), pt[u : u + 1].clone())
                 _t1 = _tp()
                 lg = self.prefill_traced_chunked(toks[:, :actual], pt[u : u + 1], actual_len=actual)
                 _t2 = _tp()
@@ -3310,6 +3315,10 @@ class Qwen36Model:
                 token_ids[:, cs : cs + chunk_size], chunk_size, cs, page_table, chunk_size, flex_sdpa=flex_sdpa
             )
             ttnn.synchronize_device(self.device)
+            # Speculative decoding: MTP prefill of this chunk (tokens + the next chunk's first token, see above).
+            self._run_prefill_hidden_hook(
+                last_hidden, token_ids[:, cs : min(cs + chunk_size + 1, actual_len)], chunk_size, chunk_size, cs
+            )
         if tail_real > 0:
             ttnn.deallocate(last_hidden)
             cs = num_full * chunk_size
@@ -3426,6 +3435,20 @@ class Qwen36Model:
 
             ttnn.execute_trace(self.device, self._chunked_trace_id, cq_id=0, blocking=False)
 
+            if self.prefill_hidden_hook is not None:
+                # Speculative decoding: the MTP head prefills this chunk from the trace's output residual (read in
+                # place after the replay completes; the eager head forward then runs before the next chunk's DMAs).
+                # The chunk's tokens travel with the NEXT chunk's first token so the head fills every position of
+                # the chunk (see MTPHead.prefill_hook); the last chunk of an exact-multiple prompt gets none.
+                ttnn.synchronize_device(self.device)
+                _host_refs.clear()
+                self._run_prefill_hidden_hook(
+                    self._chunked_trace_output,
+                    token_ids[:, cs : min(cs + chunk_size + 1, actual_len)],
+                    chunk_size,
+                    chunk_size,
+                    cs,
+                )
             # Bound in-flight depth; after a sync the completed DMAs' host tensors can be released.
             if (c + 1) % _SYNC_EVERY == 0:
                 ttnn.synchronize_device(self.device)

@@ -29,6 +29,18 @@ row (by default through `TracedKvImporter`: one staged upload + one trace replay
 preparations (`prepare_kv_import`, `prepare_gdn_import`) are torch-only and may run off the main thread.
 The decode instance then continues the request with one ordinary decode step for the last prompt token
 (the prefill side computed h(N-1)).
+
+Speculative decoding (tt/mtp_head.py, QWEN36_SPEC_MTP=1): when the model carries an MTP head (`model.mtp_head`,
+set by the MTPHead constructor on both P and D), the head's paged KV is the LAST entry of `_attention_layers`
+-- a 17th attention layer whose cache the request's block ids index exactly like the main 16 -- so
+`export_kv_blocks` / `import_kv_blocks` move it in the same call and the same payload (layer order: the 16 main
+full-attention layers in model order, then the MTP layer). The head's per-request hidden row (the main model's
+post-final-norm hidden state at the last prefilled position, bf16 [dim]) travels beside the GDN snapshot:
+`export_mtp_hidden(model, slot)` on P (after the request's prefill), `import_mtp_hidden(model, slot, row)` on D
+when the request gets its decode slot (= `MTPHead.set_hidden_in`). A payload with fewer KV layers than the model
+(a plain P feeding a speculative D) imports the layers it has and leaves the head's blocks untouched (no hidden
+row either: the D side must then not draft for that request); one with more (a speculative P feeding a plain D)
+drops the extra layers. The block layout of every layer is the one documented at `export_kv_blocks`.
 """
 
 from __future__ import annotations
@@ -126,7 +138,63 @@ def _upload(model, host: torch.Tensor, dtype, mapper):
 
 
 def _attention_layers(model):
-    return [layer.attention for layer in model.layers if layer.is_full_attention]
+    """The attention modules whose paged caches make up a request's KV state, in payload order: the model's
+    full-attention layers, then (when speculative decoding built one) the MTP head's layer (`model.mtp_head`)."""
+    layers = [layer.attention for layer in model.layers if layer.is_full_attention]
+    head = getattr(model, "mtp_head", None)
+    if head is not None:
+        layers.append(head.attention)
+    return layers
+
+
+def kv_layer_split(model):
+    """(n_main, n_mtp): how many of `_attention_layers(model)` are the model's own layers and how many the MTP
+    head's (0 or 1). The payload packer files the MTP pairs under their own names (`mtp.kv.<j>`)."""
+    n_main = sum(1 for layer in model.layers if layer.is_full_attention)
+    return n_main, len(_attention_layers(model)) - n_main
+
+
+def export_mtp_hidden(model, slot):
+    """P side: the request's MTP hidden row for decode `slot` -- the main model's post-final-norm hidden state at
+    its last prefilled position, bf16 [dim], stored by the MTP prefill hook (`MTPHead.pending_rows`) and taken here
+    (popped). None when the model has no head or the slot's prefill stored none."""
+    head = getattr(model, "mtp_head", None)
+    if head is None:
+        return None
+    return head.pop_hidden_in(int(slot))
+
+
+def import_mtp_hidden(model, slot, row):
+    """D side: hand an imported request's hidden row (`export_mtp_hidden` / the payload's `mtp.hidden`) to the
+    drafter for decode `slot` (`MTPHead.set_hidden_in`); the head's `begin_batch` uploads it as the slot's
+    first-step hidden_in. Raises when the model has no head (the caller checked `kv_layer_split`)."""
+    head = getattr(model, "mtp_head", None)
+    if head is None:
+        raise RuntimeError("import_mtp_hidden: the model has no MTP head (model.mtp_head)")
+    head.set_hidden_in(int(slot), row)
+
+
+def _zero_kv_pairs(model, kv, n_layers, why):
+    """`kv` brought to exactly `n_layers` (k, v) pairs: missing layers appended as zero pairs (their blocks are
+    then written with zeros), extra layers dropped. Logs the mismatch once per (payload, model) layer count."""
+    have = len(kv)
+    if have == n_layers:
+        return kv
+    key = (have, n_layers)
+    seen = getattr(model, "_pd_kv_layer_mismatch_logged", None)
+    if seen is None:
+        seen = model._pd_kv_layer_mismatch_logged = set()
+    if key not in seen:
+        seen.add(key)
+        logger.warning(
+            f"[pd] {why}: payload has {have} KV layer(s), this instance {n_layers} "
+            f"({'MTP head on this side only: its blocks get zeros' if have < n_layers else 'extra layer(s) dropped'})"
+        )
+    if have > n_layers:
+        return list(kv[:n_layers])
+    k0 = kv[0][0]
+    z = k0.new_zeros(k0.shape)
+    return list(kv) + [(z, z)] * (n_layers - have)
 
 
 def pad_block_ids(block_ids, n, num_blocks):
@@ -231,6 +299,9 @@ def _kv_export_pool(model):
     if os.environ.get("QWEN36_PD_EXPORT_POOL", "1") != "1":
         return None
     pool = getattr(model, "_kv_export_pool", None)
+    if pool is not None and pool.n_caches != 2 * len(_attention_layers(model)):
+        logger.info("[pd] KV export pool: attention layer count changed (MTP head); rebuilding the pool")
+        pool = None
     if pool is None:
         pool = model._kv_export_pool = KvExportPool(
             model,
@@ -243,9 +314,11 @@ def _kv_export_pool(model):
 def export_kv_blocks(model, block_ids):
     """Read one request's paged-KV blocks off the device.
 
-    Returns, per full-attention layer, a `(k, v)` pair of host tensors shaped
+    Returns, per attention layer of `_attention_layers(model)` (the 16 full-attention layers in model order, then
+    the MTP head's layer when the model has one), a `(k, v)` pair of host tensors shaped
     `[n_blocks, n_dev * n_local_kv_heads, block_size, head_dim]` in torch.bfloat16 (a bf8 cache reads
-    back through bf16 exactly), block order = `block_ids` order.
+    back through bf16 exactly), block order = `block_ids` order; dim 1 is device-major (device d's local kv
+    heads at [d * n_local_kv_heads, (d + 1) * n_local_kv_heads)).
 
     One device read for the whole request: the blocks of all 32 cache tensors are concatenated on device
     into a single tensor, converted (bfp8 -> bf16, untilize) once, and DMA'd once into a pooled, borrowed
@@ -415,7 +488,7 @@ def import_kv_blocks(model, block_ids, kv):
     n_dev = model.num_devices
     n_real = len(block_ids)
     layers = _attention_layers(model)
-    assert len(kv) == len(layers), f"{len(kv)} KV layer pairs for {len(layers)} attention layers"
+    kv = _zero_kv_pairs(model, kv, len(layers), "import_kv_blocks")
     cache0 = layers[0].paged_k
     n = export_bucket(n_real) if os.environ.get("QWEN36_PD_IMPORT_BUCKETS", "1") == "1" else n_real
     ids = [int(b) for b in block_ids] + [_pad_block(model, cache0)] * (n - n_real)
@@ -509,6 +582,7 @@ def prepare_kv_import(model, kv) -> PreparedKvImport:
     `import_kv_blocks`: one padded, chunked, device-major staging tensor (see PreparedKvImport)."""
     if isinstance(kv, PreparedKvImport):
         return kv
+    kv = _zero_kv_pairs(model, kv, len(_attention_layers(model)), "prepare_kv_import")
     n_dev = int(model.num_devices)
     n_caches = 2 * len(kv)
     n_real, ndn, blk, hd = kv[0][0].shape
@@ -623,10 +697,19 @@ class TracedKvImporter:
 
     def import_blocks(self, block_ids, kv):
         t0 = time.perf_counter()
+        if 2 * len(_attention_layers(self.model)) != self.n_caches:
+            raise RuntimeError(
+                f"TracedKvImporter was built over {self.n_caches // 2} attention layers, the model now has "
+                f"{len(_attention_layers(self.model))} (build the MTP head before import_warmup)"
+            )
         prep = prepare_kv_import(self.model, kv)
         n_real = len(block_ids)
         if prep.n_real != n_real:
             raise ValueError(f"{prep.n_real} blocks in payload vs {n_real} block ids")
+        if prep.host.shape[1] != self.n_dev * self.n_caches:
+            raise ValueError(
+                f"prepared payload has {prep.host.shape[1] // self.n_dev} caches, importer {self.n_caches}"
+            )
         chunk = prep.chunk
         ids = [int(b) for b in block_ids] + [self.pad] * (prep.n_chunks * chunk - n_real)
         t1 = time.perf_counter()

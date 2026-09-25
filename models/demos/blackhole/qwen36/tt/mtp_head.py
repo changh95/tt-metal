@@ -18,11 +18,28 @@ Device side (``MTPHead``):
     prefill's fractured residual, replicated copies for the decode step's fused-all-reduce residual), the three norms
     through the framework RMSNorm (+1 offset), the paged KV as two more cache tensors of the main cache's shape (+1 pad
     block) bound with set_paged_kv_cache; RoPE from the model's tables.
-  * prefill (``prefill_hook``, installed as ``model.prefill_hidden_hook``): after the main masked-bucket prefill of a
-    request, the head runs ONE eager forward over the bucket with the tokens shifted by one (x_1..x_{n-1} at positions
-    0..n-2) and the main post-norm hidden (``model.norm`` of the bucket's residual) -> its KV holds positions 0..n-2;
-    the row (x_n, h_{n-1}) at n-1 is left to the first draft step (one uniform draft path). The main hidden row n-1 is
-    read back once per request (host [dim]) and uploaded as the batch's first-step ``hidden_in``.
+  * prefill (``prefill_hook``, installed as ``model.prefill_hidden_hook``): after the main prefill of a request's
+    segment (a masked bucket, or one 2048-token chunk of a long prompt: model.py fires the hook per chunk with the
+    chunk trace's output residual and the chunk's tokens plus the FIRST token of the next chunk), the head runs ONE
+    eager forward over the segment with the tokens shifted by one and the main post-norm hidden (``model.norm`` of
+    the segment's residual) at ``chunk_start_idx`` = the segment's position, attending over its own KV of the earlier
+    chunks. A segment followed by more prompt (the next token is known) fills all its positions; the FINAL segment
+    of n tokens fills positions ..n-2 and leaves the row (x_n, h_{n-1}) at n-1 to the first draft step (one uniform
+    draft path). So after a prefill of N tokens the head's KV holds positions 0..N-2 and the main hidden row N-1
+    (the LM-head input, bf16 [dim]) is read back once per request (an exact one-hot select, no full-bucket read) into
+    ``pending_rows[slot]`` -- the batch's first-step ``hidden_in`` (``begin_batch``).
+  * P/D hand-off (tt/pd_transfer.py, the plugin's TTMooncakeConnector): ``model.mtp_head`` (set by the constructor)
+    makes the head's KV the 17th attention layer of ``pd_transfer._attention_layers`` -- exported/imported with the
+    request's blocks in the same payload, same block ids -- and ``pending_rows[slot]`` travels as the payload's
+    ``mtp.hidden`` row (``pd_transfer.export_mtp_hidden`` on P, ``import_mtp_hidden`` / ``set_hidden_in`` on D). A
+    D instance therefore holds, after the import, exactly the state this process holds after its own prefill of the
+    same N tokens: KV 0..N-2 + hidden row N-1; its first draft step is (x_N, h_{N-1}) at N-1 with x_N = the token
+    the P side's logits (or, under the connector's N-1 truncation, the real last prompt token) supply.
+    Allocation contract for D (the serving loop): ``MTPHead.allocate_kv(model)`` returns the [k, v] pair (main
+    cache's shape + 1 pad block); pass it as ``paged_kv=`` or let the constructor call it. Build the head BEFORE
+    ``pd_transfer.import_warmup`` / ``export_warmup`` (their pools bake the cache list) and before any trace capture.
+    ``QWEN36_SPEC_MTP=1`` (``spec_mtp_enabled``) is the process-wide switch; unset, nothing here is constructed and
+    the plain path is byte-identical.
   * draft step (traced per width w): ``hidden_in`` [1,1,w,dim] + token [1,w] + position [w] -> embedding gather ->
     pre-fc norms (decode sharded configs) -> fc (1D decode matmuls, replicated weights) -> the layer's decode forward
     (paged KV write at the position, SDPA over <= position) -> mtp.norm -> sharded lm_head -> per-device (argmax,max)
@@ -53,7 +70,14 @@ from models.tt_transformers.tt.common import Mode, get_block_size
 from models.tt_transformers.tt.distributed_norm import DistributedNorm
 
 MTP_PREFIX = "mtp."
-_SDPA_PT_BLOCKS = 32  # the SDPA page-table stick: 32 blocks (attention/tp.py forward_prefill_paged pads to this)
+_SDPA_PT_BLOCKS = 32  # the SDPA page-table stick granularity (attention/tp.py forward_prefill_paged pads to x32)
+
+
+def spec_mtp_enabled() -> bool:
+    """QWEN36_SPEC_MTP=1: speculative decoding with the MTP head is configured for this process (P: run the MTP
+    prefill per request and ship the head's KV + hidden row; D: allocate the head and import them). Default off:
+    nothing MTP-related is built and the served path is byte-identical to the plain one."""
+    return os.environ.get("QWEN36_SPEC_MTP", "0") == "1"
 
 
 class _StepBufs:
@@ -66,9 +90,26 @@ class _StepBufs:
 
 
 class MTPHead:
-    def __init__(self, model, page_tables, widths, buckets, keep_logits=False, layer_index=None):
-        """page_tables: torch [BMAX, blocks] int32, row = decode slot (the verify plans' rows are its first w rows).
-        widths: the draft-step batch widths to support (one trace each); buckets: the prefill buckets to compile."""
+    def __init__(
+        self,
+        model,
+        page_tables=None,
+        widths=(),
+        buckets=(),
+        keep_logits=False,
+        layer_index=None,
+        paged_kv=None,
+        sdpa_pt_blocks=None,
+    ):
+        """page_tables: torch [BMAX, blocks] int32, row = decode slot (the verify plans' rows are its first w rows);
+        the draft step's page tables and, for a prefill hook called without a page-table row (user_ctx of two
+        fields), the prefill's. None for a prefill-only head (a P instance: widths must then be empty; the served
+        prefill hands the hook the request's own row). widths: the draft-step batch widths to support (one trace
+        each); buckets: the prefill buckets to compile (the masked buckets + the 2048 chunk for long prompts).
+        paged_kv: the head's [k, v] cache pair from ``allocate_kv`` (default: allocated here). sdpa_pt_blocks: width
+        of the prefill's SDPA page table (default: the model's chunk-trace page table width when captured, else the
+        page_tables' width rounded up to 32); it must cover the longest prompt's blocks. Registers itself as
+        ``model.mtp_head`` (pd_transfer's 17th attention layer)."""
         self.model = model
         args = model.args
         mesh = model.mesh_device
@@ -78,13 +119,28 @@ class MTPHead:
         assert model.num_devices > 1, "the MTP head is TP only"
         assert model._decode_fused_all_reduce(), "the draft step runs the fused decode all-reduce residual path"
         assert model._paged_kv_caches, "allocate_kv_caches first (the MTP KV mirrors the main cache)"
+        assert getattr(model, "mtp_head", None) is None, "the model already has an MTP head (model.mtp_head)"
         self.keep_logits = bool(keep_logits)
         self.dim = args.dim
         self.per_shard = args.vocab_size // model.num_devices
         self.rep = ttnn.ReplicateTensorToMesh(mesh)
-        pt = page_tables if isinstance(page_tables, torch.Tensor) else torch.as_tensor(page_tables)
-        self.page_tables = pt.to(torch.int32)
-        assert self.page_tables.shape[1] % 8 == 0, "page-table stick must be a multiple of 8 blocks"
+        widths = sorted(set(int(v) for v in widths))
+        if page_tables is None:
+            assert not widths, "draft-step widths need the decode page tables"
+            self.page_tables = None
+        else:
+            pt = page_tables if isinstance(page_tables, torch.Tensor) else torch.as_tensor(page_tables)
+            self.page_tables = pt.to(torch.int32)
+            assert self.page_tables.shape[1] % 8 == 0, "page-table stick must be a multiple of 8 blocks"
+        buf = getattr(model, "_chunk_full_page_table_buf", None)
+        if sdpa_pt_blocks is None:
+            if buf is not None:
+                sdpa_pt_blocks = int(buf.shape[-1])
+            elif self.page_tables is not None:
+                sdpa_pt_blocks = int(self.page_tables.shape[1])
+            else:
+                sdpa_pt_blocks = _SDPA_PT_BLOCKS
+        self.sdpa_pt_blocks = -(-int(sdpa_pt_blocks) // _SDPA_PT_BLOCKS) * _SDPA_PT_BLOCKS
 
         # --- the virtual layer index and the weights ---
         idx = int(layer_index) if layer_index is not None else len(args.attention_type_list)
@@ -159,25 +215,21 @@ class MTPHead:
 
         # --- paged KV: the main cache's shape (+1 pad block for the fixed-width prefill fill), bound to the layer ---
         k0 = model._paged_kv_caches[0][0]
-        kv_shape = list(k0.shape)
-        self.n_main_blocks = kv_shape[0]
-        self.pad_block = kv_shape[0]  # the extra block: never in any page table
-        kv_shape[0] += 1
+        self.n_main_blocks = int(k0.shape[0])
+        self.pad_block = self.n_main_blocks  # the extra block: never in any page table
         self.block_size = get_block_size(model._paged_kv_caches)
         self.kv_dtype = k0.dtype
-
-        def _mk():
-            return ttnn.as_tensor(
-                torch.zeros(kv_shape, dtype=torch.bfloat16),
-                device=mesh,
-                dtype=self.kv_dtype,
-                layout=ttnn.TILE_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=self.rep,
-            )
-
-        self.kv_cache = [_mk(), _mk()]
+        self.kv_cache = list(paged_kv) if paged_kv is not None else self.allocate_kv(model)
+        assert len(self.kv_cache) == 2 and tuple(self.kv_cache[0].shape) == (
+            self.n_main_blocks + 1,
+            *list(k0.shape)[1:],
+        ), (
+            f"MTP KV pair must be the main cache's shape + 1 pad block: {tuple(self.kv_cache[0].shape)} vs "
+            f"{tuple(k0.shape)}"
+        )
+        kv_shape = list(self.kv_cache[0].shape)
         self.layer.attention.set_paged_kv_cache(*self.kv_cache)
+        model.mtp_head = self
 
         # --- decode-side layouts ---
         self.nc_dec = args.get_norm_config("attn", Mode.DECODE)
@@ -186,7 +238,7 @@ class MTPHead:
 
         # --- per-width draft-step buffers ---
         self.sb = {}
-        for w in sorted(set(int(v) for v in widths)):
+        for w in widths:
             assert 1 <= w <= self.page_tables.shape[0]
             b = _StepBufs()
             b.tok = self._up(torch.zeros(1, w, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
@@ -200,7 +252,8 @@ class MTPHead:
             )
             self.sb[w] = b
 
-        # --- per-bucket prefill buffers (values per request: tokens, fill page table; cos/sin constant) ---
+        # --- per-bucket prefill buffers (values per request/segment: tokens, fill page table, cos/sin of the
+        # segment's positions, the one-hot row selector of the hidden-row readback) ---
         self.pf = {}
         for bucket in sorted(set(int(v) for v in buckets)):
             assert bucket % self.block_size == 0
@@ -214,12 +267,13 @@ class MTPHead:
                     ttnn.int32,
                     ttnn.ROW_MAJOR_LAYOUT,
                 ),
+                sel=self._up(mbt.host_logit_sel(1, bucket), ttnn.bfloat16, ttnn.TILE_LAYOUT),
             )
         self.pf_full_pt = self._up(
-            torch.zeros(1, _SDPA_PT_BLOCKS, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT
+            torch.zeros(1, self.sdpa_pt_blocks, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT
         )
         self.pf_csi = self._up(torch.zeros(1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        assert self.page_tables.shape[1] <= _SDPA_PT_BLOCKS
+        assert self.page_tables is None or self.page_tables.shape[1] <= self.sdpa_pt_blocks
 
         # --- per-verify-plan 0/1 row selectors (bind_plan) ---
         self._plan_sel = {}
@@ -238,8 +292,65 @@ class MTPHead:
         }
         logger.info(
             f"[mtp] head ready: widths {sorted(self.sb)} buckets {sorted(self.pf)} kv {kv_shape} {self.kv_dtype} "
-            f"pad block {self.pad_block}"
+            f"pad block {self.pad_block} sdpa page table {self.sdpa_pt_blocks} blocks"
         )
+
+    # ------------------------------------------------------------------------------------------ KV / hidden API
+    @staticmethod
+    def allocate_kv(model, num_blocks=None):
+        """The head's paged KV pair ``[k, v]``: the main cache's per-block shape and dtype over ``num_blocks`` (default
+        = the main cache's block count, which the request block ids index) PLUS one pad block at index ``num_blocks``
+        (the fixed-width prefill fill's scratch; never in a page table). D side: call it with the engine's block count
+        once the main caches exist (``allocate_kv_caches``) and hand the pair to ``MTPHead(..., paged_kv=pair)``, or
+        let the constructor call it; either way it must exist before ``pd_transfer.import_warmup`` (the traced
+        importer bakes the cache list) and before any trace capture."""
+        assert model._paged_kv_caches, "allocate_kv_caches first"
+        k0 = model._paged_kv_caches[0][0]
+        shape = list(k0.shape)
+        if num_blocks is not None:
+            assert int(num_blocks) == int(
+                shape[0]
+            ), f"MTP KV block count {num_blocks} must equal the main cache's {shape[0]} (same block ids index both)"
+        shape[0] = int(shape[0]) + 1
+        rep = ttnn.ReplicateTensorToMesh(model.mesh_device)
+
+        def _mk():
+            return ttnn.as_tensor(
+                torch.zeros(shape, dtype=torch.bfloat16),
+                device=model.mesh_device,
+                dtype=k0.dtype,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=rep,
+            )
+
+        return [_mk(), _mk()]
+
+    @property
+    def paged_kv(self):
+        """The head's [k, v] cache pair (``allocate_kv`` layout), bound to ``self.attention``."""
+        return self.kv_cache
+
+    @property
+    def attention(self):
+        """The head's attention module: ``paged_k`` / ``paged_v`` are the pair above -- pd_transfer's 17th layer."""
+        return self.layer.attention
+
+    def set_hidden_in(self, slot, row):
+        """D side (and any importer): the request's main POST-final-norm hidden row of its last prefilled position
+        (bf16 [dim], the payload's ``mtp.hidden``) for decode slot ``slot`` -- what this process's own prefill hook
+        would have stored (``pending_rows[slot]``); ``begin_batch`` uploads it as the slot's first-step hidden_in."""
+        row = torch.as_tensor(row)
+        assert row.numel() == self.dim, f"hidden row of {row.numel()} values, expected {self.dim}"
+        self.pending_rows[int(slot)] = row.reshape(self.dim).to(torch.bfloat16).clone()
+
+    def get_hidden_in(self, slot):
+        """The stored hidden row of ``slot`` (bf16 [dim]) or None."""
+        return self.pending_rows.get(int(slot))
+
+    def pop_hidden_in(self, slot):
+        """P side: take the row of a request whose state is being exported (None when no prefill stored one)."""
+        return self.pending_rows.pop(int(slot), None)
 
     # ------------------------------------------------------------------------------------------ helpers
     def _up(self, t, dtype, layout):
@@ -257,13 +368,17 @@ class MTPHead:
         self._host_refs = []
 
     # ------------------------------------------------------------------------------------------ prefill
-    def prefill_forward(self, bucket, hidden_frac):
-        """Eager MTP forward over one bucket (inputs: the bucket's persistent buffers + hidden_frac, the main model's
-        pre-final-norm residual [1,1,bucket,dim/TP]). Side effect: the head's KV at the fill page table's blocks.
-        Everything stays FRACTURED [S, dim/TP] (no replicated full-width prefill rows): distributed pre-fc norms,
-        row-parallel fc partials summed by the reduce-scatter. Returns (h_frac_n, y): the main POST-norm hidden
-        (fractured; gather on the host for a row) and the layer output [1,1,bucket,dim/TP]; the caller deallocates both.
-        """
+    def prefill_forward(self, bucket, hidden_frac, chunk_start=0):
+        """Eager MTP forward over one bucket-sized segment at positions [chunk_start, chunk_start + bucket) (inputs:
+        the bucket's persistent buffers -- tokens, cos/sin of those positions, fill page table -- + hidden_frac, the
+        main model's pre-final-norm residual [1,1,bucket,dim/TP]; pf_full_pt / pf_csi hold the request's SDPA page
+        table and the segment offset). Side effect: the head's KV at the fill page table's blocks; the SDPA attends
+        over the head's KV of the earlier segments through the full page table. Everything stays FRACTURED
+        [S, dim/TP] (no replicated full-width prefill rows): distributed pre-fc norms, row-parallel fc partials
+        summed by the reduce-scatter. Returns (h_frac_n, y): the main POST-norm hidden (fractured; select a row with
+        ``_select_row`` or gather on the host) and the layer output [1,1,bucket,dim/TP]; the caller deallocates both.
+        Programs depend on the bucket only (the page table is fixed-width, the offset a tensor), so ``compile_prefill``
+        per bucket compiles everything a request can run."""
         m, args = self.model, self.args
         b = self.pf[bucket]
         x_e = m.embd(b["tok"])  # [1,bucket,dim/TP]
@@ -300,26 +415,61 @@ class MTPHead:
             mode="prefill",
             page_table=self.pf_full_pt,
             chunk_page_table=b["fill_pt"],
-            chunk_start_idx=0,
+            chunk_start_idx=int(chunk_start),
             chunk_start_idx_tensor=self.pf_csi,
             valid_len=bucket,
         )
         ttnn.deallocate(x)
         return h_frac_n, y
 
-    def compile_prefill(self, bucket):
-        """Compile the bucket's prefill programs eagerly (before any trace capture) on a zero residual; writes garbage
-        into the pad block only."""
-        t0 = time.perf_counter()
-        self._dma(
-            torch.full((1, bucket // self.block_size), self.pad_block, dtype=torch.int32),
-            self.pf[bucket]["fill_pt"],
-            ttnn.int32,
-            ttnn.ROW_MAJOR_LAYOUT,
+    def _select_row(self, bucket, h_frac_n, row):
+        """Host bf16 [dim]: row ``row`` of the fractured post-norm hidden ``h_frac_n`` [1,1,bucket,dim/TP] -- an exact
+        one-hot matmul (HiFi4, fp32 accumulate: one 1.0 x value term, the rest exact zeros) per device, then the
+        shards gathered on the host. One fixed program per bucket (a slice would compile per row)."""
+        sel_tt = self.pf[bucket]["sel"]
+        self._dma(mbt.host_logit_sel(row + 1, bucket), sel_tt, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        picked = ttnn.matmul(sel_tt, h_frac_n, compute_kernel_config=_EXACT_MM, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        self._sync()
+        out = ttnn.to_torch(picked, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=3))
+        ttnn.deallocate(picked)
+        return out.reshape(-1)[: self.dim].to(torch.bfloat16).clone()
+
+    def _stage_prefill_inputs(self, bucket, tok_shift, fill, pt_row, chunk_start):
+        """DMA a segment's per-request values into the bucket's persistent buffers: shifted tokens, the KV-fill page
+        table, the request's SDPA page table (padded/clipped to sdpa_pt_blocks), the segment offset and its RoPE."""
+        b = self.pf[bucket]
+        full = torch.zeros(1, self.sdpa_pt_blocks, dtype=torch.int32)
+        w = min(int(pt_row.shape[1]), self.sdpa_pt_blocks)
+        full[0, :w] = pt_row[0, :w]
+        need = (int(chunk_start) + bucket) // self.block_size
+        assert need <= self.sdpa_pt_blocks, (
+            f"MTP SDPA page table of {self.sdpa_pt_blocks} blocks does not cover positions up to "
+            f"{chunk_start + bucket} (build the head with sdpa_pt_blocks >= {need})"
         )
-        full = torch.zeros(1, _SDPA_PT_BLOCKS, dtype=torch.int32)
-        full[0, : self.page_tables.shape[1]] = self.page_tables[0]
+        self._dma(tok_shift, b["tok"], ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+        self._dma(fill, b["fill_pt"], ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         self._dma(full, self.pf_full_pt, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self._dma(torch.tensor([int(chunk_start)], dtype=torch.int32), self.pf_csi, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        cos_t, sin_t = self.model._rope_tp_cos_sin_torch(int(chunk_start), bucket)
+        self._dma(cos_t, b["cos"], ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        self._dma(sin_t, b["sin"], ttnn.bfloat16, ttnn.TILE_LAYOUT)
+
+    def compile_prefill(self, bucket):
+        """Compile the bucket's prefill programs eagerly (before any trace capture) on a zero residual, including the
+        hidden-row select; writes garbage into the pad block only."""
+        t0 = time.perf_counter()
+        pt_row = (
+            self.page_tables[0].reshape(1, -1)
+            if self.page_tables is not None
+            else torch.zeros(1, self.sdpa_pt_blocks, dtype=torch.int32)
+        )
+        self._stage_prefill_inputs(
+            bucket,
+            torch.zeros(1, bucket, dtype=torch.int32),
+            torch.full((1, bucket // self.block_size), self.pad_block, dtype=torch.int32),
+            pt_row,
+            0,
+        )
         dummy = self._up(
             torch.zeros(1, 1, bucket, self.dim // self.model.num_devices, dtype=torch.bfloat16),
             ttnn.bfloat16,
@@ -327,41 +477,54 @@ class MTPHead:
         )
         h_full, y = self.prefill_forward(bucket, dummy)
         self._sync()
+        self._select_row(bucket, h_full, bucket - 1)
         for t in (h_full, y, dummy):
             ttnn.deallocate(t)
         logger.info(f"[mtp] prefill programs compiled for bucket {bucket} in {time.perf_counter() - t0:.1f}s")
 
     def prefill_hook(self, user_ctx, hidden, token_buf, actual_len, bucket, chunk_start):
-        """model.prefill_hidden_hook: fill the head's KV over the prompt of the request being prefilled.
-        token_buf [1,bucket] (real tokens x_0..x_{n-1} then padding), hidden = the bucket's pre-final-norm residual."""
+        """model.prefill_hidden_hook: fill the head's KV over one prefilled segment of the request being prefilled.
+
+        user_ctx: ``(u, slot)`` or ``(u, slot, page_table_row)`` (model.prefill_paged_slots passes the request's own
+        [1, blocks] row; without one the head's ``page_tables[slot]`` is used). hidden: the segment's pre-final-norm
+        residual [1,1,bucket,dim/TP] (traced-bucket / chunk-trace output or eager tensor). token_buf [1, >= n]: the
+        segment's n = actual_len real tokens (then bucket padding) -- or, for a chunk followed by more prompt, n + 1
+        tokens whose extra one is the next chunk's first token (model.py's chunked paths pass it): the head then
+        fills ALL n positions of the segment; a final segment fills n - 1 and stores the main hidden row n - 1 for
+        the first draft step (``pending_rows[slot]``). chunk_start: the segment's absolute position."""
         if user_ctx is None:
             return  # warm-up / dummy prefills outside prefill_paged_slots
-        if chunk_start != 0:
-            raise NotImplementedError("MTP prefill supports prompts within one bucket (no chunked long prompts yet)")
         if bucket not in self.pf:
             raise KeyError(f"MTP prefill not compiled for bucket {bucket} (have {sorted(self.pf)})")
         n = int(actual_len)
-        assert n >= 2, "MTP prefill needs at least two prompt tokens"
-        _, slot = user_ctx
+        slot = int(user_ctx[1])
+        pt_row = user_ctx[2] if len(user_ctx) > 2 and user_ctx[2] is not None else self.page_tables[slot]
+        pt_row = torch.as_tensor(pt_row).reshape(1, -1).to(torch.int32)
+        has_next = int(token_buf.shape[1]) > n
         t0 = time.perf_counter()
-        # tokens shifted by one: x_1..x_{n-1} at positions 0..n-2 (row n-1 = the first draft step)
+        # tokens shifted by one: x_{cs+1}.. at positions cs.. (a final segment's row n-1 = the first draft step)
+        n_fill = n if has_next else n - 1
         tok_shift = torch.zeros(1, bucket, dtype=torch.int32)
-        tok_shift[0, : n - 1] = token_buf[0, 1:n].to(torch.int32)
-        pt_row = self.page_tables[slot].reshape(1, -1)
-        fill = mbt.fill_pt_row(pt_row, 0, n - 1, bucket, self.pad_block, self.block_size)
-        full = torch.zeros(1, _SDPA_PT_BLOCKS, dtype=torch.int32)
-        full[0, : pt_row.shape[1]] = pt_row[0]
-        b = self.pf[bucket]
-        self._dma(tok_shift, b["tok"], ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-        self._dma(fill, b["fill_pt"], ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        self._dma(full, self.pf_full_pt, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        h_full, y = self.prefill_forward(bucket, hidden)
+        tok_shift[0, :n_fill] = token_buf[0, 1 : 1 + n_fill].to(torch.int32)
+        if n_fill > 0:
+            fill = mbt.fill_pt_row(pt_row, int(chunk_start), n_fill, bucket, self.pad_block, self.block_size)
+        else:  # a one-token final segment: nothing to fill, only the hidden row
+            fill = torch.full((1, bucket // self.block_size), self.pad_block, dtype=torch.int32)
+        self._stage_prefill_inputs(bucket, tok_shift, fill, pt_row, chunk_start)
+        h_full, y = self.prefill_forward(bucket, hidden, chunk_start)
         self._sync()
-        rows = ttnn.to_torch(h_full, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=3))  # gather the shards
-        rows = rows.reshape(-1, self.dim)[:n]  # bf16 [n, dim] post-final-norm (the LM-head input rows)
-        self.pending_rows[slot] = rows[n - 1].clone()
+        if not has_next:
+            self.pending_rows[slot] = self._select_row(bucket, h_full, n - 1)
         if self.probe:
-            self.probe_prefill[slot] = (tok_shift[0, : n - 1].clone(), rows[: n - 1].clone())
+            rows = ttnn.to_torch(h_full, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=3))
+            rows = rows.reshape(-1, self.dim)[:n].to(torch.bfloat16)  # [n, dim] post-final-norm rows
+            if not has_next:
+                assert torch.equal(rows[n - 1], self.pending_rows[slot]), "hidden-row select != full readback"
+            prev = self.probe_prefill.get(slot) if int(chunk_start) else None
+            toks, hs = tok_shift[0, :n_fill].clone(), rows[:n_fill].clone()
+            if prev is not None:
+                toks, hs = torch.cat([prev[0], toks]), torch.cat([prev[1], hs])
+            self.probe_prefill[slot] = (toks, hs)
         ttnn.deallocate(h_full)
         ttnn.deallocate(y)
         self.stats["prefill_calls"] += 1
