@@ -213,3 +213,30 @@ class CpuGreedyOracle:
                 out[row(s, j, T)] = int(self.next_fn(self.prefixes[s] + [int(t) for t in tokens[s][: j + 1]]))
         self.prev_tokens = [list(t) for t in tokens]
         return out
+
+
+def chain_drafts(run_step: Callable, w: int, k: int, last: Sequence[int], positions: Sequence[int], observer=None):
+    """The MTP drafter's chained schedule (host logic of tt/mtp_head.py MTPHead.draft), ttnn-free.
+
+    ``run_step(tokens [w], positions [w]) -> next tokens [w]`` is one MTP step for w users: it consumes the token at
+    ``positions[s] + 1`` together with the hidden state of ``positions[s]`` (the drafter's chain buffer; the first step's
+    is the main model's), writes the head's KV at ``positions[s]`` and returns the draft for ``positions[s] + 2``.
+    With ``last[s]`` = the user's row-0 token t'_s (the token at its committed position P_s, not yet fed to the main
+    model) and ``positions[s]`` = P_s, step j (0-based) runs at KV position P_s - 1 + j with token d_j (d_0 = t'_s):
+    the drafts d_1..d_k are the verify grid's rows 1..k. observer(phase, j, tokens, positions, drafts_j) is called
+    with phase "pre" before and "post" after each step. Returns drafts [w][k]."""
+    drafts = [[] for _ in range(w)]
+    tok = [int(t) for t in last]
+    pos = [int(p) - 1 for p in positions]
+    for j in range(k):
+        if observer is not None:
+            observer("pre", j, list(tok), list(pos), None)
+        d = [int(v) for v in run_step(tok, pos)]
+        assert len(d) == w
+        if observer is not None:
+            observer("post", j, list(tok), list(pos), list(d))
+        for s in range(w):
+            drafts[s].append(d[s])
+        tok = d
+        pos = [p + 1 for p in pos]
+    return drafts

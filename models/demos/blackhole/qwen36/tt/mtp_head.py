@@ -505,24 +505,13 @@ class MTPHead:
         self.stats["select_wall"] += time.perf_counter() - t0
 
     def draft(self, w, k, last, positions, observer=None):
-        """k chained drafts per user. last[s] = the user's row-0 token (t'_s), positions[s] = P_s (the verify grid's
-        committed position); hidden_in holds h at position P_s - 1 (select_hidden / begin_batch). Step j writes the
-        head's KV at P_s - 1 + j. observer(phase, j, tokens, positions, drafts_j) is called with phase "pre" before
-        each step (hidden_in still holds the step's input) and "post" after it (probe)."""
-        drafts = [[] for _ in range(w)]
-        tok = [int(t) for t in last]
-        pos = [int(p) - 1 for p in positions]
+        """k chained drafts per user (schedule: verify_grid.chain_drafts). last[s] = the user's row-0 token (t'_s),
+        positions[s] = P_s (the verify grid's committed position); hidden_in holds h at position P_s - 1
+        (select_hidden / begin_batch). Step j writes the head's KV at P_s - 1 + j. observer(phase, j, tokens,
+        positions, drafts_j) is called with phase "pre" before each step (hidden_in still holds the step's input) and
+        "post" after it (probe)."""
         t0 = time.perf_counter()
-        for j in range(k):
-            if observer is not None:
-                observer("pre", j, list(tok), list(pos), None)
-            d = self.run_step(w, tok, pos)
-            if observer is not None:
-                observer("post", j, list(tok), list(pos), list(d))
-            for s in range(w):
-                drafts[s].append(int(d[s]))
-            tok = [int(v) for v in d]
-            pos = [p + 1 for p in pos]
+        drafts = vg.chain_drafts(lambda tok, pos: self.run_step(w, tok, pos), w, k, last, positions, observer)
         self.stats["draft_steps"] += k
         self.stats["draft_wall"] += time.perf_counter() - t0
         return drafts
