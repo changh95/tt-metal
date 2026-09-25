@@ -48,6 +48,7 @@ from models.demos.blackhole.qwen36.tt import verify_grid as vg
 from models.demos.blackhole.qwen36.tt.layer import Qwen36DecoderLayer
 from models.demos.blackhole.qwen36.tt.verify_step import _EXACT_MM, argmax_sharded_rows, combine_sharded_argmax
 from models.demos.blackhole.qwen36.tt.weight_mapping import load_qwen36_mtp_state_dict
+from models.tt_transformers.tt.ccl import tt_all_reduce
 from models.tt_transformers.tt.common import Mode, get_block_size
 from models.tt_transformers.tt.distributed_norm import DistributedNorm
 
@@ -122,18 +123,19 @@ class MTPHead:
             return DistributedNorm(n, args, tt_ccl=self.tt_ccl, TG=args.is_galaxy) if distributed else n
 
         self.final_norm = _norm("norm", True)  # like model.norm: prefill distributed+gather, decode sharded
-        self.pre_fc_norm_emb = _norm("pre_fc_norm_embedding", False)  # plain norms on replicated full-dim rows
-        self.pre_fc_norm_hid = _norm("pre_fc_norm_hidden", False)
+        # pre-fc norms: bare RMSNorm with the distributed flag -- PREFILL runs the framework's distributed rmsnorm
+        # (pre/post all-gather stats) on FRACTURED [S, dim/TP] rows (a plain ttnn.rms_norm over a full-width
+        # interleaved [S, 5120] row sizes its static CBs into the persistent L1 buffers: "dataflow buffers clash with
+        # L1 buffers", logs/mtp_smoke1.log); DECODE takes the sharded decode-norm config on the replicated residual.
+        self.pre_fc_norm_emb = _norm("pre_fc_norm_embedding", True).norm
+        self.pre_fc_norm_hid = _norm("pre_fc_norm_hidden", True).norm
         fc = sd["mtp.fc.weight"]  # [dim, 2*dim] = [out, in]; in = concat(embedding, hidden) (vLLM cat order)
         assert tuple(fc.shape) == (args.dim, 2 * args.dim), fc.shape
         fc_e, fc_h = fc[:, : args.dim].contiguous(), fc[:, args.dim :].contiguous()
-        # prefill: column shards [dim, dim/TP] -> fractured residual; decode: replicated [dim, dim] -> replicated residual
-        self.fc_e_col = tpc.shard_w(
-            fc_e, mesh, -1, ttnn.DRAM_MEMORY_CONFIG, str(cache / "mtp.fc_e.col"), ttnn.bfloat8_b
-        )
-        self.fc_h_col = tpc.shard_w(
-            fc_h, mesh, -1, ttnn.DRAM_MEMORY_CONFIG, str(cache / "mtp.fc_h.col"), ttnn.bfloat8_b
-        )
+        # prefill: ROW-parallel (K-sharded [dim/TP, dim]) on the fractured normed inputs -> per-device partial [S, dim]
+        # -> reduce-scatter = the fractured residual; decode: replicated [dim, dim] -> replicated residual
+        self.fc_e_row = tpc.shard_w(fc_e, mesh, 0, ttnn.DRAM_MEMORY_CONFIG, str(cache / "mtp.fc_e.row"), ttnn.bfloat8_b)
+        self.fc_h_row = tpc.shard_w(fc_h, mesh, 0, ttnn.DRAM_MEMORY_CONFIG, str(cache / "mtp.fc_h.row"), ttnn.bfloat8_b)
 
         def _rep_w(w, name):
             return ttnn.as_tensor(
@@ -258,32 +260,40 @@ class MTPHead:
     def prefill_forward(self, bucket, hidden_frac):
         """Eager MTP forward over one bucket (inputs: the bucket's persistent buffers + hidden_frac, the main model's
         pre-final-norm residual [1,1,bucket,dim/TP]). Side effect: the head's KV at the fill page table's blocks.
-        Returns (h_full, y): the main POST-norm hidden [1,1,bucket,dim] (replicated DRAM) and the layer output
-        [1,1,bucket,dim/TP] (fractured); the caller deallocates both."""
+        Everything stays FRACTURED [S, dim/TP] (no replicated full-width prefill rows): distributed pre-fc norms,
+        row-parallel fc partials summed by the reduce-scatter. Returns (h_frac_n, y): the main POST-norm hidden
+        (fractured; gather on the host for a row) and the layer output [1,1,bucket,dim/TP]; the caller deallocates both.
+        """
         m, args = self.model, self.args
         b = self.pf[bucket]
         x_e = m.embd(b["tok"])  # [1,bucket,dim/TP]
         x_e = ttnn.reshape(x_e, (1, 1, bucket, x_e.shape[-1]))
         x_e = ttnn.to_memory_config(x_e, ttnn.DRAM_MEMORY_CONFIG)
-        e_full = tpc.all_gather_prefill_small_m(
-            x_e, self.tt_ccl, args.ccl_topology(), memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )  # [1,1,bucket,dim]
+        e_n = self.pre_fc_norm_emb(x_e, mode=Mode.PREFILL)  # distributed rmsnorm -> fractured normed rows
         ttnn.deallocate(x_e)
-        e_n = self.pre_fc_norm_emb(e_full, mode=Mode.PREFILL)
-        ttnn.deallocate(e_full)
-        h_full = m.norm(hidden_frac, mode=Mode.PREFILL)  # the LM-head input rows, replicated [1,1,bucket,dim]
-        h_n = self.pre_fc_norm_hid(h_full, mode=Mode.PREFILL)
+        h_frac_n = m.norm.norm(hidden_frac, mode=Mode.PREFILL)  # the LM-head input rows, fractured (no gather)
+        h_n = self.pre_fc_norm_hid(h_frac_n, mode=Mode.PREFILL)
         pe = ttnn.linear(
-            e_n, self.fc_e_col, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            e_n, self.fc_e_row, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
         ph = ttnn.linear(
-            h_n, self.fc_h_col, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            h_n, self.fc_h_row, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
         ttnn.deallocate(e_n)
         ttnn.deallocate(h_n)
-        x = ttnn.add(pe, ph, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # fractured residual [1,1,bucket,dim/TP]
+        part = ttnn.add(pe, ph, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # per-device partial [1,1,bucket,dim]
         ttnn.deallocate(pe)
         ttnn.deallocate(ph)
+        x = tt_all_reduce(
+            part,
+            self.mesh,
+            self.tt_ccl,
+            cluster_axis=0,
+            dim=3,
+            topology=args.ccl_topology(),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # fractured residual [1,1,bucket,dim/TP]
+        ttnn.deallocate(part)
         y = self.layer.forward(
             x,
             cos=b["cos"],
@@ -296,7 +306,7 @@ class MTPHead:
             valid_len=bucket,
         )
         ttnn.deallocate(x)
-        return h_full, y
+        return h_frac_n, y
 
     def compile_prefill(self, bucket):
         """Compile the bucket's prefill programs eagerly (before any trace capture) on a zero residual; writes garbage
@@ -348,7 +358,8 @@ class MTPHead:
         self._dma(full, self.pf_full_pt, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         h_full, y = self.prefill_forward(bucket, hidden)
         self._sync()
-        rows = ttnn.to_torch(ttnn.get_device_tensors(h_full)[0]).reshape(-1, self.dim)[:n]  # bf16 [n, dim]
+        rows = ttnn.to_torch(h_full, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=3))  # gather the shards
+        rows = rows.reshape(-1, self.dim)[:n]  # bf16 [n, dim] post-final-norm (the LM-head input rows)
         self.pending_rows[slot] = rows[n - 1].clone()
         if self.probe:
             self.probe_prefill[slot] = (tok_shift[0, : n - 1].clone(), rows[: n - 1].clone())
