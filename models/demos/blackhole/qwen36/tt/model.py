@@ -244,6 +244,15 @@ class Qwen36Model:
         # replay, so it is never freed/reallocated (only zeroed in place). See _bind_gdn_prefill_scratch.
         self._gdn_prefill_scratch = None
 
+        # Speculative decoding (tt/mtp_head.py): an optional observer of the prefill's FINAL hidden states. When set,
+        # the masked-bucket prefill calls ``hook(user_ctx, hidden, token_buf, actual_len, bucket, chunk_start)`` with
+        # the pre-final-norm residual of the whole bucket ([1,1,bucket,dim/TP], fractured; the traced path's output
+        # buffer or the eager path's tensor, still alive) BEFORE the logits select, so the MTP head can fill its own KV
+        # over the prompt. ``_prefill_hook_user`` = (request index, decode slot) of the request being prefilled by
+        # prefill_paged_slots (None outside it). Both None by default: the single-token serving path is unchanged.
+        self.prefill_hidden_hook = None
+        self._prefill_hook_user = None
+
         # Optional vision tower (DropInVisionTransformer), attached lazily by
         # init_vision_model() for the multimodal serving path. None on the text-only path.
         self.vision_model = None
@@ -1931,6 +1940,8 @@ class Qwen36Model:
                 assert actual >= 1, f"request {u}: empty prompt (actual_len={actual})"
                 # Trace-safe prefill into the B=1 scratch: prefill_traced_chunked runs short prompts in
                 # one masked-bucket forward and chunks longer ones; GDN state carries + is snapshotted below.
+                if self.prefill_hidden_hook is not None:
+                    self._prefill_hook_user = (u, int(empty_slots[u]))  # speculative decoding: who is being prefilled
                 _t1 = _tp()
                 lg = self.prefill_traced_chunked(toks[:, :actual], pt[u : u + 1], actual_len=actual)
                 _t2 = _tp()
@@ -2070,6 +2081,7 @@ class Qwen36Model:
             _t5 = _tp()
             self._unbind_gdn_prefill_scratch(prev)
             _t["unbind"] += _tp() - _t5
+            self._prefill_hook_user = None
 
         if _dev_copy and _hist_fix:
             # The device-side slot write above rewrote row `slot` of the K conv taps but NOT the fused plain-decode
@@ -2694,6 +2706,7 @@ class Qwen36Model:
         ttnn.synchronize_device(self.device)
 
         if self.num_devices > 1:
+            self._run_prefill_hidden_hook(hidden, token_buf, actual_len, bucket, chunk_start)
             return self._masked_bucket_logits_tp(hidden, actual_len, bucket)
 
         # One-hot matmul for last row (fixed program per bucket; slice would recompile per length).
@@ -2706,6 +2719,12 @@ class Qwen36Model:
         x_last = self.norm(x_last, mode=Mode.PREFILL)
         logits = self._lm_head(x_last)
         return logits.cpu()
+
+    def _run_prefill_hidden_hook(self, hidden, token_buf, actual_len, bucket, chunk_start):
+        """Speculative-decoding observer of the prefill's final hidden states (see __init__); no-op unless set."""
+        hook = self.prefill_hidden_hook
+        if hook is not None:
+            hook(self._prefill_hook_user, hidden, token_buf, actual_len, bucket, chunk_start)
 
     def _masked_bucket_logits_tp(self, hidden, actual_len, bucket):
         """TP: one-hot select row actual_len-1, norm, lm_head. Returns replicated [1,1,vocab]."""
@@ -2987,6 +3006,8 @@ class Qwen36Model:
         ttnn.execute_trace(self.device, tr.trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(self.device)
         refs.clear()
+        # Speculative decoding: the MTP head reads the bucket's final hidden rows (the trace output, in place).
+        self._run_prefill_hidden_hook(tr.output, token_buf, actual_len, bucket, chunk_start)
         # Logits eagerly after the replay: 5 queued ops on a program warmed at capture time. The
         # trace output is read in place (never ttnn.clone()'d — a clone draws from the same pool
         # the trace's baked intermediates use).

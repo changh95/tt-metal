@@ -195,3 +195,56 @@ def load_qwen36_state_dict_fp8(model_path) -> Dict[str, torch.Tensor]:
             state_dict[short] = tensor
 
     return state_dict
+
+
+# --------------------------------------------------------------------------------------------- MTP head
+# The checkpoint's native multi-token-prediction head (config text_config.mtp_num_hidden_layers = 1): ONE full-attention
+# Qwen3.5 decoder layer (mtp.layers.0.*) plus the fusion in-projection mtp.fc [dim, 2*dim] and three zero-centered norms
+# (mtp.pre_fc_norm_embedding / mtp.pre_fc_norm_hidden / mtp.norm). Both main loaders above DROP every mtp.* key (the
+# served text model never runs the head); the speculative-decoding drafter (tt/mtp_head.py) loads them with this helper.
+MTP_KEYS = (
+    "mtp.fc.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
+)
+
+
+def load_qwen36_mtp_state_dict(model_path, layer_index: int) -> Dict[str, torch.Tensor]:
+    """Read ONLY the ``mtp.*`` tensors of a Qwen3.5/3.6/3.8 checkpoint (bf16 safetensors) and remap them so the MTP
+    decoder layer can be built by ``Qwen36DecoderLayer(..., layer_num=layer_index)``:
+
+      mtp.layers.0.<sub>  -> layers.{layer_index}.<sub>   (self_attn.*, mlp.*, input_layernorm, post_attention_layernorm)
+      mtp.fc.weight, mtp.pre_fc_norm_*.weight, mtp.norm.weight -> unchanged (MTP_KEYS)
+
+    layer_index is a virtual index past the model's real layers (n_layers, i.e. 64 for the 27B) so the per-layer
+    tensor cache files (`layers.{layer_index}/...`) never collide with a real layer's. Raises if the checkpoint has no
+    MTP head (no mtp.* key) or holds it in a quantized form this loader does not dequantize.
+    """
+    from safetensors import safe_open
+
+    model_path = Path(model_path)
+    with open(model_path / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+    mtp_keys = [k for k in weight_map if k.startswith("mtp.")]
+    if not mtp_keys:
+        raise KeyError(f"checkpoint {model_path} has no mtp.* tensors (no MTP head)")
+    if any(k.endswith(".weight_scale_inv") for k in mtp_keys):
+        raise NotImplementedError("quantized (block-FP8) MTP weights are not dequantized by load_qwen36_mtp_state_dict")
+    by_file: Dict[str, list] = {}
+    for k in mtp_keys:
+        by_file.setdefault(weight_map[k], []).append(k)
+    out: Dict[str, torch.Tensor] = {}
+    for filename, keys in by_file.items():
+        with safe_open(str(model_path / filename), framework="pt") as sf:
+            for k in keys:
+                t = sf.get_tensor(k)
+                if k.startswith("mtp.layers.0."):
+                    out[f"layers.{layer_index}." + k[len("mtp.layers.0.") :]] = t
+                elif k in MTP_KEYS:
+                    out[k] = t
+                else:
+                    raise KeyError(f"unexpected MTP tensor {k} (only one MTP layer, mtp.layers.0, is supported)")
+    missing = [k for k in MTP_KEYS if k not in out]
+    assert not missing, f"MTP head incomplete: missing {missing}"
+    return out

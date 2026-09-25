@@ -128,11 +128,15 @@ def combine_sharded_argmax(mesh, idx_t, val_t, R, per_shard):
 class VerifyPlan:
     """Everything a (w, T) verify step needs on device, allocated before any trace capture."""
 
-    def __init__(self, model, w, T, page_table, use_kernel=None):
+    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False):
         self.model = model
         mesh = model.mesh_device
         args = model.args
         self.w, self.T = int(w), int(T)
+        # keep_hidden: the body also keeps the post-final-norm hidden state of EVERY row (the LM-head input,
+        # [1,1,R,dim] replicated DRAM) as a third trace output, ``out_hidden`` -- the MTP drafter (tt/mtp_head.py)
+        # selects each user's accepted row from it on device. False = the M2 body byte-for-byte.
+        self.keep_hidden = bool(keep_hidden)
         self.R = vg.grid_rows(self.w, self.T)
         assert (
             self.w * self.T == self.R
@@ -256,6 +260,7 @@ class VerifyPlan:
             self.sdpa_chunks.append((a, b, pt_c, pos_c))
         self.trace_id = None
         self.out_idx = self.out_val = None
+        self.out_hidden = None  # keep_hidden: [1,1,R,dim] post-final-norm rows (trace output / last eager run)
         self._host_refs = []
         self.debug_attn_offsets = None  # timing only, see attention.forward_verify
         # persistent residual-shaped inputs of the per-section sub-traces (time_sections_traced); allocated NOW
@@ -469,12 +474,13 @@ class VerifyStep:
         argmax_rows = vs.run(tokens [w][T], positions [w], accept_prev [w])            # -> [R] int64 per step
     """
 
-    def __init__(self, model, w, T, page_table, use_kernel=None):
+    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False):
         self.model = model
         self.mesh = model.mesh_device
-        self.plan = VerifyPlan(model, w, T, page_table, use_kernel=use_kernel)
+        self.plan = VerifyPlan(model, w, T, page_table, use_kernel=use_kernel, keep_hidden=keep_hidden)
         self.per_shard = model.args.vocab_size // model.num_devices
         self.section_times = None
+        self._last_hidden = None  # keep_hidden: the hidden tensor of the most recent forward()
 
     # ------------------------------------------------------------------------------------------ forward body
     def forward(self, profile=False, row_check=None, debug_head=None):
@@ -526,7 +532,10 @@ class VerifyStep:
             ttnn.deallocate(x_n)
         t0 = tick("final_norm", t0)
         logits = ttnn.linear(x, model.lm_head_weight)  # vocab-sharded [1,1,R,V/TP]
-        ttnn.deallocate(x)
+        if plan.keep_hidden:
+            self._last_hidden = x  # the LM-head input rows survive the body (MTP drafter input)
+        else:
+            ttnn.deallocate(x)
         t0 = tick("lm_head", t0)
         idx, val = argmax_sharded_rows(logits)
         if debug_head is not None:  # eager-only diagnostic hook: (final-norm output x is gone; logits + device argmax)
@@ -551,6 +560,12 @@ class VerifyStep:
         self.plan._host_refs = []
         ttnn.deallocate(idx)
         ttnn.deallocate(val)
+        self._drop_last_hidden()
+
+    def _drop_last_hidden(self):
+        if self._last_hidden is not None:
+            ttnn.deallocate(self._last_hidden)
+            self._last_hidden = None
 
     def capture(self):
         """Capture the trace (the programs must be compiled: compile() first). Mutates state like compile()."""
@@ -563,6 +578,9 @@ class VerifyStep:
         ttnn.synchronize_device(self.mesh)
         self.plan._host_refs = []
         self.plan.trace_id = tid
+        if self.plan.keep_hidden:
+            self.plan.out_hidden = self._last_hidden  # trace output: fixed address, refreshed by every replay
+            self._last_hidden = None
 
     def release(self):
         self.plan.release()
@@ -582,6 +600,15 @@ class VerifyStep:
             out = combine_sharded_argmax(self.mesh, idx, val, plan.R, self.per_shard)
             ttnn.deallocate(idx)
             ttnn.deallocate(val)
+            if plan.keep_hidden and plan.trace_id is None:
+                # eager-only use: the latest rows replace the previous eager run's (a captured plan's out_hidden is
+                # the trace output and is left alone; the eager rows are then dropped)
+                if plan.out_hidden is not None:
+                    ttnn.deallocate(plan.out_hidden)
+                plan.out_hidden = self._last_hidden
+                self._last_hidden = None
+            else:
+                self._drop_last_hidden()
         else:
             ttnn.execute_trace(self.mesh, plan.trace_id, cq_id=0, blocking=False)
             ttnn.synchronize_device(self.mesh)
