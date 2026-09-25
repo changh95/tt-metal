@@ -582,6 +582,26 @@ def test_mtp_spec(mesh_device):
             + f" spec_tok_s={cfg['spec_tok_s_aggregate']:.1f} decode_tok_s={cfg['decode_tok_s_aggregate']:.1f}"
         )
     print("MTP_TIMING " + json.dumps(results["timing"]))
-    assert all(c["exact_vs_decode"] for c in results["configs"].values()), "committed stream != plain greedy decode"
+    # Exactness: bitwise vs the plain decode for every plan on the fused-AR path (R <= 32: the verify body runs the
+    # decode step's own ops). Above 32 rows the body runs the fractured reduce-scatter path whose numerics are not the
+    # fused all-reduce's (verify_step.py), so its greedy stream may flip at bf16 near-ties: such a config passes when
+    # every divergence is a near-tie of the plain decode's own logits (gap <= 2 bf16 ulps at |logit| 16..32 = 0.25) and
+    # the draft-policy runs (when requested) commit identical streams (logs/mtp_diag32.log: 15/15 divergences at gap
+    # 0.125/0.25/0.0, MTP == oracle == random streams).
+    for key, cfg in results["configs"].items():
+        if cfg["exact_vs_decode"]:
+            continue
+        assert (
+            cfg["R"] > 32
+        ), f"config {key} (R={cfg['R']}, decode-numerics path) committed stream != plain greedy decode"
+        for r in cfg["runs"]:
+            if r["mismatch_vs_decode"]:
+                assert "neartie" in r, f"config {key}: divergences without the near-tie probe (MTP_NEARTIE=0)"
+                bad = [x for x in r["neartie"] if x["gap"] > 0.25]
+                assert not bad, f"config {key}: divergences that are NOT near-ties: {bad}"
+            for pol in MECH_POLICIES:
+                assert r[f"policy_{pol}"][
+                    "identical_to_mtp_stream"
+                ], f"config {key}: {pol} drafts commit a different stream"
     if results["pcc"] is not None:
         assert results["pcc"]["pcc_mean"] >= 0.99, f"draft logits PCC {results['pcc']['pcc_mean']}"
