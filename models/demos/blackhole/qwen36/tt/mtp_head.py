@@ -292,8 +292,7 @@ class MTPHead:
             dim=3,
             topology=args.ccl_topology(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )  # fractured residual [1,1,bucket,dim/TP]
-        ttnn.deallocate(part)
+        )  # fractured residual [1,1,bucket,dim/TP]; tt_all_reduce frees `part` itself
         y = self.layer.forward(
             x,
             cos=b["cos"],
