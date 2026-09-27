@@ -256,6 +256,9 @@ class Qwen36Model:
         # None by default: the single-token serving path is unchanged.
         self.prefill_hidden_hook = None
         self._prefill_hook_user = None
+        # P/D producer (pd_transfer.py): callable(slot) invoked by prefill_paged_slots right after a request's GDN
+        # snapshot is parked under its slot, so the connector can stage THAT request before the next one prefills.
+        self.pd_stage_hook = None
 
         # Optional vision tower (DropInVisionTransformer), attached lazily by
         # init_vision_model() for the multimodal serving path. None on the text-only path.
@@ -1901,6 +1904,7 @@ class Qwen36Model:
             "unbind": 0.0,
             "hist": 0.0,
             "write_slot": 0.0,
+            "stage": 0.0,
         }
         # Slot-copy mode 1/2: write each user's B=1 scratch state into its decode slot ON DEVICE
         # (clone -> row write, consumed before the next user's trace replay, so the clone never coexists
@@ -2080,6 +2084,16 @@ class Qwen36Model:
                 _t["prefill"] += _t2 - _t1
                 _t["logits"] += _t3 - _t2
                 _t["snapshot"] += _t4 - _t3
+                _hook = getattr(self, "pd_stage_hook", None) if _pd_capture is not None else None
+                if _hook is not None:
+                    # P/D producer: release THIS request to its consumer now (tt_mooncake_connector.stage_slot exports
+                    # its KV blocks and files the payload) instead of after the whole N-user step. The hook isolates
+                    # its own failures; this guard keeps any exception from aborting the remaining users' prefills.
+                    try:
+                        _hook(slot_u)
+                    except Exception:
+                        logger.exception(f"[pd] pd_stage_hook failed for slot {slot_u}; request left unstaged")
+                    _t["stage"] += _tp() - _t4
         finally:
             # Always rebind the batched decode buffers (a mid-loop assert must not leave GDN on scratch).
             # Does NOT free the scratch — it persists for the next request and keeps the trace valid.
