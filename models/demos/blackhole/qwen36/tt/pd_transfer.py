@@ -334,11 +334,20 @@ def _piece_row_map(runs, mode: str, real_off: int, cnt: int):
 
 
 def _copy_rows(dst: torch.Tensor, src: torch.Tensor, rows) -> None:
-    """dst[i] = src[rows[i]] in one pass (a contiguous ascending `rows` is a plain strided copy, anything else an
-    index_select straight into `dst`); `src` may be a non-contiguous (permuted) view."""
+    """dst[i] = src[rows[i]]; `src` is the device-major pool view permuted to `[bucket, n_dev, nkv, blk, hd]` (dim 1 =
+    device, each `src[a:b, d]` a contiguous slab), `dst` the contiguous `[cnt, n_dev, nkv, blk, hd]` output rows.
+    A contiguous ascending `rows` is one strided copy; a contiguous DESCENDING run (vLLM hands out descending block
+    sequences after frees) is one flipped slab copy per device (0.7 ms per 32 MiB cache vs 3.5-5 ms for an
+    index_select / advanced index over the permuted view); anything else an index_select straight into `dst`."""
     cnt = len(rows)
-    if cnt and rows == list(range(rows[0], rows[0] + cnt)):
+    if cnt == 0:
+        return
+    if rows == list(range(rows[0], rows[0] + cnt)):
         dst.copy_(src[rows[0] : rows[0] + cnt])
+    elif rows == list(range(rows[0], rows[0] - cnt, -1)):
+        lo = rows[-1]
+        for d in range(src.shape[1]):
+            dst[:, d].copy_(src[lo : lo + cnt, d].flip(0))
     else:
         torch.index_select(src, 0, torch.tensor(rows, dtype=torch.long), out=dst)
 
