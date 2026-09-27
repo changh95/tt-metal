@@ -75,28 +75,6 @@ def coalesce_runs(block_ids):
     return [(lo, hi, d < 0) for lo, hi, d in runs]
 
 
-def _reorder_runs(host: torch.Tensor, runs) -> torch.Tensor:
-    """Put a device-read tensor whose dim 0 is the concatenation of the runs' contiguous regions into
-    block_ids order: descending runs are read ascending on device and flipped here."""
-    if not any(desc for _, _, desc in runs):
-        return host
-    parts, off = [], 0
-    for lo, hi, desc in runs:
-        n = hi - lo
-        part = host[off : off + n]
-        parts.append(torch.flip(part, dims=[0]) if desc else part)
-        off += n
-    return torch.cat(parts, dim=0)
-
-
-def _copy_off_pool(t: torch.Tensor, pool_buf) -> torch.Tensor:
-    """`t` as a contiguous tensor that does not alias `pool_buf` (a borrowed KvExportPool entry, or None for
-    the composer read whose host tensor is already a fresh copy)."""
-    if pool_buf is not None and t.untyped_storage().data_ptr() == pool_buf.untyped_storage().data_ptr():
-        return t.clone(memory_format=torch.contiguous_format)
-    return t.contiguous()
-
-
 def _device_convert() -> bool:
     """QWEN36_PD_DEVICE_CONVERT=0 falls back to host-side tilize/untilize + dtype conversion."""
     return os.environ.get("QWEN36_PD_DEVICE_CONVERT", "1") != "0"
@@ -232,13 +210,12 @@ class KvExportPool:
     the buffer, so from_torch borrows it (dim-0 shards are contiguous chunks) and `ttnn.copy_device_to_host_tensor`
     lands device d's `[n_caches * n, nkv, blk, hd]` straight in the torch memory -- no mesh composer, no host
     concat, no `to_torch` copy. One buffer serves every bucket, so the pages faulted in by the first (warm-up)
-    read stay warm for all of them. `export_kv_blocks` borrows an entry for the duration of one call and hands
-    it back; its outputs never alias the entry (they are copied off it unconditionally -- at n_dev > 1 the
-    device-major -> block-major permute is already a copy, at n_dev == 1 it is a view and an explicit clone is
-    taken), so one entry per concurrent export suffices; the pool is capped at `max_entries` (an exhausted
-    pool falls back to the composer read). Memory per entry =
-    4 MiB x max_blocks at TP4 (1 GiB at the default 256 blocks); buckets above `max_blocks` use the composer.
-    Host memory only: safe to create at request time under captured traces.
+    read stay warm for all of them. `export_kv_blocks` borrows an entry for the duration of one PIECE (a bucket
+    <= max_blocks; longer requests are read as a sequence of pieces, `export_pieces`) and hands it back; its
+    outputs never alias the entry (every piece is copied device-major -> block-major into the preallocated
+    outputs), so one entry per concurrent export suffices; the pool is capped at `max_entries` (an exhausted pool
+    falls back to the composer read for that piece). Memory per entry = 4 MiB x max_blocks at TP4 (1 GiB at the
+    default 256 blocks). Host memory only: safe to create at request time under captured traces.
     """
 
     def __init__(self, model, max_blocks: int, max_entries: int):
@@ -311,46 +288,65 @@ def _kv_export_pool(model):
     return pool
 
 
-def export_kv_blocks(model, block_ids):
-    """Read one request's paged-KV blocks off the device.
+def export_pieces(n_real: int, max_piece: int, fixed: int | None = None):
+    """Split an `n_real`-block export into `(real_count, bucket)` pieces, each a pre-warmed power-of-two bucket
+    <= `max_piece` (the pool's reach), in block order: full `max_piece` pieces first, then the remainder as the
+    cheapest of "one padded bucket" / "its top set bits as exact pieces + one padded bucket for the rest". The cost
+    model is `fixed` block-equivalents per piece (the ~37 ms of eager slice/concat/convert dispatch a piece costs
+    regardless of size, at ~0.75 ms per DMA'd + permuted block; QWEN36_PD_EXPORT_PIECE_FIXED, default 48) plus the
+    padded block count. 129 blocks -> [(128, 128), (1, 1)] (no 256-bucket padding tax), 255 -> [(255, 256)],
+    2049 -> 8 x (256, 256) + (1, 1)."""
+    if fixed is None:
+        fixed = int(os.environ.get("QWEN36_PD_EXPORT_PIECE_FIXED", "48"))
+    max_piece = max(1, int(max_piece))
+    pieces = []
+    rem = int(n_real)
+    while rem >= max_piece:
+        pieces.append((max_piece, max_piece))
+        rem -= max_piece
+    if rem:
+        bits = [1 << i for i in range(rem.bit_length()) if (rem >> i) & 1][::-1]  # descending
+        best = None
+        for j in range(len(bits) + 1):
+            exact = bits[:j]
+            left = rem - sum(exact)
+            cand = [(b, b) for b in exact] + ([(left, export_bucket(left))] if left else [])
+            cost = fixed * len(cand) + sum(b for _, b in cand)
+            if best is None or cost < best[0]:
+                best = (cost, cand)
+        pieces.extend(best[1])
+    return pieces
 
-    Returns, per attention layer of `_attention_layers(model)` (the 16 full-attention layers in model order, then
-    the MTP head's layer when the model has one), a `(k, v)` pair of host tensors shaped
-    `[n_blocks, n_dev * n_local_kv_heads, block_size, head_dim]` in torch.bfloat16 (a bf8 cache reads
-    back through bf16 exactly), block order = `block_ids` order; dim 1 is device-major (device d's local kv
-    heads at [d * n_local_kv_heads, (d + 1) * n_local_kv_heads)).
 
-    One device read for the whole request: the blocks of all 32 cache tensors are concatenated on device
-    into a single tensor, converted (bfp8 -> bf16, untilize) once, and DMA'd once into a pooled, borrowed
-    row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`; 128 blocks = 512 MiB read in
-    ~14 ms vs ~330 ms through the composer; ~38 ms for the whole export incl. the host permute below).
-    The returned tensors own their memory (never a view of the pool entry, which is released on return).
-    Buckets beyond the pool (or QWEN36_PD_EXPORT_POOL=0 /
-    QWEN36_PD_DEVICE_CONVERT=0) fall back to the dim-0 mesh composer read (~1.2 GiB/s plus a host cat;
-    composing along a middle dim ran at ~0.1 GiB/s and 32 separate reads took seconds).
+def _piece_row_map(runs, mode: str, real_off: int, cnt: int):
+    """Device-read row of each REAL block position of one padded piece. `runs` mode reads every run's contiguous
+    region ascending in `runs` order (a descending run's blocks come back reversed); `blocks` mode reads the padded
+    list in order. Returns the `cnt` row indices for positions [real_off, real_off + cnt)."""
+    if mode != "runs":
+        return list(range(real_off, real_off + cnt))
+    pos_to_row = []
+    off = 0
+    for lo, hi, desc in runs:
+        n = hi - lo
+        pos_to_row.extend(off + (n - 1 - i if desc else i) for i in range(n))
+        off += n
+    return pos_to_row[real_off : real_off + cnt]
 
-    Program shapes depend on the block count, so the block list is padded to a power-of-two bucket
-    (export_warmup compiles every bucket at startup) and read by one of two fixed-shape paths:
-    `runs`  -- the list is one contiguous run: one slice per cache, concat of 32;
-    `blocks` -- anything else: one single-block slice per (cache, block), a concat of `bucket` per
-    cache, then a concat of 32. Slice offsets are runtime arguments, so neither path compiles per
-    block id. (`ttnn.gather` was tried for fragmented lists: it reads the WHOLE cache per call, ~110 ms
-    x 32 caches = 3.5 s per request on a 500 MB cache, and returned wrong rows for a bfp8 cache.)
+
+def _copy_rows(dst: torch.Tensor, src: torch.Tensor, rows) -> None:
+    """dst[i] = src[rows[i]] in one pass (a contiguous ascending `rows` is a plain strided copy, anything else an
+    index_select straight into `dst`); `src` may be a non-contiguous (permuted) view."""
+    cnt = len(rows)
+    if cnt and rows == list(range(rows[0], rows[0] + cnt)):
+        dst.copy_(src[rows[0] : rows[0] + cnt])
+    else:
+        torch.index_select(src, 0, torch.tensor(rows, dtype=torch.long), out=dst)
+
+
+def _read_piece_device(caches, block_ids, runs, mode, nkv, blk, hd):
+    """Device side of one export piece: the padded block list's rows of every cache concatenated into one per-device
+    `[n_caches * n, nkv, blk, hd]` tensor, converted to bf16 ROW_MAJOR on device when QWEN36_PD_DEVICE_CONVERT (default).
     """
-    t0 = time.perf_counter()
-    layers = _attention_layers(model)
-    n_dev = model.num_devices
-    n_real = len(block_ids)
-    block_ids = [int(b) for b in block_ids]
-    n = export_bucket(n_real) if os.environ.get("QWEN36_PD_EXPORT_BUCKETS", "1") == "1" else n_real
-    cache0 = layers[0].paged_k
-    num_blocks, nkv, blk, hd = cache0.shape
-    block_ids, real_off = pad_block_ids(block_ids, n, int(num_blocks))
-    runs = coalesce_runs(block_ids)
-    caches = [c for att in layers for c in (att.paged_k, att.paged_v)]
-    mode = os.environ.get("QWEN36_PD_EXPORT", "auto")
-    if mode == "auto":
-        mode = "runs" if len(runs) == 1 else "blocks"
     parts = []
     if mode == "runs":
         for cache in caches:
@@ -368,7 +364,7 @@ def export_kv_blocks(model, block_ids):
                 parts.append(singles[0])
     else:
         raise ValueError(f"QWEN36_PD_EXPORT={mode!r}: expected auto, runs or blocks")
-    big = ttnn.concat(parts, dim=0) if len(parts) > 1 else parts[0]  # per device [32*n, nkv, blk, hd]
+    big = ttnn.concat(parts, dim=0) if len(parts) > 1 else parts[0]  # per device [n_caches*n, nkv, blk, hd]
     if len(parts) > 1:
         for p_ in parts:
             ttnn.deallocate(p_)
@@ -380,54 +376,127 @@ def export_kv_blocks(model, block_ids):
         rm = ttnn.to_layout(big, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(big)
         big = rm
-    t1 = time.perf_counter()
-    pool = _kv_export_pool(model) if big.dtype == ttnn.bfloat16 and big.layout == ttnn.ROW_MAJOR_LAYOUT else None
-    borrowed = pool.acquire(n) if pool is not None else None
-    try:
-        if borrowed is not None:
-            _, host, host_tt = borrowed  # host: torch view the DMA lands in, [n_dev * 32 * n, nkv, blk, hd]
-            ttnn.copy_device_to_host_tensor(big, host_tt, blocking=True)
-            read = "dma"
-        else:
-            host = ttnn.to_torch(big, mesh_composer=ttnn.ConcatMeshToTensor(model.mesh_device, dim=0)).to(
-                torch.bfloat16
-            )
-            read = "composer"
-        ttnn.deallocate(big)
+    return big
+
+
+def export_kv_blocks(model, block_ids):
+    """Read one request's paged-KV blocks off the device.
+
+    Returns, per attention layer of `_attention_layers(model)` (the 16 full-attention layers in model order, then
+    the MTP head's layer when the model has one), a `(k, v)` pair of host tensors shaped
+    `[n_blocks, n_dev * n_local_kv_heads, block_size, head_dim]` in torch.bfloat16 (a bf8 cache reads
+    back through bf16 exactly), block order = `block_ids` order; dim 1 is device-major (device d's local kv
+    heads at [d * n_local_kv_heads, (d + 1) * n_local_kv_heads)). The returned tensors own their memory.
+
+    The block list is read in PIECES (`export_pieces`): each piece is a pre-warmed power-of-two bucket no larger
+    than the KV export pool's reach (QWEN36_PD_EXPORT_POOL_MAX_BLOCKS, 256), so every request of any length goes
+    through the pooled, borrowed row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`: ~8 GB/s
+    at TP4) and never through the dim-0 mesh composer (~1.3 GiB/s plus a host cat, and an exact-count compile above
+    the 2048 bucket): 128k tokens = 2049 blocks = 8 x 256 + 1 instead of one 2048 (+ a 2049-shape JIT) composer
+    read; 8k+1 = 129 blocks = 128 + 1 instead of a padded 256-bucket DMA + permute. Per piece the blocks of all
+    caches are concatenated on device, converted (bfp8 -> bf16, untilize) once, DMA'd into the pool entry and
+    written device-major -> block-major straight into the preallocated per-layer outputs (one strided copy per
+    cache per piece; no torch.cat). A piece the pool cannot serve (QWEN36_PD_EXPORT_POOL=0, every entry busy,
+    QWEN36_PD_DEVICE_CONVERT=0) falls back to the composer read for that piece; with the pool off the whole list is
+    one bucketed piece as before. Bit-exact with the single-read path (same programs, same bytes).
+
+    Program shapes depend on the block count, so each piece is padded to its bucket (`pad_block_ids`; the pad rows
+    are dropped on the host) and read by one of two fixed-shape paths per piece:
+    `runs`  -- the piece is one contiguous run: one slice per cache, concat of 32;
+    `blocks` -- anything else: one single-block slice per (cache, block), a concat of `bucket` per
+    cache, then a concat of 32. Slice offsets are runtime arguments, so neither path compiles per
+    block id. (`ttnn.gather` was tried for fragmented lists: it reads the WHOLE cache per call, ~110 ms
+    x 32 caches = 3.5 s per request on a 500 MB cache, and returned wrong rows for a bfp8 cache.)
+    """
+    t0 = time.perf_counter()
+    layers = _attention_layers(model)
+    n_dev = int(model.num_devices)
+    n_real = len(block_ids)
+    block_ids = [int(b) for b in block_ids]
+    cache0 = layers[0].paged_k
+    num_blocks, nkv, blk, hd = (int(x) for x in cache0.shape)
+    caches = [c for att in layers for c in (att.paged_k, att.paged_v)]
+    n_caches = len(caches)
+    mode_env = os.environ.get("QWEN36_PD_EXPORT", "auto")
+    pool = _kv_export_pool(model) if _device_convert() else None
+    if os.environ.get("QWEN36_PD_EXPORT_BUCKETS", "1") != "1":
+        pieces = [(n_real, n_real)]  # exact count (compiles on first use)
+    elif pool is None:
+        pieces = [(n_real, export_bucket(n_real))]  # composer read, one bucket (the pre-pool path)
+    else:
+        pieces = export_pieces(n_real, pool.max_blocks)
+    out = [
+        (
+            torch.empty((n_real, n_dev * nkv, blk, hd), dtype=torch.bfloat16),
+            torch.empty((n_real, n_dev * nkv, blk, hd), dtype=torch.bfloat16),
+        )
+        for _ in layers
+    ]
+    dev_s = read_s = host_s = 0.0
+    reads, modes, n_runs = set(), set(), 0
+    off = 0
+    for cnt, bucket in pieces:
+        t1 = time.perf_counter()
+        ids, real_off = pad_block_ids(block_ids[off : off + cnt], bucket, num_blocks)
+        runs = coalesce_runs(ids)
+        n_runs += len(runs)
+        mode = mode_env if mode_env != "auto" else ("runs" if len(runs) == 1 else "blocks")
+        modes.add(mode)
+        big = _read_piece_device(caches, ids, runs, mode, nkv, blk, hd)
         t2 = time.perf_counter()
-        # host: [n_dev * 32 * n, nkv, blk, hd] -> [n_dev, 32, n, nkv, blk, hd]
-        host = host.view(n_dev, len(caches), n, nkv, blk, hd)
-        out = []
-        for li in range(len(layers)):
-            pair = []
-            for j in (0, 1):
-                t = host[:, 2 * li + j]  # [n_dev, n, nkv, blk, hd]
-                t = t.permute(1, 0, 2, 3, 4).reshape(n, n_dev * nkv, blk, hd)
-                if mode == "runs":
-                    t = _reorder_runs(t, runs)
-                # The output must own its memory: the pool entry is released below and refilled by the next
-                # export. permute+reshape is a copy only when n_dev > 1; at n_dev == 1 it is a view (and
-                # _reorder_runs returns its input for ascending runs, .contiguous() is a no-op), so clone then.
-                pair.append(_copy_off_pool(t[real_off : real_off + n_real], host if borrowed is not None else None))
-            out.append((pair[0], pair[1]))
-    finally:
-        if borrowed is not None:
-            pool.release(borrowed[0])
-    t3 = time.perf_counter()
+        pooled = big.dtype == ttnn.bfloat16 and big.layout == ttnn.ROW_MAJOR_LAYOUT
+        borrowed = pool.acquire(bucket) if (pool is not None and pooled) else None
+        try:
+            if borrowed is not None:
+                (
+                    _,
+                    host,
+                    host_tt,
+                ) = borrowed  # host: torch view the DMA lands in, [n_dev * n_caches * bucket, nkv, blk, hd]
+                ttnn.copy_device_to_host_tensor(big, host_tt, blocking=True)
+                reads.add("dma")
+            else:
+                host = ttnn.to_torch(big, mesh_composer=ttnn.ConcatMeshToTensor(model.mesh_device, dim=0)).to(
+                    torch.bfloat16
+                )
+                reads.add("composer")
+            ttnn.deallocate(big)
+            t3 = time.perf_counter()
+            # host: [n_dev * n_caches * bucket, nkv, blk, hd] -> [n_dev, n_caches, bucket, nkv, blk, hd]
+            host = host.view(n_dev, n_caches, bucket, nkv, blk, hd)
+            rows = _piece_row_map(runs, mode, real_off, cnt)
+            for li in range(len(layers)):
+                for j in (0, 1):
+                    src = host[:, 2 * li + j].permute(1, 0, 2, 3, 4)  # [bucket, n_dev, nkv, blk, hd] (view)
+                    dst = out[li][j][off : off + cnt].view(cnt, n_dev, nkv, blk, hd)
+                    _copy_rows(dst, src, rows)
+        finally:
+            if borrowed is not None:
+                pool.release(borrowed[0])
+        t4 = time.perf_counter()
+        dev_s += t2 - t1
+        read_s += t3 - t2
+        host_s += t4 - t3
+        off += cnt
+    t5 = time.perf_counter()
+    n_padded = sum(b for _, b in pieces)
+    read = "+".join(sorted(reads))
+    mode = "+".join(sorted(modes))
     LAST_EXPORT_TIMING.update(
         n_real=n_real,
-        bucket=n,
+        bucket=n_padded,
+        pieces=[b for _, b in pieces],
         mode=mode,
         read=read,
-        total_ms=1e3 * (t3 - t0),
-        device_ms=1e3 * (t1 - t0),
-        read_ms=1e3 * (t2 - t1),
-        host_ms=1e3 * (t3 - t2),
+        total_ms=1e3 * (t5 - t0),
+        device_ms=1e3 * dev_s,
+        read_ms=1e3 * read_s,
+        host_ms=1e3 * host_s,
     )
     logger.debug(
-        f"[pd] exported {n_real} KV blocks (bucket {n}) x {len(out)} layers in {1e3 * (t3 - t0):.1f} ms "
-        f"({len(runs)} run(s), {mode}; device {1e3 * (t1 - t0):.1f} ms, {read} read {1e3 * (t2 - t1):.1f} ms, "
-        f"host {1e3 * (t3 - t2):.1f} ms)"
+        f"[pd] exported {n_real} KV blocks (pieces {[b for _, b in pieces]}) x {len(out)} layers in "
+        f"{1e3 * (t5 - t0):.1f} ms ({n_runs} run(s), {mode}; device {1e3 * dev_s:.1f} ms, {read} read "
+        f"{1e3 * read_s:.1f} ms, host {1e3 * host_s:.1f} ms)"
     )
     return out
 
@@ -443,17 +512,29 @@ def export_bucket(n_blocks: int) -> int:
 
 
 def export_warmup(model, max_bucket: int = 2048):
-    """Compile the export programs for every bucket up to max_bucket (~2 s per bucket and path)."""
+    """Compile the export programs for every bucket up to max_bucket (~2 s per bucket and path). With the KV export
+    pool on (default) exports are read in pieces no larger than the pool's reach (QWEN36_PD_EXPORT_POOL_MAX_BLOCKS,
+    256), so buckets above it are never used and are skipped (the 512-2048 composer buckets alone were ~24 s of P
+    boot); one piecewise export (reach + 1 blocks) exercises the loop."""
     t0 = time.perf_counter()
     num_blocks = int(_attention_layers(model)[0].paged_k.shape[0])
+    pool = _kv_export_pool(model) if _device_convert() else None
+    cap = max_bucket
+    if pool is not None and os.environ.get("QWEN36_PD_EXPORT_BUCKETS", "1") == "1":
+        cap = min(max_bucket, pool.max_blocks)
     for b in _EXPORT_BUCKETS:
-        if b > max_bucket:
+        if b > cap:
             break
         # both fixed-shape paths: one contiguous run (single slice per cache) and the per-block path
         export_kv_blocks(model, list(range(1, 1 + b)))
         if b > 1:
             export_kv_blocks(model, [1] * b)
-    logger.info(f"[pd] export warm-up: buckets <= {max_bucket} in {time.perf_counter() - t0:.1f} s")
+    if cap < max_bucket and cap + 1 < num_blocks:
+        export_kv_blocks(model, list(range(1, 2 + cap)))  # two pieces: [cap, 1]
+    logger.info(
+        f"[pd] export warm-up: buckets <= {cap}{f' (pool reach; {max_bucket} requested)' if cap < max_bucket else ''} "
+        f"in {time.perf_counter() - t0:.1f} s"
+    )
 
 
 def _pad_block(model, cache):
