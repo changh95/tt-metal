@@ -66,11 +66,16 @@ TT_ADDITIONAL_CONFIG = {
         "sample_on_device_mode": "decode_only",
     }
 }
-# Environment the model code expects (mirrors the p300x2 bundle's serve.env).
+# Environment the model code expects (mirrors the p300x2 bundle's serve.env). The KV pool (QWEN36_MAX_TOKENS_ALL_USERS)
+# is set per role in vllm_env: the prefill half only holds in-flight prefills (the p300x2 spec's 525,312 tokens), the
+# decode half holds every live context. D's KV is bfp8, 17 layers x 2 x 256 x 1.0625 B = 9,248 B per token per chip:
+# 525,312 tokens = 4.9 GB, DECODE_MAX_TOKENS = 9.7 GB of the P150's 32 GB (the served D half had ~14 GB free at 525k).
+# 1,052,672 = 16,448 blocks of 64 = 32 x 32k, 16 x 64k or 8 x 128k contexts with 128 output tokens each.
+PREFILL_MAX_TOKENS = 525312
+DECODE_MAX_TOKENS = 1052672
 CHILD_ENV = {
     "ARCH_NAME": "blackhole",
     "TT_QWEN35_TEXT_VER": "qwen36_blackhole",
-    "QWEN36_MAX_TOKENS_ALL_USERS": "525312",
     "VLLM_RPC_TIMEOUT": "900000",
     "VLLM_CONFIGURE_LOGGING": "1",
     "TORCHDYNAMO_DISABLE": "1",
@@ -122,6 +127,9 @@ class BundleConfig:
     side_channel_port: int = 18100
     prefill_max_num_seqs: int = 8
     decode_max_num_seqs: int = 32
+    # per-role KV pools in tokens (each half's QWEN36_MAX_TOKENS_ALL_USERS); see the note above CHILD_ENV
+    prefill_max_tokens: int = PREFILL_MAX_TOKENS
+    decode_max_tokens: int = DECODE_MAX_TOKENS
     max_model_len: int = 262144
     block_size: int = 64
     metal_cache: Path = Path("/cache")
@@ -163,6 +171,8 @@ class BundleConfig:
             side_channel_port=ports["QWEN36_PD_SIDE_PORT"],
             prefill_max_num_seqs=_env_int(env, "QWEN36_PD_PREFILL_MAX_NUM_SEQS", 8),
             decode_max_num_seqs=_env_int(env, "QWEN36_PD_DECODE_MAX_NUM_SEQS", 32),
+            prefill_max_tokens=_env_int(env, "QWEN36_PD_PREFILL_MAX_TOKENS", PREFILL_MAX_TOKENS),
+            decode_max_tokens=_env_int(env, "QWEN36_PD_DECODE_MAX_TOKENS", DECODE_MAX_TOKENS),
             max_model_len=_env_int(env, "QWEN36_PD_MAX_MODEL_LEN", 262144),
             # tt-model exports TT_METAL_CACHE=/cache; outside a container fall back to tt-metal's own default
             metal_cache=Path(env.get("TT_METAL_CACHE") or Path.home() / ".cache" / "tt-metal-cache"),
@@ -271,6 +281,9 @@ def vllm_env(config: BundleConfig, role: str, base: Mapping[str, str] | None = N
     env["HF_MODEL"] = config.weights
     env["HF_HUB_OFFLINE"] = "1" if config.offline else "0"
     env["TT_METAL_CACHE"] = str(config.metal_cache / role)
+    env["QWEN36_MAX_TOKENS_ALL_USERS"] = str(
+        config.prefill_max_tokens if role == "prefill" else config.decode_max_tokens
+    )
     env["PYTHONUNBUFFERED"] = "1"
     stub_dirs = _cuda_stub_dirs()
     if stub_dirs:
@@ -457,6 +470,7 @@ def bundle_description(config: BundleConfig, stack: Stack | None) -> dict[str, A
             "chips": list(config.prefill_chips if h.role == "prefill" else config.decode_chips),
             "port": h.port,
             "max_num_seqs": h.argv[h.argv.index("--max-num-seqs") + 1],
+            "kv_pool_tokens": int(h.env["QWEN36_MAX_TOKENS_ALL_USERS"]),
             "ready_seconds": h.ready_seconds,
             "exit": exit_status(h.poll()),
         }

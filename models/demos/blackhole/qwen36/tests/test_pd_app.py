@@ -193,3 +193,31 @@ def test_vllm_argv_speculative_mtp_only_on_the_decode_half():
     assert argv[i + 1] == '{"method": "mtp", "num_speculative_tokens": 2}'
     assert "--no-async-scheduling" in argv
     assert pd_app.vllm_argv(on, "prefill") == pd_app.vllm_argv(off, "prefill")
+
+
+def test_kv_pool_is_per_role():
+    """QWEN36_MAX_TOKENS_ALL_USERS (each vLLM's KV pool) is set per half: the prefill half keeps the p300x2 spec's
+    525,312 tokens (it only holds in-flight prefills), the decode half gets QWEN36_PD_DECODE_MAX_TOKENS (default
+    pd_app.DECODE_MAX_TOKENS: 32 x 32k / 16 x 64k / 8 x 128k live contexts); an operator's own value never leaks from
+    one role to the other, and the bundle description reports both."""
+    assert "QWEN36_MAX_TOKENS_ALL_USERS" not in pd_app.CHILD_ENV
+    base = {"HF_MODEL": "Qwen/Qwen3.8-27B", "QWEN36_MAX_TOKENS_ALL_USERS": "1"}
+    cfg = pd_app.BundleConfig.from_env(base)
+    assert cfg.prefill_max_tokens == pd_app.PREFILL_MAX_TOKENS == 525312
+    assert cfg.decode_max_tokens == pd_app.DECODE_MAX_TOKENS
+    assert pd_app.DECODE_MAX_TOKENS % 64 == 0 and pd_app.DECODE_MAX_TOKENS >= 32 * (32768 + 128)
+    assert pd_app.DECODE_MAX_TOKENS >= 16 * (65536 + 128) and pd_app.DECODE_MAX_TOKENS >= 8 * (131072 + 128)
+    p_env = pd_app.vllm_env(cfg, "prefill", base)
+    d_env = pd_app.vllm_env(cfg, "decode", base)
+    assert p_env["QWEN36_MAX_TOKENS_ALL_USERS"] == "525312"
+    assert d_env["QWEN36_MAX_TOKENS_ALL_USERS"] == str(pd_app.DECODE_MAX_TOKENS)
+    custom = pd_app.BundleConfig.from_env(
+        {**base, "QWEN36_PD_DECODE_MAX_TOKENS": "1048576", "QWEN36_PD_PREFILL_MAX_TOKENS": "262144"}
+    )
+    assert pd_app.vllm_env(custom, "decode", base)["QWEN36_MAX_TOKENS_ALL_USERS"] == "1048576"
+    assert pd_app.vllm_env(custom, "prefill", base)["QWEN36_MAX_TOKENS_ALL_USERS"] == "262144"
+    stack = pd_app.Stack(cfg, pd_app.VllmHalf(cfg, "prefill"), pd_app.VllmHalf(cfg, "decode"))
+    halves = pd_app.bundle_description(cfg, stack)["halves"]
+    assert (
+        halves["prefill"]["kv_pool_tokens"] == 525312 and halves["decode"]["kv_pool_tokens"] == pd_app.DECODE_MAX_TOKENS
+    )
