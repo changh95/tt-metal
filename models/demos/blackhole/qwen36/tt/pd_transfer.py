@@ -448,11 +448,8 @@ def export_kv_blocks(model, block_ids):
         borrowed = pool.acquire(bucket) if (pool is not None and pooled) else None
         try:
             if borrowed is not None:
-                (
-                    _,
-                    host,
-                    host_tt,
-                ) = borrowed  # host: torch view the DMA lands in, [n_dev * n_caches * bucket, nkv, blk, hd]
+                # host: the torch view the DMA lands in, [n_dev * n_caches * bucket, nkv, blk, hd]
+                _, host, host_tt = borrowed
                 ttnn.copy_device_to_host_tensor(big, host_tt, blocking=True)
                 reads.add("dma")
             else:
