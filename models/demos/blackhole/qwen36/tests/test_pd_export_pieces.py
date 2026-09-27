@@ -138,3 +138,52 @@ def test_copy_rows_is_in_place_and_single_pass():
     ptr = dst2.data_ptr()
     _copy_rows(dst2, src, [5, 0, 2])  # gather straight into dst
     assert dst2.data_ptr() == ptr and torch.equal(dst2, src[[5, 0, 2]])
+
+
+def _runs_of_piece(ids):
+    return len(coalesce_runs(ids))
+
+
+@pytest.mark.parametrize(
+    "name,ids",
+    [
+        ("contig", list(range(100, 357))),
+        ("desc", list(range(356, 99, -1))),
+        ("two_long", list(range(0, 300)) + list(range(1000, 1213))),
+        ("long_frag_long", list(range(0, 200)) + [900, 950, 800, 5, 7] + list(range(2000, 2300))),
+        ("all_frag", [int(x) for x in torch.randperm(3000)[:300]]),
+        ("many_runs", sum([list(range(i * 100, i * 100 + 62)) for i in range(33)], [])),  # 33 x 62 = 2046
+        ("short_runs_between", sum([list(range(i * 300, i * 300 + 40)) for i in range(10)], [])),
+    ],
+)
+def test_export_pieces_for_cuts_at_long_runs(name, ids):
+    from models.demos.blackhole.qwen36.tt.pd_transfer import export_pieces_for
+
+    pieces = export_pieces_for(ids, 256, long_run=64)
+    _check_plan(len(ids), pieces, 256)
+    off = 0
+    for cnt, bucket in pieces:
+        piece = ids[off : off + cnt]
+        runs = coalesce_runs(piece)
+        if len(runs) == 1:
+            pass  # single run: the `runs` device path
+        else:
+            # a per-block piece never swallows a long run
+            assert all(hi - lo < 64 for lo, hi, _ in runs), (name, piece[:8])
+        off += cnt
+    if name in ("contig", "desc"):
+        assert pieces == [(256, 256), (1, 1)]
+    if name == "two_long":
+        assert pieces == [(256, 256), (44, 64), (213, 256)]
+    if name == "many_runs":  # every 62-block run is a short run: grouped per block as before
+        assert pieces == export_pieces(2046, 256)
+    if name == "long_frag_long":
+        assert pieces == [(200, 256), (5, 8), (256, 256), (44, 64)]
+
+
+def test_export_pieces_for_single_run_matches_export_pieces():
+    from models.demos.blackhole.qwen36.tt.pd_transfer import export_pieces_for
+
+    for n in (1, 129, 257, 2049):
+        assert export_pieces_for(list(range(5, 5 + n)), 256) == export_pieces(n, 256)
+        assert export_pieces_for(list(range(5 + n, 5, -1)), 256) == export_pieces(n, 256)

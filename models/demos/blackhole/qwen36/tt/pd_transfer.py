@@ -318,6 +318,43 @@ def export_pieces(n_real: int, max_piece: int, fixed: int | None = None):
     return pieces
 
 
+def export_pieces_for(block_ids, max_piece: int, long_run: int | None = None):
+    """`export_pieces` made run-aware: `(real_count, bucket)` pieces over the block LIST positions, cut so that every
+    run of >= `long_run` consecutive block ids (QWEN36_PD_EXPORT_LONG_RUN, default 64) is read as its own single-run
+    piece(s) (the `runs` device path: one slice per cache, ~37 ms fixed) while the short runs between them are grouped
+    into <= max_piece pieces read per block (the `blocks` path, ~1.1 ms per block of device dispatch). vLLM's free
+    list hands long requests out as a few dozen runs (a served 2049-block list had 33), and reading such a list in
+    fixed 256-position pieces put nearly every piece on the per-block path (2.0 s of device dispatch at 128k)."""
+    if long_run is None:
+        long_run = int(os.environ.get("QWEN36_PD_EXPORT_LONG_RUN", "64"))
+    max_piece = max(1, int(max_piece))
+    n = len(block_ids)
+    if long_run <= 0 or long_run > n:
+        return export_pieces(n, max_piece)
+    runs = coalesce_runs(block_ids)
+    if len(runs) == 1:
+        return export_pieces(n, max_piece)
+    pieces = []
+    frag = 0  # positions of short runs waiting to be emitted as per-block pieces
+
+    def flush():
+        nonlocal frag
+        while frag:
+            take = min(frag, max_piece)
+            pieces.append((take, export_bucket(take)))
+            frag -= take
+
+    for lo, hi, _ in runs:
+        r = hi - lo
+        if r >= long_run:
+            flush()
+            pieces.extend(export_pieces(r, max_piece))
+        else:
+            frag += r
+    flush()
+    return pieces
+
+
 def _piece_row_map(runs, mode: str, real_off: int, cnt: int):
     """Device-read row of each REAL block position of one padded piece. `runs` mode reads every run's contiguous
     region ascending in `runs` order (a descending run's blocks come back reversed); `blocks` mode reads the padded
@@ -397,7 +434,8 @@ def export_kv_blocks(model, block_ids):
     back through bf16 exactly), block order = `block_ids` order; dim 1 is device-major (device d's local kv
     heads at [d * n_local_kv_heads, (d + 1) * n_local_kv_heads)). The returned tensors own their memory.
 
-    The block list is read in PIECES (`export_pieces`): each piece is a pre-warmed power-of-two bucket no larger
+    The block list is read in PIECES (`export_pieces_for`: run-aware, long runs on the `runs` path, the short runs
+    between them grouped on the `blocks` path): each piece is a pre-warmed power-of-two bucket no larger
     than the KV export pool's reach (QWEN36_PD_EXPORT_POOL_MAX_BLOCKS, 256), so every request of any length goes
     through the pooled, borrowed row-major host buffer (`KvExportPool`, `ttnn.copy_device_to_host_tensor`: ~8 GB/s
     at TP4) and never through the dim-0 mesh composer (~1.3 GiB/s plus a host cat, and an exact-count compile above
@@ -433,7 +471,7 @@ def export_kv_blocks(model, block_ids):
     elif pool is None:
         pieces = [(n_real, export_bucket(n_real))]  # composer read, one bucket (the pre-pool path)
     else:
-        pieces = export_pieces(n_real, pool.max_blocks)
+        pieces = export_pieces_for(block_ids, pool.max_blocks)
     out = [
         (
             torch.empty((n_real, n_dev * nkv, blk, hd), dtype=torch.bfloat16),
