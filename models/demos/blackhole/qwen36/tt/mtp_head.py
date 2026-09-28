@@ -45,6 +45,17 @@ Device side (``MTPHead``):
     (paged KV write at the position, SDPA over <= position) -> mtp.norm -> sharded lm_head -> per-device (argmax,max)
     readback [TP,w]; the post-norm output is copied back into ``hidden_in`` in-trace for the chain. ``select_hidden``
     (eager, 0/1 matmul + copy) loads each user's accepted row of the verify step's ``out_hidden`` into ``hidden_in``.
+  * keep-current (HYBRID serving only, tt/spec_decoder.py ``_HybridDrafter``; the mtp mode never calls it): when the
+    DFlash2 drafter drafts, nothing writes the head's KV for the committed positions, so a later switch to the MTP
+    drafter (the batch grows past 4 users) would find a hole for every token committed meanwhile. ``keep_current(plan,
+    next_tokens)`` runs the head's LAYER (no lm_head) over the verify grid's R rows as one traced program per verify
+    plan: row (s, j) at position P_s + j takes ``fc(norm(embed(x_{P_s+j+1})), norm(h_{P_s+j}))`` with x_{P_s+j+1} = the
+    verify's argmax of that row (the committed next token for rows <= a_s) and h = the row of ``plan.out_hidden``
+    (the verify's post-norm rows), and the layer's ``forward_verify`` writes K/V at P_s + j through the plan's
+    positions / page table (rows past a_s hold speculative entries the next step overwrites before any read; padding
+    users' rows are skipped at position -1). The head's KV then holds, for every committed position i, the entry of
+    (x_{i+1}, h_i) with the TARGET's hidden -- what the head's own prefill writes and what vLLM's proposer feeds it
+    for accepted tokens. Fused-AR plans only (R <= 32: the layer runs the decode-step ops, like the draft step).
   Trace safety: every buffer allocated here exists before any capture; per-step values are DMA'd in; the draft-step
   programs are compiled eagerly (compile_step) before ANY trace is captured (tests/VERIFY_W32_AUDIT.md rule).
 
@@ -265,8 +276,9 @@ class MTPHead:
         self.pf_csi = self._up(torch.zeros(1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         assert self.page_tables is None or self.page_tables.shape[1] <= self.sdpa_pt_blocks
 
-        # --- per-verify-plan 0/1 row selectors (bind_plan) ---
+        # --- per-verify-plan 0/1 row selectors (bind_plan) and keep-current buffers (bind_keep_plan) ---
         self._plan_sel = {}
+        self._keep = {}
         self._host_refs = []
         # per-request host bookkeeping filled by prefill_hook: slot -> main post-norm hidden row n-1 (bf16 [dim])
         self.pending_rows = {}
@@ -650,6 +662,10 @@ class MTPHead:
             if b.trace_id is not None:
                 ttnn.release_trace(self.mesh, b.trace_id)
                 b.trace_id = None
+        for kb in self._keep.values():
+            if kb.trace_id is not None:
+                ttnn.release_trace(self.mesh, kb.trace_id)
+                kb.trace_id = None
 
     def run_step(self, w, tokens, positions):
         """One draft step for w users: upload -> replay (or eager) -> argmax [w] (list of ints)."""
@@ -732,6 +748,108 @@ class MTPHead:
         self.stats["draft_steps"] += k
         self.stats["draft_wall"] += time.perf_counter() - t0
         return drafts
+
+    # ------------------------------------------------------------------------------------------ keep-current (hybrid)
+    def bind_keep_plan(self, plan):
+        """Persistent inputs of the keep-current program of a verify plan (module docstring): the R next-token rows
+        and, for the compile before the plan's capture, a stand-in for ``plan.out_hidden``. Allocate BEFORE any
+        capture; fused-AR (R <= 32) plans only."""
+        assert plan.keep_hidden, "keep-current reads plan.out_hidden (VerifyStep(keep_hidden=True))"
+        assert plan.fused_ar, f"keep-current runs the decode-step ops: R = {plan.R} must be <= 32 (fused all-reduce)"
+        kb = _StepBufs()
+        kb.tok = self._up(torch.zeros(1, plan.R, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+        kb.hidden_in = self._up(
+            torch.zeros(1, 1, plan.R, self.dim, dtype=torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT
+        )  # compile-time stand-in only
+        self._keep[id(plan)] = kb
+
+    def _keep_body(self, plan, hidden_rows):
+        """The traced keep-current body: the draft step's input path at R rows (embedding of the next tokens, the two
+        pre-fc norms, fc) into the verify plan's residual layout, then the head's layer over the grid
+        (``Qwen36DecoderLayer.forward_verify``: attention writes the head's K/V at P_s + j and attends the grid, the
+        MLP completes the layer; its output is discarded -- only the K/V side effect matters)."""
+        m = self.model
+        kb = self._keep[id(plan)]
+        R = plan.R
+        x_e = m.embd(kb.tok)  # [1,R,dim/TP]
+        x_e = ttnn.reshape(x_e, (1, 1, R, x_e.shape[-1]))
+        x_e = m._decode_residual_in(x_e)  # begin_step + all-gather -> replicated L1 width-sharded [1,1,R,dim]
+        e_n = self.pre_fc_norm_emb(x_e, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=self.nc_dec)
+        ttnn.deallocate(x_e)
+        h_sh = ttnn.to_memory_config(hidden_rows, self.act_memcfg)
+        h_n = self.pre_fc_norm_hid(h_sh, mode=Mode.DECODE, in_sharded=True, out_sharded=True, norm_config=self.nc_dec)
+        ttnn.deallocate(h_sh)
+        pe = tpc.matmul_1d_decode(e_n, self.fc_e_rep, self.fc_progcfg, self.compute_cfg, ttnn.L1_MEMORY_CONFIG)
+        ph = tpc.matmul_1d_decode(h_n, self.fc_h_rep, self.fc_progcfg, self.compute_cfg, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(e_n)
+        ttnn.deallocate(h_n)
+        x = ttnn.add(pe, ph, memory_config=ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(pe)
+        ttnn.deallocate(ph)
+        x_sh = ttnn.to_memory_config(x, self.act_memcfg)
+        ttnn.deallocate(x)
+        y = self.layer.forward_verify(
+            x_sh, plan, cur_pos_list=plan.cur_pos, cos_list=plan.cos, sin_list=plan.sin, page_table=plan.page_table
+        )
+        ttnn.deallocate(x_sh)
+        ttnn.deallocate(y)
+
+    def _upload_keep(self, plan, next_tokens):
+        kb = self._keep[id(plan)]
+        tok = torch.zeros(1, plan.R, dtype=torch.int32)
+        n = min(plan.R, len(next_tokens))
+        tok[0, :n] = torch.as_tensor([int(t) for t in next_tokens[:n]], dtype=torch.int32)
+        self._dma(tok, kb.tok, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+
+    def compile_keep(self, plan):
+        """Eager keep-current on the stand-in hidden rows (the plan's out_hidden exists only after its capture): writes
+        garbage K/V at the plan's current (warm-up) positions. Before any trace capture, after the plan's own compile.
+        """
+        t0 = time.perf_counter()
+        kb = self._keep[id(plan)]
+        self._upload_keep(plan, [1] * plan.R)
+        self._keep_body(plan, kb.hidden_in)
+        self._sync()
+        logger.info(f"[mtp] keep-current ({plan.w},T={plan.T}) compiled in {time.perf_counter() - t0:.1f}s")
+
+    def capture_keep(self, plan):
+        """Capture the keep-current trace reading ``plan.out_hidden`` (capture the verify step first)."""
+        kb = self._keep[id(plan)]
+        assert kb.trace_id is None
+        assert plan.out_hidden is not None, "plan.out_hidden missing: capture the verify step first"
+        self._upload_keep(plan, [1] * plan.R)
+        self._sync()
+        tid = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._keep_body(plan, plan.out_hidden)
+        ttnn.end_trace_capture(self.mesh, tid, cq_id=0)
+        self._sync()
+        kb.trace_id = tid
+
+    def keep_current(self, plan, next_tokens):
+        """After a verify step (its rows' post-norm hidden in ``plan.out_hidden``, its positions / page table
+        uploaded): write the head's K/V for every grid row (s, j) at P_s + j from (``next_tokens[s*T+j]``, that row's
+        hidden). ``next_tokens`` = the verify's per-row argmax (host list [R]; pads: anything)."""
+        t0 = time.perf_counter()
+        kb = self._keep[id(plan)]
+        self._upload_keep(plan, next_tokens)
+        if kb.trace_id is None:
+            assert plan.out_hidden is not None, "run the verify step first"
+            self._keep_body(plan, plan.out_hidden)
+        else:
+            ttnn.execute_trace(self.mesh, kb.trace_id, cq_id=0, blocking=False)
+        self._sync()
+        self.stats["keep_steps"] = self.stats.get("keep_steps", 0) + 1
+        self.stats["keep_wall"] = self.stats.get("keep_wall", 0.0) + (time.perf_counter() - t0)
+
+    def time_keep_replays(self, plan, n=50):
+        """Traced keep-current wall (upload + replay + sync), median / min ms over n replays."""
+        ms = []
+        for i in range(n):
+            t0 = time.perf_counter()
+            self.keep_current(plan, [(100 + i + r) % 1000 for r in range(plan.R)])
+            ms.append(1e3 * (time.perf_counter() - t0))
+        ms.sort()
+        return ms[len(ms) // 2], ms[0]
 
     def time_step_replays(self, w, n=50):
         """Traced draft-step time (upload + replay + argmax readback), median / min ms over n replays."""

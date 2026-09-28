@@ -25,6 +25,20 @@ Drafters (``QWEN36_SPEC_DRAFTER``, tt/aux_hidden.py ``spec_drafter``), behind on
     request without it decodes with no drafts (its rows are padding in the draft step). No hidden row and no
     catch-up step: the first verify step at P_s = N (row 0 = P's first token) commits the aux row of position N, so
     the first draft (anchor = the committed token at N + a_s, positions N + a_s + 1 ..) reads a gap-free context.
+  * ``hybrid`` -- BOTH drafters resident, the ladder picks one per plan by width (tt/spec_serving.py
+    ``Ladder.drafter_for``: DFlash2 at T = 8 up to 4 users, the MTP bands above; the served A/B behind the split is in
+    the plugin's docs/SPECULATIVE.md). Verify plans keep both the post-norm rows and the aux rows. Every spec step
+    keeps BOTH drafters' per-slot state current so a drafter change (a plan change: flush / migration as usual) is
+    exact from the new drafter's point of view without a re-prefill: the DFlash2 context commit runs on every step
+    (also when the MTP head drafts), and the MTP head's K/V for the committed rows is written by ``MTPHead.keep_current``
+    (the head's layer over the grid rows from the verify's argmax + post-norm rows) on every step the MTP chain did
+    not just cover -- i.e. every DFlash2-drafted step and the first MTP-drafted step after one (or after a plain step);
+    inside the MTP band the chain writes the head's K/V exactly as in mtp mode. The MTP catch-up step of a freshly
+    admitted user (its imported hidden row) runs whichever drafter is active, the DFlash2 context report
+    (``note_context``) is taken as in dflash2 mode; a user without DFlash2 context proposes nothing while DFlash2 is
+    active and drafts normally once the MTP head is. P ships both states (payload v3: mtp.kv / mtp.hidden + KV group
+    "dflash2"), D imports both. With ``QWEN36_SPEC_DRAFTER=mtp`` / ``dflash2`` nothing of this runs: those loops are
+    the 2026-09-28 ones op for op.
 Every program runs compiled before any trace is captured (``compile`` in the first warm-up phase, ``capture`` in the
 second; tests/VERIFY_W32_AUDIT.md).
 """
@@ -101,8 +115,18 @@ class _MtpDrafter:
     def note_context(self, slot, req_id, meta):
         pass  # the hidden row arrives through MTPHead.set_hidden_in (pd_transfer.import_mtp_hidden)
 
-    def drafts_enabled(self, slot) -> bool:
+    def drafts_enabled(self, slot, active=None) -> bool:
         return True
+
+    def drop_stale(self, w, sp):
+        """A slot re-used by a new request whose hidden row never arrived has nothing to consume; a stale row of a
+        previous occupant is dropped when the owner changes (SpecServingState resets the slot -> not fresh here)."""
+        for s in range(w):
+            if sp.live[s] and self.has_state(s) and s not in sp.catchup:
+                self.drop_state(s)
+
+    def note_plain(self):
+        pass
 
     # --- per step ---
     def catchup(self, w, sp, last, pos, pt):
@@ -117,10 +141,10 @@ class _MtpDrafter:
             w, [last[s] if s in cu else 0 for s in range(w)], [pos[s] - 1 if s in cu else -1 for s in range(w)]
         )
 
-    def after_verify(self, vs, sp, accepts, pos_before):
+    def after_verify(self, vs, sp, accepts, pos_before, argmax_rows=None, active=None):
         self.head.select_hidden(vs.plan, accepts)
 
-    def draft(self, w, k, last, positions, pad, pt):
+    def draft(self, w, k, last, positions, pad, pt, active=None):
         self.head.set_page_table(w, pt)
         return self.head.draft(w, k, last, positions, pad=pad)
 
@@ -184,20 +208,142 @@ class _DFlash2Drafter:
     def drop_state(self, slot):
         self.context.pop(slot, None)
 
-    def drafts_enabled(self, slot) -> bool:
+    def drafts_enabled(self, slot, active=None) -> bool:
         return slot in self.context
+
+    def drop_stale(self, w, sp):
+        pass  # the context of a slot is replaced by the next admission's report (note_context) / dropped with it
+
+    def note_plain(self):
+        pass
 
     # --- per step ---
     def catchup(self, w, sp, last, pos, pt):
         pass  # no hidden row: the context is complete once the first verify step's commit ran (module docstring)
 
-    def after_verify(self, vs, sp, accepts, pos_before):
+    def after_verify(self, vs, sp, accepts, pos_before, argmax_rows=None, active=None):
         self.head.commit(vs.plan, pos_before)
 
-    def draft(self, w, k, last, positions, pad, pt):
+    def draft(self, w, k, last, positions, pad, pt, active=None):
         self.head.set_page_table(w, pt)
         drafts7, _, _ = self.head.draft(w, last, positions, pad=pad)
         return [list(d[:k]) for d in drafts7]
+
+
+class HybridHeads:
+    """The two drafter modules of the hybrid policy (``make_drafter`` -> ``_HybridDrafter``)."""
+
+    def __init__(self, mtp_head, dflash2_drafter):
+        assert hasattr(mtp_head, "select_hidden") and hasattr(mtp_head, "keep_current"), type(mtp_head).__name__
+        assert hasattr(dflash2_drafter, "commit") and hasattr(dflash2_drafter.cfg, "target_layer_ids")
+        self.mtp = mtp_head
+        self.dflash2 = dflash2_drafter
+
+
+class _HybridDrafter:
+    """Both drafters behind the decoder's interface; the ladder's ``drafter_for(plan)`` (passed as ``active``) picks
+    who drafts, both states are kept current every step (module docstring). ``widths_of(name)`` = the ladder widths
+    each drafter drafts at (set by the decoder before ``build_step_buffers``: the block step is built only for the
+    DFlash2 buckets, the MTP step for every width because the catch-up runs at the current plan's width)."""
+
+    name = "hybrid"
+    post_name = "post"  # commit (+ keep-current) (+ select): the per-step ops between the verify commit and the draft
+
+    def __init__(self, heads: HybridHeads, ladder):
+        self.mtp = _MtpDrafter(heads.mtp)
+        self.df2 = _DFlash2Drafter(heads.dflash2)
+        self.ladder = ladder
+        self.prev_active = None  # the drafter of the previous spec step (None after a plain step / at start)
+        self.stats = {"commit_ms": 0.0, "keep_ms": 0.0, "select_ms": 0.0, "keep_steps": 0, "select_steps": 0}
+        self.last_times = {}
+
+    def verify_kwargs(self):
+        kw = dict(self.df2.verify_kwargs())
+        kw.update(self.mtp.verify_kwargs())
+        return kw
+
+    def build_step_buffers(self, widths, page_tables):
+        self.mtp.build_step_buffers(widths, page_tables)  # every width: the catch-up step runs at the plan's width
+        self.df2.build_step_buffers(self.ladder.widths_for("dflash2"), page_tables)
+
+    def bind_plan(self, plan):
+        self.mtp.bind_plan(plan)
+        self.mtp.head.bind_keep_plan(plan)
+        self.df2.bind_plan(plan)
+
+    def compile_width(self, w):
+        self.mtp.compile_width(w)
+        if w in self.df2.head.sb:
+            self.df2.compile_width(w)
+
+    def compile_plan(self, vs):
+        self.df2.compile_plan(vs)
+        self.mtp.compile_plan(vs)
+        self.mtp.head.compile_keep(vs.plan)
+
+    def capture_width(self, w):
+        self.mtp.capture_width(w)
+        if w in self.df2.head.sb:
+            self.df2.capture_width(w)
+
+    def capture_plan(self, vs):
+        self.df2.capture_plan(vs)  # reads out_aux
+        self.mtp.head.capture_keep(vs.plan)  # reads out_hidden
+
+    def release(self):
+        self.mtp.release()
+        self.df2.release()
+
+    # --- per-slot state ---
+    def has_state(self, slot) -> bool:
+        return self.mtp.has_state(slot)  # the catch-up list: fresh slots whose MTP hidden row arrived
+
+    def drop_state(self, slot):
+        self.mtp.drop_state(slot)
+        self.df2.drop_state(slot)
+
+    def note_context(self, slot, req_id, meta):
+        self.df2.note_context(slot, req_id, meta)
+
+    def drafts_enabled(self, slot, active=None) -> bool:
+        return self.df2.drafts_enabled(slot) if active == "dflash2" else True
+
+    def drop_stale(self, w, sp):
+        self.mtp.drop_stale(w, sp)
+
+    def note_plain(self):
+        self.prev_active = None  # a plain step wrote neither drafter's state: the next MTP step keeps current
+
+    # --- per step ---
+    def catchup(self, w, sp, last, pos, pt):
+        self.mtp.catchup(w, sp, last, pos, pt)  # the head's KV at P_s - 1, whichever drafter is active
+
+    def after_verify(self, vs, sp, accepts, pos_before, argmax_rows=None, active=None):
+        """DFlash2 context commit (always); MTP keep-current unless the MTP chain of the previous step covered the
+        committed rows (an MTP step right after an MTP step); the MTP hidden select when the MTP head drafts."""
+        t0 = time.perf_counter()
+        self.df2.after_verify(vs, sp, accepts, pos_before)
+        t1 = time.perf_counter()
+        times = {"commit_ms": 1e3 * (t1 - t0)}
+        if active != "mtp" or self.prev_active != "mtp":
+            self.mtp.head.keep_current(vs.plan, [int(t) for t in argmax_rows.tolist()])
+            t2 = time.perf_counter()
+            times["keep_ms"] = 1e3 * (t2 - t1)
+            self.stats["keep_steps"] += 1
+            t1 = t2
+        if active == "mtp":
+            self.mtp.after_verify(vs, sp, accepts, pos_before)
+            times["select_ms"] = 1e3 * (time.perf_counter() - t1)
+            self.stats["select_steps"] += 1
+        for key, v in times.items():
+            self.stats[key] += v
+        self.last_times = times
+        self.prev_active = active
+
+    def draft(self, w, k, last, positions, pad, pt, active=None):
+        if active == "dflash2":
+            return self.df2.draft(w, k, last, positions, pad, pt)
+        return self.mtp.draft(w, k, last, positions, pad, pt)
 
 
 class RowChunkedProjector:
@@ -253,8 +399,12 @@ class RowChunkedProjector:
         return self._cat(parts)
 
 
-def make_drafter(head):
-    """The adapter for a drafter module: an MTPHead or a DFlash2Drafter (duck-typed on their distinctive API)."""
+def make_drafter(head, ladder=None):
+    """The adapter for a drafter module: an MTPHead or a DFlash2Drafter (duck-typed on their distinctive API), or the
+    ``HybridHeads`` pair (needs the ladder for the per-plan choice)."""
+    if isinstance(head, HybridHeads):
+        assert ladder is not None and ladder.drafter == "hybrid", "HybridHeads need a hybrid ladder"
+        return _HybridDrafter(head, ladder)
     if hasattr(head, "select_hidden") and hasattr(head, "pending_rows"):
         return _MtpDrafter(head)
     if hasattr(head, "commit") and hasattr(head, "cfg") and hasattr(head.cfg, "target_layer_ids"):
@@ -270,7 +420,7 @@ class SpecDecoder:
         the draft-step buffers of the ladder's widths are built here. num_blocks_pt: the served block-table width
         (max_num_blocks_per_req, a multiple of 8). Allocates every persistent buffer (call before ANY trace capture)."""
         self.model = model
-        self.drafter = make_drafter(head)
+        self.drafter = make_drafter(head, ladder)
         self.head = head
         self.mesh = model.mesh_device
         self.ladder = ladder
@@ -300,8 +450,9 @@ class SpecDecoder:
         self.acc_users = 0
         self.acc_accepted = 0
         self.n_no_context = 0  # dflash2: user-steps drafted as padding (no context K/V for the request)
+        self.n_steps_by_drafter = {}
         logger.info(
-            f"[spec] decoder ({self.drafter.name}): ladder {[str(p) for p in ladder.plans]} k_max={ladder.k_max} "
+            f"[spec] decoder ({self.drafter.name}): ladder {[f'{p}:{ladder.drafter_for(p)}' for p in ladder.plans]} k_max={ladder.k_max} "
             f"bmax={self.bmax} page table {self.nb} blocks; fractured plans {[str(p) for p in ladder.fractured_plans]}; "
             f"{len(self.steps)} verify plans + {len(ladder.widths)} draft widths allocated in {time.perf_counter() - t0:.1f}s"
         )
@@ -379,8 +530,10 @@ class SpecDecoder:
         dr = list(drafts) + [None] * (self.bmax - len(drafts))
         sp = self.state.begin_step(rows, dr, eligible, flush=flush, has_state=self.drafter.has_state)
         if sp.mode == "plain":
+            self.drafter.note_plain()
             return None
         plan, w, k = sp.plan, sp.plan.w, sp.plan.k
+        active = sp.drafter  # the drafter of this plan (Ladder.drafter_for; the single drafter outside hybrid mode)
         vs = self.steps[plan]
         times = {}
         tok_all = tokens.reshape(-1).tolist()
@@ -402,10 +555,7 @@ class SpecDecoder:
             times["catchup_ms"] = 1e3 * (time.perf_counter() - t0)
         # a slot re-used by a new request whose drafter state never arrived: nothing to consume; a stale row of a
         # previous occupant is dropped when the owner changes (SpecServingState resets the slot -> not fresh here)
-        if self.drafter.name == "mtp":
-            for s in range(w):
-                if sp.live[s] and self.drafter.has_state(s) and s not in sp.catchup:
-                    self.drafter.drop_state(s)
+        self.drafter.drop_stale(w, sp)
 
         t0 = time.perf_counter()
         grid_tokens = self.state.grid_tokens(sp, last)
@@ -416,15 +566,15 @@ class SpecDecoder:
 
         next_drafts = [[] for _ in range(w)]
         if k >= 1:
-            self.drafter.after_verify(vs, sp, accepts, pos)
+            self.drafter.after_verify(vs, sp, accepts, pos, argmax_rows=argmax_rows, active=active)
             t2 = time.perf_counter()
             times[self.post_key] = 1e3 * (t2 - t1)
             new_last = [committed[s][-1] if sp.live[s] else 0 for s in range(w)]
             new_pos = [pos[s] + accepts[s] + 1 if sp.live[s] else 0 for s in range(w)]
             # users the drafter has no state for (a request whose context K/V never arrived) are padding in the draft
-            draft_pad = [pad[s] or not self.drafter.drafts_enabled(s) for s in range(w)]
+            draft_pad = [pad[s] or not self.drafter.drafts_enabled(s, active) for s in range(w)]
             self.n_no_context += sum(1 for s in range(w) if sp.live[s] and draft_pad[s])
-            drafted = self.drafter.draft(w, k, new_last, new_pos, draft_pad, pt)
+            drafted = self.drafter.draft(w, k, new_last, new_pos, draft_pad, pt, active=active)
             next_drafts = [list(drafted[s]) if not draft_pad[s] else [] for s in range(w)]
             times["draft_ms"] = 1e3 * (time.perf_counter() - t2)
 
@@ -447,6 +597,7 @@ class SpecDecoder:
     # ------------------------------------------------------------------------------------------ metrics
     def _account(self, sp, committed, accepts, times):
         self.n_steps += 1
+        self.n_steps_by_drafter[sp.drafter] = self.n_steps_by_drafter.get(sp.drafter, 0) + 1
         n_live = sum(sp.live)
         self.acc_users += n_live
         self.acc_tokens += sum(len(c) for c in committed)
@@ -456,15 +607,27 @@ class SpecDecoder:
         if self.log_every and self.n_steps % self.log_every == 0:
             st = self.state.stats
             n = self.log_every
+            hybrid = ""
+            if self.drafter.name == "hybrid":
+                hs = self.drafter.stats
+                hybrid = (
+                    f" [hybrid: commit {hs['commit_ms'] / n:.2f} keep {hs['keep_ms'] / n:.2f} ({hs['keep_steps']} steps) "
+                    f"select {hs['select_ms'] / n:.2f} ({hs['select_steps']} steps) ms/step; steps by drafter "
+                    f"{self.n_steps_by_drafter}; switches {st['drafter_switches']}]"
+                )
+                for key in ("commit_ms", "keep_ms", "select_ms"):
+                    hs[key] = 0.0
+                hs["keep_steps"] = hs["select_steps"] = 0
             logger.info(
-                f"[spec] step {self.n_steps}: w_grid={sp.w_grid} plan={sp.plan} live={n_live} flush={sp.flush} "
-                f"| last {n} steps: {self.acc_tokens / max(1, self.acc_users):.2f} tok/user/step "
+                f"[spec] step {self.n_steps}: w_grid={sp.w_grid} plan={sp.plan} drafter={sp.drafter} live={n_live} "
+                f"flush={sp.flush} | last {n} steps: {self.acc_tokens / max(1, self.acc_users):.2f} tok/user/step "
                 f"({self.acc_accepted / max(1, self.acc_users):.2f} accepted), per step verify "
                 f"{self.acc['verify_ms'] / n:.1f} + {self.drafter.post_name} {self.acc[self.post_key] / n:.1f} + draft "
                 f"{self.acc['draft_ms'] / n:.1f} ms (catch-up {self.acc['catchup_ms'] / n:.2f}, migrate "
                 f"{self.acc['migrate_ms'] / n:.2f}) | totals: spec {st['spec_steps']} plain {st['plain_steps']} "
                 f"flushes {st['flushes']} plan changes {st['plan_changes']} migrations {st['migrations']}"
-                + (f" no-context user-steps {self.n_no_context}" if self.drafter.name == "dflash2" else "")
+                + (f" no-context user-steps {self.n_no_context}" if self.drafter.name in ("dflash2", "hybrid") else "")
+                + hybrid
             )
             self.acc = {key: 0.0 for key in self.acc}
             self.acc_tokens = self.acc_users = self.acc_accepted = 0

@@ -13,7 +13,12 @@ DFlash2 block drafter with the SERVED context path: the P-side prefill hook (aux
 stages the prompt's context K/V, pd_transfer.export_kv_groups lays them out as the payload KV group and
 pd_transfer.import_kv_groups writes them into the drafter caches at the request's blocks (what the connector's drain
 does on D), then SpecDecoder.note_context (the runner's admission report). One request joins WITHOUT context (its
-payload lacked the group): it must decode with no drafts and still stay bitwise.
+payload lacked the group): it must decode with no drafts and still stay bitwise. ``hybrid`` = both drafters resident
+(HybridHeads), both prefill hooks installed, both state paths taken per admission, the ladder switching drafters by
+width: the scenario ramps 3 -> 5 -> 9 -> 17 users (the 4 -> 5 DFlash2 -> MTP crossing, the 8 -> 9 MTP band-up, plain
+above 16) and drains back (5 -> 4: MTP -> DFlash2 by migration); every stream must be bitwise the plain decode.
+
+  scripts/spec_scenario_run.sh B spec_serving_hybrid1 SPEC_DRAFTER=hybrid
 
   scripts/mtp_spec_run.sh spec_serving1 TEST=models/demos/blackhole/qwen36/tests/test_spec_serving_scratch.py
   scripts/mtp_spec_run.sh spec_serving_df2 SPEC_DRAFTER=dflash2 TEST=...test_spec_serving_scratch.py
@@ -44,14 +49,16 @@ from models.demos.blackhole.qwen36.tt import pd_transfer
 from models.demos.blackhole.qwen36.tt import spec_serving as ss
 from models.demos.blackhole.qwen36.tt.model import Qwen36Model
 from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead
-from models.demos.blackhole.qwen36.tt.spec_decoder import RowChunkedProjector, SpecDecoder
+from models.demos.blackhole.qwen36.tt.spec_decoder import HybridHeads, RowChunkedProjector, SpecDecoder
 
 BMAX = 32
 BPU = 8  # blocks per slot = 512 positions
 CHUNK = 2048
 DRAFTER = os.environ.get("SPEC_DRAFTER", "mtp")
 MIN_TOKENS = int(os.environ.get("SPEC_MIN_TOKENS", "24"))
-K = int(os.environ.get("SPEC_K", "7" if DRAFTER == "dflash2" else "3"))
+K = int(os.environ.get("SPEC_K", "7" if DRAFTER in ("dflash2", "hybrid") else "3"))
+USES_DFLASH2 = DRAFTER in ("dflash2", "hybrid")
+USES_MTP = DRAFTER in ("mtp", "hybrid")
 NO_CONTEXT_REQ = os.environ.get("SPEC_NO_CONTEXT_REQ", "r5")  # dflash2: this request joins without context K/V
 OUT_JSON = os.environ.get("SPEC_OUT", "/home/eslim/experiments/qwen36/logs/spec_serving_result.json")
 
@@ -96,7 +103,7 @@ class Engine:
         for rid, n, t in zip(rids, lens, first):
             r = self.req[rid]
             r["stream"], r["pos"], r["last"], r["drafts"], r["src"] = [t], n, t, [], [0]
-        if self.drafter == "dflash2":
+        if self.drafter in ("dflash2", "hybrid"):
             for rid, slot, n in zip(rids, slots, lens):
                 block_ids = self.pt[slot].tolist()
                 t0 = time.perf_counter()
@@ -152,7 +159,7 @@ class Engine:
                 if rows[s] is not None:
                     committed[s] = res.committed[s]
                     assert 1 <= len(committed[s]) <= 1 + len(drafts[s] or []), (s, committed[s], drafts[s])
-            mode = f"spec{res.plan}{' flush' if res.flush else ''}{' migrate' if res.migrated else ''}"
+            mode = f"spec{res.plan}[{self.spec.ladder.drafter_for(res.plan)}]{' flush' if res.flush else ''}{' migrate' if res.migrated else ''}"
         wall = time.perf_counter() - t0
         for s, toks in committed.items():
             r = self.req[rows[s]]
@@ -161,8 +168,13 @@ class Engine:
             r["pos"] += len(toks)
             r["last"] = toks[-1]
             r["drafts"] = list(res.next_drafts[s]) if res is not None else []
-            if self.drafter == "dflash2" and rows[s] == NO_CONTEXT_REQ:
-                assert r["drafts"] == [], (rows[s], r["drafts"])  # no context -> no drafts, ever
+            if (
+                self.drafter in ("dflash2", "hybrid")
+                and rows[s] == NO_CONTEXT_REQ
+                and res is not None
+                and self.spec.ladder.drafter_for(res.plan) == "dflash2"
+            ):
+                assert r["drafts"] == [], (rows[s], r["drafts"])  # no context -> no DFlash2 drafts, ever
         for s in range(BMAX):
             o = self.owner[s]
             if o is not None and len(self.req[o]["stream"]) - 1 >= self.req[o]["want"]:
@@ -205,17 +217,19 @@ def test_spec_serving(mesh_device):
     try:
         # --- persistent buffers before any capture: the drafter (as the served allocate_kv_cache builds it), the
         # decoder (its ladder from the env knobs, as qwen36_vllm._spec_prepare) ---
-        if DRAFTER == "dflash2":
+        df2_head = mtp_head = None
+        if USES_DFLASH2:
             from models.demos.blackhole.qwen36.tt.dflash2_head import DFlash2Drafter
 
-            head = DFlash2Drafter(model, page_tables=None, widths=())
+            df2_head = DFlash2Drafter(model, page_tables=None, widths=())
             model.prefill_aux_layers = ah.aux_layers_for(model)  # BEFORE the prefill warm-up captures
-        else:
-            head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=32)
+        if USES_MTP:
+            mtp_head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=32)
+        head = HybridHeads(mtp_head, df2_head) if DRAFTER == "hybrid" else (df2_head or mtp_head)
         ladder = ss.Ladder.for_drafter(
             DRAFTER, K, BMAX, spec=os.environ.get("SPEC_LADDER"), allow_fractured=os.environ.get("SPEC_ALLOW_FRACTURED")
         )
-        results["ladder"] = [str(p) for p in ladder.plans]
+        results["ladder"] = [f"{p}:{ladder.drafter_for(p)}" for p in ladder.plans]
         results["fractured_plans"] = [str(p) for p in ladder.fractured_plans]
         spec = SpecDecoder(model, head, ladder, BMAX, page_tables.shape[1], log_every=20)
         # --- compile everything first ---
@@ -223,13 +237,13 @@ def test_spec_serving(mesh_device):
             refs[w] = DecodeRef(model, w, page_tables[:w])
             refs[w].compile()
         spec.compile()
-        if DRAFTER == "dflash2":
-            hook = ah.DFlash2ContextPrefillHook(model, RowChunkedProjector(head.projector), block_size=BLOCK_SIZE)
+        if USES_DFLASH2:
+            hook = ah.DFlash2ContextPrefillHook(model, RowChunkedProjector(df2_head.projector), block_size=BLOCK_SIZE)
             hook.compile(sorted(set(buckets) | {CHUNK}))
             pd_transfer.kv_group_import_warmup(model, 256)
-        else:
+        if USES_MTP:
             for b in buckets:
-                head.compile_prefill(b)
+                mtp_head.compile_prefill(b)
         ttnn.synchronize_device(device)
         # --- prefill warm-up as served, hook installed, warm prefill ---
         pt_full = torch.arange(BMAX * BPU, dtype=torch.int32).reshape(1, -1)
@@ -243,22 +257,22 @@ def test_spec_serving(mesh_device):
             if not layer.is_full_attention and hasattr(layer.attention, "warmup_hist_device_pack"):
                 layer.attention.warmup_hist_device_pack()
         ttnn.synchronize_device(device)
-        if DRAFTER == "dflash2":
+        if USES_DFLASH2:
             model.prefill_aux_hook = hook
-        else:
-            model.prefill_hidden_hook = head.prefill_hook
+        if USES_MTP:
+            model.prefill_hidden_hook = mtp_head.prefill_hook
         _prefill(model, [prompt_ids[0]], page_tables, [0])
 
         def _clear_state():
             """Drop drafter state a reference prefill produced (the served path consumes it per request)."""
-            if DRAFTER == "dflash2":
+            if USES_DFLASH2:
                 store = ah.kv_group_stage_store(model)
                 store.clear()
-            else:
-                head.pending_rows.clear()
+            if USES_MTP:
+                mtp_head.pending_rows.clear()
 
         _clear_state()
-        if DRAFTER == "dflash2":
+        if USES_DFLASH2:
             # the group import of every block bucket a prompt needs, before the captures (the eager paged fills)
             for nblk in sorted(set(-(-int(i.shape[1]) // BLOCK_SIZE) for i in prompt_ids)):
                 z = torch.zeros(nblk, ah.DFLASH2_KV_HEADS, BLOCK_SIZE, ah.DFLASH2_HEAD_DIM, dtype=torch.bfloat16)
@@ -327,7 +341,12 @@ def test_spec_serving(mesh_device):
         eng = Engine(model, spec, refs[32], page_tables, prompt_ids, _prefill, drafter=DRAFTER)
         rng = random.Random(7)
         n_prompts = len(prompt_ids)
-        waves = [(0, 3), (2, 3), (5, 3), (9, 8), (32, 2)]
+        # hybrid: 3 -> 5 -> 9 -> 17 (the 4 -> 5 DFlash2 -> MTP crossing, then the MTP band-up, then plain) and back
+        waves = (
+            [(0, 3), (2, 2), (5, 4), (9, 8), (32, 2)]
+            if DRAFTER == "hybrid"
+            else [(0, 3), (2, 3), (5, 3), (9, 8), (32, 2)]
+        )
         i = 0
         submitted = {}
         for at, cnt in waves:
@@ -378,6 +397,10 @@ def test_spec_serving(mesh_device):
         results["neartie"] = neartie
         results["context_imports"] = eng.context_imports
         results["no_context_user_steps"] = spec.n_no_context
+        results["steps_by_drafter"] = {str(k): v for k, v in spec.n_steps_by_drafter.items()}
+        if DRAFTER == "hybrid":
+            results["hybrid_keep_steps_total"] = spec.head.mtp.stats.get("keep_steps", 0)
+            results["hybrid_keep_wall_ms"] = 1e3 * spec.head.mtp.stats.get("keep_wall", 0.0)
         st = spec.state.stats
         modes = [e["mode"] for e in eng.log]
         by_mode = {}
@@ -403,7 +426,8 @@ def test_spec_serving(mesh_device):
             f"[spec-test] scenario ({DRAFTER}): {len(eng.log)} steps in {wall:.1f}s, {tot_tokens} tokens, stats {st}, "
             f"divergences {mism[:5]} (rid, token, got, exp, R of the producing step; near-tie-bounded after a fractured "
             f"plan: {len(mism) - len(bad)}, BAD: {bad[:5]}); "
-            f"modes: {sorted(set(modes))}; no-context user-steps {spec.n_no_context}"
+            f"modes: {sorted(set(modes))}; no-context user-steps {spec.n_no_context}; steps by drafter "
+            f"{spec.n_steps_by_drafter}"
         )
         # --- protocol violation: a crossing the scheduler did not hold must raise, never corrupt ---
         eng2 = Engine(model, spec, refs[32], page_tables, prompt_ids, _prefill, drafter=DRAFTER)
@@ -432,6 +456,7 @@ def test_spec_serving(mesh_device):
             spec.release()
         model.mtp_head = None
         model.dflash2_drafter = None
+        model.pd_kv_group_stage = None
         model.pd_kv_groups = None
         model.free_kv_caches()
         with open(OUT_JSON, "w") as f:
@@ -440,7 +465,7 @@ def test_spec_serving(mesh_device):
         f"SPEC_SERVING drafter={DRAFTER} ladder={results.get('ladder')} exact={results['exact']} "
         f"bitwise={results.get('bitwise')} neartie_flips={len(results.get('neartie') or [])} "
         f"width_independent={results.get('width_independent')} stats={results.get('stats')} "
-        f"no_context_user_steps={results.get('no_context_user_steps')}"
+        f"no_context_user_steps={results.get('no_context_user_steps')} steps_by_drafter={results.get('steps_by_drafter')}"
     )
     assert results.get("width_independent"), "plain decode differs across widths 1 / 8 / 32"
     assert results["exact"], f"committed streams != plain decode beyond fractured near-ties: {results['mismatch'][:5]}"
@@ -451,3 +476,6 @@ def test_spec_serving(mesh_device):
         and results["stats"]["migrations"] >= 1
         and results["stats"]["plain_steps"] >= 1
     )
+    if DRAFTER == "hybrid":
+        assert set(results["steps_by_drafter"]) == {"mtp", "dflash2"}, results["steps_by_drafter"]
+        assert results["stats"]["drafter_switches"] >= 2, results["stats"]

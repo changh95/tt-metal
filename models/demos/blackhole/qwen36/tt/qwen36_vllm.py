@@ -218,7 +218,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
 
     # ------------------------------------------------------------------------------------------ speculative decoding
     def _build_drafter_if_enabled(self, kv_cache):
-        """QWEN36_SPEC_MTP=1: build the drafter right after the main KV caches, before any warm-up / capture
+        """QWEN36_SPEC_MTP=1: build the drafter(s) right after the main KV caches, before any warm-up / capture
         (tests/VERIFY_W32_AUDIT.md), on BOTH roles of the P/D stack (the plugin's runner allocates the caches the same
         way on each half). Idempotent; the plain path never reaches it.
 
@@ -231,7 +231,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
           ~540 MiB + 2720 B/token per chip) -> ``model.dflash2_drafter`` (tt/pd_transfer.py registers its caches as the
           payload KV group "dflash2" on first use) and ``model.dflash2_projector`` (the P-side prefill hook's context
           projection). The P half only needs the projector (its context caches stay unused: ~1.4 GB/chip at the
-          525k-token prefill pool -- a projector-only construction would save them)."""
+          525k-token prefill pool -- a projector-only construction would save them).
+        * ``QWEN36_SPEC_DRAFTER=hybrid``: BOTH (tt/spec_decoder.py ``_HybridDrafter``): P computes and ships both
+          states, D keeps both resident and drafts with the one the ladder picks for the batch width."""
         from models.demos.blackhole.qwen36.tt.aux_hidden import spec_drafter
         from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead, spec_mtp_enabled
 
@@ -240,33 +242,30 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             return
         if model.num_devices <= 1 or model.args.max_batch_size <= 1:
             return  # the prefill-hook installer logs the reason
-        if spec_drafter() == "dflash2":
-            if getattr(model, "dflash2_drafter", None) is not None:
-                return
+        drafter = spec_drafter()
+        if drafter in ("dflash2", "hybrid") and getattr(model, "dflash2_drafter", None) is None:
             from models.demos.blackhole.qwen36.tt.dflash2_head import DFlash2Drafter
 
             t0 = time.perf_counter()
             from models.demos.blackhole.qwen36.tt.spec_decoder import RowChunkedProjector
 
-            drafter = DFlash2Drafter(model, page_tables=None, widths=())
+            drafter_mod = DFlash2Drafter(model, page_tables=None, widths=())
             model.dflash2_projector = RowChunkedProjector(
-                drafter.projector
+                drafter_mod.projector
             )  # the prefill hook's row-chunked projection
-            rep = drafter.dram_report(int(kv_cache[0][0].shape[0]) * int(kv_cache[0][0].shape[2]))
+            rep = drafter_mod.dram_report(int(kv_cache[0][0].shape[0]) * int(kv_cache[0][0].shape[2]))
             logger.info(
                 f"[spec] DFlash2 drafter built with the KV caches in {time.perf_counter() - t0:.1f}s: weights "
                 f"{rep['weights_bytes'] / 2**20:.0f} MiB + context KV {rep['kv_pool_bytes'] / 2**20:.0f} MiB per chip "
-                f"({rep['kv_bytes_per_token']} B/token; target layers {tuple(drafter.cfg.target_layer_ids)})"
+                f"({rep['kv_bytes_per_token']} B/token; target layers {tuple(drafter_mod.cfg.target_layer_ids)})"
             )
-            return
-        if getattr(model, "mtp_head", None) is not None:
-            return
-        buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
-        num_blocks = math.ceil(int(kv_cache[0][0].shape[0]) / 32) * 32
-        MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=num_blocks)
-        logger.info(
-            f"[spec] MTP head built with the KV caches (prefill buckets {buckets}, sdpa page table {num_blocks})"
-        )
+        if drafter in ("mtp", "hybrid") and getattr(model, "mtp_head", None) is None:
+            buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
+            num_blocks = math.ceil(int(kv_cache[0][0].shape[0]) / 32) * 32
+            MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=num_blocks)
+            logger.info(
+                f"[spec] MTP head built with the KV caches (prefill buckets {buckets}, sdpa page table {num_blocks})"
+            )
 
     # the name the 2026-09-25 loop used (tests / external callers)
     _build_mtp_head_if_enabled = _build_drafter_if_enabled
@@ -274,13 +273,13 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     def _spec_prepare(self, max_batch_size, num_blocks):
         """Decode warm-up phase 1 (no trace captured yet): the served speculative decoder -- the drafter's ladder
         (spec_serving.Ladder.from_env: QWEN36_SPEC_LADDER / QWEN36_SPEC_ALLOW_FRACTURED), verify plans, draft-step
-        buffers at the served block-table width, every program compiled; with the DFlash2 drafter also the payload
-        KV-group import programs (pd_transfer.kv_group_import_warmup, eager paged fills per block bucket: compiled now,
-        never inside a request). Needs ``tt_speculative_k`` (the runner sets it from vLLM's speculative_config) and
-        the drafter; no-op otherwise or when already built."""
+        buffers at the served block-table width, every program compiled; with the DFlash2 drafter (also in hybrid
+        mode) the payload KV-group import programs (pd_transfer.kv_group_import_warmup, eager paged fills per block
+        bucket: compiled now, never inside a request). Needs ``tt_speculative_k`` (the runner sets it from vLLM's
+        speculative_config) and the drafter(s); no-op otherwise or when already built."""
         from models.demos.blackhole.qwen36.tt.aux_hidden import spec_drafter
         from models.demos.blackhole.qwen36.tt.mtp_head import spec_mtp_enabled
-        from models.demos.blackhole.qwen36.tt.spec_decoder import SpecDecoder
+        from models.demos.blackhole.qwen36.tt.spec_decoder import HybridHeads, SpecDecoder
         from models.demos.blackhole.qwen36.tt.spec_serving import Ladder
 
         k = getattr(self, "tt_speculative_k", None)
@@ -288,14 +287,20 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             return
         model = self.model[0]
         drafter = spec_drafter()
-        head = getattr(model, "dflash2_drafter" if drafter == "dflash2" else "mtp_head", None)
-        if head is None:
+        heads = {
+            name: getattr(model, attr, None)
+            for name, attr in (("mtp", "mtp_head"), ("dflash2", "dflash2_drafter"))
+            if name in (("mtp", "dflash2") if drafter == "hybrid" else (drafter,))
+        }
+        missing = [name for name, h in heads.items() if h is None]
+        if missing:
             logger.warning(
-                f"[spec] speculative decoding requested but the model has no {drafter} drafter; running plain decode"
+                f"[spec] speculative decoding ({drafter}) requested but the model has no {missing} drafter; running plain decode"
             )
             return
+        head = HybridHeads(heads["mtp"], heads["dflash2"]) if drafter == "hybrid" else heads[drafter]
         ladder = Ladder.from_env(drafter, int(k), int(max_batch_size))
-        if drafter == "dflash2":
+        if "dflash2" in heads:
             from models.demos.blackhole.qwen36.tt import pd_transfer
 
             pd_transfer.kv_group_import_warmup(
@@ -306,8 +311,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
 
     def spec_note_admission(self, slot, req_id, extra):
         """The runner's admission report of an imported request (P/D): ``extra`` = the payload's parked sidecar
-        (entry[4]: ``mtp_hidden``, ``kv_groups`` = {name: meta}). Tells the DFlash2 drafter whether the request's
-        context K/V (KV group "dflash2") were imported into decode ``slot``; no-op for the MTP head / plain serving."""
+        (entry[4]: ``mtp_hidden``, ``kv_groups`` = {name: meta}). Tells the DFlash2 drafter (also the hybrid's) whether
+        the request's context K/V (KV group "dflash2") were imported into decode ``slot``; no-op for the MTP head /
+        plain serving (the MTP hidden row reaches the head through pd_transfer.import_mtp_hidden)."""
         spec = getattr(self, "_spec", None)
         if spec is None:
             return
@@ -617,11 +623,13 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             logger.warning("QWEN36_SPEC_MTP=1 ignored: the MTP prefill hook needs the TP batched (max_num_seqs>1) path")
             return
         self._mtp_prefill_hook_installed = True
-        if spec_drafter() == "dflash2":
+        if spec_drafter() in ("dflash2", "hybrid"):
             # QWEN36_SPEC_DRAFTER=dflash2: the prefill side computes the DFlash2 drafter's context K/V (from the
-            # target's aux hidden states) instead of the MTP head's KV + hidden row.
+            # target's aux hidden states) instead of the MTP head's KV + hidden row; hybrid: in addition to them
+            # (both hooks fire per prefilled segment, tt/model.py; the payload carries both states).
             self._install_dflash2_prefill_hook(kv_cache)
-            return
+            if spec_drafter() == "dflash2":
+                return
         t0 = time.perf_counter()
         buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
         head = getattr(model, "mtp_head", None)

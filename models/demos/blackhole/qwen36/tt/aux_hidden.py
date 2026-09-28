@@ -31,11 +31,11 @@ Layouts this module hands around (TP mesh, ``n_dev`` devices):
     ``[d * dim / n_dev, (d + 1) * dim / n_dev)`` of aux ``j`` (the prefill's residual layout; what the model's
     ``prefill_aux_hook`` receives).
 
-Knob: ``QWEN36_SPEC_DRAFTER=mtp|dflash2`` (``spec_drafter``, default ``mtp``) selects which drafter state the
-prefill side computes and ships (tt/qwen36_vllm.py ``_install_spec_prefill_hook``, tt/pd_transfer.py kv groups):
+Knob: ``QWEN36_SPEC_DRAFTER=mtp|dflash2|hybrid`` (``spec_drafter``, default ``mtp``) selects which drafter state the
+prefill side computes and ships (tt/qwen36_vllm.py ``_install_mtp_prefill_hook``, tt/pd_transfer.py kv groups):
 ``mtp`` = the MTP head's 17th KV layer + hidden row (unchanged path), ``dflash2`` = the DFlash2 context K/V of the
-prompt (``KV group "dflash2"`` of the version-3 payload). Unset / ``mtp`` leaves every byte of the served path as
-it was.
+prompt (``KV group "dflash2"`` of the version-3 payload), ``hybrid`` = both (the decode side keeps both drafters and
+picks one by batch width, tt/spec_serving.py). Unset / ``mtp`` leaves every byte of the served path as it was.
 """
 import os
 import time
@@ -54,16 +54,21 @@ DFLASH2_N_LAYERS = 5
 DFLASH2_SLIDING_WINDOW = 2048  # config.json sliding_window (every draft layer is "sliding_attention")
 
 
+SPEC_DRAFTERS = ("mtp", "dflash2", "hybrid")
+
+
 def spec_drafter() -> str:
-    """``QWEN36_SPEC_DRAFTER``: ``mtp`` (default) or ``dflash2``."""
+    """``QWEN36_SPEC_DRAFTER``: ``mtp`` (default), ``dflash2``, or ``hybrid`` (both resident, chosen per batch width:
+    tt/spec_serving.py ``Ladder.drafter_for``; the prefill side then computes and ships BOTH states)."""
     v = os.environ.get("QWEN36_SPEC_DRAFTER", "mtp").strip().lower() or "mtp"
-    if v not in ("mtp", "dflash2"):
-        raise ValueError(f"QWEN36_SPEC_DRAFTER={v!r}: expected mtp or dflash2")
+    if v not in SPEC_DRAFTERS:
+        raise ValueError(f"QWEN36_SPEC_DRAFTER={v!r}: expected one of {SPEC_DRAFTERS}")
     return v
 
 
 def dflash2_selected() -> bool:
-    return spec_drafter() == "dflash2"
+    """The DFlash2 drafter is part of the configured policy (dflash2 or hybrid)."""
+    return spec_drafter() in ("dflash2", "hybrid")
 
 
 def dflash2_context_window() -> int:
