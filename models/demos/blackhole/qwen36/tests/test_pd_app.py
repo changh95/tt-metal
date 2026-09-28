@@ -9,6 +9,7 @@ context manager and ``VllmHalf.start`` is disabled for every test.
 """
 
 import asyncio
+import dataclasses
 import json
 
 import httpx
@@ -193,6 +194,55 @@ def test_vllm_argv_speculative_mtp_only_on_the_decode_half():
     assert argv[i + 1] == '{"method": "mtp", "num_speculative_tokens": 2}'
     assert "--no-async-scheduling" in argv
     assert pd_app.vllm_argv(on, "prefill") == pd_app.vllm_argv(off, "prefill")
+
+
+def test_dflash2_drafter_config_and_weights_resolution(tmp_path, monkeypatch, expect_error):
+    """QWEN36_SPEC_DRAFTER=dflash2: the draft count defaults to the block's 7, the halves get the knob and the resolved
+    drafter snapshot (DFLASH2_MODEL) in their env, a snapshot directory is taken as is, and a missing cache offline
+    is a BundleConfigError naming the download; mtp / plain configs are unchanged."""
+    base = {"HF_MODEL": "Qwen/Qwen3.8-27B", "HF_HUB_OFFLINE": "1", "QWEN36_SPEC_MTP": "1"}
+    df = pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "dflash2"})
+    assert df.uses_dflash2 and df.speculative_k == 7 and df.dflash2_model == pd_app.DFLASH2_REPO
+    assert df.dflash2_revision == pd_app.DFLASH2_REVISION
+    argv = pd_app.vllm_argv(df, "decode")
+    assert argv[argv.index("--speculative-config") + 1] == '{"method": "mtp", "num_speculative_tokens": 7}'
+    mtp = pd_app.BundleConfig.from_env(base)
+    assert not mtp.uses_dflash2 and mtp.speculative_k == 3 and mtp.speculative_drafter == "mtp"
+    assert (
+        pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "dflash2", "QWEN36_SPEC_K": "3"}).speculative_k
+        == 3
+    )
+    with expect_error(pd_app.BundleConfigError, "QWEN36_SPEC_DRAFTER"):
+        pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "eagle"})
+    # env of the halves: the knob on both, the snapshot only once resolved
+    for role in ("prefill", "decode"):
+        env = pd_app.vllm_env(df, role, base={})
+        assert env["QWEN36_SPEC_MTP"] == "1" and env["QWEN36_SPEC_DRAFTER"] == "dflash2" and "DFLASH2_MODEL" not in env
+        assert pd_app.vllm_env(mtp, role, base={})["QWEN36_SPEC_DRAFTER"] == "mtp"
+        assert "QWEN36_SPEC_MTP" not in pd_app.vllm_env(
+            pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_MTP": "0"}), role, base={}
+        )
+    snap = tmp_path / "dflash2"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    local = pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "dflash2", "DFLASH2_MODEL": str(snap)})
+    assert pd_app.resolve_dflash2_snapshot(local) == str(snap)
+    resolved = dataclasses.replace(local, dflash2_snapshot=pd_app.resolve_dflash2_snapshot(local))
+    assert pd_app.vllm_env(resolved, "decode", base={})["DFLASH2_MODEL"] == str(snap)
+    desc = pd_app.bundle_description(resolved, None)["speculative"]
+    assert desc["drafter"] == "dflash2" and desc["max_drafts_per_step"] == 7 and desc["drafter_weights"] == str(snap)
+    assert pd_app.bundle_description(mtp, None)["speculative"] == {"drafter": "mtp", "max_drafts_per_step": 3}
+    # offline with the snapshot missing from the cache (the hub raises): the error names the repo, the revision and the
+    # download command
+    import huggingface_hub
+
+    def missing(repo_id, revision=None, local_files_only=False, **kw):
+        assert (repo_id, revision, local_files_only) == (pd_app.DFLASH2_REPO, pd_app.DFLASH2_REVISION, True)
+        raise FileNotFoundError("not in cache")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", missing)
+    with expect_error(pd_app.BundleConfigError, "huggingface-cli download z-lab/Qwen3.8-27B-DFlash2"):
+        pd_app.resolve_dflash2_snapshot(df)
 
 
 def test_kv_pool_is_per_role():

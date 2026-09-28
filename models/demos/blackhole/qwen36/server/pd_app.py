@@ -28,6 +28,7 @@ host-side tests can exercise them; ``app`` is built on first access.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import signal
@@ -73,6 +74,12 @@ TT_ADDITIONAL_CONFIG = {
 # 1,052,672 = 16,448 blocks of 64 = 32 x 32k, 16 x 64k or 8 x 128k contexts with 128 output tokens each.
 PREFILL_MAX_TOKENS = 525312
 DECODE_MAX_TOKENS = 1052672
+# Speculative decoding drafters (QWEN36_SPEC_DRAFTER): the checkpoint's own MTP head, or the DFlash2 block drafter whose
+# weights are a SECOND HF repo (tt-model's manifest names one weights repo, so the bundle resolves this one itself at
+# boot: the host HF cache is mounted at /hf; offline it must already be there -- README quickstart).
+DFLASH2_REPO = "z-lab/Qwen3.8-27B-DFlash2"
+DFLASH2_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"  # the snapshot the drafter port was validated on
+SPEC_DRAFTERS = ("mtp", "dflash2")
 CHILD_ENV = {
     "ARCH_NAME": "blackhole",
     "TT_QWEN35_TEXT_VER": "qwen36_blackhole",
@@ -145,6 +152,12 @@ class BundleConfig:
     # drafts with the head and verifies); only D's vLLM needs the speculative_config for its token bookkeeping.
     speculative_mtp: bool = False
     speculative_k: int = 3
+    # QWEN36_SPEC_DRAFTER=mtp|dflash2; the DFlash2 drafter's weights: DFLASH2_MODEL (a local snapshot dir or HF repo id,
+    # default DFLASH2_REPO) at QWEN36_DFLASH2_REVISION, resolved by resolve_dflash2_snapshot before the halves start
+    speculative_drafter: str = "mtp"
+    dflash2_model: str = DFLASH2_REPO
+    dflash2_revision: str = DFLASH2_REVISION
+    dflash2_snapshot: str | None = None  # the resolved local directory (handed to the halves as DFLASH2_MODEL)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "BundleConfig":
@@ -161,6 +174,9 @@ class BundleConfig:
         if len(set(ports.values())) != 3:
             raise BundleConfigError(f"the internal ports must differ: {ports}")
         extra = env.get("QWEN36_PD_VLLM_ARGS", "").split()
+        drafter = (env.get("QWEN36_SPEC_DRAFTER") or "mtp").strip().lower()
+        if drafter not in SPEC_DRAFTERS:
+            raise BundleConfigError(f"QWEN36_SPEC_DRAFTER={drafter!r}: expected one of {SPEC_DRAFTERS}")
         return cls(
             weights=env.get("HF_MODEL") or MODEL_ID,
             prefill_chips=prefill,
@@ -182,8 +198,40 @@ class BundleConfig:
             proxy_fanout=env.get("QWEN36_PD_PROXY_FANOUT", "1") not in ("0", "false", "False"),
             extra_vllm_args=tuple(extra),
             speculative_mtp=env.get("QWEN36_SPEC_MTP", "0") in ("1", "true", "True"),
-            speculative_k=int(env.get("QWEN36_SPEC_K", "3")),
+            # the default draft count is the drafter's: 3 chained MTP steps, or the 7 drafts of one DFlash2 block
+            speculative_k=int(env.get("QWEN36_SPEC_K") or (7 if drafter == "dflash2" else 3)),
+            speculative_drafter=drafter,
+            dflash2_model=env.get("DFLASH2_MODEL") or DFLASH2_REPO,
+            dflash2_revision=env.get("QWEN36_DFLASH2_REVISION") or DFLASH2_REVISION,
         )
+
+    @property
+    def uses_dflash2(self) -> bool:
+        return self.speculative_mtp and self.speculative_drafter == "dflash2"
+
+
+def resolve_dflash2_snapshot(config: BundleConfig) -> str:
+    """The local directory of the DFlash2 drafter's weights: ``dflash2_model`` when it is a snapshot directory
+    (config.json present), else the HF snapshot of that repo id at ``dflash2_revision`` -- from the HF cache only when
+    the bundle runs offline (the default), downloaded into it otherwise. Raises BundleConfigError with the download
+    command when the weights are missing."""
+    p = os.path.expanduser(config.dflash2_model)
+    if os.path.isfile(os.path.join(p, "config.json")):
+        return p
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            config.dflash2_model, revision=config.dflash2_revision, local_files_only=config.offline
+        )
+    except Exception as e:  # noqa: BLE001 -- any hub / cache error: say what the operator has to do
+        raise BundleConfigError(
+            f"QWEN36_SPEC_DRAFTER=dflash2 needs the drafter weights {config.dflash2_model} @ {config.dflash2_revision} "
+            f"{'in the HF cache (HF_HUB_OFFLINE=1)' if config.offline else 'downloadable'}: {e!r}. Download them into the "
+            f"host HF cache before serving (`huggingface-cli download {DFLASH2_REPO} --revision {config.dflash2_revision}`; "
+            "tt-model mounts ~/.cache/huggingface at /hf), or point DFLASH2_MODEL at a local snapshot directory, or run with "
+            "HF_HUB_OFFLINE=0"
+        ) from e
 
 
 def kv_transfer_config(config: BundleConfig, role: str) -> dict[str, Any]:
@@ -284,6 +332,11 @@ def vllm_env(config: BundleConfig, role: str, base: Mapping[str, str] | None = N
     env["QWEN36_MAX_TOKENS_ALL_USERS"] = str(
         config.prefill_max_tokens if role == "prefill" else config.decode_max_tokens
     )
+    if config.speculative_mtp:
+        env["QWEN36_SPEC_MTP"] = "1"
+        env["QWEN36_SPEC_DRAFTER"] = config.speculative_drafter
+        if config.uses_dflash2 and config.dflash2_snapshot:
+            env["DFLASH2_MODEL"] = config.dflash2_snapshot  # the resolved snapshot dir (tt/dflash2_head.py)
     env["PYTHONUNBUFFERED"] = "1"
     stub_dirs = _cuda_stub_dirs()
     if stub_dirs:
@@ -487,6 +540,19 @@ def bundle_description(config: BundleConfig, stack: Stack | None) -> dict[str, A
             "proxy": "fan-out (P and D posted concurrently)" if config.proxy_fanout else "serial (P, then D)",
         },
         "limits": {"max_model_len": config.max_model_len, "block_size": config.block_size},
+        "speculative": (
+            {
+                "drafter": config.speculative_drafter,
+                "max_drafts_per_step": config.speculative_k,
+                **(
+                    {"drafter_weights": config.dflash2_model, "revision": config.dflash2_revision}
+                    if config.uses_dflash2
+                    else {}
+                ),
+            }
+            if config.speculative_mtp
+            else None
+        ),
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completions": "/v1/completions",
@@ -565,6 +631,10 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config = BundleConfig.from_env()
+        if config.uses_dflash2:
+            # the drafter's second weights repo: resolved (or, online, downloaded) before either half starts
+            config = dataclasses.replace(config, dflash2_snapshot=resolve_dflash2_snapshot(config))
+            _log("dflash2_weights", snapshot=config.dflash2_snapshot, revision=config.dflash2_revision)
         _log("config", **{k: v for k, v in bundle_description(config, None).items() if k not in ("halves", "boot")})
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
