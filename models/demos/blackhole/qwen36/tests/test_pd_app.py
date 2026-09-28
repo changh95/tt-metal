@@ -245,6 +245,39 @@ def test_dflash2_drafter_config_and_weights_resolution(tmp_path, monkeypatch, ex
         pd_app.resolve_dflash2_snapshot(df)
 
 
+def test_hybrid_drafter_config(tmp_path):
+    """QWEN36_SPEC_DRAFTER=hybrid: both drafters resident on D (the DFlash2 weights repo is resolved like dflash2's),
+    the draft count defaults to the block's 7 (the hybrid's DFlash2 band; its MTP bands clamp their own T), both halves
+    get the knob, and the description names the policy."""
+    base = {"HF_MODEL": "Qwen/Qwen3.8-27B", "HF_HUB_OFFLINE": "1", "QWEN36_SPEC_MTP": "1"}
+    hy = pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "hybrid"})
+    assert hy.uses_dflash2 and hy.speculative_drafter == "hybrid" and hy.speculative_k == 7
+    argv = pd_app.vllm_argv(hy, "decode")
+    assert argv[argv.index("--speculative-config") + 1] == '{"method": "mtp", "num_speculative_tokens": 7}'
+    assert "--speculative-config" not in pd_app.vllm_argv(hy, "prefill")
+    for role in ("prefill", "decode"):
+        env = pd_app.vllm_env(hy, role, base={})
+        assert env["QWEN36_SPEC_MTP"] == "1" and env["QWEN36_SPEC_DRAFTER"] == "hybrid" and "DFLASH2_MODEL" not in env
+    snap = tmp_path / "dflash2"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    local = pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "hybrid", "DFLASH2_MODEL": str(snap)})
+    resolved = dataclasses.replace(local, dflash2_snapshot=pd_app.resolve_dflash2_snapshot(local))
+    assert pd_app.vllm_env(resolved, "decode", base={})["DFLASH2_MODEL"] == str(snap)
+    desc = pd_app.bundle_description(resolved, None)["speculative"]
+    assert desc == {
+        "drafter": "hybrid",
+        "max_drafts_per_step": 7,
+        "drafter_weights": str(snap),
+        "revision": pd_app.DFLASH2_REVISION,
+    }
+    # the sibling knobs are unchanged
+    assert pd_app.BundleConfig.from_env({**base, "QWEN36_SPEC_DRAFTER": "mtp"}).speculative_k == 3
+    assert not pd_app.BundleConfig.from_env(
+        {**base, "QWEN36_SPEC_MTP": "0", "QWEN36_SPEC_DRAFTER": "hybrid"}
+    ).uses_dflash2
+
+
 def test_kv_pool_is_per_role():
     """QWEN36_MAX_TOKENS_ALL_USERS (each vLLM's KV pool) is set per half: the prefill half keeps the p300x2 spec's
     525,312 tokens (it only holds in-flight prefills), the decode half gets QWEN36_PD_DECODE_MAX_TOKENS (default

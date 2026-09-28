@@ -74,12 +74,13 @@ TT_ADDITIONAL_CONFIG = {
 # 1,052,672 = 16,448 blocks of 64 = 32 x 32k, 16 x 64k or 8 x 128k contexts with 128 output tokens each.
 PREFILL_MAX_TOKENS = 525312
 DECODE_MAX_TOKENS = 1052672
-# Speculative decoding drafters (QWEN36_SPEC_DRAFTER): the checkpoint's own MTP head, or the DFlash2 block drafter whose
+# Speculative decoding drafters (QWEN36_SPEC_DRAFTER): the checkpoint's own MTP head, the DFlash2 block drafter whose
 # weights are a SECOND HF repo (tt-model's manifest names one weights repo, so the bundle resolves this one itself at
-# boot: the host HF cache is mounted at /hf; offline it must already be there -- README quickstart).
+# boot: the host HF cache is mounted at /hf; offline it must already be there -- README quickstart), or "hybrid" = both
+# resident on the decode half, DFlash2 drafting up to 4 concurrent users and the MTP head above (tt/spec_serving.py).
 DFLASH2_REPO = "z-lab/Qwen3.8-27B-DFlash2"
 DFLASH2_REVISION = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"  # the snapshot the drafter port was validated on
-SPEC_DRAFTERS = ("mtp", "dflash2")
+SPEC_DRAFTERS = ("mtp", "dflash2", "hybrid")
 CHILD_ENV = {
     "ARCH_NAME": "blackhole",
     "TT_QWEN35_TEXT_VER": "qwen36_blackhole",
@@ -152,8 +153,9 @@ class BundleConfig:
     # drafts with the head and verifies); only D's vLLM needs the speculative_config for its token bookkeeping.
     speculative_mtp: bool = False
     speculative_k: int = 3
-    # QWEN36_SPEC_DRAFTER=mtp|dflash2; the DFlash2 drafter's weights: DFLASH2_MODEL (a local snapshot dir or HF repo id,
-    # default DFLASH2_REPO) at QWEN36_DFLASH2_REVISION, resolved by resolve_dflash2_snapshot before the halves start
+    # QWEN36_SPEC_DRAFTER=mtp|dflash2|hybrid; the DFlash2 drafter's weights (dflash2 / hybrid): DFLASH2_MODEL (a local
+    # snapshot dir or HF repo id, default DFLASH2_REPO) at QWEN36_DFLASH2_REVISION, resolved by resolve_dflash2_snapshot
+    # before the halves start
     speculative_drafter: str = "mtp"
     dflash2_model: str = DFLASH2_REPO
     dflash2_revision: str = DFLASH2_REVISION
@@ -198,8 +200,9 @@ class BundleConfig:
             proxy_fanout=env.get("QWEN36_PD_PROXY_FANOUT", "1") not in ("0", "false", "False"),
             extra_vllm_args=tuple(extra),
             speculative_mtp=env.get("QWEN36_SPEC_MTP", "0") in ("1", "true", "True"),
-            # the default draft count is the drafter's: 3 chained MTP steps, or the 7 drafts of one DFlash2 block
-            speculative_k=int(env.get("QWEN36_SPEC_K") or (7 if drafter == "dflash2" else 3)),
+            # the default draft count is the drafter's: 3 chained MTP steps, or the 7 drafts of one DFlash2 block (the
+            # hybrid's maximum too: its MTP bands clamp their own T)
+            speculative_k=int(env.get("QWEN36_SPEC_K") or (7 if drafter in ("dflash2", "hybrid") else 3)),
             speculative_drafter=drafter,
             dflash2_model=env.get("DFLASH2_MODEL") or DFLASH2_REPO,
             dflash2_revision=env.get("QWEN36_DFLASH2_REVISION") or DFLASH2_REVISION,
@@ -207,7 +210,8 @@ class BundleConfig:
 
     @property
     def uses_dflash2(self) -> bool:
-        return self.speculative_mtp and self.speculative_drafter == "dflash2"
+        """The DFlash2 drafter is part of the configured policy (its weights repo must be resolved)."""
+        return self.speculative_mtp and self.speculative_drafter in ("dflash2", "hybrid")
 
 
 def resolve_dflash2_snapshot(config: BundleConfig) -> str:
@@ -226,7 +230,7 @@ def resolve_dflash2_snapshot(config: BundleConfig) -> str:
         )
     except Exception as e:  # noqa: BLE001 -- any hub / cache error: say what the operator has to do
         raise BundleConfigError(
-            f"QWEN36_SPEC_DRAFTER=dflash2 needs the drafter weights {config.dflash2_model} @ {config.dflash2_revision} "
+            f"QWEN36_SPEC_DRAFTER={config.speculative_drafter} needs the drafter weights {config.dflash2_model} @ {config.dflash2_revision} "
             f"{'in the HF cache (HF_HUB_OFFLINE=1)' if config.offline else 'downloadable'}: {e!r}. Download them into the "
             f"host HF cache before serving (`huggingface-cli download {DFLASH2_REPO} --revision {config.dflash2_revision}`; "
             "tt-model mounts ~/.cache/huggingface at /hf), or point DFLASH2_MODEL at a local snapshot directory, or run with "
