@@ -236,7 +236,8 @@ def run_producer(device):
                 torch.save({"buf": st.buf[: st.nbytes].clone(), "header": st.header}, path)
                 w.pool.release(st.buf)
                 hdr = st.header
-                assert hdr["version"] == 2 and hdr["n_attn_layers"] == N_MAIN_LAYERS, hdr
+                assert hdr["version"] in (2, 3) and hdr["n_attn_layers"] == N_MAIN_LAYERS, hdr  # v3 = + KV groups
+                assert "kv_groups" not in hdr, hdr.get("kv_groups")  # the mtp drafter stages no group
                 if BASELINE:
                     assert "mtp" not in hdr, hdr.get("mtp")
                 else:

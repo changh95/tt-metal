@@ -221,11 +221,14 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         the P/D transfer, the pools of pd_transfer bake the cache list) -- prefill buckets for the prefill hook
         (installed by _install_mtp_prefill_hook), no draft widths yet (the decode warm-up adds the ladder's, with the
         served block-table width). Idempotent; the plain path never reaches it."""
+        from models.demos.blackhole.qwen36.tt.aux_hidden import spec_drafter
         from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead, spec_mtp_enabled
 
         model = self.model[0]
         if not spec_mtp_enabled() or getattr(model, "mtp_head", None) is not None:
             return
+        if spec_drafter() != "mtp":
+            return  # QWEN36_SPEC_DRAFTER=dflash2: no MTP head anywhere (the DFlash2 path ships context K/V instead)
         if model.num_devices <= 1 or model.args.max_batch_size <= 1:
             return  # the prefill-hook installer logs the reason
         buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
@@ -545,6 +548,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         builder that runs later would find `model.mtp_head` set and reuse it). The SDPA page table of the head's
         prefill is sized like the chunk trace's (the whole KV cache in blocks, rounded to 32). Buckets: every
         masked bucket + the 2048 chunk (long prompts are prefilled chunk by chunk, hook per chunk)."""
+        from models.demos.blackhole.qwen36.tt.aux_hidden import spec_drafter
         from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead, spec_mtp_enabled
 
         if not spec_mtp_enabled() or getattr(self, "_mtp_prefill_hook_installed", False):
@@ -554,6 +558,11 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             logger.warning("QWEN36_SPEC_MTP=1 ignored: the MTP prefill hook needs the TP batched (max_num_seqs>1) path")
             return
         self._mtp_prefill_hook_installed = True
+        if spec_drafter() == "dflash2":
+            # QWEN36_SPEC_DRAFTER=dflash2: the prefill side computes the DFlash2 drafter's context K/V (from the
+            # target's aux hidden states) instead of the MTP head's KV + hidden row.
+            self._install_dflash2_prefill_hook(kv_cache)
+            return
         t0 = time.perf_counter()
         buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK})
         head = getattr(model, "mtp_head", None)
@@ -574,8 +583,42 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             f"(every served prefill now fills the head's KV + stores the request's hidden row)"
         )
 
+    def _install_dflash2_prefill_hook(self, kv_cache):
+        """Speculative decoding with the DFlash2 drafter (QWEN36_SPEC_MTP=1 QWEN36_SPEC_DRAFTER=dflash2;
+        tt/aux_hidden.py): (1) ``model.prefill_aux_layers`` = the drafter's target layers, set BEFORE the prefill
+        warm-up so the chunk / masked-bucket traces allocate their persistent aux copy buffers at capture; (2) the
+        context projector -- ``model.dflash2_projector`` when the serving integration pre-set one, else
+        tt/dflash2_head.py ``DFlash2ContextProjector(model)`` (the drafter's owner; weights from
+        z-lab/Qwen3.8-27B-DFlash2); (3) ``model.prefill_aux_hook`` = ``DFlash2ContextPrefillHook`` which projects every
+        prefilled segment's aux rows and stages the context K/V per decode slot for ``pd_transfer.export_kv_groups``
+        (the connector ships them as payload KV group "dflash2"). Without a projector nothing is installed and the
+        prefill runs as plain (logged)."""
+        from models.demos.blackhole.qwen36.tt import aux_hidden as ah
+
+        model = self.model[0]
+        t0 = time.perf_counter()
+        projector = getattr(model, "dflash2_projector", None)
+        if projector is None:
+            try:
+                from models.demos.blackhole.qwen36.tt.dflash2_head import DFlash2ContextProjector
+            except ImportError as e:
+                logger.warning(f"[dflash2] no context projector (tt/dflash2_head.py: {e!r}); prefill runs plain")
+                return
+            projector = DFlash2ContextProjector(model)
+            model.dflash2_projector = projector
+        block_size = int(kv_cache[0][0].shape[2]) if kv_cache else _BLOCK_SIZE
+        model.prefill_aux_layers = ah.aux_layers_for(model)
+        hook = ah.DFlash2ContextPrefillHook(model, projector, block_size=block_size)
+        hook.compile(sorted(set(model._PREFILL_MASK_BUCKETS) | {_PREFILL_WARMUP_CHUNK}))  # before any capture
+        model.prefill_aux_hook = hook
+        logger.info(
+            f"[dflash2] prefill hook installed in {time.perf_counter() - t0:.1f}s: aux layers {model.prefill_aux_layers}, "
+            f"context window {model.prefill_aux_hook.window} (every served prefill now stages the drafter's context K/V)"
+        )
+
     def warmup_model_prefill(self, kv_cache, enable_trace, *args, **kwargs):
-        # Speculative decoding (QWEN36_SPEC_MTP=1): the MTP prefill hook, before any capture (no-op otherwise).
+        # Speculative decoding (QWEN36_SPEC_MTP=1): the drafter's prefill hook (MTP head, or the DFlash2 context
+        # projection with QWEN36_SPEC_DRAFTER=dflash2), before any capture (no-op otherwise).
         self._install_mtp_prefill_hook(kv_cache)
         # Capture the chunk-prefill trace + warm the masked-bucket set so requests only replay
         # pre-compiled programs (compile-clobbers-trace fix). Guard name must match the plugin's reset.

@@ -41,6 +41,10 @@ when the request gets its decode slot (= `MTPHead.set_hidden_in`). A payload wit
 (a plain P feeding a speculative D) imports the layers it has and leaves the head's blocks untouched (no hidden
 row either: the D side must then not draft for that request); one with more (a speculative P feeding a plain D)
 drops the extra layers. The block layout of every layer is the one documented at `export_kv_blocks`.
+
+DFlash2 drafter (tt/aux_hidden.py, QWEN36_SPEC_DRAFTER=dflash2): the drafter's CONTEXT K/V of the prompt travel as a
+named KV GROUP of the version-3 payload (`export_kv_groups` on P from the prefill hook's host staging, `import_kv_groups`
+on D into caches registered with `register_kv_group`; see the "extra KV groups" section at the end of this module).
 """
 
 from __future__ import annotations
@@ -1408,3 +1412,260 @@ def verify_gdn_slot(model, slot, rec_snap, conv_snap, tag=""):
     logger.info(
         f"[pd] VERIFY slot {slot} {tag}: max|rec diff| {worst_rec:.3g}, max|tap diff| {worst_tap:.3g}, max|packed-hist diff| {worst_hist:.3g}"
     )
+
+
+# --------------------------------------------------------------------------------------
+# extra KV groups: the DFlash2 drafter's context K/V (payload version 3, tt/aux_hidden.py)
+# --------------------------------------------------------------------------------------
+# A KV GROUP is a named set of paged caches with its own head count / head dim that a request's block ids index
+# exactly like the main layers (same page table). Today's only group is "dflash2": the 5 draft layers' CONTEXT K/V
+# (8 kv heads x 128, projections of the target's aux hidden states) which the prefill side computes with
+# ``aux_hidden.DFlash2ContextPrefillHook`` (host staging per decode slot: ``KvGroupStage``) and the payload carries
+# as ``dflash2.kv.<j>.k/.v`` [n_blocks_shipped, kv_heads, block_size, head_dim] bf16 (dim 1 = GLOBAL kv-head order =
+# device-major over the D-side shards, like the main layers) plus a header entry ``kv_groups["dflash2"]`` =
+# {n_layers, kv_heads, head_dim, block_size, block_index, first_pos, n_tokens} where ``block_index`` lists the
+# shipped blocks as indices into the request's block list (the sliding-window tail of a long prompt: the drafter's
+# layers attend within 2048 positions, so only those blocks are computed / shipped). The D side registers its
+# drafter's caches with ``register_kv_group`` (contract for tt/dflash2_head.py ``DFlash2Drafter``: call it right
+# after ``allocate_kv`` with the [k, v] pairs, before ``kv_group_import_warmup`` and any trace capture) and
+# ``import_kv_groups`` writes the payload's blocks into them (padded to the power-of-two bucket like the main KV,
+# pad rows aimed at the group's pad block). A consumer without the group logs once and skips it (the request then
+# has no drafter context: plain decode); a producer without a staged group ships none.
+
+
+class KvGroup:
+    """The D-side caches of one KV group: ``caches`` = list of (k, v) device tensors, each
+    ``[num_blocks (+ pad), nkv_local, block_size, head_dim]`` per device (the group's kv heads sharded over the mesh,
+    ``kv_heads = n_dev * nkv_local``); ``pad_block`` = a block index no page table hands out (the import's pad rows)."""
+
+    def __init__(self, model, name, caches, pad_block=None):
+        self.name = str(name)
+        self.caches = [(k, v) for k, v in caches]
+        assert self.caches, "a KV group needs at least one (k, v) pair"
+        k0 = self.caches[0][0]
+        num_blocks, nkv, blk, hd = (int(x) for x in k0.shape)
+        for k, v in self.caches:
+            assert tuple(k.shape) == tuple(k0.shape) == tuple(v.shape), (k.shape, v.shape, k0.shape)
+        self.n_layers = len(self.caches)
+        self.n_dev = int(model.num_devices)
+        self.nkv_local, self.block_size, self.head_dim = nkv, blk, hd
+        self.kv_heads = self.n_dev * nkv
+        self.num_blocks = num_blocks
+        self.pad_block = int(pad_block) if pad_block is not None else num_blocks - 1
+        assert 0 <= self.pad_block < num_blocks, (self.pad_block, num_blocks)
+        self.dtype = k0.dtype
+
+    def meta(self):
+        return {
+            "n_layers": self.n_layers,
+            "kv_heads": self.kv_heads,
+            "head_dim": self.head_dim,
+            "block_size": self.block_size,
+        }
+
+
+def register_kv_group(model, name, caches, pad_block=None) -> KvGroup:
+    """D side / standalone: make ``caches`` (see ``KvGroup``) the importer's target for payload KV group ``name``."""
+    groups = getattr(model, "pd_kv_groups", None)
+    if groups is None:
+        groups = model.pd_kv_groups = {}
+    g = KvGroup(model, name, caches, pad_block)
+    groups[name] = g
+    logger.info(
+        f"[pd] KV group {name!r} registered: {g.n_layers} layer(s) x {g.kv_heads} kv heads x {g.head_dim}, "
+        f"{g.num_blocks} blocks of {g.block_size} ({g.dtype}), pad block {g.pad_block}"
+    )
+    return g
+
+
+def kv_groups(model) -> dict:
+    """The registered KV groups {name: KvGroup}. A DFlash2 drafter attached as ``model.dflash2_drafter``
+    (tt/dflash2_head.py ``DFlash2Drafter``: ``kv_layers`` = its [(k, v)] caches, ``pad_block``) is registered as
+    "dflash2" on first use when nobody registered it explicitly."""
+    groups = getattr(model, "pd_kv_groups", None)
+    if groups is None:
+        groups = model.pd_kv_groups = {}
+    drafter = getattr(model, "dflash2_drafter", None)
+    if "dflash2" not in groups and drafter is not None and getattr(drafter, "kv_layers", None):
+        register_kv_group(model, "dflash2", drafter.kv_layers, pad_block=getattr(drafter, "pad_block", None))
+    return groups
+
+
+def rows_to_kv_blocks(rows, block_size):
+    """Position-ordered rows ``[n_tokens, H, hd]`` (row 0 = the first position of a block-aligned range) -> the
+    payload block layout ``[n_blocks, H, block_size, hd]`` (tail rows zero)."""
+    n, H, hd = rows.shape
+    n_blk = -(-int(n) // int(block_size))
+    padded = rows.new_zeros((n_blk * int(block_size), H, hd))
+    padded[:n] = rows
+    return padded.view(n_blk, int(block_size), H, hd).permute(0, 2, 1, 3).contiguous()
+
+
+def kv_blocks_to_rows(blocks, n_tokens=None):
+    """Inverse of ``rows_to_kv_blocks``: ``[n_blocks, H, block_size, hd]`` -> ``[n_blocks * block_size, H, hd]``
+    (the first ``n_tokens`` rows when given)."""
+    n_blk, H, blk, hd = blocks.shape
+    rows = blocks.permute(0, 2, 1, 3).reshape(n_blk * blk, H, hd)
+    return rows[: int(n_tokens)] if n_tokens is not None else rows
+
+
+def export_kv_groups(model, slot, block_ids, num_tokens):
+    """P side (the connector's ``_stage_one``): every KV group staged for decode ``slot`` by a prefill hook
+    (``aux_hidden.kv_group_stage_store``: name -> slot -> ``KvGroupStage``), taken (popped) and laid out in blocks:
+    returns {name: (kv, meta)} with ``kv`` = per layer (k, v) host bf16 ``[n_shipped, kv_heads, block_size, head_dim]``
+    and ``meta`` = the group's header entry (``block_index`` = the shipped blocks' indices into ``block_ids``, in
+    order; ``first_pos`` = the first shipped position, block aligned; ``n_tokens`` = staged positions). Empty when
+    nothing is staged (no drafter, or the knob is not dflash2)."""
+    store = getattr(model, "pd_kv_group_stage", None) or {}
+    out = {}
+    for name, slots in store.items():
+        stage = slots.pop(int(slot), None)
+        if stage is None:
+            continue
+        t0 = time.perf_counter()
+        n_tok = int(stage.n_tokens)
+        if n_tok == 0:
+            continue
+        bs = int(get_block_size_of(model))
+        first = int(stage.first_pos)
+        assert first % bs == 0, f"KV group {name!r}: first_pos {first} is not block aligned ({bs})"
+        b0 = first // bs
+        n_blk = -(-(first + n_tok) // bs) - b0
+        assert b0 + n_blk <= len(block_ids), (
+            f"KV group {name!r}: positions [{first}, {first + n_tok}) need blocks {b0}..{b0 + n_blk - 1}, "
+            f"the request has {len(block_ids)} ({num_tokens} tokens)"
+        )
+        kv = [(rows_to_kv_blocks(k, bs), rows_to_kv_blocks(v, bs)) for k, v in stage.rows()]
+        meta = {
+            "n_layers": stage.n_layers,
+            "kv_heads": stage.kv_heads,
+            "head_dim": stage.head_dim,
+            "block_size": bs,
+            "block_index": list(range(b0, b0 + n_blk)),
+            "first_pos": first,
+            "n_tokens": n_tok,
+        }
+        out[name] = (kv, meta)
+        logger.debug(
+            f"[pd] exported KV group {name!r} for slot {slot}: {n_tok} positions from {first} -> {n_blk} block(s) x "
+            f"{stage.n_layers} layer(s), {kv_nbytes(kv) / 2**20:.1f} MiB, host {1e3 * (time.perf_counter() - t0):.1f} ms"
+        )
+    return out
+
+
+def get_block_size_of(model):
+    from models.tt_transformers.tt.common import get_block_size
+
+    return get_block_size(model._paged_kv_caches)
+
+
+def import_kv_group_blocks(model, group: KvGroup, block_ids, kv):
+    """Write ``kv`` (per layer (k, v) host ``[n_real, kv_heads, block_size, head_dim]``) into the group's caches at
+    ``block_ids`` (the D-side block ids of the shipped blocks): the eager upload + ``paged_fill_cache`` path of
+    ``import_kv_blocks``, padded to the power-of-two bucket (pad rows -> the group's pad block; programs compile per
+    bucket, ``kv_group_import_warmup`` compiles them up front)."""
+    t0 = time.perf_counter()
+    n_real = len(block_ids)
+    assert len(kv) == group.n_layers, f"KV group {group.name!r}: payload has {len(kv)} layers, caches {group.n_layers}"
+    n = export_bucket(n_real) if os.environ.get("QWEN36_PD_IMPORT_BUCKETS", "1") == "1" else n_real
+    ids = [int(b) for b in block_ids] + [group.pad_block] * (n - n_real)
+    mesh = model.mesh_device
+    page_table_tt = ttnn.from_torch(
+        torch.tensor([ids], dtype=torch.int32),
+        dtype=ttnn.int32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    mapper = ttnn.ShardTensorToMesh(mesh, dim=0)
+    n_dev, nkv, blk, hd = group.n_dev, group.nkv_local, group.block_size, group.head_dim
+    for (k_host, v_host), (k_cache, v_cache) in zip(kv, group.caches):
+        for host, cache in ((k_host, k_cache), (v_host, v_cache)):
+            host = torch.as_tensor(host)
+            nb, H, blk_h, hd_h = host.shape
+            assert (nb, H, blk_h, hd_h) == (n_real, group.kv_heads, blk, hd), (tuple(host.shape), n_real, group.meta())
+            if n != nb:
+                host = torch.cat([host, host.new_zeros((n - nb, H, blk, hd))], dim=0)
+            x = host.view(n, n_dev, nkv, blk, hd).permute(1, 2, 0, 3, 4).reshape(n_dev, nkv, n * blk, hd)
+            xt = _upload(model, x.contiguous(), cache.dtype, mapper)
+            ttnn.experimental.paged_fill_cache(cache, xt, page_table_tt, batch_idx=0)
+            ttnn.deallocate(xt)
+    ttnn.deallocate(page_table_tt)
+    logger.debug(
+        f"[pd] imported KV group {group.name!r}: {n_real} blocks (bucket {n}) x {group.n_layers} layers in "
+        f"{1e3 * (time.perf_counter() - t0):.1f} ms"
+    )
+
+
+def import_kv_groups(model, block_ids, groups):
+    """D side (the connector's drain, right after ``import_kv_blocks``): ``groups`` = {name: (kv, meta)} as
+    ``unpack_kv_groups`` returns; ``block_ids`` = the request's D-side block list (``meta["block_index"]`` selects the
+    shipped blocks). Returns the names imported; a group this instance has not registered is skipped (logged once)."""
+    done = []
+    for name, (kv, meta) in (groups or {}).items():
+        g = kv_groups(model).get(name)
+        if g is None:
+            seen = getattr(model, "_pd_kv_group_skipped", None)
+            if seen is None:
+                seen = model._pd_kv_group_skipped = set()
+            if name not in seen:
+                seen.add(name)
+                logger.warning(f"[pd] payload carries KV group {name!r} but this instance has no such caches; skipped")
+            continue
+        if (int(meta["kv_heads"]), int(meta["head_dim"]), int(meta["block_size"])) != (
+            g.kv_heads,
+            g.head_dim,
+            g.block_size,
+        ):
+            raise ValueError(f"KV group {name!r}: payload geometry {meta} vs caches {g.meta()}")
+        idx = [int(i) for i in meta["block_index"]]
+        if idx and max(idx) >= len(block_ids):
+            raise ValueError(
+                f"KV group {name!r}: block_index up to {max(idx)} but the request has {len(block_ids)} blocks"
+            )
+        import_kv_group_blocks(model, g, [int(block_ids[i]) for i in idx], kv)
+        done.append(name)
+    return done
+
+
+def read_kv_group_blocks(model, group: KvGroup, block_ids):
+    """Test / verification helper: the group's blocks read back to the host in the payload layout (per layer (k, v)
+    ``[n_blocks, kv_heads, block_size, head_dim]`` bf16, dim 1 device-major) through the mesh composer."""
+    comp = ttnn.ConcatMeshToTensor(model.mesh_device, dim=0)
+    out = []
+    nkv, blk, hd = group.nkv_local, group.block_size, group.head_dim
+    for k_cache, v_cache in group.caches:
+        pair = []
+        for cache in (k_cache, v_cache):
+            parts = []
+            for b in block_ids:
+                sl = ttnn.slice(cache, (int(b), 0, 0, 0), (int(b) + 1, nkv, blk, hd))
+                if sl.dtype != ttnn.bfloat16:
+                    c = ttnn.typecast(sl, ttnn.bfloat16)
+                    ttnn.deallocate(sl)
+                    sl = c
+                h = ttnn.to_torch(sl, mesh_composer=comp).to(torch.bfloat16)  # [n_dev, nkv, blk, hd]
+                ttnn.deallocate(sl)
+                parts.append(h.reshape(1, group.kv_heads, blk, hd))
+            pair.append(torch.cat(parts, dim=0))
+        out.append((pair[0], pair[1]))
+    return out
+
+
+def kv_group_import_warmup(model, max_bucket: int = 256):
+    """Compile the group import programs (zero payloads into the pad block) for every bucket <= max_bucket (the eager
+    import pads to the power-of-two bucket of the SHIPPED block count: 66 blocks -> 128; a bucket first compiled at
+    request time cost 450 ms in logs/pddf_D1.log case b), for every registered group. Call at warm-up (before any
+    trace capture), never at request time."""
+    t0 = time.perf_counter()
+    for g in kv_groups(model).values():
+        for b in _EXPORT_BUCKETS:
+            if b > max_bucket:
+                break
+            z = torch.zeros((b, g.kv_heads, g.block_size, g.head_dim), dtype=torch.bfloat16)
+            import_kv_group_blocks(model, g, [g.pad_block] * b, [(z, z) for _ in range(g.n_layers)])
+    if kv_groups(model):
+        ttnn.synchronize_device(model.mesh_device)
+        logger.info(
+            f"[pd] KV group import warm-up: {sorted(kv_groups(model))} buckets <= {max_bucket} in {time.perf_counter() - t0:.1f} s"
+        )
