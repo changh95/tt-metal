@@ -18,7 +18,12 @@ every formula below was read off that code and pinned by ``tests/test_dflash2_cp
     block's own K/V appended (RoPE'd at the block positions); ``x += attention_conv.finish(a, c)``; the same around
     the SwiGLU MLP with ``mlp_conv``. Attention is NON-causal inside the block (config ``is_causal: false`` wins over
     the ``sliding_attention`` layer type in every reference implementation) with a sliding window of 2048 over the
-    context (query_pos - key_pos < 2048; irrelevant below 2048 tokens; the device SDPA has no window: documented).
+    context (``query_pos - key_pos < 2048``: the block reads the last 2048 context positions, nothing older). On device
+    the paged SDPA decode applies it as ``sliding_window_size`` (keys ``[cur_pos + 1 - 2048, cur_pos]`` per virtual
+    user; the block's rows share ``cur_pos = P + 7``, so row j lacks the ``7 - j`` oldest keys of its reference window
+    and sees nothing the reference does not; knob ``QWEN36_DFLASH2_DEVICE_WINDOW``, ``dflash2_device_window``).
+    Without it the drafter attends the WHOLE context and its drafts degrade with the context length (served, random
+    prompts: 2.8 tokens/step at 4k context, 1.5 at 16k, 1.0-1.2 at 64k-128k; tests/DFLASH2_RESULTS.md section 8).
   * Conv (``GroupedDynamicCausalConv``, kernel 2 taps, groups of 16 channels): ``dyn = kernel_projection(h)`` viewed
     ``[2 (pre/post), 2 (tap), 320 (groups)]``; ``out_t = sum_tap (base[side][tap] + expand16(dyn[side][tap]_t)) *
     x_{t-tap}`` with ``x_{t-1} = 0`` for the block's first row (block-local, stateless); the POST kernel
@@ -36,7 +41,7 @@ column-parallel + all-gather, conv kernel projections replicated), the residual 
 mean-of-squares ops (a plain ttnn.rms_norm over a 5120-wide interleaved row sizes its static CBs into the persistent
 L1 buffers, logs/mtp_smoke1.log). The block's K/V go through ``paged_update_cache(num_tokens=8)`` into the drafter's
 paged KV (5 layers x [k, v], the model's page table / block size, bfp8) and ONE virtual-user paged SDPA decode per
-layer attends every row to the context + the whole block (cur_pos = P+7). Context writes: ``commit_rows`` (traced per
+layer attends every row to the context (the last ``sliding_window`` positions) + the whole block (cur_pos = P+7). Context writes: ``commit_rows`` (traced per
 verify plan, reads ``plan.out_aux``) and ``write_context`` (prompt / payload: paged_fill_cache per block run). The
 selector runs on host from the per-device top-32 readback ([TP, R, 64] values + ids) and the [R, 256] projected hidden.
 Trace rules (tests/VERIFY_W32_AUDIT.md): every buffer allocated before any capture, every program compiled eagerly
@@ -59,6 +64,17 @@ from models.tt_transformers.tt.ccl import tt_all_reduce
 from models.tt_transformers.tt.common import get_block_size
 
 DFLASH2_REPO = "z-lab/Qwen3.8-27B-DFlash2"
+
+
+def dflash2_device_window(cfg_window):
+    """The sliding window the DEVICE drafter applies to its context attention: ``QWEN36_DFLASH2_DEVICE_WINDOW`` unset
+    -> the checkpoint's (``cfg_window``, 2048: the reference semantics); ``0`` -> None = attend the whole context (the
+    pre-2026-09-28 behaviour, kept for A/B runs); ``n`` -> a window of n positions."""
+    v = os.environ.get("QWEN36_DFLASH2_DEVICE_WINDOW")
+    if v in (None, ""):
+        return None if cfg_window is None else int(cfg_window)
+    v = int(v)
+    return None if v <= 0 else v
 
 
 def dflash2_snapshot_dir():
@@ -441,11 +457,19 @@ class DFlash2Drafter:
         self.eps = cfg.eps
         assert self.NKV * self.B <= tpc.TILE_SIZE, "paged_update_cache(num_tokens) needs num_kv_heads * T <= 32"
         self.causal = cfg.is_causal[0]
-        if cfg.sliding_window[0] is not None:
+        # the reference's sliding window over the context, applied by the paged SDPA decode (module docstring)
+        self.window = dflash2_device_window(cfg.sliding_window[0])
+        if self.window is None and cfg.sliding_window[0] is not None:
             logger.warning(
-                f"[dflash2] sliding window {cfg.sliding_window[0]} of the reference is NOT applied on device (the paged "
-                "SDPA decode attends to the whole context); identical below that context length"
+                f"[dflash2] QWEN36_DFLASH2_DEVICE_WINDOW=0: sliding window {cfg.sliding_window[0]} of the reference is NOT "
+                "applied on device (the paged SDPA decode attends to the whole context); drafts degrade past that length"
             )
+        elif self.window is not None:
+            logger.info(
+                f"[dflash2] context attention sliding window {self.window} applied on device "
+                f"(reference {cfg.sliding_window[0]}; paged SDPA decode sliding_window_size)"
+            )
+        self._sdpa_window_kw = {} if self.window is None else {"sliding_window_size": int(self.window)}
         self._host_refs = []
         self.weight_bytes = 0
         self._load_weights(load_dflash2_state_dict(path), args.weight_cache_path())
@@ -489,6 +513,7 @@ class DFlash2Drafter:
         logger.info(
             f"[dflash2] drafter ready: widths {sorted(self.sb)} kv {cfg.n_layers} x 2 x {list(self.kv_caches[0][0].shape)} "
             f"{self.kv_dtype} ({self.kv_bytes / 2**20:.0f} MiB/chip) block attention {'causal' if self.causal else 'non-causal'}"
+            f" context window {self.window if self.window is not None else 'none (whole context)'}"
         )
 
     # ------------------------------------------------------------------------------------------ weights
@@ -883,46 +908,56 @@ class DFlash2Drafter:
         pos = torch.as_tensor(positions, dtype=torch.int32).reshape(-1)
         return vg.rope_cos_sin(pos.clamp(min=0), self.HD, self.cfg.rope_theta)
 
-    def write_context(self, slot, positions, aux, page_table_row=None):
+    def write_context(self, slot, positions, aux, page_table_row=None, rows=None):
         """Eager: project the aux rows ``aux`` [N, 5*dim] (host, any float dtype) at ``positions`` [N] (a contiguous
         run starting at a block boundary, e.g. the prompt 0..N-1) and write the K/V of every drafter layer into the
         blocks of ``page_table_row`` (default ``page_tables[slot]``) with paged_fill_cache (whole blocks: the rows past
-        N in the last block hold zeros, never read before the block K/V overwrite them)."""
+        N in the last block hold zeros, never read before the block K/V overwrite them). The projection runs in
+        block-aligned chunks of ``rows`` (``QWEN36_DFLASH2_PROJECT_ROWS``, default 256, as the served P-side hook's
+        RowChunkedProjector): the small-M matmul configs of ``project_kv`` exceed L1 past a few hundred rows."""
         t0 = time.perf_counter()
         pos = torch.as_tensor(positions, dtype=torch.int64).reshape(-1)
         N = int(pos.numel())
         assert N >= 1 and torch.equal(pos, torch.arange(int(pos[0]), int(pos[0]) + N)), "contiguous positions"
         assert int(pos[0]) % self.block_size == 0, "write_context: the run must start at a block boundary"
+        rows = int(rows if rows is not None else os.environ.get("QWEN36_DFLASH2_PROJECT_ROWS", "256"))
+        rows = max(self.block_size, rows // self.block_size * self.block_size)
         pt_row = self.page_tables[int(slot)] if page_table_row is None else torch.as_tensor(page_table_row)
         pt_row = pt_row.reshape(-1).to(torch.int32)
-        aux_t = torch.as_tensor(aux).to(torch.bfloat16).reshape(1, 1, N, 5 * self.dim)
-        S = -(-N // self.block_size) * self.block_size
-        if S > N:
-            aux_t = torch.cat([aux_t, torch.zeros(1, 1, S - N, 5 * self.dim, dtype=torch.bfloat16)], dim=2)
-        pos_pad = torch.cat([pos, torch.zeros(S - N, dtype=torch.int64)])
-        aux_tt = self._up(aux_t, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-        cos_t, sin_t = self._rope_rows(pos_pad)
-        cos_tt = self._up(cos_t, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-        sin_tt = self._up(sin_t, ttnn.bfloat16, ttnn.TILE_LAYOUT)
-        kvs = self.project_kv(aux_tt, cos_tt, sin_tt)
-        blk0 = int(pos[0]) // self.block_size
-        nblk = S // self.block_size
-        fill_pt = self._up(pt_row[blk0 : blk0 + nblk].reshape(1, nblk).contiguous(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        for (k_cache, v_cache), (ks, vs) in zip(self.kv_caches, kvs):
-            for cache, heads in ((k_cache, ks), (v_cache, vs)):
-                # [1,1,S,HD] per head -> [1,NKV,S,HD] in the cache dtype -> whole-block fill
-                hs = [ttnn.reshape(h, (1, 1, S, self.HD)) for h in heads]
-                cat = ttnn.concat(hs, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG) if self.NKV > 1 else hs[0]
-                fill = ttnn.typecast(cat, self.kv_dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-                ttnn.experimental.paged_fill_cache(cache, fill, fill_pt, batch_idx=0)
-                ttnn.deallocate(fill)
-                if cat is not hs[0]:
-                    ttnn.deallocate(cat)
-                for h in heads:
-                    ttnn.deallocate(h)
-        self._sync()
-        for t in (aux_tt, cos_tt, sin_tt, fill_pt):
-            ttnn.deallocate(t)
+        aux_all = torch.as_tensor(aux).to(torch.bfloat16).reshape(N, 5 * self.dim)
+        for a in range(0, N, rows):
+            e = min(N, a + rows)
+            n = e - a
+            S = -(-n // self.block_size) * self.block_size
+            aux_t = aux_all[a:e].reshape(1, 1, n, 5 * self.dim)
+            if S > n:
+                aux_t = torch.cat([aux_t, torch.zeros(1, 1, S - n, 5 * self.dim, dtype=torch.bfloat16)], dim=2)
+            pos_pad = torch.cat([pos[a:e], torch.zeros(S - n, dtype=torch.int64)])
+            aux_tt = self._up(aux_t.contiguous(), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            cos_t, sin_t = self._rope_rows(pos_pad)
+            cos_tt = self._up(cos_t, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            sin_tt = self._up(sin_t, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+            kvs = self.project_kv(aux_tt, cos_tt, sin_tt)
+            blk0 = int(pos[a]) // self.block_size
+            nblk = S // self.block_size
+            fill_pt = self._up(
+                pt_row[blk0 : blk0 + nblk].reshape(1, nblk).contiguous(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT
+            )
+            for (k_cache, v_cache), (ks, vs) in zip(self.kv_caches, kvs):
+                for cache, heads in ((k_cache, ks), (v_cache, vs)):
+                    # [1,1,S,HD] per head -> [1,NKV,S,HD] in the cache dtype -> whole-block fill
+                    hs = [ttnn.reshape(h, (1, 1, S, self.HD)) for h in heads]
+                    cat = ttnn.concat(hs, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG) if self.NKV > 1 else hs[0]
+                    fill = ttnn.typecast(cat, self.kv_dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                    ttnn.experimental.paged_fill_cache(cache, fill, fill_pt, batch_idx=0)
+                    ttnn.deallocate(fill)
+                    if cat is not hs[0]:
+                        ttnn.deallocate(cat)
+                    for h in heads:
+                        ttnn.deallocate(h)
+            self._sync()
+            for t in (aux_tt, cos_tt, sin_tt, fill_pt):
+                ttnn.deallocate(t)
         self.stats["commit_wall"] += time.perf_counter() - t0
         return N
 
@@ -1149,6 +1184,7 @@ class DFlash2Drafter:
                         scale=HD**-0.5,
                         program_config=self.sdpa_cfg,
                         memory_config=L1,
+                        **self._sdpa_window_kw,
                     )
                 )
                 if q_c is not q:

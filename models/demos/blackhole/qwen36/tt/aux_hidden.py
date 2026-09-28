@@ -75,9 +75,10 @@ def dflash2_context_window() -> int:
     """How many trailing prompt positions of DFlash2 context K/V the prefill side computes and ships
     (``QWEN36_DFLASH2_CONTEXT_WINDOW``; 0 = every position, the default). Every draft layer of Qwen3.8-27B-DFlash2 is a
     sliding-attention layer of window 2048 in the reference, so a value of 2048 ships only what the reference drafter
-    can read (an 8k prompt: 32 of 128 blocks, 40 MiB instead of 160 MiB of bf16 context K/V) -- turn it on once the
-    device drafter (tt/dflash2_head.py) applies the window; today it attends the whole context, so the default ships
-    every position."""
+    can read (an 8k prompt: 32 of 128 blocks, 40 MiB instead of 160 MiB of bf16 context K/V). The device drafter
+    (tt/dflash2_head.py ``dflash2_device_window``) applies the window since 2026-09-28, so ``2048`` is safe on a stack
+    whose decode half runs with the default ``QWEN36_DFLASH2_DEVICE_WINDOW``; the default still ships every position
+    (the D-side ``note_context`` warns when a shipped tail is shorter than the device window)."""
     v = os.environ.get("QWEN36_DFLASH2_CONTEXT_WINDOW")
     return 0 if v in (None, "") else int(v)
 

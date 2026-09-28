@@ -194,12 +194,20 @@ class _DFlash2Drafter:
         if meta is None:
             self.context.pop(slot, None)
             return
-        if int(meta.get("first_pos", 0)) != 0 and not self._warned_window:
-            self._warned_window = True
-            logger.warning(
-                f"[spec] dflash2 context of slot {slot} starts at position {meta.get('first_pos')}: the device drafter "
-                "attends the whole context (no sliding window); positions below hold stale blocks"
-            )
+        first = int(meta.get("first_pos", 0))
+        if first != 0 and not self._warned_window:
+            # a windowed transport (QWEN36_DFLASH2_CONTEXT_WINDOW on P) ships positions >= first_pos only; the device
+            # drafter's first block step reads [total + 8 - window, total + 7] (cur_pos = P + 7): fine iff the device
+            # window is applied and the shipped tail covers it, else the drafter reads stale blocks
+            window = getattr(self.head, "window", None)
+            total = first + int(meta.get("n_tokens", 0))
+            if window is None or first > max(0, total - int(window)):
+                self._warned_window = True
+                logger.warning(
+                    f"[spec] dflash2 context of slot {slot} starts at position {first} (prompt {total} tokens) but the "
+                    f"device drafter attends {'the whole context (QWEN36_DFLASH2_DEVICE_WINDOW=0)' if window is None else f'the last {window} positions'}: "
+                    "positions below hold stale blocks (drafts degrade; the committed stream is unaffected)"
+                )
         self.context[slot] = (req_id, dict(meta))
 
     def has_state(self, slot) -> bool:

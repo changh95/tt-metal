@@ -347,3 +347,111 @@ at 32; 128/128 random 11.9 / 74, 15.2 / 226, 16.2 / 405, 24.6 / 552, 39.6 / 684.
 draft 7.6 ms; (8,4) MTP 33.5 + commit 1.1 + select 0.4 + draft 7.9; (16,2) MTP 33.9 + 1.7 + 3.1. P side: both hooks add
 ~11 ms to a short prefill (118.6 vs 107.2 mtp / 112.5 dflash2 ms total at <= 256 tokens) and the payload is 164.3 MiB per
 179-token request (mtp 160.5, dflash2 163.5, plain ~158); D 5698 / P 13071 MiB DRAM free after warm-up.
+
+## 8. Long-context TPOT regression of the hybrid bundle (2026-09-28) -- the missing 2048 sliding window
+
+The v11 sweep (`QWEN36_SPEC_DRAFTER=hybrid`, K=7, decode bucketing on, D pool 1,052,672, random prompts;
+`logs/points_pd_v11_merged`) had long-prompt TPOT ~2x the v10 (MTP drafter) sweep at EVERY concurrency: 16k/128
+14-15 -> 27-35 ms, 32k 15 -> 34-40, 64k 13 -> 55-59, 128k 18 -> 70; 128/128 unchanged (11.9 / 39.9 at 1 / 32 users).
+D's `SpecDecoding metrics` fell to a mean acceptance length of 1.04-1.25 late in the sweep.
+
+### 8.1 A/B matrix (all 8 chips, `scripts/spec_ab_longctx.sh`, `logs/ab_<tag>/summary.txt`; AICLK under firmware control)
+
+Four stacks on this tree, the v11 env otherwise (`vllm bench serve`, random prompts, n = users; the real-text probe
+`scripts/longctx_accept_probe.py` = one user, GSM8K-train text of exactly `ctx` tokens, 128 greedy tokens, one streamed
+chunk per decode step, so `tok/step` = the acceptance length + 1):
+
+| stack | D DRAM free after warm-up | 128/128 1u / 32u | 16k/128 1u / 32u | 32k/128 1u / 15u | 16k/1024 32u | real text tok/step at 1k / 4k / 8k / 16k / 32k ctx | ms/token at 1k / 32k |
+|---|---|---|---|---|---|---|---|
+| (3) hybrid default (the v11 config) | 5698 MiB | 13.3 / 37.2 | 27.3 / 34.2 | 35.0 / 40.2 | 20.8 | 4.74 / 4.27 / 2.42 / 2.03 / 1.75 | 9.4 / 29.7 |
+| (1) `QWEN36_SPEC_DRAFTER=mtp` K=3 (the v10 config on this tree) | 9078 | 13.0 / 34.2 | 13.6 / 14.8 | 15.0 / 15.8 | 17.0 | 3.28 / 3.12 / 3.05 / 3.05 / 3.37 | 11.3 / 11.9 |
+| (2) hybrid resident, never drafting (`QWEN36_SPEC_VLLM_CONFIG=0`: both drafters built, P ships both states, D imports them, no speculative_config -> plain steps) | 5835 | 24.2 / 36.9 | 24.8 / 27.8 | 25.2 / 25.4 | 36.7 | 1.00 everywhere (plain) | 24.2 / 25.2 |
+| (4) `QWEN36_SPEC_MTP=0` (no speculation, the floor) | 9956 | 24.2 / 36.7 | 24.7 / 26.4 | 25.3 / 25.4 | 35.9 | 1.00 | 24.2 / 25.2 |
+
+TPOT in ms (mean over the point's requests). The "32-user" long-prompt points never reach 32 live users on D: P
+prefills a 16k prompt every ~1.5-3 s while a 128-token decode lasts 2-5 s, so D runs 1-2 live users the whole time
+(the D log's `[spec] step` lines of the 16k c32 point: `w_grid=1` x14 / `w_grid=2` x12, vLLM `Running: 0-2 reqs,
+Deferred: 22-31`), i.e. inside the hybrid's DFlash2 band, not the plain band. The true 32-live-user long-context
+points of the sweeps (8192/1024 and 10000/1024 at 32 users: v10 48.8 / 29.2, v11 46.7 / 29.2) never regressed.
+
+Reading: (2) == (4) at every context length (24.2 / 24.8 / 25.2 vs 24.2 / 24.7 / 25.3 ms at 128 / 16k / 32k for one
+user; 36.9 vs 36.7 at 32 users x 128 tokens) -> the resident drafters (3.4 GB of weights + context pool, the KV group
+import per admission, the MTP hidden import, the P-side hooks) cost the decode NOTHING: H2 (DRAM placement / page
+tables / imports / per-step keep-current) is refuted; keep-current and commit run on spec steps only (checked:
+`_HybridDrafter.after_verify` is reached from `SpecDecoder.step` after the verify, never on a plain step). (1) is at
+the v10 level (13.6-15.8 ms at 16k-32k; the MTP head's acceptance is context-independent, 3.05-3.37 tok/step on real
+text at 1k-32k) -> the tree is fine. (3) is the regression: the block drafter's acceptance falls with the context
+length on real text (4.74 tok/step at 1k-2k, 4.27 at 4k, 2.42 at 8k, 2.03 at 16k, 1.75 at 32k) and on random prompts
+(3.3 at 128, 2.8 at 4k, 1.6 at 16k, 1.45-1.9 at 32k, 1.0-1.2 at 64k-128k; the pre-fix D log, `[spec] step` lines) while
+its step cost grows (verify 35 -> 57 ms, draft 8 -> 15, commit + keep 1.7 -> 3.1 at 128k: three SDPAs over the whole
+context), so a T=8 step of ~48-76 ms buys 1.0-2 tokens: 24-70 ms/token. H1 confirmed: the device drafter attended the
+WHOLE context while z-lab/Qwen3.8-27B-DFlash2 is trained with `sliding_window: 2048` on every layer (config.json
+`layer_types: sliding_attention` x5, `use_sliding_window: true`), and the reference (`dflash/model.py`, the vLLM PR's
+`qwen3_dflash2.py`, `DFlash2HostReference._attn_mask`: `query_pos - key_pos < 2048`) never lets a block row see a
+context key older than 2048 positions; past 2k tokens the device drafts were out of distribution.
+
+### 8.2 The fix: the window on device (`QWEN36_DFLASH2_DEVICE_WINDOW`, default = the checkpoint's 2048)
+
+`DFlash2Drafter.step_forward` passes `sliding_window_size=2048` to the paged SDPA decode of every layer: per virtual
+user (one block row) the kernel attends keys `[cur_pos + 1 - 2048, cur_pos]` (`rt_args_common.hpp`: chunk-aligned
+reads, the partial chunk masked to the exact start). The block's 8 rows share `cur_pos = P + 7`, so row j's window is
+the reference's shifted by `7 - j` positions (it lacks the `7 - j` oldest keys of the reference's window, sees nothing
+the reference does not); the K/V write and the commit are unchanged. `0` restores the whole-context attention (A/B
+only). The transport window `QWEN36_DFLASH2_CONTEXT_WINDOW` (P ships only the tail) stays 0 by default; the D-side
+`note_context` warns when a shipped tail is shorter than the device window.
+
+Tests: `tests/test_dflash2_window_op.py` (one chip): the drafter's SDPA configuration (8 rows sharing cur_pos, 2 kv
+heads x 128, bfp8 paged K/V, block 64) with the window equals attention over keys `[cur_pos + 1 - 2048, cur_pos]`
+(PCC 0.9997 at 3000 / 5000 context) and differs from the whole-context result (PCC 0.81 / 0.62); below 2048 both are
+identical (PCC 0.99965). `tests/test_dflash2_spec_scratch.py DF_PCC_LEN=3000 DF_BPU=64` (half B): the device draft
+logits vs the fp32 host reference (which applies the window) on a 3000-token GSM8K prompt -- section 8.3.
+
+### 8.3 Re-measure with the window (served, `logs/ab_hybrid_window/`; standalone, `logs/df2_window2.log` / `df2_window8k.log`)
+
+Served hybrid stack, the v11 env + the device window (default), same driver / points as 8.1 (TPOT ms, mean; the
+"32u" long-prompt points run 1-2 live users on D, see 8.1):
+
+| point | v10 sweep (mtp) | v11 sweep (hybrid) | today, hybrid no window | today, mtp | **today, hybrid + window** | D tok/step (`[spec]` lines of the point) |
+|---|---|---|---|---|---|---|
+| 128/128 1u | 12.3 | 11.9 | 13.3 | 13.0 | 14.5 | -- |
+| 128/128 8u | 15.3 | 16.2 | -- | -- | 17.0 | 3.34 |
+| 128/128 32u | 38.1 | 39.9 | 37.2 | 34.2 | 37.8 | plain band |
+| 16k/128 1u | 13.6 | 27.1 | 27.3 | 13.6 | **17.4** | -- |
+| 16k/128 32u (31u in the sweeps) | 14.9 | 31.4 | 34.2 | 14.8 | **19.2** | 2.79 (was 1.64) |
+| 32k/128 1u | 15.0 | 34.9 | 35.0 | 15.0 | **17.9** | 2.74 (was 1.88) |
+| 32k/128 15u | 15.6 | 40.1 | 40.2 | 15.8 | **24.0** | 2.70 (was 1.45) |
+| 64k/128 1u (n = 1) | 13.3 | 59.3 | -- | -- | 47.9 (one random request; vLLM acceptance 1.2-1.6 on it) | 2.0 |
+| 64k/128 8u | 14.9 | 55.0 | -- | -- | **32.2** (median 30.4) | 2.25 (was 1.0-1.2) |
+| 128k/128 1u / 4u | 18.0 / 19.5 | 69.9 / 71.5 | -- | -- | **blocked: P (half A) wedged** on the 128k prefill, below | 1.94 during the pull |
+| 16k/1024 32u | -- | -- | 20.8 | 17.0 | not reached (wedge) | -- |
+
+Per step at 16k-32k with the window (D log): verify 41.8-43.4 + commit/keep 2.6 + **draft 8.9 ms** (the block SDPA
+is context-independent now: 8.8 ms at 64k-128k too, was 15.2 at 128k); the verify's own SDPA still grows with the
+context (35 ms at 128 tokens, 43 at 32k, 47 at 64k, 51 at 128k: the target's T=8 rows over the whole context). Random
+prompts: 2.7-2.8 tokens/step at 16k-32k (was 1.45-1.9), 2.0-2.25 at 64k-128k (was 1.0-1.2); the random-prompt
+acceptance still declines past 32k, so at 64k+ the (1..4, T=8) DFlash2 band (~56 ms/step / 2.1 = 27 ms/token) stays
+behind the MTP band (~50 ms / 3.2 = 15). Real text (the standalone probes, half B, GSM8K questions vs the fp32 host
+reference WITH the window): 3000-token prompt -- PCC 0.9991 (min 0.998), argmax agreement 0.921, path agreement
+0.841, **4.12 tok/step**; 8192-token prompt -- PCC 0.9991 (min 0.994), argmax 0.949, path 0.949, **3.38 tok/step**
+(the pre-fix served probe on GSM8K text: 2.42 at 8k). The served real-text probe of the fixed stack (1k..64k) and the
+128k / 16k-1024 points were not reached: the P half wedged (below).
+
+**Wedge (2026-09-28 20:51, P = chips 0,1,6,7):** the first 128k request of the fixed stack hung P inside the traced
+chunked prefill at chunk 59/64 (`_prefill_traced_chunked_tp` -> `ttnn.synchronize_device`, py-spy: the engine core
+spinning in `FDMeshCommandQueue::finish`), after 118,784 positions of the DFlash2 hook had staged normally; D idle
+(waiting for the payload). Killed by PID after 10 min; afterwards chip 1 reports `Read 0xffffffff over PCIe ID 1: the
+board should be reset` and chips 0 / 6 / 7 hang on open, chips 2-5 (D) open and run. Not caused by the fix (P runs
+none of the changed drafter code; the same P code prefilled three 128k prompts at 19:23-19:25 and every 128k point of
+the v10 / v11 sweeps) -- an intermittent half-A hang at 128k prefill; no `tt-smi -r` was issued (hard rule).
+
+Open observation (pre-existing, not the drafter's): the standalone PCC probes' committed stream at 3000 / 8192
+context was NOT identical to the plain traced decode (`exact vs decode=False`) while every short-prompt config of the
+same runs was (`exact_vs_plain_decode=True`, as in sections 4-7). Drafts cannot change a greedy stream, so this is
+the R=8 verify's numerics vs the one-row decode at long context (the T=8-row SDPA's chunking / reduction order) --
+the bitwise claim of `docs/SPECULATIVE.md` was established on prompts <= 300 tokens and 128/128; a near-tie probe at
+>= 3k context should decide whether these are ulp-level near-tie flips like the R=64 ones.
+
+Next: (a) `QWEN36_DFLASH2_CONTEXT_WINDOW=2048` on P (ships the 2048-token tail only: the hook's 73 ms per 2048-token
+chunk x 64 chunks and ~2.6 GB of payload at 128k go away; +800 ms TTFT at 16k today vs mtp) once it has a served
+gate; (b) the random-prompt acceptance decline past 32k with the window in place (real text at 16k-64k served, the
+128k points) once half A is back; (c) the long-context bitwise question above.

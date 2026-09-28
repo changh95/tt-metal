@@ -58,7 +58,7 @@ from models.demos.blackhole.qwen36.tt.model import Qwen36Model
 from models.demos.blackhole.qwen36.tt.verify_step import VerifyStep
 
 BMAX = 32
-BPU = 8  # blocks per user = 512 positions
+BPU = int(os.environ.get("DF_BPU", "8"))  # blocks per user (8 = 512 positions; DF_BPU=48 for the long PCC probe)
 CHUNK = 2048
 CONFIGS = [
     tuple(int(v) for v in c.split(","))
@@ -68,6 +68,7 @@ CONFIGS = [
 MIN_TOKENS = int(os.environ.get("DF_MIN_TOKENS", "64"))
 W1_PROMPTS = [int(v) for v in os.environ.get("DF_W1_PROMPTS", "0,1,2,3,4,5,6,11,12,13").split(",") if v]
 DO_PCC = os.environ.get("DF_PCC", "1") == "1"
+PCC_LEN = int(os.environ.get("DF_PCC_LEN", "128"))  # the PCC probe prompt (tokens); > 2048 exercises the context window
 DO_TIMING = os.environ.get("DF_TIMING", "1") == "1"
 N_REPLAYS = int(os.environ.get("DF_TIMING_REPLAYS", "30"))
 PROBE_STEPS = int(os.environ.get("DF_PROBE_STEPS", "8"))
@@ -193,9 +194,10 @@ def test_dflash2_spec(mesh_device):
         import pandas as pd
 
         df = pd.read_parquet(GSM8K_PARQUET)
-        text = " ".join(str(df.question[i]) for i in range(8, 20))
-        probe_ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids[:, :128].to(torch.int32)
-        assert probe_ids.shape[1] == 128
+        text = " ".join(str(df.question[i]) for i in range(8, min(len(df), 20 + PCC_LEN // 12)))
+        probe_ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids[:, :PCC_LEN].to(torch.int32)
+        assert probe_ids.shape[1] == PCC_LEN, (probe_ids.shape, PCC_LEN)
+        assert PCC_LEN + PROBE_STEPS * 8 + 16 <= BPU * BLOCK_SIZE, f"DF_PCC_LEN={PCC_LEN} needs a larger DF_BPU"
     bucket_reps = {}
     for i, ids in enumerate(prompt_ids + ([probe_ids] if probe_ids is not None else [])):
         bucket_reps.setdefault(Qwen36Model._mask_bucket_for(int(ids.shape[1])), ids)
@@ -260,9 +262,12 @@ def test_dflash2_spec(mesh_device):
         # compile the context fill (projector matmuls at S rows + paged_fill_cache over S/64 blocks) for EVERY prompt
         # length class before the captures: the fill program depends on the block count (a 93-token prompt = 2 blocks
         # cost a 4.8 s post-capture JIT in logs/df2_full1.log, "context write 4841 ms")
+        # (write_context projects in <= 256-row chunks, so only the row counts below one chunk are distinct programs)
         max_len = max(int(i.shape[1]) for i in prompt_ids + ([probe_ids] if probe_ids is not None else []))
-        for S in range(BLOCK_SIZE, -(-max_len // BLOCK_SIZE) * BLOCK_SIZE + 1, BLOCK_SIZE):
+        for S in range(BLOCK_SIZE, min(256, -(-max_len // BLOCK_SIZE) * BLOCK_SIZE) + 1, BLOCK_SIZE):
             head.write_context(0, torch.arange(S), torch.zeros(S, 5 * cfg.dim))
+        if max_len > 256:
+            head.write_context(0, torch.arange(max_len), torch.zeros(max_len, 5 * cfg.dim))
         logger.info(f"[df2] prefill warmup {time.perf_counter() - t0:.1f}s")
 
         # --- captures: decode references, drafter steps, verify bodies, then the commits (they read plan.out_aux) ---
@@ -319,7 +324,7 @@ def test_dflash2_spec(mesh_device):
             lens, first, aux = _prefill_with_aux(model, [probe_ids], page_tables, [0], cap)
             ref_streams, _ = _reference_stream(refs[w], first, lens, PROBE_STEPS * (k + 1) + 4)
             lens, first, aux = _prefill_with_aux(model, [probe_ids], page_tables, [0], cap)
-            assert lens[0] == 128
+            assert lens[0] == PCC_LEN
             state["ref"] = ref.new_state()
             ref.append_context(state["ref"], aux[0], torch.arange(lens[0]))
             res = _spec_loop(
@@ -348,7 +353,7 @@ def test_dflash2_spec(mesh_device):
                 "steps": probe["steps"],
             }
             logger.info(
-                f"[df2] PCC probe (128-token prompt, {res['steps']} verify steps, k=7): {len(probe['pcc'])} draft rows, "
+                f"[df2] PCC probe ({PCC_LEN}-token prompt, window {head.window}, {res['steps']} verify steps, k=7): {len(probe['pcc'])} draft rows, "
                 f"PCC mean {float(pcc_t.mean()):.5f} min {float(pcc_t.min()):.5f}, argmax agreement "
                 f"{results['pcc']['argmax_agree_rate']:.3f}, selected-path agreement {results['pcc']['path_agree_rate']:.3f}, "
                 f"exact vs decode={i is None}, accept len {res['accept_len_mean']:.2f}"
