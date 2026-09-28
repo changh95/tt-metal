@@ -28,6 +28,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.demos.blackhole.qwen36.tt import aux_hidden as ah
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from models.demos.blackhole.qwen36.tt import verify_grid as vg
 from models.tt_transformers.tt.ccl import tt_all_reduce
@@ -128,7 +129,18 @@ def combine_sharded_argmax(mesh, idx_t, val_t, R, per_shard):
 class VerifyPlan:
     """Everything a (w, T) verify step needs on device, allocated before any trace capture."""
 
-    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False, pad_safe=False):
+    def __init__(
+        self,
+        model,
+        w,
+        T,
+        page_table,
+        use_kernel=None,
+        keep_hidden=False,
+        pad_safe=False,
+        keep_aux_hidden=False,
+        aux_layers=None,
+    ):
         self.model = model
         mesh = model.mesh_device
         args = model.args
@@ -137,6 +149,17 @@ class VerifyPlan:
         # [1,1,R,dim] replicated DRAM) as a third trace output, ``out_hidden`` -- the MTP drafter (tt/mtp_head.py)
         # selects each user's accepted row from it on device. False = the M2 body byte-for-byte.
         self.keep_hidden = bool(keep_hidden)
+        # keep_aux_hidden: the body also COPIES the residual stream after every layer in ``aux_layers`` (default
+        # tt/aux_hidden.py DFLASH2_TARGET_LAYERS = the 0-based layers whose output DFlash2 conditions on) of every
+        # grid row into the persistent ``out_aux`` [1,1,R,n_aux*dim] bf16 (replicated DRAM, allocated here, before
+        # any capture; row r = s*T+j = [h_a | h_b | ...] in aux_layers order). Copies only (to_memory_config /
+        # all-gather / concat / copy): the main path's arithmetic is untouched, so the (idx, val, out_hidden) outputs
+        # are byte-identical with and without it. On the fused-AR path (R <= 32) the residual is already replicated
+        # (L1 width-sharded) and each aux costs one sharded->interleaved copy; on the fractured path (R > 32) each aux
+        # is all-gathered ([1,1,R,dim/TP] -> [1,1,R,dim], pure data movement). False = no extra op anywhere.
+        self.keep_aux_hidden = bool(keep_aux_hidden)
+        self.aux_layers = ah.aux_layers_for(model, aux_layers) if self.keep_aux_hidden else ()
+        self.out_aux = None
         # pad_safe (served grids, tt/spec_serving.py): grid users may be PADDING rows (decode slots without a live
         # request, ``upload(positions[s] = -1)``): token 0, KV update / SDPA skipped at -1, accept 0, and the
         # attention / GDN sub-layer outputs of their rows forced to exact zeros through ``keep_attn`` / ``keep_gdn``
@@ -184,6 +207,14 @@ class VerifyPlan:
             # LayerNorm kernel at block_h > 1 is row-position dependent on the attn grid (test_verify_rowpos_probe_scratch).
             self.norm_attn = None
             self.norm_lm = None
+
+        # --- keep_aux_hidden: the persistent aux output rows (values written in-trace by copies) ---
+        if self.keep_aux_hidden:
+            self.out_aux = self._up(
+                torch.zeros(1, 1, R, len(self.aux_layers) * self.dim, dtype=torch.bfloat16),
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            )
 
         # --- 0/1 gather / scatter constants ---
         sel_h, selT_h = vg.select_matrices(self.w, self.T, R)
@@ -386,6 +417,30 @@ class VerifyPlan:
         ttnn.deallocate(acc)
         ttnn.deallocate(part)
         return out
+
+    def aux_copy(self, x):
+        """keep_aux_hidden: a REPLICATED DRAM-interleaved [1,1,R,dim] copy of the residual ``x`` after a layer (values
+        untouched): sharded->interleaved copy on the fused-AR path, an all-gather of the fractured [1,1,R,dim/TP]
+        residual otherwise. The caller deallocates it after the concat into ``out_aux``."""
+        if x.shape[-1] == self.dim:
+            return ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
+        return ah.all_gather_copy(self.model, x, ttnn.DRAM_MEMORY_CONFIG)
+
+    def write_aux(self, parts):
+        """keep_aux_hidden: concat the aux copies along the hidden dim (aux_layers order) and copy the rows into the
+        persistent ``out_aux`` (same address every replay). Consumes ``parts``."""
+        assert len(parts) == len(self.aux_layers), (len(parts), self.aux_layers)
+        cat = ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG) if len(parts) > 1 else parts[0]
+        ttnn.copy(cat, self.out_aux)
+        ttnn.deallocate(cat)
+        if len(parts) > 1:
+            for p in parts:
+                ttnn.deallocate(p)
+
+    def read_aux(self, n_rows=None):
+        """Host bf16 [R, n_aux*dim] rows of ``out_aux`` (device 0's replica; the last replay's / eager run's values)."""
+        assert self.out_aux is not None, "plan built without keep_aux_hidden"
+        return ah.aux_rows_to_host(self.model, self.out_aux, n_valid=n_rows)
 
     def all_reduce(self, partial, tt_ccl, mesh, args):
         """The sub-layer all-reduce: fused all_reduce_async (replicated, decode norm layout) on the fused-AR path,
@@ -596,13 +651,34 @@ class VerifyStep:
     Usage (host bookkeeping in verify_grid.VerifyController):
         vs = VerifyStep(model, w, T, page_table[w, blocks]); vs.compile(); vs.capture()   # before prefill of real users
         argmax_rows = vs.run(tokens [w][T], positions [w], accept_prev [w])            # -> [R] int64 per step
+    keep_aux_hidden=True (DFlash2 drafter, tt/aux_hidden.py): after every run the plan's persistent ``out_aux``
+    [1,1,R,n_aux*dim] holds the aux hidden rows of the step (``plan.read_aux()`` for the host copy).
     """
 
-    def __init__(self, model, w, T, page_table, use_kernel=None, keep_hidden=False, pad_safe=False):
+    def __init__(
+        self,
+        model,
+        w,
+        T,
+        page_table,
+        use_kernel=None,
+        keep_hidden=False,
+        pad_safe=False,
+        keep_aux_hidden=False,
+        aux_layers=None,
+    ):
         self.model = model
         self.mesh = model.mesh_device
         self.plan = VerifyPlan(
-            model, w, T, page_table, use_kernel=use_kernel, keep_hidden=keep_hidden, pad_safe=pad_safe
+            model,
+            w,
+            T,
+            page_table,
+            use_kernel=use_kernel,
+            keep_hidden=keep_hidden,
+            pad_safe=pad_safe,
+            keep_aux_hidden=keep_aux_hidden,
+            aux_layers=aux_layers,
         )
         self.per_shard = model.args.vocab_size // model.num_devices
         self.section_times = None
@@ -611,10 +687,14 @@ class VerifyStep:
     # ------------------------------------------------------------------------------------------ forward body
     def forward(self, profile=False, row_check=None, debug_head=None):
         """The traced body: reads only the plan's persistent buffers; returns (idx, val) device tensors.
-        row_check(name, tensor): eager-only diagnostic hook called after the embedding and every layer."""
+        row_check(name, tensor): eager-only diagnostic hook called after the embedding and every layer.
+        keep_aux_hidden: the residual after every aux layer is copied (plan.aux_copy) and the copies land in
+        plan.out_aux (plan.write_aux) before the final norm -- copies only, no change to the main path."""
         model, plan = self.model, self.plan
         R = plan.R
         t = {} if profile else None
+        aux_set = set(plan.aux_layers) if plan.keep_aux_hidden else ()
+        aux_parts = []
 
         def tick(name, t0):
             if profile:
@@ -644,8 +724,14 @@ class VerifyStep:
                 t0 = tick("gdn_layers", t0)
             ttnn.deallocate(x)
             x = x_new
+            if li in aux_set:
+                aux_parts.append(plan.aux_copy(x))
+                t0 = tick("aux_copies", t0)
             if row_check is not None:
                 row_check(f"layer{li}_{'attn' if layer.is_full_attention else 'gdn'}", x)
+        if aux_parts:
+            plan.write_aux(aux_parts)
+            t0 = tick("aux_copies", t0)
         if plan.fused_ar:
             x = model._final_norm_decode(x)
         elif R <= ttnn.TILE_SIZE:
