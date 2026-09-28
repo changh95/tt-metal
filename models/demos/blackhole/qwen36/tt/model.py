@@ -54,6 +54,9 @@ class _MaskedBucketBufs:
     sel_x: object  # [1, K-1, bucket] bf16 TILE (fused-KDA decode-window one-hot over x); None on the FIR path
     sel_c: object  # [1, K-1, K-1] bf16 TILE (fused-KDA decode-window one-hot over the carry); None on the FIR path
     K: int  # GDN conv kernel size the one-hots were built for
+    # prefill_aux_layers (DFlash2, tt/aux_hidden.py): per aux layer a persistent [1, 1, bucket, dim/TP] bf16 copy of
+    # the residual after that layer, written in-trace by ttnn.copy and read in place by the aux hook; None when off.
+    aux: object = None
 
 
 @dataclass
@@ -256,6 +259,16 @@ class Qwen36Model:
         # None by default: the single-token serving path is unchanged.
         self.prefill_hidden_hook = None
         self._prefill_hook_user = None
+        # DFlash2 drafter (tt/aux_hidden.py): ``prefill_aux_layers`` = the 0-based layers whose OUTPUT residual is an
+        # auxiliary hidden state (DFLASH2_TARGET_LAYERS); when non-empty, every TP prefill path COPIES the residual
+        # after those layers (traced chunk / masked-bucket bodies: into persistent per-layer buffers allocated at
+        # capture time, so set it BEFORE the prefill warm-up; eager paths: clones) and calls
+        # ``prefill_aux_hook(user_ctx, aux_list, token_buf, actual_len, bucket, chunk_start)`` right after the hidden
+        # hook, aux_list[k] = the FRACTURED [1,1,bucket,dim/TP] copy of aux layer k (rows >= actual_len padding; the
+        # tensors are the model's: read them in place, never deallocate). Empty / None: no extra op anywhere.
+        self.prefill_aux_layers = ()
+        self.prefill_aux_hook = None
+        self._chunk_aux_bufs = None  # per aux layer [1,1,chunk,dim/TP] (the chunk trace's copies)
         # P/D producer (pd_transfer.py): callable(slot) invoked by prefill_paged_slots right after a request's GDN
         # snapshot is parked under its slot, so the connector can stage THAT request before the next one prefills.
         self.pd_stage_hook = None
@@ -1141,6 +1154,7 @@ class Qwen36Model:
                 x_new = layer.forward(x, mode="prefill", chunk_size=self.args.gdn_chunk_size, valid_len=None)
             ttnn.deallocate(x)
             x = x_new
+            self._aux_capture(layer, x, self._chunk_aux_bufs)  # DFlash2 aux copies (no-op unless configured)
         return x
 
     def capture_prefill_trace_chunked(
@@ -1318,6 +1332,11 @@ class Qwen36Model:
         self._chunk_sin_buf = ttnn.from_torch(
             sin_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=rep
         )
+        # DFlash2 aux copies of the chunk body (persistent, baked into the trace; None unless prefill_aux_layers)
+        if self._chunk_aux_bufs is not None:
+            for t in self._chunk_aux_bufs:
+                ttnn.deallocate(t)
+        self._chunk_aux_bufs = self._alloc_prefill_aux_bufs(device, chunk_size)
 
         # Warmup outside trace: compile per-chunk programs.
         self._reset_gdn_state_for_new_sequence()
@@ -1948,9 +1967,10 @@ class Qwen36Model:
                 assert actual >= 1, f"request {u}: empty prompt (actual_len={actual})"
                 # Trace-safe prefill into the B=1 scratch: prefill_traced_chunked runs short prompts in
                 # one masked-bucket forward and chunks longer ones; GDN state carries + is snapshotted below.
-                if self.prefill_hidden_hook is not None:
-                    # speculative decoding: who is being prefilled (user, decode slot, its own page-table row)
-                    self._prefill_hook_user = (u, int(empty_slots[u]), pt[u : u + 1].clone())
+                if self.prefill_hidden_hook is not None or self.prefill_aux_hook is not None:
+                    # speculative decoding: who is being prefilled (user, decode slot, its own page-table row, its
+                    # total prompt length -- the DFlash2 hook windows its context on it)
+                    self._prefill_hook_user = (u, int(empty_slots[u]), pt[u : u + 1].clone(), actual)
                 _t1 = _tp()
                 lg = self.prefill_traced_chunked(toks[:, :actual], pt[u : u + 1], actual_len=actual)
                 _t2 = _tp()
@@ -2522,15 +2542,22 @@ class Qwen36Model:
         return ((length + 127) // 128) * 128
 
     def _forward_prefill_chunk_masked(
-        self, token_buf, valid_len, chunk_start, page_table, bucket, flex_sdpa=True, vision_tokens=None
+        self, token_buf, valid_len, chunk_start, page_table, bucket, flex_sdpa=True, vision_tokens=None, aux_sink=None
     ):
         """Single masked fixed-bucket prefill forward over `bucket` positions.
 
         First valid_len tokens real; rest padded. Attn runs full bucket; GDN masks via valid_len.
-        Returns hidden [1,bucket,hidden] or [1,1,bucket,hidden] (TP)."""
+        Returns hidden [1,bucket,hidden] or [1,1,bucket,hidden] (TP). aux_sink: TP only (DFlash2 aux clones)."""
         if self.num_devices > 1:
             return self._forward_prefill_chunk_masked_tp(
-                token_buf, valid_len, chunk_start, page_table, bucket, flex_sdpa=flex_sdpa, vision_tokens=vision_tokens
+                token_buf,
+                valid_len,
+                chunk_start,
+                page_table,
+                bucket,
+                flex_sdpa=flex_sdpa,
+                vision_tokens=vision_tokens,
+                aux_sink=aux_sink,
             )
         block_size = get_block_size(self._paged_kv_caches)
         tok = ttnn.from_torch(
@@ -2579,12 +2606,13 @@ class Qwen36Model:
         return x
 
     def _forward_prefill_chunk_masked_tp(
-        self, token_buf, valid_len, chunk_start, page_table, bucket, flex_sdpa=True, vision_tokens=None
+        self, token_buf, valid_len, chunk_start, page_table, bucket, flex_sdpa=True, vision_tokens=None, aux_sink=None
     ):
         """TP (num_devices>1) masked fixed-bucket single-chunk prefill forward.
 
         flex_sdpa=True: flexible chunked SDPA (serving). flex_sdpa=False: host-int path (debug).
-        Fills K/V for real blocks only. Returns hidden [1,1,bucket,dim]."""
+        Fills K/V for real blocks only. Returns hidden [1,1,bucket,dim]. aux_sink (DFlash2): an empty list that
+        receives a clone of the residual after every prefill_aux_layers layer (the caller deallocates them)."""
         block_size = get_block_size(self._paged_kv_caches)
         tok = ttnn.from_torch(
             token_buf.to(torch.int32),
@@ -2649,6 +2677,7 @@ class Qwen36Model:
                 x_new = layer.forward(x, mode="prefill", chunk_size=self.args.gdn_chunk_size, valid_len=valid_len)
             ttnn.deallocate(x)
             x = x_new
+            self._aux_capture(layer, x, aux_sink)  # DFlash2 aux clones (no-op unless configured)
         # Deallocate per-chunk inputs; only hidden survives (avoids OOM in eager 64k loop).
         ttnn.deallocate(cos)
         ttnn.deallocate(sin)
@@ -2719,13 +2748,25 @@ class Qwen36Model:
         if _tr is not None:
             return self._replay_prefill_bucket_trace_tp(_tr, token_buf, actual_len, chunk_start, page_table)
 
+        aux = [] if (self.num_devices > 1 and self._aux_layer_set()) else None
         hidden = self._forward_prefill_chunk_masked(
-            token_buf, actual_len, chunk_start, page_table, bucket, flex_sdpa=flex_sdpa, vision_tokens=vision_tokens
+            token_buf,
+            actual_len,
+            chunk_start,
+            page_table,
+            bucket,
+            flex_sdpa=flex_sdpa,
+            vision_tokens=vision_tokens,
+            aux_sink=aux,
         )
         ttnn.synchronize_device(self.device)
 
         if self.num_devices > 1:
             self._run_prefill_hidden_hook(hidden, token_buf, actual_len, bucket, chunk_start)
+            if aux:
+                self._run_prefill_aux_hook(aux, token_buf, actual_len, bucket, chunk_start)
+                for t in aux:
+                    ttnn.deallocate(t)
             return self._masked_bucket_logits_tp(hidden, actual_len, bucket)
 
         # One-hot matmul for last row (fixed program per bucket; slice would recompile per length).
@@ -2744,6 +2785,50 @@ class Qwen36Model:
         hook = self.prefill_hidden_hook
         if hook is not None:
             hook(self._prefill_hook_user, hidden, token_buf, actual_len, bucket, chunk_start)
+
+    def _run_prefill_aux_hook(self, aux, token_buf, actual_len, bucket, chunk_start):
+        """DFlash2 observer of the segment's aux hidden copies (see __init__ ``prefill_aux_hook``); no-op unless set."""
+        hook = self.prefill_aux_hook
+        if hook is not None and aux:
+            hook(self._prefill_hook_user, aux, token_buf, actual_len, bucket, chunk_start)
+
+    def _aux_layer_set(self):
+        return set(int(i) for i in (self.prefill_aux_layers or ()))
+
+    def _alloc_prefill_aux_bufs(self, device, length):
+        """Persistent per-aux-layer copy buffers [1,1,length,dim/TP] bf16 DRAM (replicated allocation: every device
+        holds its own hidden shard) for a traced prefill body; None when prefill_aux_layers is empty."""
+        layers = sorted(self._aux_layer_set())
+        if not layers:
+            return None
+        rep = ttnn.ReplicateTensorToMesh(device)
+        return [
+            ttnn.from_torch(
+                torch.zeros(1, 1, length, self.args.dim // self.num_devices, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=rep,
+            )
+            for _ in layers
+        ]
+
+    def _aux_capture(self, layer, x, sink):
+        """Traced/eager bodies: after ``layer``, copy the residual ``x`` for the aux hook. ``sink`` is a list of
+        persistent buffers (traced body: ttnn.copy in place) or an empty list to append clones to (eager body); None or
+        a layer outside prefill_aux_layers = no op."""
+        if sink is None:
+            return
+        layers = sorted(self._aux_layer_set())
+        if layer.layer_num not in layers:
+            return
+        k = layers.index(layer.layer_num)
+        if len(sink) == len(layers) and isinstance(sink[k], ttnn.Tensor):
+            ttnn.copy(x, sink[k])
+        else:
+            assert len(sink) == k, "eager aux sink must receive the aux layers in order"
+            sink.append(ttnn.clone(x, memory_config=ttnn.DRAM_MEMORY_CONFIG))
 
     def _masked_bucket_logits_tp(self, hidden, actual_len, bucket):
         """TP: one-hot select row actual_len-1, norm, lm_head. Returns replicated [1,1,vocab]."""
@@ -2838,6 +2923,7 @@ class Qwen36Model:
                 )
             ttnn.deallocate(x)
             x = x_new
+            self._aux_capture(layer, x, bufs.aux)  # DFlash2 aux copies (no-op unless configured)
         return x
 
     def _alloc_masked_bucket_bufs(self, device, bucket, page_table):
@@ -2879,6 +2965,7 @@ class Qwen36Model:
             sel_x=_up(sel_x_h, ttnn.bfloat16, ttnn.TILE_LAYOUT) if kda_masked else None,
             sel_c=_up(sel_c_h, ttnn.bfloat16, ttnn.TILE_LAYOUT) if kda_masked else None,
             K=K,
+            aux=self._alloc_prefill_aux_bufs(device, bucket),
         )
 
     @staticmethod
@@ -3025,8 +3112,10 @@ class Qwen36Model:
         ttnn.execute_trace(self.device, tr.trace_id, cq_id=0, blocking=False)
         ttnn.synchronize_device(self.device)
         refs.clear()
-        # Speculative decoding: the MTP head reads the bucket's final hidden rows (the trace output, in place).
+        # Speculative decoding: the MTP head reads the bucket's final hidden rows (the trace output, in place); the
+        # DFlash2 hook the bucket's aux copies (persistent buffers, in place).
         self._run_prefill_hidden_hook(tr.output, token_buf, actual_len, bucket, chunk_start)
+        self._run_prefill_aux_hook(tr.bufs.aux, token_buf, actual_len, bucket, chunk_start)
         # Logits eagerly after the replay: 5 queued ops on a program warmed at capture time. The
         # trace output is read in place (never ttnn.clone()'d — a clone draws from the same pool
         # the trace's baked intermediates use).
@@ -3043,6 +3132,9 @@ class Qwen36Model:
                 buf = getattr(tr.bufs, f.name)
                 if isinstance(buf, ttnn.Tensor):  # None on the path not taken; K is a host int
                     ttnn.deallocate(buf)
+                elif isinstance(buf, list):  # aux copy buffers
+                    for t in buf:
+                        ttnn.deallocate(t)
         self._mb_traces = {}
 
     def warmup_prefill_masked_buckets(self, page_table, buckets=None):
@@ -3325,14 +3417,27 @@ class Qwen36Model:
                 token_ids[:, cs : cs + chunk_size], vision_tokens, self._vis_row_offset_for(token_ids, cs)
             )
             # Full chunk: valid_len == bucket == chunk_size (no padding/masking).
+            aux = [] if self._aux_layer_set() else None
             last_hidden = self._forward_prefill_chunk_masked_tp(
-                token_ids[:, cs : cs + chunk_size], chunk_size, cs, page_table, chunk_size, flex_sdpa=flex_sdpa
+                token_ids[:, cs : cs + chunk_size],
+                chunk_size,
+                cs,
+                page_table,
+                chunk_size,
+                flex_sdpa=flex_sdpa,
+                aux_sink=aux,
             )
             ttnn.synchronize_device(self.device)
             # Speculative decoding: MTP prefill of this chunk (tokens + the next chunk's first token, see above).
             self._run_prefill_hidden_hook(
                 last_hidden, token_ids[:, cs : min(cs + chunk_size + 1, actual_len)], chunk_size, chunk_size, cs
             )
+            if aux:
+                self._run_prefill_aux_hook(
+                    aux, token_ids[:, cs : min(cs + chunk_size + 1, actual_len)], chunk_size, chunk_size, cs
+                )
+                for t in aux:
+                    ttnn.deallocate(t)
         if tail_real > 0:
             ttnn.deallocate(last_hidden)
             cs = num_full * chunk_size
@@ -3449,20 +3554,17 @@ class Qwen36Model:
 
             ttnn.execute_trace(self.device, self._chunked_trace_id, cq_id=0, blocking=False)
 
-            if self.prefill_hidden_hook is not None:
+            if self.prefill_hidden_hook is not None or self.prefill_aux_hook is not None:
                 # Speculative decoding: the MTP head prefills this chunk from the trace's output residual (read in
                 # place after the replay completes; the eager head forward then runs before the next chunk's DMAs).
                 # The chunk's tokens travel with the NEXT chunk's first token so the head fills every position of
-                # the chunk (see MTPHead.prefill_hook); the last chunk of an exact-multiple prompt gets none.
+                # the chunk (see MTPHead.prefill_hook); the last chunk of an exact-multiple prompt gets none. The
+                # DFlash2 aux hook reads the chunk body's persistent aux copies the same way.
                 ttnn.synchronize_device(self.device)
                 _host_refs.clear()
-                self._run_prefill_hidden_hook(
-                    self._chunked_trace_output,
-                    token_ids[:, cs : min(cs + chunk_size + 1, actual_len)],
-                    chunk_size,
-                    chunk_size,
-                    cs,
-                )
+                chunk_tokens = token_ids[:, cs : min(cs + chunk_size + 1, actual_len)]
+                self._run_prefill_hidden_hook(self._chunked_trace_output, chunk_tokens, chunk_size, chunk_size, cs)
+                self._run_prefill_aux_hook(self._chunk_aux_bufs, chunk_tokens, chunk_size, chunk_size, cs)
             # Bound in-flight depth; after a sync the completed DMAs' host tensors can be released.
             if (c + 1) % _SYNC_EVERY == 0:
                 ttnn.synchronize_device(self.device)

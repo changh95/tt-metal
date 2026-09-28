@@ -67,11 +67,14 @@ def dflash2_selected() -> bool:
 
 
 def dflash2_context_window() -> int:
-    """How many trailing prompt positions of DFlash2 context K/V the prefill side ships (``QWEN36_DFLASH2_CONTEXT_WINDOW``,
-    default = the drafter's sliding window, 2048; 0 = every position). Every draft layer of Qwen3.8-27B-DFlash2 is a
-    sliding-attention layer of window 2048, so context K/V older than that are never read by the drafter."""
+    """How many trailing prompt positions of DFlash2 context K/V the prefill side computes and ships
+    (``QWEN36_DFLASH2_CONTEXT_WINDOW``; 0 = every position, the default). Every draft layer of Qwen3.8-27B-DFlash2 is a
+    sliding-attention layer of window 2048 in the reference, so a value of 2048 ships only what the reference drafter
+    can read (an 8k prompt: 32 of 128 blocks, 40 MiB instead of 160 MiB of bf16 context K/V) -- turn it on once the
+    device drafter (tt/dflash2_head.py) applies the window; today it attends the whole context, so the default ships
+    every position."""
     v = os.environ.get("QWEN36_DFLASH2_CONTEXT_WINDOW")
-    return DFLASH2_SLIDING_WINDOW if v in (None, "") else int(v)
+    return 0 if v in (None, "") else int(v)
 
 
 def aux_layers_for(model, layers=DFLASH2_TARGET_LAYERS):
@@ -196,15 +199,19 @@ class DFlash2ContextPrefillHook:
     position; ``user_ctx`` = ``(u, slot, page_table_row[, total_len])`` of the request being prefilled
     (``prefill_paged_slots``), None outside it (warm-ups: ignored).
 
-    Projector contract (tt/dflash2_head.py ``DFlash2ContextProjector``, built by the drafter's owner; a stub with the
-    same interface serves the plumbing tests):
-        ``projector.project(aux, positions) -> [(K_0, V_0), ..., (K_4, V_4)]``
-    with ``aux`` the REPLICATED device tensor ``[1,1,S,n_aux*dim]`` bf16 (row = ``[h_5|h_19|h_33|h_47|h_61]``, rows
-    ``>= n_valid`` are padding the projector may compute on and the hook drops), ``positions`` a host int32 ``[S]``
-    (``chunk_start + i``; the RoPE positions of the context keys) and each ``K_j`` / ``V_j`` a HOST torch bf16
-    ``[S, kv_heads, head_dim]`` in GLOBAL kv-head order (heads ``[2d, 2d+1]`` of a TP=4 mesh come from device d).
-    Optional fast path: a projector exposing ``project_fractured(aux_frac, positions)`` gets the fractured list
-    instead (skips the hook's all-gather; device d holds columns ``[d*dim/n_dev, (d+1)*dim/n_dev)`` of every aux).
+    Projector contract (tt/dflash2_head.py ``DFlash2ContextProjector``, built by the drafter's owner; the stub in
+    tests/dflash2_stub.py has the same interface): ``[(K_0, V_0), ..., (K_4, V_4)]`` with each ``K_j`` / ``V_j`` a
+    HOST torch bf16 ``[S, kv_heads, head_dim]`` in GLOBAL kv-head order (heads ``[2d, 2d+1]`` of a TP=4 mesh come
+    from device d), ``positions`` a host int ``[S]`` (``chunk_start + i``; the RoPE positions of the context keys),
+    rows ``>= n_valid`` padding the projector may compute on and the hook drops. The hook picks the first of:
+      * ``project_device(aux_rep, positions)`` -- ``aux_rep`` the REPLICATED device tensor ``[1,1,S,n_aux*dim]`` bf16
+        (row = ``[h_5|h_19|h_33|h_47|h_61]``; the hook all-gathers the fractured copies); no host round trip of the
+        105 MB/chunk aux rows -- the fast path the drafter's owner can expose (``DFlash2Drafter.project_kv`` is fed
+        exactly this tensor);
+      * ``project_fractured(aux_frac, positions)`` -- the fractured list itself (device d holds columns
+        ``[d*dim/n_dev, (d+1)*dim/n_dev)`` of every aux; skips the all-gather too);
+      * ``project(aux, positions)`` -- ``aux`` a HOST torch bf16 ``[S, n_aux*dim]`` (``DFlash2ContextProjector.project``
+        as built: it uploads the rows itself; the hook gathers + reads them back, ~2 x 105 MB per 2048 chunk).
 
     Window: with ``total_len`` in ``user_ctx`` and a finite ``dflash2_context_window()``, segments that end before
     ``total_len - window`` (rounded down to a KV block) are skipped -- the drafter never reads them -- and the stage's
@@ -250,16 +257,23 @@ class DFlash2ContextPrefillHook:
             return
         positions = torch.arange(cs, cs + int(bucket), dtype=torch.int32)
         t1 = time.perf_counter()
-        fast = getattr(self.projector, "project_fractured", None)
-        if fast is not None:
-            kv = fast(aux_frac, positions)
+        on_device = getattr(self.projector, "project_device", None)
+        fractured = getattr(self.projector, "project_fractured", None)
+        if fractured is not None and on_device is None:
             t2 = time.perf_counter()
+            kv = fractured(aux_frac, positions)
         else:
             aux_rep = gather_aux_replicated(self.model, aux_frac)
             ttnn.synchronize_device(self.model.mesh_device)
-            t2 = time.perf_counter()
-            kv = self.projector.project(aux_rep, positions)
-            ttnn.deallocate(aux_rep)
+            if on_device is None:
+                rows = aux_rows_to_host(self.model, aux_rep)  # [S, n_aux*dim] bf16 host
+                ttnn.deallocate(aux_rep)
+                t2 = time.perf_counter()
+                kv = self.projector.project(rows, positions)
+            else:
+                t2 = time.perf_counter()
+                kv = on_device(aux_rep, positions)
+                ttnn.deallocate(aux_rep)
         t3 = time.perf_counter()
         skip = max(0, stage.first_pos - cs)  # rows of this segment before the window start
         if skip:
@@ -267,7 +281,7 @@ class DFlash2ContextPrefillHook:
         stage.append(kv, n - skip, cs + skip)
         self.stats["calls"] += 1
         self.stats["tokens"] += n - skip
-        self.stats["gather"] += t2 - t1
+        self.stats["gather"] += t2 - t1  # all-gather (+ host readback on the host-facing projector path)
         self.stats["project"] += t3 - t2
         self.stats["wall"] += time.perf_counter() - t0
         logger.debug(
@@ -278,3 +292,43 @@ class DFlash2ContextPrefillHook:
     def pop(self, slot):
         """The staged context K/V of ``slot`` (a ``KvGroupStage``) or None; taken (the export consumes it)."""
         return self.store.pop(int(slot), None)
+
+    def compile(self, buckets):
+        """Compile-first rule (tests/VERIFY_W32_AUDIT.md): run the hook's device programs once per segment width
+        (every masked bucket + the 2048 chunk) on zero aux copies BEFORE the prefill warm-up captures any trace --
+        the all-gathers / concat of ``gather_aux_replicated`` and the projector's ops otherwise compile at request
+        time (a 4196-token request paid 1.4 s of gather + 1.4 s of projector JIT in the first run). Stages nothing."""
+        t0 = time.perf_counter()
+        n_aux = len(self.model.prefill_aux_layers)
+        dim_tp = self.model.args.dim // self.model.num_devices
+        rep = ttnn.ReplicateTensorToMesh(self.model.mesh_device)
+        for bucket in sorted(set(int(b) for b in buckets)):
+            aux = [
+                ttnn.from_torch(
+                    torch.zeros(1, 1, bucket, dim_tp, dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.model.mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=rep,
+                )
+                for _ in range(n_aux)
+            ]
+            positions = torch.arange(bucket, dtype=torch.int32)
+            on_device = getattr(self.projector, "project_device", None)
+            fractured = getattr(self.projector, "project_fractured", None)
+            if fractured is not None and on_device is None:
+                fractured(aux, positions)
+            else:
+                aux_rep = gather_aux_replicated(self.model, aux)
+                if on_device is None:
+                    self.projector.project(aux_rows_to_host(self.model, aux_rep), positions)
+                else:
+                    on_device(aux_rep, positions)
+                ttnn.deallocate(aux_rep)
+            ttnn.synchronize_device(self.model.mesh_device)
+            for t in aux:
+                ttnn.deallocate(t)
+        logger.info(
+            f"[dflash2] prefill hook programs compiled for buckets {sorted(set(buckets))} in {time.perf_counter() - t0:.1f}s"
+        )
