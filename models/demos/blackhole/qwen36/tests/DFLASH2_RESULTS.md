@@ -273,3 +273,27 @@ At w=1 the step is weight-streaming bound (~540 MB of bfp8 weights + ~100 ops pe
 * **Not needed**: the drafter has no per-request host state (no `hidden_in` row, no chained KV of its own past the
   committed positions), so slot admission/eviction only has to keep the block ids; a request whose drafter context
   is missing simply decodes plainly (drafts of zeros are rejected, `pad` users are skipped).
+
+## 6. Served integration (M4d, 2026-09-28) -- see the plugin's docs/SPECULATIVE.md for the design and the A/B tables
+
+`QWEN36_SPEC_DRAFTER=dflash2` on both halves of the 4+4 P/D stack: `qwen36_vllm._build_drafter_if_enabled` builds the
+`DFlash2Drafter` with the KV caches (540 MiB weights + 2736 MiB context KV per chip at the 1,052,672-token D pool;
+6.5 GB DRAM free after warm-up), `tt/spec_decoder.py` runs it behind the drafter adapter (`keep_aux_hidden` verify
+plans, traced `commit(plan, positions)` per plan captured right after each verify trace, one block draft step per
+bucket width, first k of the 7 path tokens; a request whose payload lacked the KV group decodes with no drafts), the
+runner reports the imported context per slot (`spec_note_admission` -> `SpecDecoder.note_context`), no catch-up step.
+Ladders (`tt/spec_serving.py`, knob `QWEN36_SPEC_ALLOW_FRACTURED`): default `1:8,2:8,4:8,8:8,16:2` (R <= 64), `0` ->
+`1:8,2:8,4:8,8:4,16:2` (bitwise), `1` -> + `32:2`. The P-side prefill hook projects the aux rows in <= 256-row chunks
+(`spec_decoder.RowChunkedProjector`: the small-M matmul configs of `project_kv` exceed L1 at the 2048-row chunk).
+
+* Device scenario (`tests/test_spec_serving_scratch.py SPEC_DRAFTER=dflash2`, half B, 3 -> 6 -> 9 -> 17 users, flush /
+  migration / no-context user / plain-forced steps): bitwise ladder -- every stream bitwise the plain decode
+  (`logs/spec_serving_df2d.log`); default ladder -- 2 divergences, both greedy near-ties of gap 0.125 (one at the
+  (8,T=8) step, one at a later plain step of a user that had run it: the fractured path's ulp-level state carries
+  forward), nothing else (`logs/spec_serving_df2e.log`); the MTP scenario unchanged (`logs/spec_serving_mtp_regress.log`).
+* Served gate (all 8 chips, `scripts/spec_ab_gate.sh` / `spec_gate_variant.sh`, `logs/served_spec_*/summary.txt`):
+  GSM8K lm-eval 200 = 0.835 (R <= 64) / 0.82 (bitwise) / 0.82 (mtp); det_probe deterministic; self-consistency over
+  1..32 users x 64 tokens ALL MATCH for the bitwise ladder and mtp, 10/63 streams differ with the R = 64 plan (near-tie
+  flips) -> the bundle ships `QWEN36_SPEC_ALLOW_FRACTURED=0`. GSM8K text TPOT (bitwise dflash2 / mtp): 9.4 / 12.1 ms at
+  1 user, 10.3 / 13.0 at 4, 15.3 / 14.4 at 8, 31.1 / 22.9 at 16, 39 / 38 at 32 (plain); vLLM acceptance length 5.9-6.3
+  at k = 7 on lm-eval GSM8K answers (8 users, R <= 64 run), 3.5-3.6 at k = 3.
