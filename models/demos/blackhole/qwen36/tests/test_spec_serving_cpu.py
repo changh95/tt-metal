@@ -64,6 +64,151 @@ def test_ladder_clamps_k_and_fractured(expect_error):
         ss.Ladder.from_spec("12:3", k_max=3, max_batch=32)  # 36 rows -> 64
 
 
+def test_ladder_dflash2_default_bitwise_and_fractured(expect_error):
+    """The DFlash2 block drafter's ladder (spec_serving module docstring): T=8 up to 8 users (bucket 8 = the R=64
+    fractured plan), T=2 up to 16, plain above; QWEN36_SPEC_ALLOW_FRACTURED unset / 0 / 1."""
+    lad = ss.Ladder.for_drafter("dflash2", k_max=7, max_batch=32)
+    assert [(p.w, p.T) for p in lad.plans] == [(1, 8), (2, 8), (4, 8), (8, 8), (16, 2)]
+    assert lad.max_rows == 64 and [str(p) for p in lad.fractured_plans] == ["(8,T=8)"]
+    assert lad.plan_for(1) == ss.Plan(1, 8) and lad.plan_for(3) == ss.Plan(4, 8) and lad.plan_for(4) == ss.Plan(4, 8)
+    assert lad.plan_for(5) == ss.Plan(8, 8) and lad.plan_for(8) == ss.Plan(8, 8)
+    assert lad.plan_for(9) == ss.Plan(16, 2) and lad.plan_for(16) == ss.Plan(16, 2)
+    assert lad.plan_for(17) is None
+    assert lad.band_max(8) == 8 and lad.band_max(2) == 16
+    assert lad.min_T_above(8) == 1 and lad.min_T_above(16) == 1  # plain reachable above both bands
+    assert lad.widths == [1, 2, 4, 8, 16]
+    # 0 = strictly bitwise: (8,4) replaces (8,8), every R <= 32
+    bit = ss.Ladder.for_drafter("dflash2", 7, 32, allow_fractured="0")
+    assert [(p.w, p.T) for p in bit.plans] == [(1, 8), (2, 8), (4, 8), (8, 4), (16, 2)]
+    assert bit.max_rows == 32 and bit.fractured_plans == [] and all(p.R <= 32 for p in bit.plans)
+    # 1 = the R<=64 ladder plus the (32,2) tail
+    fr = ss.Ladder.for_drafter("dflash2", 7, 32, allow_fractured="1")
+    assert [(p.w, p.T) for p in fr.plans] == [(1, 8), (2, 8), (4, 8), (8, 8), (16, 2), (32, 2)]
+    assert fr.plan_for(17) == ss.Plan(32, 2) and [str(p) for p in fr.fractured_plans] == ["(8,T=8)", "(32,T=2)"]
+    # the T=4 band for 9..16 users is selectable (R = 64, near-tie-bounded)
+    t4 = ss.Ladder.for_drafter("dflash2", 7, 32, spec="1:8,2:8,4:8,8:8,16:4")
+    assert t4.plan_for(12) == ss.Plan(16, 4) and t4.plan_for(12).R == 64
+    with expect_error(AssertionError, "R = 64"):
+        ss.Ladder.for_drafter("dflash2", 7, 32, spec="1:8,2:8,4:8,8:8,16:4", allow_fractured="0")
+    with expect_error(AssertionError, "R = 128"):
+        ss.Ladder.for_drafter("dflash2", 7, 32, spec="1:8,16:8", allow_fractured="1")
+    # k clamps T: QWEN36_SPEC_K=3 with the block drafter -> the first 3 path tokens, T=4 plans
+    k3 = ss.Ladder.for_drafter("dflash2", 3, 32)
+    assert [(p.w, p.T) for p in k3.plans] == [(1, 4), (2, 4), (4, 4), (8, 4), (16, 2)]
+    # the MTP ladder through the same entry points is unchanged
+    assert [(p.w, p.T) for p in ss.Ladder.for_drafter("mtp", 3, 32).plans] == [
+        (1, 4),
+        (2, 4),
+        (4, 4),
+        (8, 4),
+        (10, 3),
+        (16, 2),
+    ]
+    assert ss.Ladder.for_drafter("mtp", 3, 32).max_rows == 32
+    assert ss.Ladder.for_drafter("mtp", 3, 32, allow_fractured="1").plans[-1] == ss.Plan(32, 2)
+    assert ss.Ladder.for_drafter("mtp", 3, 32, allow_fractured="0").plans == ss.Ladder.for_drafter("mtp", 3, 32).plans
+    env = {"QWEN36_SPEC_ALLOW_FRACTURED": "0", "QWEN36_SPEC_LADDER": "1:8,4:8"}
+    assert [(p.w, p.T) for p in ss.Ladder.from_env("dflash2", 7, 32, env).plans] == [(1, 8), (4, 8)]
+    assert [(p.w, p.T) for p in ss.Ladder.from_env("dflash2", 7, 32, {}).plans] == [(p.w, p.T) for p in lad.plans]
+    with expect_error(AssertionError, "expected 0 or 1"):
+        ss.Ladder.for_drafter("dflash2", 7, 32, allow_fractured="yes")
+    with expect_error(AssertionError, "unknown drafter"):
+        ss.Ladder.for_drafter("eagle", 7, 32)
+
+
+def test_hold_info_dflash2_bands(expect_error):
+    """T=8 band: a pending prefix of up to 7 rows never fits the T=2 band above (min T above 8 is 1: plain is
+    reachable), so every admission that leaves the band is held; inside the band (free slots below 8) it is not."""
+    st = ss.SpecServingState(ss.Ladder.for_drafter("dflash2", 7, 32), 32)
+    rows = [f"r{s}" if s in (0, 1, 4) else None for s in range(32)]
+    sp = st.begin_step(rows, [list(range(10, 17)) if r else None for r in rows], eligible=True)
+    assert sp.plan == ss.Plan(8, 8) and sp.plan.R == 64 and sp.n_drafts[0] == 7
+    tokens = st.grid_tokens(sp, [1] * 8)
+    am = torch.zeros(64, dtype=torch.int64)
+    for j in range(7):
+        am[vg.row(0, j, 8)] = 10 + j  # user 0 accepts all 7 drafts
+    accepts, committed = st.commit(sp, am, tokens)
+    assert accepts[0] == 7 and len(committed[0]) == 8 and accepts[1] == 0 and committed[1] == [0]
+    h = st.hold_info()
+    assert h.pending_any and h.T == 8 and h.band_max == 8 and h.slots_before_crossing == 5  # free below 8: 2,3,5,6,7
+    # five more users fit the band (w_grid 8): no flush needed, no migration within the (8,8) bucket
+    rows2 = [f"r{s}" for s in range(8)] + [None] * 24
+    sp2 = st.begin_step(rows2, [[1] if r else None for r in rows2], eligible=True)
+    assert sp2.plan == ss.Plan(8, 8) and not sp2.migrate and sp2.accept_prev[0] == 7
+    # a 9th user without a flush breaks the prefix (a_s = 7 > T_new - 1 = 1)
+    st.commit(sp2, torch.zeros(64, dtype=torch.int64), st.grid_tokens(sp2, [1] * 8))
+    sp3 = st.begin_step(rows2, [[1, 2, 3, 4, 5, 6, 7] if r else None for r in rows2], eligible=True)
+    am = torch.zeros(64, dtype=torch.int64)
+    am[vg.row(3, 0, 8)] = 1
+    am[vg.row(3, 1, 8)] = 2  # user 3 accepts 2
+    st.commit(sp3, am, st.grid_tokens(sp3, [1] * 8))
+    rows3 = rows2[:8] + ["r8"] + [None] * 23
+    with expect_error(ss.SpecProtocolError, "plan change"):
+        st.begin_step(rows3, [[1] if r else None for r in rows3], eligible=True)
+
+
+@pytest.mark.parametrize("policy", ["mixed", "oracle", "random"])
+@pytest.mark.parametrize("knob", [None, "0", "1"])
+def test_dflash2_ladder_joins_leaves_cross_bands(policy, knob):
+    """The 3 -> 9 -> 17 ramp and drain on the DFlash2 ladders (k_max = 7): the T=8 -> T=2 band-up crossing at the 9th
+    user needs a flush whenever a prefix is pending, the (32,2) tail (knob 1) keeps 17+ users speculative, the
+    drain migrates back down -- every stream stays the greedy one."""
+    seed = 11 + len(policy)
+    rng = random.Random(seed)
+    lad = ss.Ladder.for_drafter("dflash2", 7, 32, allow_fractured=knob)
+    sim = Sim(lad, 32, policy, seed=seed)
+    waves = [(0, 3), (3, 6), (7, 8), (40, 2)]
+    n = 0
+    wants, submitted = {}, {}
+    for at, cnt in waves:
+        for _ in range(cnt):
+            wants[f"r{n}"] = rng.randrange(25, 60)
+            submitted.setdefault(at, []).append(f"r{n}")
+            n += 1
+    step = 0
+    while submitted or sim.pending_join or sim.live_count() > 0:
+        for rid in submitted.pop(step, []):
+            sim.submit(rid, [rng.randrange(50) for _ in range(3 + rng.randrange(4))], want=wants[rid])
+        if sim.live_count() == 0 and not sim.pending_join:
+            step += 1
+            continue
+        sp = sim.step()
+        if sp.mode == "spec":
+            assert sp.plan.R <= lad.max_rows
+        step += 1
+        assert step < 3000
+    sim.check_streams()
+    st = sim.state.stats
+    plans = {p for m, p, *_ in sim.step_log if p is not None}
+    assert {p.T for p in plans} >= {8, 2}, plans
+    if knob == "1":
+        assert ss.Plan(32, 2) in plans and st["plain_steps"] == 0, (plans, st)
+    else:
+        assert st["plain_steps"] >= 1, st  # 17 users -> plain decode
+    if policy == "oracle":
+        assert st["flushes"] >= 1 and st["migrations"] >= 1, st
+        # k = 7 accepted every step in the T=8 band: 8 tokens per user per step
+        t8 = [e for e in sim.step_log if e[0] == "spec" and e[1].T == 8 and not e[2]]
+        assert t8, sim.step_log[:5]
+    for rid, r in sim.req.items():
+        assert len(r["stream"]) - 1 >= r["want"]
+
+
+def test_fresh_slot_state_callback_alias():
+    """``has_state`` is the drafter-neutral name of ``has_hidden`` (MTP hidden row / DFlash2 context K/V)."""
+    st = ss.SpecServingState(ss.Ladder.for_drafter("dflash2", 7, 8), 8)
+    rows = ["a", None, "b", None, None, None, None, None]
+    sp = st.begin_step(
+        rows, [[1, 2], None, [], None, None, None, None, None], eligible=True, has_state=lambda s: s == 2
+    )
+    assert (
+        sp.plan == ss.Plan(4, 8) and sp.catchup == [2] and sp.n_drafts == [2, 0, 0, 0] and sp.drafts[0][:3] == [1, 2, 0]
+    )
+    st.commit(sp, torch.zeros(32, dtype=torch.int64), st.grid_tokens(sp, [5, 0, 6, 0]))
+    sp2 = st.begin_step(rows, [[1], None, [], None, None, None, None, None], eligible=True, has_hidden=lambda s: True)
+    assert sp2.catchup == []  # both slots have run a step
+
+
 # ------------------------------------------------------------------------------------------------ helpers
 def test_commit_with_real_draft_counts():
     T = 4

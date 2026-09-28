@@ -1,19 +1,32 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Device side of SERVED speculative decoding with the MTP drafter (the P/D decode engine, TP=4).
+"""Device side of SERVED speculative decoding (the P/D decode engine, TP=4) with either drafter.
 
 One ``SpecDecoder`` per model owns the verify plans of the ladder (tt/spec_serving.py: one traced ``VerifyStep`` per
-(bucket width, T), pad-safe, keep_hidden), the drafter's draft-step traces per bucket width (tt/mtp_head.py) and the
-host state machine (``SpecServingState``). Per decode step the vLLM wrapper (tt/qwen36_vllm.py) hands it the padded
-decode inputs of the plugin (tokens [B,1], positions [B] with -1 pad rows, block tables [B, blocks], the request per
-row, the scheduled draft tokens per row, whether every request may take the greedy verify path, and the scheduler's
-flush request) and gets back, per grid row, the committed tokens (1..1+K_s) and the drafts for the next step -- or
-None when the step must run as a plain decode (above the ladder, or a request that forces host/sampled decoding).
+(bucket width, T), pad-safe), the drafter's per-width draft-step traces and the host state machine
+(``SpecServingState``). Per decode step the vLLM wrapper (tt/qwen36_vllm.py) hands it the padded decode inputs of the
+plugin (tokens [B,1], positions [B] with -1 pad rows, block tables [B, blocks], the request per row, the scheduled
+draft tokens per row, whether every request may take the greedy verify path, and the scheduler's flush request) and
+gets back, per grid row, the committed tokens (1..1+K_s) and the drafts for the next step -- or None when the step
+must run as a plain decode (above the ladder, or a request that forces host/sampled decoding).
 
-Step = [migrate qkv_prev rows on a plan change] -> [catch-up draft step for freshly admitted users: writes the head's
-KV at P_s-1 from the imported hidden row] -> verify (traced, R <= 32 = bitwise the decode step) -> commit -> select
-the accepted rows' hidden states into the drafter -> k chained draft steps (traced). Every program runs compiled
-before any trace is captured (``compile`` in the first warm-up phase, ``capture`` in the second; VERIFY_W32_AUDIT.md).
+Drafters (``QWEN36_SPEC_DRAFTER``, tt/aux_hidden.py ``spec_drafter``), behind one adapter interface (``_MtpDrafter`` /
+``_DFlash2Drafter``):
+  * ``mtp`` -- the checkpoint's MTP head (tt/mtp_head.py). Verify plans keep the post-norm hidden rows
+    (``keep_hidden``); step = [migrate qkv_prev rows on a plan change] -> [catch-up draft step for freshly admitted
+    users: writes the head's KV at P_s-1 from the imported hidden row] -> verify -> commit -> select the accepted rows'
+    hidden states into the head (exact 0/1 matmul) -> k chained draft steps (traced per width).
+  * ``dflash2`` -- the DFlash2 block-diffusion drafter (tt/dflash2_head.py, z-lab/Qwen3.8-27B-DFlash2). Verify plans
+    keep the target's aux hidden rows (``keep_aux_hidden`` -> ``plan.out_aux``); step = [migrate] -> verify -> commit
+    -> ``drafter.commit(plan, positions)`` (traced per plan: the grid rows' aux -> the drafter's context K/V at
+    P_s + j) -> ONE traced block draft step at the bucket width (7 drafts per user, the first k used). The prompt's
+    context K/V arrive with the P/D payload (KV group "dflash2", imported into the drafter's caches by the connector
+    before admission) or from a local prefill hook; the runner reports the import per slot (``note_context``) and a
+    request without it decodes with no drafts (its rows are padding in the draft step). No hidden row and no
+    catch-up step: the first verify step at P_s = N (row 0 = P's first token) commits the aux row of position N, so
+    the first draft (anchor = the committed token at N + a_s, positions N + a_s + 1 ..) reads a gap-free context.
+Every program runs compiled before any trace is captured (``compile`` in the first warm-up phase, ``capture`` in the
+second; tests/VERIFY_W32_AUDIT.md).
 """
 import os
 import time
@@ -44,13 +57,220 @@ class SpecStepResult:
     times_ms: dict = field(default_factory=dict)
 
 
+# ================================================================================================ drafter adapters
+class _MtpDrafter:
+    """The MTP head behind the decoder's drafter interface (the op sequence of the 2026-09-25 served loop)."""
+
+    name = "mtp"
+    post_name = "select"  # the per-step op between the verify commit and the draft (metrics key)
+
+    def __init__(self, head):
+        self.head = head
+
+    def verify_kwargs(self):
+        return dict(keep_hidden=True)
+
+    def build_step_buffers(self, widths, page_tables):
+        self.head.build_step_buffers(widths, page_tables)
+
+    def bind_plan(self, plan):
+        self.head.bind_plan(plan)
+
+    def compile_width(self, w):
+        self.head.compile_step(w)
+
+    def compile_plan(self, vs):
+        self.head.compile_select(vs.plan)
+
+    def capture_width(self, w):
+        self.head.capture_step(w)
+
+    def capture_plan(self, vs):
+        pass
+
+    def release(self):
+        self.head.release()
+
+    # --- per-slot state ---
+    def has_state(self, slot) -> bool:
+        return slot in self.head.pending_rows
+
+    def drop_state(self, slot):
+        self.head.pending_rows.pop(slot, None)
+
+    def note_context(self, slot, req_id, meta):
+        pass  # the hidden row arrives through MTPHead.set_hidden_in (pd_transfer.import_mtp_hidden)
+
+    def drafts_enabled(self, slot) -> bool:
+        return True
+
+    # --- per step ---
+    def catchup(self, w, sp, last, pos, pt):
+        """The fresh users' first draft step: (t'_s, h_{P_s-1}) at P_s - 1 fills the head's KV hole left by the
+        prefill (positions ..P_s-2) before the post-verify chain attends over it; its draft is not used (the scheduler
+        gave these users no draft slots this step)."""
+        rows_h = {s: self.head.pending_rows.pop(s) for s in sp.catchup}
+        self.head.set_page_table(w, pt)
+        self.head.upload_hidden_rows(w, rows_h)
+        cu = set(sp.catchup)
+        self.head.run_step(
+            w, [last[s] if s in cu else 0 for s in range(w)], [pos[s] - 1 if s in cu else -1 for s in range(w)]
+        )
+
+    def after_verify(self, vs, sp, accepts, pos_before):
+        self.head.select_hidden(vs.plan, accepts)
+
+    def draft(self, w, k, last, positions, pad, pt):
+        self.head.set_page_table(w, pt)
+        return self.head.draft(w, k, last, positions, pad=pad)
+
+
+class _DFlash2Drafter:
+    """The DFlash2 block drafter behind the decoder's drafter interface (module docstring)."""
+
+    name = "dflash2"
+    post_name = "commit"
+
+    def __init__(self, head):
+        self.head = head
+        self.aux_layers = tuple(int(i) for i in head.cfg.target_layer_ids)
+        self.context = {}  # slot -> (req_id, meta) of the imported / prefilled context K/V
+        self._warned_window = False
+
+    def verify_kwargs(self):
+        return dict(keep_aux_hidden=True, aux_layers=self.aux_layers)
+
+    def build_step_buffers(self, widths, page_tables):
+        self.head.build_step_buffers(widths, page_tables)
+
+    def bind_plan(self, plan):
+        self.head.bind_plan(plan)
+
+    def compile_width(self, w):
+        self.head.compile_step(w)
+
+    def compile_plan(self, vs):
+        self.head.compile_commit(vs.plan)
+
+    def capture_width(self, w):
+        self.head.capture_step(w)
+
+    def capture_plan(self, vs):
+        self.head.capture_commit(vs.plan)  # reads the verify trace's out_aux: after vs.capture()
+
+    def release(self):
+        self.head.release()
+
+    # --- per-slot state ---
+    def note_context(self, slot, req_id, meta):
+        """The runner (or a local prefill path) reports that decode ``slot``'s request ``req_id`` has its prompt's
+        context K/V in the drafter caches (``meta`` = the payload group's header entry: first_pos, n_tokens, ...);
+        ``meta`` None = the request arrived without them (it decodes with no drafts)."""
+        slot = int(slot)
+        if meta is None:
+            self.context.pop(slot, None)
+            return
+        if int(meta.get("first_pos", 0)) != 0 and not self._warned_window:
+            self._warned_window = True
+            logger.warning(
+                f"[spec] dflash2 context of slot {slot} starts at position {meta.get('first_pos')}: the device drafter "
+                "attends the whole context (no sliding window); positions below hold stale blocks"
+            )
+        self.context[slot] = (req_id, dict(meta))
+
+    def has_state(self, slot) -> bool:
+        return slot in self.context
+
+    def drop_state(self, slot):
+        self.context.pop(slot, None)
+
+    def drafts_enabled(self, slot) -> bool:
+        return slot in self.context
+
+    # --- per step ---
+    def catchup(self, w, sp, last, pos, pt):
+        pass  # no hidden row: the context is complete once the first verify step's commit ran (module docstring)
+
+    def after_verify(self, vs, sp, accepts, pos_before):
+        self.head.commit(vs.plan, pos_before)
+
+    def draft(self, w, k, last, positions, pad, pt):
+        self.head.set_page_table(w, pt)
+        drafts7, _, _ = self.head.draft(w, last, positions, pad=pad)
+        return [list(d[:k]) for d in drafts7]
+
+
+class RowChunkedProjector:
+    """``DFlash2ContextProjector`` over row chunks (the P-side prefill hook's projector): the drafter's projection
+    GEMMs use the small-M 1D matmul configs (every M tile on each core), whose static circular buffers exceed L1 at
+    the 2048-row prefill chunk / masked buckets >= 512 (2.6 MB of CBs at 2048 rows; logs/spec_serving_df2a.log). The
+    rows are independent (fc -> hidden_norm -> K/V GEMM -> k_norm -> RoPE per row), so the wrapper slices the
+    replicated aux tensor into <= ``rows`` rows (tile aligned; ``QWEN36_DFLASH2_PROJECT_ROWS``, default 256, the
+    largest size the drafter harness ran) and concatenates the per-layer host K/V it gets back."""
+
+    def __init__(self, projector, rows=None):
+        self.p = projector
+        self.rows = int(rows if rows is not None else os.environ.get("QWEN36_DFLASH2_PROJECT_ROWS", "256"))
+        if self.rows % 32 != 0 or self.rows <= 0:
+            raise ValueError(f"QWEN36_DFLASH2_PROJECT_ROWS={self.rows}: expected a positive multiple of 32")
+        self.head_dim = projector.head_dim
+        self.n_kv_heads = projector.n_kv_heads
+
+    @staticmethod
+    def _cat(parts):
+        if len(parts) == 1:
+            return parts[0]
+        n_layers = len(parts[0])
+        return [(torch.cat([p[j][0] for p in parts]), torch.cat([p[j][1] for p in parts])) for j in range(n_layers)]
+
+    def project(self, aux, positions):
+        """Host rows [N, 5*dim] -> per layer (K, V) host bf16 [N, n_kv_heads, HD] (DFlash2ContextProjector.project)."""
+        aux = torch.as_tensor(aux)
+        pos = torch.as_tensor(positions).reshape(-1)
+        N = int(aux.shape[0])
+        return self._cat(
+            [
+                self.p.project(aux[a : min(N, a + self.rows)], pos[a : min(N, a + self.rows)])
+                for a in range(0, N, self.rows)
+            ]
+        )
+
+    def project_device(self, aux_rep, positions):
+        """The REPLICATED device rows [1,1,N,5*dim] (left alone) -> per layer (K, V) host bf16 [N, n_kv_heads, HD]."""
+        import ttnn
+
+        N = int(aux_rep.shape[-2])
+        pos = torch.as_tensor(positions).reshape(-1)[:N]
+        if N <= self.rows:
+            return self.p.project_device(aux_rep, pos)
+        parts = []
+        W = int(aux_rep.shape[-1])
+        for a in range(0, N, self.rows):
+            b = min(N, a + self.rows)
+            sl = ttnn.slice(aux_rep, (0, 0, a, 0), (1, 1, b, W))
+            parts.append(self.p.project_device(sl, pos[a:b]))
+            ttnn.deallocate(sl)
+        return self._cat(parts)
+
+
+def make_drafter(head):
+    """The adapter for a drafter module: an MTPHead or a DFlash2Drafter (duck-typed on their distinctive API)."""
+    if hasattr(head, "select_hidden") and hasattr(head, "pending_rows"):
+        return _MtpDrafter(head)
+    if hasattr(head, "commit") and hasattr(head, "cfg") and hasattr(head.cfg, "target_layer_ids"):
+        return _DFlash2Drafter(head)
+    raise TypeError(f"unknown drafter module {type(head).__name__}")
+
+
+# ================================================================================================ the decoder
 class SpecDecoder:
     def __init__(self, model, head, ladder: ss.Ladder, bmax: int, num_blocks_pt: int, log_every: Optional[int] = None):
-        """model: the Qwen36Model (KV caches allocated); head: its MTPHead (prefill buckets may already be compiled by
-        the P-side installer; the draft-step buffers of the ladder's widths are built here); num_blocks_pt: the
-        served block-table width (max_num_blocks_per_req, a multiple of 8). Allocates every persistent buffer
-        (call before ANY trace capture)."""
+        """model: the Qwen36Model (KV caches allocated); head: its drafter -- the MTPHead (prefill buckets may already
+        be compiled by the P-side installer) or the DFlash2Drafter (weights + context caches built with the KV caches);
+        the draft-step buffers of the ladder's widths are built here. num_blocks_pt: the served block-table width
+        (max_num_blocks_per_req, a multiple of 8). Allocates every persistent buffer (call before ANY trace capture)."""
         self.model = model
+        self.drafter = make_drafter(head)
         self.head = head
         self.mesh = model.mesh_device
         self.ladder = ladder
@@ -64,58 +284,63 @@ class SpecDecoder:
         self.state = ss.SpecServingState(ladder, self.bmax)
         zeros_pt = torch.zeros(self.bmax, self.nb, dtype=torch.int32)
         t0 = time.perf_counter()
-        head.build_step_buffers(ladder.widths, zeros_pt)
+        self.drafter.build_step_buffers(ladder.widths, zeros_pt)
         self.steps = {}
         for plan in ladder.plans:
-            vs = VerifyStep(model, plan.w, plan.T, zeros_pt[: plan.w], keep_hidden=True, pad_safe=True)
+            vs = VerifyStep(model, plan.w, plan.T, zeros_pt[: plan.w], pad_safe=True, **self.drafter.verify_kwargs())
             assert vs.plan.attn_mode == "batched", vs.plan.attn_mode
-            head.bind_plan(vs.plan)
+            self.drafter.bind_plan(vs.plan)
             self.steps[plan] = vs
         self.log_every = int(os.environ.get("QWEN36_SPEC_LOG_EVERY", "50")) if log_every is None else int(log_every)
         self._compiled = self._captured = False
         self.n_steps = 0
-        self.acc = {"verify_ms": 0.0, "select_ms": 0.0, "draft_ms": 0.0, "catchup_ms": 0.0, "migrate_ms": 0.0}
+        self.post_key = f"{self.drafter.post_name}_ms"
+        self.acc = {"verify_ms": 0.0, self.post_key: 0.0, "draft_ms": 0.0, "catchup_ms": 0.0, "migrate_ms": 0.0}
         self.acc_tokens = 0
         self.acc_users = 0
         self.acc_accepted = 0
+        self.n_no_context = 0  # dflash2: user-steps drafted as padding (no context K/V for the request)
         logger.info(
-            f"[spec] decoder: ladder {[str(p) for p in ladder.plans]} k_max={ladder.k_max} bmax={self.bmax} "
-            f"page table {self.nb} blocks; {len(self.steps)} verify plans + {len(ladder.widths)} draft widths allocated "
-            f"in {time.perf_counter() - t0:.1f}s"
+            f"[spec] decoder ({self.drafter.name}): ladder {[str(p) for p in ladder.plans]} k_max={ladder.k_max} "
+            f"bmax={self.bmax} page table {self.nb} blocks; fractured plans {[str(p) for p in ladder.fractured_plans]}; "
+            f"{len(self.steps)} verify plans + {len(ladder.widths)} draft widths allocated in {time.perf_counter() - t0:.1f}s"
         )
 
     # ------------------------------------------------------------------------------------------ warm-up
     def compile(self):
-        """Phase 1 (no trace captured yet): every program the loop runs -- draft steps per width, verify bodies,
-        selects, qkv_prev migrations between every plan pair (mutates the KV / GDN state of slots 0..w-1: warm-up)."""
+        """Phase 1 (no trace captured yet): every program the loop runs -- draft steps per width, verify bodies, the
+        drafter's per-plan op (MTP select / DFlash2 commit), qkv_prev migrations between every plan pair (mutates the
+        KV / GDN state of slots 0..w-1: warm-up)."""
         if self._compiled:
             return
         t0 = time.perf_counter()
         for w in self.ladder.widths:
-            self.head.compile_step(w)
+            self.drafter.compile_width(w)
         for plan, vs in self.steps.items():
             t1 = time.perf_counter()
             vs.compile()
-            self.head.compile_select(vs.plan)
+            self.drafter.compile_plan(vs)
             logger.info(f"[spec] verify {plan} R={vs.plan.R} compiled in {time.perf_counter() - t1:.1f}s")
         for a, va in self.steps.items():
             for b, vb in self.steps.items():
                 if a != b:
                     vb.plan.compile_migration(va.plan)
-        # the sparse hidden-row upload + one padded draft step (the catch-up) run the same programs as a draft step
+        # the sparse hidden-row upload + one padded draft step (the MTP catch-up) run the same programs as a draft step
         self._compiled = True
         logger.info(f"[spec] every speculative program compiled in {time.perf_counter() - t0:.1f}s")
 
     def capture(self):
-        """Phase 2: capture the draft-step and verify traces (all programs compiled)."""
+        """Phase 2: capture the draft-step and verify traces (all programs compiled); the DFlash2 commit trace of a
+        plan right after its verify trace (it reads the verify output buffer's fixed address)."""
         assert self._compiled, "compile() first"
         if self._captured:
             return
         t0 = time.perf_counter()
         for w in self.ladder.widths:
-            self.head.capture_step(w)
+            self.drafter.capture_width(w)
         for plan, vs in self.steps.items():
             vs.capture()
+            self.drafter.capture_plan(vs)
         self._captured = True
         logger.info(
             f"[spec] {len(self.steps)} verify + {len(self.ladder.widths)} draft traces captured in {time.perf_counter() - t0:.1f}s"
@@ -124,11 +349,16 @@ class SpecDecoder:
     def release(self):
         for vs in self.steps.values():
             vs.release()
-        self.head.release()
+        self.drafter.release()
 
     # ------------------------------------------------------------------------------------------ per step
     def hold_info(self) -> ss.HoldInfo:
         return self.state.hold_info()
+
+    def note_context(self, slot, req_id, meta):
+        """Admission report (the runner, from the payload's ``kv_groups`` metadata; or a local prefill path): the
+        drafter state of ``req_id`` in decode ``slot`` -- no-op for the MTP head."""
+        self.drafter.note_context(int(slot), req_id, meta)
 
     def note_plain_step(self, row_req_ids, drafts=None):
         """A step that runs as plain decode: keeps the slot ownership in sync and checks nothing was pending."""
@@ -147,7 +377,7 @@ class SpecDecoder:
         rows = list(row_req_ids) + [None] * (self.bmax - len(row_req_ids))
         rows = [rows[s] if s < B and pos_all[s] >= 0 else None for s in range(self.bmax)]
         dr = list(drafts) + [None] * (self.bmax - len(drafts))
-        sp = self.state.begin_step(rows, dr, eligible, flush=flush, has_hidden=lambda s: s in self.head.pending_rows)
+        sp = self.state.begin_step(rows, dr, eligible, flush=flush, has_state=self.drafter.has_state)
         if sp.mode == "plain":
             return None
         plan, w, k = sp.plan, sp.plan.w, sp.plan.k
@@ -167,23 +397,15 @@ class SpecDecoder:
             vs.plan.migrate_qkv_prev_from(self.steps[sp.prev_plan].plan, live=sp.live)
             times["migrate_ms"] = 1e3 * (time.perf_counter() - t0)
         if sp.catchup:
-            # the fresh users' first draft step: (t'_s, h_{P_s-1}) at P_s - 1 fills the head's KV hole left by the
-            # prefill (positions ..P_s-2) before the post-verify chain attends over it; its draft is not used
-            # (the scheduler gave these users no draft slots this step)
             t0 = time.perf_counter()
-            rows_h = {s: self.head.pending_rows.pop(s) for s in sp.catchup}
-            self.head.set_page_table(w, pt)
-            self.head.upload_hidden_rows(w, rows_h)
-            cu = set(sp.catchup)
-            self.head.run_step(
-                w, [last[s] if s in cu else 0 for s in range(w)], [pos[s] - 1 if s in cu else -1 for s in range(w)]
-            )
+            self.drafter.catchup(w, sp, last, pos, pt)
             times["catchup_ms"] = 1e3 * (time.perf_counter() - t0)
-        # a slot re-used by a new request whose hidden row never arrived: nothing to consume; a stale row of a
+        # a slot re-used by a new request whose drafter state never arrived: nothing to consume; a stale row of a
         # previous occupant is dropped when the owner changes (SpecServingState resets the slot -> not fresh here)
-        for s in range(w):
-            if sp.live[s] and s in self.head.pending_rows and s not in sp.catchup:
-                self.head.pending_rows.pop(s, None)
+        if self.drafter.name == "mtp":
+            for s in range(w):
+                if sp.live[s] and self.drafter.has_state(s) and s not in sp.catchup:
+                    self.drafter.drop_state(s)
 
         t0 = time.perf_counter()
         grid_tokens = self.state.grid_tokens(sp, last)
@@ -194,14 +416,16 @@ class SpecDecoder:
 
         next_drafts = [[] for _ in range(w)]
         if k >= 1:
-            self.head.select_hidden(vs.plan, accepts)
+            self.drafter.after_verify(vs, sp, accepts, pos)
             t2 = time.perf_counter()
-            times["select_ms"] = 1e3 * (t2 - t1)
-            self.head.set_page_table(w, pt)
+            times[self.post_key] = 1e3 * (t2 - t1)
             new_last = [committed[s][-1] if sp.live[s] else 0 for s in range(w)]
             new_pos = [pos[s] + accepts[s] + 1 if sp.live[s] else 0 for s in range(w)]
-            drafted = self.head.draft(w, k, new_last, new_pos, pad=pad)
-            next_drafts = [list(drafted[s]) if sp.live[s] else [] for s in range(w)]
+            # users the drafter has no state for (a request whose context K/V never arrived) are padding in the draft
+            draft_pad = [pad[s] or not self.drafter.drafts_enabled(s) for s in range(w)]
+            self.n_no_context += sum(1 for s in range(w) if sp.live[s] and draft_pad[s])
+            drafted = self.drafter.draft(w, k, new_last, new_pos, draft_pad, pt)
+            next_drafts = [list(drafted[s]) if not draft_pad[s] else [] for s in range(w)]
             times["draft_ms"] = 1e3 * (time.perf_counter() - t2)
 
         hold = self.state.hold_info()
@@ -236,10 +460,11 @@ class SpecDecoder:
                 f"[spec] step {self.n_steps}: w_grid={sp.w_grid} plan={sp.plan} live={n_live} flush={sp.flush} "
                 f"| last {n} steps: {self.acc_tokens / max(1, self.acc_users):.2f} tok/user/step "
                 f"({self.acc_accepted / max(1, self.acc_users):.2f} accepted), per step verify "
-                f"{self.acc['verify_ms'] / n:.1f} + select {self.acc['select_ms'] / n:.1f} + draft "
+                f"{self.acc['verify_ms'] / n:.1f} + {self.drafter.post_name} {self.acc[self.post_key] / n:.1f} + draft "
                 f"{self.acc['draft_ms'] / n:.1f} ms (catch-up {self.acc['catchup_ms'] / n:.2f}, migrate "
                 f"{self.acc['migrate_ms'] / n:.2f}) | totals: spec {st['spec_steps']} plain {st['plain_steps']} "
                 f"flushes {st['flushes']} plan changes {st['plan_changes']} migrations {st['migrations']}"
+                + (f" no-context user-steps {self.n_no_context}" if self.drafter.name == "dflash2" else "")
             )
             self.acc = {key: 0.0 for key in self.acc}
             self.acc_tokens = self.acc_users = self.acc_accepted = 0

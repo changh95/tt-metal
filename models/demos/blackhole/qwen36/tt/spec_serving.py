@@ -10,11 +10,20 @@ tests/VERIFY_W32_AUDIT.md), so a (w, T) plan covers slots 0..w-1 and every slot 
 grid user: a live request, or a PADDING user (token 0, KV update / SDPA skipped at position -1, accept 0, its
 residual rows kept finite by the plan's pad mask so the body's row-mixing 0/1 matmuls never see NaN).
 
-Ladder (design (a)): bucket widths -> rows per user T = k + 1, chosen by w_grid = highest live slot + 1:
-    w <= 8 : T = 4 (buckets 1, 2, 4, 8)    w <= 10 : T = 3    w <= 16 : T = 2    w > 16 : plain decode
-(``QWEN36_SPEC_ALLOW_FRACTURED=1`` adds (32, 2): R = 64, the fractured reduce-scatter numerics of verify_step.py that
-flip greedy near-ties; ``QWEN36_SPEC_LADDER="1:4,2:4,4:4,8:4,10:3,16:2"`` overrides). Every plan's R = w*T <= 32 runs
-the decode step's own ops, so a committed stream is bitwise the plain greedy decode's.
+Ladder (design (a)): bucket widths -> rows per user T = k + 1, chosen by w_grid = highest live slot + 1. One ladder
+per drafter (``ladder_from_env``):
+  * MTP head (``QWEN36_SPEC_DRAFTER=mtp``, k chained one-layer steps): w <= 8 : T = 4 (buckets 1, 2, 4, 8),
+    w <= 10 : T = 3, w <= 16 : T = 2, w > 16 : plain decode. Every plan's R = w*T <= 32 runs the decode step's own
+    ops, so a committed stream is bitwise the plain greedy decode's. ``QWEN36_SPEC_ALLOW_FRACTURED=1`` adds (32, 2):
+    R = 64 on the fractured reduce-scatter path of verify_step.py whose numerics flip greedy near-ties.
+  * DFlash2 block drafter (``QWEN36_SPEC_DRAFTER=dflash2``, ONE 8-row block step per verify step at any k, so the
+    largest T the verify budget allows wins): w <= 8 : T = 8 (k = 7; buckets 1, 2, 4 are R <= 32 bitwise, bucket 8 is
+    R = 64: the fractured path, near-tie-bounded -- tests/DFLASH2_RESULTS.md (8,7) x2.13 with 4 near-tie flips of
+    gap <= 0.25 over 8 x 64 tokens), w <= 16 : T = 2 (R = 32, bitwise; ``QWEN36_SPEC_LADDER="1:8,2:8,4:8,8:8,16:4"``
+    selects the R = 64 k = 3 band instead), w > 16 : plain decode. The bitwise / near-tie bound is the knob
+    ``QWEN36_SPEC_ALLOW_FRACTURED``: unset = R <= 64 allowed (the default above); ``0`` = strictly bitwise, the ladder
+    becomes ``1:8,2:8,4:8,8:4,16:2`` (R <= 32 everywhere, (8,4) x1.86); ``1`` = the R <= 64 ladder plus the (32, 2) tail.
+``QWEN36_SPEC_LADDER="w:T,..."`` overrides either default (its R must respect the knob's bound).
 
 Lazy GDN prefix across plan changes (design (c)): the kernel commits the PREVIOUS step's accepted rows 1..a_s from the
 plan's ``qkv_prev`` buffers, whose row layout is s*T + j. A plan change carries the pending rows over with an exact
@@ -29,6 +38,7 @@ admission that would cross for one decode-only step flagged ``flush`` (docs/SPEC
 scheduler did not hold raises ``SpecProtocolError`` (a bug signal, never silent state corruption).
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -37,8 +47,15 @@ import torch
 from models.demos.blackhole.qwen36.tt import verify_grid as vg
 
 TILE = 32
-DEFAULT_LADDER = "1:4,2:4,4:4,8:4,10:3,16:2"
+FRACTURED_ROWS = 64  # the widest verify grid the fractured (R > 32) path is allowed to run (near-tie numerics)
+DEFAULT_LADDER = "1:4,2:4,4:4,8:4,10:3,16:2"  # MTP head
+DEFAULT_LADDER_MTP = DEFAULT_LADDER
+DEFAULT_LADDER_DFLASH2 = (
+    "1:8,2:8,4:8,8:8,16:2"  # DFlash2 block drafter, R <= 64 (bucket 8 at T=8 is the fractured plan)
+)
+DEFAULT_LADDER_DFLASH2_BITWISE = "1:8,2:8,4:8,8:4,16:2"  # DFlash2, R <= 32 everywhere (QWEN36_SPEC_ALLOW_FRACTURED=0)
 FRACTURED_LADDER_TAIL = "32:2"
+DRAFTERS = ("mtp", "dflash2")
 
 
 class SpecProtocolError(RuntimeError):
@@ -70,6 +87,7 @@ class Ladder:
 
     def __init__(self, entries: Sequence[tuple[int, int]], k_max: int, max_batch: int, max_rows: int = TILE):
         k_max = int(k_max)
+        max_rows = int(max_rows)
         assert k_max >= 1, "speculative decoding needs num_speculative_tokens >= 1"
         plans = []
         for w, T in entries:
@@ -91,13 +109,24 @@ class Ladder:
             assert a.T >= b.T, f"ladder T must not grow with the width: {a} {b}"
         for p in plans:
             assert p.R == vg.grid_rows(p.w, p.T), f"{p}: w*T must fill the tile-padded grid (no tile padding rows)"
-            assert p.R <= max_rows, f"{p}: R = {p.R} > {max_rows} (set QWEN36_SPEC_ALLOW_FRACTURED=1 for R > 32)"
+            assert p.R <= max_rows, (
+                f"{p}: R = {p.R} > {max_rows} (QWEN36_SPEC_ALLOW_FRACTURED unset/1 allows R <= {FRACTURED_ROWS} for the "
+                "dflash2 drafter and adds the (32,2) tail at 1; 0 = bitwise R <= 32 only)"
+            )
         self.plans = plans
         self.k_max = k_max
         self.max_batch = int(max_batch)
+        self.max_rows = max_rows
+
+    @property
+    def fractured_plans(self) -> list:
+        """The plans on the fractured (R > 32) verify path: near-tie-bounded, not bitwise."""
+        return [p for p in self.plans if p.R > TILE]
 
     @classmethod
-    def from_spec(cls, spec: str, k_max: int, max_batch: int, allow_fractured: bool = False):
+    def from_spec(cls, spec: str, k_max: int, max_batch: int, allow_fractured: bool = False, max_rows=None):
+        """``spec`` = "w:T,w:T,..."; ``allow_fractured`` appends the (32, 2) tail; ``max_rows`` (default 64 with the
+        tail, 32 without) bounds every plan's R."""
         entries = []
         for item in spec.split(","):
             item = item.strip()
@@ -107,11 +136,44 @@ class Ladder:
             entries.append((int(w), int(T)))
         if allow_fractured:
             entries += [tuple(int(v) for v in FRACTURED_LADDER_TAIL.split(":"))]
-        return cls(entries, k_max, max_batch, max_rows=64 if allow_fractured else TILE)
+        if max_rows is None:
+            max_rows = FRACTURED_ROWS if allow_fractured else TILE
+        return cls(entries, k_max, max_batch, max_rows=int(max_rows))
 
     @classmethod
-    def default(cls, k_max: int, max_batch: int, allow_fractured: bool = False):
-        return cls.from_spec(DEFAULT_LADDER, k_max, max_batch, allow_fractured)
+    def default(cls, k_max: int, max_batch: int, allow_fractured: bool = False, drafter: str = "mtp"):
+        """The drafter's default ladder (module docstring): ``allow_fractured`` = the QWEN36_SPEC_ALLOW_FRACTURED=1
+        reading (R <= 64 + the (32,2) tail); ``for_drafter`` has the three-valued knob."""
+        return cls.for_drafter(drafter, k_max, max_batch, allow_fractured="1" if allow_fractured else None)
+
+    @classmethod
+    def for_drafter(cls, drafter: str, k_max: int, max_batch: int, spec=None, allow_fractured=None):
+        """``drafter`` in DRAFTERS; ``spec`` = a QWEN36_SPEC_LADDER override or None; ``allow_fractured`` = the raw
+        QWEN36_SPEC_ALLOW_FRACTURED value: None (unset), "0" or "1" (see the module docstring)."""
+        assert drafter in DRAFTERS, f"unknown drafter {drafter!r} (expected one of {DRAFTERS})"
+        af = None if allow_fractured in (None, "") else str(allow_fractured).strip()
+        assert af in (None, "0", "1"), f"QWEN36_SPEC_ALLOW_FRACTURED={allow_fractured!r}: expected 0 or 1"
+        tail = af == "1"
+        if drafter == "dflash2":
+            bitwise_only = af == "0"
+            default = DEFAULT_LADDER_DFLASH2_BITWISE if bitwise_only else DEFAULT_LADDER_DFLASH2
+            max_rows = TILE if bitwise_only else FRACTURED_ROWS
+        else:
+            default = DEFAULT_LADDER_MTP
+            max_rows = FRACTURED_ROWS if tail else TILE
+        return cls.from_spec(spec or default, k_max, max_batch, allow_fractured=tail, max_rows=max_rows)
+
+    @classmethod
+    def from_env(cls, drafter: str, k_max: int, max_batch: int, env=None):
+        """The served ladder: QWEN36_SPEC_LADDER / QWEN36_SPEC_ALLOW_FRACTURED of ``env`` (default os.environ)."""
+        env = os.environ if env is None else env
+        return cls.for_drafter(
+            drafter,
+            k_max,
+            max_batch,
+            spec=env.get("QWEN36_SPEC_LADDER"),
+            allow_fractured=env.get("QWEN36_SPEC_ALLOW_FRACTURED"),
+        )
 
     @property
     def widths(self) -> list:
@@ -168,14 +230,14 @@ class StepPlan:
     n_drafts: list = field(default_factory=list)  # [plan.w] real drafts per grid user (0 = padding / flush)
     drafts: list = field(default_factory=list)  # [plan.w][k] draft tokens (padding 0)
     accept_prev: list = field(default_factory=list)  # [plan.w] the previous step's a_s (0 for pads / fresh)
-    catchup: list = field(default_factory=list)  # slots whose first draft step must fill the head's KV first
+    catchup: list = field(default_factory=list)  # fresh slots with drafter state (MTP: hidden row -> catch-up step)
 
 
 @dataclass
 class SlotState:
     owner: Optional[str] = None
     accept_prev: int = 0
-    seen: bool = False  # has run a step under this owner (a fresh slot may carry an imported hidden row)
+    seen: bool = False  # has run a step under this owner (a fresh slot may carry imported drafter state)
 
 
 class SpecServingState:
@@ -232,12 +294,17 @@ class SpecServingState:
         drafts: Sequence[Optional[Sequence[int]]],
         eligible: bool,
         flush: bool = False,
+        has_state: Optional[Callable[[int], bool]] = None,
         has_hidden: Optional[Callable[[int], bool]] = None,
     ) -> StepPlan:
         """Decide this step. row_req_ids[s] = the request at slot s (None = pad); drafts[s] = its scheduled draft
         tokens (a -1 ends the list: unfilled scheduler placeholders); eligible = every live request may take the
-        greedy verify path (else the whole step is plain decode); flush = the scheduler asked for a zero-draft step.
+        greedy verify path (else the whole step is plain decode); flush = the scheduler asked for a zero-draft step;
+        has_state(s) = the drafter holds imported / prefilled state for the FRESH slot s (the MTP hidden row, the
+        DFlash2 context K/V) -> the slot is listed in ``catchup`` on its first step (``has_hidden`` is the old name).
         Raises SpecProtocolError when a pending prefix cannot survive the transition."""
+        if has_state is None:
+            has_state = has_hidden
         self._sync_owners(row_req_ids)
         self.stats["steps"] += 1
         live_all = self.live_mask()
@@ -288,7 +355,7 @@ class SpecServingState:
             n_drafts.append(len(d))
             dr.append(d + [0] * (k - len(d)))
             acc.append(st.accept_prev if live[s] else 0)
-            if live[s] and not st.seen and has_hidden is not None and has_hidden(s):
+            if live[s] and not st.seen and has_state is not None and has_state(s):
                 catchup.append(s)
         self.stats["spec_steps"] += 1
         if flush:
