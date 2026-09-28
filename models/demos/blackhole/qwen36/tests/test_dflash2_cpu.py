@@ -18,8 +18,10 @@ from loguru import logger
 
 from models.demos.blackhole.qwen36.tt.dflash2_head import (
     DFlash2Config,
+    DFlash2Drafter,
     DFlash2HostReference,
     dflash2_snapshot_dir,
+    grouped_dynamic_conv,
     load_dflash2_state_dict,
     load_target_embed_and_head,
 )
@@ -118,3 +120,26 @@ def test_vs_official_dflash2(ref):
         )
         assert rel < 1e-4, rel
         assert mine["tokens"] == path_off[0].tolist()
+
+
+def test_device_constant_matrices():
+    """The device path's 0/1 constants: the block-local shift equals the conv's x_{t-1} (zero at each block's first
+    row) and the K/V spread puts grid row s*T+j of kv head h at shard row s*32 + h*T + j."""
+    w, T = 3, 8
+    R = w * T
+    x = torch.randn(R, 64)
+    shift = DFlash2Drafter.shift_matrix(w, T, R)[0, 0]
+    xs = shift @ x
+    for s in range(w):
+        blk = x[s * T : (s + 1) * T]
+        ref = grouped_dynamic_conv(blk, torch.zeros(T, 2, 4), torch.tensor([[0.0] * 64, [1.0] * 64]), 16)  # = x_{t-1}
+        assert torch.equal(xs[s * T : (s + 1) * T], ref)
+    NKV = 2
+    spreads = DFlash2Drafter.spread_matrices(w, T, R, NKV)
+    heads = [torch.randn(R, 64) for _ in range(NKV)]
+    sh = sum(spreads[h][0, 0] @ heads[h] for h in range(NKV))  # [w*32, 64]
+    for s in range(w):
+        for h in range(NKV):
+            for j in range(T):
+                assert torch.equal(sh[s * 32 + h * T + j], heads[h][s * T + j])
+        assert torch.equal(sh[s * 32 + NKV * T : (s + 1) * 32], torch.zeros(32 - NKV * T, 64))
