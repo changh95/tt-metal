@@ -297,3 +297,53 @@ Ladders (`tt/spec_serving.py`, knob `QWEN36_SPEC_ALLOW_FRACTURED`): default `1:8
   flips) -> the bundle ships `QWEN36_SPEC_ALLOW_FRACTURED=0`. GSM8K text TPOT (bitwise dflash2 / mtp): 9.4 / 12.1 ms at
   1 user, 10.3 / 13.0 at 4, 15.3 / 14.4 at 8, 31.1 / 22.9 at 16, 39 / 38 at 32 (plain); vLLM acceptance length 5.9-6.3
   at k = 7 on lm-eval GSM8K answers (8 users, R <= 64 run), 3.5-3.6 at k = 3.
+
+## 7. Hybrid drafter policy (M4e, 2026-09-28) -- `QWEN36_SPEC_DRAFTER=hybrid`
+
+Section 6's served A/B decides it: the block drafter wins only at <= 4 users (GSM8K TPOT 9.4 / 10.3 ms at 1 / 4 vs MTP
+12.1 / 13.0) and loses at 8 (15.3 vs 14.4) and 16 (31 vs 23), and the R <= 64 ladder that would rescue the 8-user band
+is not self-consistent. `hybrid` keeps BOTH drafters resident on D and the ladder picks one per plan by width
+(`tt/spec_serving.py` `Ladder.drafter_for`; default `1:8,2:8,4:8,8:4,10:3,16:2`, every R <= 32): DFlash2 at T = 8 for
+buckets 1 / 2 / 4, the MTP bands (8,4) / (10,3) / (16,2) above, plain past 16. A drafter change is a plan change and
+takes the existing flush / migration protocol (4 -> 5 is a band-up change held for a flush, 5 -> 4 migrates, 16 -> 17
+flushes into plain). Both drafters' per-slot state is kept current on every spec step (`tt/spec_decoder.py`
+`_HybridDrafter`), so a switch needs no re-prefill:
+
+* P runs both prefill hooks and ships both states (payload v3: `mtp.kv.0` + `mtp.hidden` and the `dflash2` group,
+  +3 MiB per 179-token request over either single-drafter payload); D imports both (`import_mtp_hidden`, the group import).
+* Verify plans keep `out_hidden` AND `out_aux`. Per step: the DFlash2 `commit(plan, P)` always (1.1-1.3 ms); the MTP
+  head's K/V for the committed rows by `MTPHead.keep_current(plan, argmax)` -- one traced program per plan running the
+  head's LAYER (no lm_head) over the R grid rows with `fc(norm(embed(x_{P_s+j+1})), norm(h_{P_s+j}))` (the verify's
+  argmax and post-norm row of row (s, j)) and `forward_verify`'s K/V write at `P_s + j` -- on every DFlash2-drafted step
+  and on the first MTP step after one (or after a plain step): **0.82 ms** per step traced (R <= 32; half B); inside the
+  MTP band the chain writes the head's K/V exactly as in mtp mode. The MTP select + chain run only when MTP drafts, the
+  block step only when DFlash2 drafts; the MTP catch-up of a fresh user runs whichever drafter is active.
+* The MTP head's K/V then holds, for every committed position i, the entry of (x_{i+1}, h_i) with the TARGET's hidden
+  (what the head's prefill writes, and what vLLM's proposer feeds it for accepted tokens). Observation on the mtp mode
+  (unchanged here, byte-identical when selected): the k-step chain writes P_s-1 .. P_s+k-2, so a step that accepts all
+  k drafts leaves position P_s+k-1 unwritten (stale block content) before the next chain attends over it -- a draft
+  quality matter only (the committed stream never depends on the drafter's state); the hybrid's keep-current fills it
+  on the steps where it runs.
+* DRAM (D, after warm-up, 1,052,672-token pool): both drafters + the full DFlash2 context pool fit with **5698 MiB**
+  free per chip (mtp alone 9078, dflash2 alone 6497), so the context pool is not shrunk.
+
+Exactness: CPU (`tests/test_spec_serving_cpu.py`: the hybrid ladder, the 4 <-> 5 and 16 <-> 17 switches, the
+3 -> 5 -> 9 -> 17 ramp with oracle / random / mixed drafts; 46 pass). Device (`tests/test_spec_serving_scratch.py
+SPEC_DRAFTER=hybrid`, half B, `logs/spec_serving_hybrid1.log`): 3 -> 5 -> 9 -> 17 users and back, one user without
+DFlash2 context, a sampled user forcing plain steps -- 50 steps (19 spec: 8 DFlash2-drafted, 9 MTP-drafted; 30 plain),
+3 drafter switches ((4,8) -> flush -> (8,4); (8,4) -> flush -> (10,3) -> flush -> plain; (16,2) -> (2,8) by migration),
+3 flushes, 1 migration, **every committed stream bitwise the plain traced decode**, the unheld crossing raises
+`SpecProtocolError`. Step walls: (4,T=8) DFlash2 50-55 ms, (8,T=4) MTP 47-51, (10,T=3) 46-48, (16,T=2) 40-42,
+plain 35.
+
+Served gate (all 8 chips, `scripts/spec_gate_variant.sh spec_hybrid hybrid`, `logs/served_spec_hybrid/summary.txt`;
+the full table is in the plugin's docs/SPECULATIVE.md): det_probe deterministic; self-consistency 1..32 users x 64 tokens
+ALL MATCH; GSM8K lm-eval 200 = 0.82 with all 200 generations token-identical to the mtp and dflash2 runs; 6100 spec steps
+(1503 DFlash2-drafted, 4597 MTP-drafted), 2361 plain, 29 flushes, 31 migrations, **19 drafter switches**, 0 protocol
+errors. TPOT ms / tok/s (hybrid vs the better single drafter at that width): GSM8K text 9.5 / 90 (dflash2 9.4 / 93) at 1
+user, 10.5 / 307 (10.3 / 316) at 4, 15.1 / 442 (mtp 14.4 / 471) at 8, 24.0 / 573 (mtp 22.9 / 599) at 16, 38.9 / 690 plain
+at 32; 128/128 random 11.9 / 74, 15.2 / 226, 16.2 / 405, 24.6 / 552, 39.6 / 684. Acceptance length 5.15 at 1-4 users
+(DFlash2, k = 7), 3.5 at 8 (MTP, k = 3). Per step on D: (1,8) DFlash2 verify 34.2 + commit 0.85 + keep-current 0.71 +
+draft 7.6 ms; (8,4) MTP 33.5 + commit 1.1 + select 0.4 + draft 7.9; (16,2) MTP 33.9 + 1.7 + 3.1. P side: both hooks add
+~11 ms to a short prefill (118.6 vs 107.2 mtp / 112.5 dflash2 ms total at <= 256 tokens) and the payload is 164.3 MiB per
+179-token request (mtp 160.5, dflash2 163.5, plain ~158); D 5698 / P 13071 MiB DRAM free after warm-up.
