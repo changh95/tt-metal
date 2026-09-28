@@ -194,6 +194,173 @@ def test_dflash2_ladder_joins_leaves_cross_bands(policy, knob):
         assert len(r["stream"]) - 1 >= r["want"]
 
 
+def test_ladder_hybrid_default_and_drafter_by_width(expect_error):
+    """The hybrid ladder: DFlash2's T=8 buckets up to 4 users, the MTP bands above, plain past 16; every plan R <= 32
+    (bitwise); the drafter of a plan is chosen by its width (also for a QWEN36_SPEC_LADDER override); the knob's 1
+    adds the MTP (32,2) tail; k clamps the MTP bands like the mtp ladder."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32)
+    assert lad.drafter == "hybrid" and lad.drafters == ("mtp", "dflash2")
+    assert [(p.w, p.T, lad.drafter_for(p)) for p in lad.plans] == [
+        (1, 8, "dflash2"),
+        (2, 8, "dflash2"),
+        (4, 8, "dflash2"),
+        (8, 4, "mtp"),
+        (10, 3, "mtp"),
+        (16, 2, "mtp"),
+    ]
+    assert lad.max_rows == 32 and lad.fractured_plans == [] and all(p.R <= 32 for p in lad.plans)
+    assert lad.widths_for("dflash2") == [1, 2, 4] and lad.widths_for("mtp") == [8, 10, 16]
+    assert lad.drafter_for(lad.plan_for(3)) == "dflash2" and lad.drafter_for(lad.plan_for(4)) == "dflash2"
+    assert lad.drafter_for(lad.plan_for(5)) == "mtp" and lad.drafter_for(lad.plan_for(16)) == "mtp"
+    assert lad.plan_for(17) is None and lad.drafter_for(None) is None
+    # band structure the hold protocol sees: T=8 band up to 4, then 8 / 10 / 16; plain reachable
+    assert lad.band_max(8) == 4 and lad.band_max(4) == 8 and lad.band_max(3) == 10 and lad.band_max(2) == 16
+    assert lad.min_T_above(4) == 1 and lad.min_T_above(16) == 1
+    assert ss.Ladder.for_drafter("hybrid", 7, 32, allow_fractured="0").plans == lad.plans
+    tail = ss.Ladder.for_drafter("hybrid", 7, 32, allow_fractured="1")
+    assert tail.plans[-1] == ss.Plan(32, 2) and tail.drafter_for(tail.plans[-1]) == "mtp"
+    # an override keeps the width rule: buckets <= 4 -> dflash2, wider -> mtp
+    ov = ss.Ladder.for_drafter("hybrid", 7, 32, spec="1:8,4:8,8:2")
+    assert [(p.w, p.T, ov.drafter_for(p)) for p in ov.plans] == [(1, 8, "dflash2"), (4, 8, "dflash2"), (8, 2, "mtp")]
+    with expect_error(AssertionError, "R = 64"):
+        ss.Ladder.for_drafter("hybrid", 7, 32, spec="1:8,4:8,8:8,16:2")
+    # QWEN36_SPEC_K=3 shortens the DFlash2 band to the first 3 path tokens (T=4 plans), the MTP bands stay
+    k3 = ss.Ladder.for_drafter("hybrid", 3, 32)
+    assert [(p.w, p.T) for p in k3.plans] == [(1, 4), (2, 4), (4, 4), (8, 4), (10, 3), (16, 2)]
+    assert [k3.drafter_for(p) for p in k3.plans] == ["dflash2"] * 3 + ["mtp"] * 3
+    # the single-drafter ladders name their drafter for every plan; from_env reads the knob
+    m = ss.Ladder.for_drafter("mtp", 3, 32)
+    assert m.drafters == ("mtp",) and all(m.drafter_for(p) == "mtp" for p in m.plans) and m.widths_for("dflash2") == []
+    d = ss.Ladder.for_drafter("dflash2", 7, 32)
+    assert all(d.drafter_for(p) == "dflash2" for p in d.plans) and d.widths_for("dflash2") == d.widths
+    env = {"QWEN36_SPEC_LADDER": "1:8,4:8,8:4"}
+    assert [(p.w, p.T) for p in ss.Ladder.from_env("hybrid", 7, 32, env).plans] == [(1, 8), (4, 8), (8, 4)]
+
+
+def _drafter_log(sim, lad):
+    """(mode, drafter, plan, flush, migrate) per step of a Sim."""
+    return [(m, lad.drafter_for(p), p, fl, mg) for m, p, fl, mg, _ in sim.step_log]
+
+
+def test_hybrid_switch_4_to_5_is_held_for_a_flush_and_5_to_4_migrates():
+    """4 users at (4,T=8) with pending DFlash2 prefixes: the 5th user crosses into the MTP (8,4) band -- a_s up to 7
+    does not fit T-1 = 3, so the scheduler holds it for a flush (hold_info: slots_before_crossing = 0), the next step is
+    the (8,4) MTP plan (a drafter switch), and when a user leaves the batch returns to (4,8) DFlash2 by migration."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32)
+    sim = Sim(lad, 32, "oracle", seed=3)
+    for i in range(4):
+        sim.submit(f"r{i}", [i + 1, i + 2, i + 3], want=400)
+    sim.step()
+    sim.step()  # oracle drafts: everyone accepted 7 -> pending 7 rows
+    assert sim.state.plan == ss.Plan(4, 8) and sim.state.max_pending() == 7
+    h = sim.state.hold_info()
+    assert h.pending_any and h.T == 8 and h.band_max == 4 and h.slots_before_crossing == 0
+    sim.submit("r4", [9, 9, 9], want=400)
+    sp = sim.step()
+    assert sp.flush and sp.plan == ss.Plan(4, 8) and sp.drafter == "dflash2" and "r4" in sim.pending_join
+    assert not sim.state.pending_any
+    sp = sim.step()
+    assert sp.plan == ss.Plan(8, 4) and sp.drafter == "mtp" and not sp.migrate and "r4" in sim.owner
+    assert sim.state.stats["drafter_switches"] == 1 and sim.state.stats["flushes"] == 1
+    sim.step()  # pending 3 rows everywhere under the MTP plan
+    assert sim.state.max_pending() == 3
+    # the newest user leaves: back to 4 users -> (4,8) DFlash2 with the pending MTP-band rows migrated (3 <= 7)
+    sim.req["r4"]["want"] = len(sim.req["r4"]["stream"]) - 1
+    sim.step()  # r4 reaches its budget at the end of this step and is released
+    assert "r4" not in sim.owner
+    sp = sim.step()
+    assert sp.plan == ss.Plan(4, 8) and sp.drafter == "dflash2" and sp.migrate and not sp.flush
+    assert sim.state.stats["drafter_switches"] == 2 and sim.state.stats["migrations"] == 1
+    for _ in range(6):
+        sim.step()
+    sim.check_streams()
+
+
+def test_hybrid_switch_16_to_17_flushes_to_plain_and_back():
+    """16 users at (16,T=2) MTP with pending rows: the 17th crosses into plain decode (a_s = 1 never fits), held for a
+    flush; the drain from 17 back to 16 re-enters the (16,2) MTP band (no pending after plain steps), and down to 4
+    users lands in the DFlash2 band by migration."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32)
+    sim = Sim(lad, 32, "oracle", seed=4)
+    for i in range(16):
+        sim.submit(f"r{i}", [i + 1, i + 2], want=60)
+    sim.step()
+    sim.step()
+    assert sim.state.plan == ss.Plan(16, 2) and sim.state.max_pending() == 1
+    assert sim.state.hold_info().slots_before_crossing == 0
+    sim.submit("r16", [7, 7], want=8)
+    sp = sim.step()
+    assert sp.flush and sp.plan == ss.Plan(16, 2) and sp.drafter == "mtp"
+    sp = sim.step()
+    assert sp.mode == "plain" and sp.drafter is None and "r16" in sim.owner
+    n_plain = 0
+    while "r16" in sim.owner:
+        assert sim.step().mode == "plain"
+        n_plain += 1
+    sp = sim.step()
+    assert sp.mode == "spec" and sp.plan == ss.Plan(16, 2) and sp.drafter == "mtp" and not sp.migrate
+    for rid in [f"r{i}" for i in range(4, 16)]:
+        sim.req[rid]["want"] = len(sim.req[rid]["stream"]) - 1
+    sim.step()  # they leave at the end of this step
+    sp = sim.step()
+    assert sp.plan == ss.Plan(4, 8) and sp.drafter == "dflash2" and sp.migrate
+    while sim.live_count():
+        sim.step()
+    sim.check_streams()
+    st = sim.state.stats
+    assert st["plain_steps"] == n_plain + 1 and st["drafter_switches"] >= 1 and st["flushes"] >= 1
+
+
+@pytest.mark.parametrize("policy", ["mixed", "oracle", "random"])
+@pytest.mark.parametrize("seed", [1, 2])
+def test_hybrid_ramp_3_5_9_17_and_back(policy, seed):
+    """The hybrid scenario of the device harness: 3 -> 5 -> 9 -> 17 users and the drain -- the DFlash2 (4,8) band, the
+    MTP (8,4) / (10,3) / (16,2) bands and plain decode are all visited, every drafter change is a plan change taken
+    through the flush / migration protocol, every stream stays the greedy one."""
+    rng = random.Random(seed)
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32)
+    sim = Sim(lad, 32, policy, seed=seed)
+    waves = [(0, 3), (2, 2), (4, 4), (6, 8), (60, 2)]  # tight enough for 17 live users at 8 tokens per oracle step
+    n, wants, submitted = 0, {}, {}
+    for at, cnt in waves:
+        for _ in range(cnt):
+            wants[f"r{n}"] = rng.randrange(60, 100)
+            submitted.setdefault(at, []).append(f"r{n}")
+            n += 1
+    step = 0
+    while submitted or sim.pending_join or sim.live_count() > 0:
+        for rid in submitted.pop(step, []):
+            sim.submit(rid, [rng.randrange(50) for _ in range(3 + rng.randrange(4))], want=wants[rid])
+        if sim.live_count() == 0 and not sim.pending_join:
+            step += 1
+            continue
+        sp = sim.step()
+        if sp.mode == "spec":
+            assert sp.plan.R <= 32 and sp.drafter == lad.drafter_for(sp.plan)
+        step += 1
+        assert step < 3000
+    sim.check_streams()
+    log = _drafter_log(sim, lad)
+    drafters_seen = {d for m, d, *_ in log if m == "spec"}
+    plans = {p for m, d, p, *_ in log if p is not None}
+    assert drafters_seen == {"dflash2", "mtp"}, drafters_seen
+    # the T=2 band is reached on the way down only when slot 16 frees before the others (stable slots: w_grid = the
+    # highest live slot + 1); test_hybrid_switch_16_to_17_flushes_to_plain_and_back drives that case explicitly
+    assert {p.T for p in plans} >= {8, 4}, plans
+    st = sim.state.stats
+    assert st["plain_steps"] >= 1 and st["drafter_switches"] >= 1, st
+    # a drafter change between consecutive spec steps is a plan change: either the pending rows fit (migration) or
+    # nothing was pending (a flush ran before, or nothing was accepted)
+    prev = None
+    for m, d, p, fl, mg in log:
+        if m == "spec" and prev is not None and prev[0] == "spec" and prev[1] != d:
+            assert p != prev[2]
+        prev = (m, d, p)
+    if policy == "oracle":
+        assert st["flushes"] >= 2, st  # the 4 -> 5 and 8 -> 9 (and 16 -> 17) crossings with full prefixes pending
+        assert st["migrations"] >= 1 and st["drafter_switches"] >= 2, st  # the drain's band-down changes
+
+
 def test_fresh_slot_state_callback_alias():
     """``has_state`` is the drafter-neutral name of ``has_hidden`` (MTP hidden row / DFlash2 context K/V)."""
     st = ss.SpecServingState(ss.Ladder.for_drafter("dflash2", 7, 8), 8)

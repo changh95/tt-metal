@@ -23,7 +23,17 @@ per drafter (``ladder_from_env``):
     selects the R = 64 k = 3 band instead), w > 16 : plain decode. The bitwise / near-tie bound is the knob
     ``QWEN36_SPEC_ALLOW_FRACTURED``: unset = R <= 64 allowed (the default above); ``0`` = strictly bitwise, the ladder
     becomes ``1:8,2:8,4:8,8:4,16:2`` (R <= 32 everywhere, (8,4) x1.86); ``1`` = the R <= 64 ladder plus the (32, 2) tail.
-``QWEN36_SPEC_LADDER="w:T,..."`` overrides either default (its R must respect the knob's bound).
+  * HYBRID (``QWEN36_SPEC_DRAFTER=hybrid``): both drafters resident, chosen per plan BY WIDTH -- the served A/B
+    (plugin docs/SPECULATIVE.md) has DFlash2 winning only up to 4 users (GSM8K TPOT 9.4 vs 12.1 ms at 1, 10.3 vs 13.0
+    at 4) and MTP winning above (14.4 vs 15.3 at 8, 23 vs 31 at 16). Default ladder ``1:8,2:8,4:8,8:4,10:3,16:2``: the
+    buckets w <= HYBRID_DFLASH2_MAX_W = 4 run T = 8 with the DFlash2 block drafter (R <= 32, bitwise), the MTP bands
+    of the mtp ladder above (k = 3 to 8, 2 to 10, 1 to 16), plain decode above 16. ``Ladder.drafter_for(plan)`` names
+    the drafter of a plan; a drafter change is a plan change and goes through the flush / migration protocol below
+    (a band-up crossing 4 -> 5 users is held for a flush like any other, a band-down 5 -> 4 migrates), while the
+    device half keeps BOTH drafters' per-slot state current on every step (tt/spec_decoder.py ``_HybridDrafter``).
+    ``QWEN36_SPEC_ALLOW_FRACTURED=1`` adds the (32, 2) MTP tail as for mtp.
+``QWEN36_SPEC_LADDER="w:T,..."`` overrides any default (its R must respect the knob's bound; in hybrid mode the
+drafter of an overridden plan is still chosen by its width).
 
 Lazy GDN prefix across plan changes (design (c)): the kernel commits the PREVIOUS step's accepted rows 1..a_s from the
 plan's ``qkv_prev`` buffers, whose row layout is s*T + j. A plan change carries the pending rows over with an exact
@@ -54,8 +64,10 @@ DEFAULT_LADDER_DFLASH2 = (
     "1:8,2:8,4:8,8:8,16:2"  # DFlash2 block drafter, R <= 64 (bucket 8 at T=8 is the fractured plan)
 )
 DEFAULT_LADDER_DFLASH2_BITWISE = "1:8,2:8,4:8,8:4,16:2"  # DFlash2, R <= 32 everywhere (QWEN36_SPEC_ALLOW_FRACTURED=0)
+DEFAULT_LADDER_HYBRID = "1:8,2:8,4:8,8:4,10:3,16:2"  # hybrid: DFlash2 T=8 up to 4 users, the MTP bands above
+HYBRID_DFLASH2_MAX_W = 4  # hybrid: buckets up to this width draft with DFlash2, wider ones with the MTP head
 FRACTURED_LADDER_TAIL = "32:2"
-DRAFTERS = ("mtp", "dflash2")
+DRAFTERS = ("mtp", "dflash2", "hybrid")
 
 
 class SpecProtocolError(RuntimeError):
@@ -85,9 +97,12 @@ class Ladder:
     """Bucket widths -> T. ``entries`` ascending in w with T non-increasing; ``plan_for(w_grid)`` is the smallest
     bucket that covers the highest live slot, None = plain decode (w_grid above the last bucket)."""
 
-    def __init__(self, entries: Sequence[tuple[int, int]], k_max: int, max_batch: int, max_rows: int = TILE):
+    def __init__(
+        self, entries: Sequence[tuple[int, int]], k_max: int, max_batch: int, max_rows: int = TILE, drafter: str = "mtp"
+    ):
         k_max = int(k_max)
         max_rows = int(max_rows)
+        assert drafter in DRAFTERS, f"unknown drafter {drafter!r} (expected one of {DRAFTERS})"
         assert k_max >= 1, "speculative decoding needs num_speculative_tokens >= 1"
         plans = []
         for w, T in entries:
@@ -117,6 +132,25 @@ class Ladder:
         self.k_max = k_max
         self.max_batch = int(max_batch)
         self.max_rows = max_rows
+        self.drafter = drafter
+
+    def drafter_for(self, plan: Optional["Plan"]) -> Optional[str]:
+        """The drafter that drafts at ``plan``: the ladder's single drafter, or in hybrid mode "dflash2" for buckets up
+        to HYBRID_DFLASH2_MAX_W and "mtp" above; None for a plain step (plan None)."""
+        if plan is None:
+            return None
+        if self.drafter != "hybrid":
+            return self.drafter
+        return "dflash2" if plan.w <= HYBRID_DFLASH2_MAX_W else "mtp"
+
+    @property
+    def drafters(self) -> tuple:
+        """The drafter names this ladder needs resident (hybrid: both)."""
+        return ("mtp", "dflash2") if self.drafter == "hybrid" else (self.drafter,)
+
+    def widths_for(self, drafter: str) -> list:
+        """The bucket widths ``drafter`` drafts at (its draft-step buffers / traces)."""
+        return [p.w for p in self.plans if self.drafter_for(p) == drafter]
 
     @property
     def fractured_plans(self) -> list:
@@ -124,9 +158,11 @@ class Ladder:
         return [p for p in self.plans if p.R > TILE]
 
     @classmethod
-    def from_spec(cls, spec: str, k_max: int, max_batch: int, allow_fractured: bool = False, max_rows=None):
+    def from_spec(
+        cls, spec: str, k_max: int, max_batch: int, allow_fractured: bool = False, max_rows=None, drafter: str = "mtp"
+    ):
         """``spec`` = "w:T,w:T,..."; ``allow_fractured`` appends the (32, 2) tail; ``max_rows`` (default 64 with the
-        tail, 32 without) bounds every plan's R."""
+        tail, 32 without) bounds every plan's R; ``drafter`` names the ladder's drafter policy (DRAFTERS)."""
         entries = []
         for item in spec.split(","):
             item = item.strip()
@@ -138,7 +174,7 @@ class Ladder:
             entries += [tuple(int(v) for v in FRACTURED_LADDER_TAIL.split(":"))]
         if max_rows is None:
             max_rows = FRACTURED_ROWS if allow_fractured else TILE
-        return cls(entries, k_max, max_batch, max_rows=int(max_rows))
+        return cls(entries, k_max, max_batch, max_rows=int(max_rows), drafter=drafter)
 
     @classmethod
     def default(cls, k_max: int, max_batch: int, allow_fractured: bool = False, drafter: str = "mtp"):
@@ -159,9 +195,12 @@ class Ladder:
             default = DEFAULT_LADDER_DFLASH2_BITWISE if bitwise_only else DEFAULT_LADDER_DFLASH2
             max_rows = TILE if bitwise_only else FRACTURED_ROWS
         else:
-            default = DEFAULT_LADDER_MTP
+            # mtp, and hybrid (bitwise by construction: every default plan has R <= 32; the knob's 1 adds the tail)
+            default = DEFAULT_LADDER_HYBRID if drafter == "hybrid" else DEFAULT_LADDER_MTP
             max_rows = FRACTURED_ROWS if tail else TILE
-        return cls.from_spec(spec or default, k_max, max_batch, allow_fractured=tail, max_rows=max_rows)
+        return cls.from_spec(
+            spec or default, k_max, max_batch, allow_fractured=tail, max_rows=max_rows, drafter=drafter
+        )
 
     @classmethod
     def from_env(cls, drafter: str, k_max: int, max_batch: int, env=None):
@@ -231,6 +270,7 @@ class StepPlan:
     drafts: list = field(default_factory=list)  # [plan.w][k] draft tokens (padding 0)
     accept_prev: list = field(default_factory=list)  # [plan.w] the previous step's a_s (0 for pads / fresh)
     catchup: list = field(default_factory=list)  # fresh slots with drafter state (MTP: hidden row -> catch-up step)
+    drafter: Optional[str] = None  # the drafter that drafts at this plan (Ladder.drafter_for; None for plain)
 
 
 @dataclass
@@ -248,7 +288,15 @@ class SpecServingState:
         self.bmax = int(bmax)
         self.slots = [SlotState() for _ in range(self.bmax)]
         self.plan: Optional[Plan] = None
-        self.stats = {"steps": 0, "spec_steps": 0, "plain_steps": 0, "flushes": 0, "migrations": 0, "plan_changes": 0}
+        self.stats = {
+            "steps": 0,
+            "spec_steps": 0,
+            "plain_steps": 0,
+            "flushes": 0,
+            "migrations": 0,
+            "plan_changes": 0,
+            "drafter_switches": 0,  # hybrid: consecutive spec steps drafted by different drafters
+        }
 
     # ------------------------------------------------------------------------------------------ queries
     def live_mask(self, n: Optional[int] = None) -> list:
@@ -340,6 +388,8 @@ class SpecServingState:
                 migrate = True
                 self.stats["migrations"] += 1
             self.stats["plan_changes"] += 1
+            if self.ladder.drafter_for(prev) not in (None, self.ladder.drafter_for(plan)):
+                self.stats["drafter_switches"] += 1
         w, k = plan.w, plan.k
         live = live_all[:w]
         n_drafts, dr, acc, catchup = [], [], [], []
@@ -372,6 +422,7 @@ class SpecServingState:
             drafts=dr,
             accept_prev=acc,
             catchup=catchup,
+            drafter=self.ladder.drafter_for(plan),
         )
 
     def grid_tokens(self, sp: StepPlan, last: Sequence[int]) -> list:
