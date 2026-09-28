@@ -23,8 +23,12 @@ above 16) and drains back (5 -> 4: MTP -> DFlash2 by migration); every stream mu
   scripts/mtp_spec_run.sh spec_serving1 TEST=models/demos/blackhole/qwen36/tests/test_spec_serving_scratch.py
   scripts/mtp_spec_run.sh spec_serving_df2 SPEC_DRAFTER=dflash2 TEST=...test_spec_serving_scratch.py
 Env: SPEC_DRAFTER (mtp), SPEC_MIN_TOKENS (24), SPEC_LADDER (the drafter's default), SPEC_ALLOW_FRACTURED (unset / 0 / 1
-= QWEN36_SPEC_ALLOW_FRACTURED), SPEC_K (3 mtp / 7 dflash2), SPEC_NO_CONTEXT_REQ (r5), SPEC_OUT (json path).
+= QWEN36_SPEC_ALLOW_FRACTURED), SPEC_K (3 mtp / 7 dflash2), SPEC_NO_CONTEXT_REQ (r5), SPEC_OUT (json path),
+SPEC_DFLASH2_MAX_CTX / SPEC_DFLASH2_CTX_HYST (= QWEN36_SPEC_DFLASH2_MAX_CTX / _CTX_HYST: the hybrid context rule; a
+small limit such as 100 / 20 makes the scenario's users grow past it mid-generation -> the (w,8) DFlash2 -> (w,4) MTP
+switches with the state machine's own flush, and the way back when the long users leave; every stream bitwise).
 """
+
 import json
 import os
 import random
@@ -159,7 +163,7 @@ class Engine:
                 if rows[s] is not None:
                     committed[s] = res.committed[s]
                     assert 1 <= len(committed[s]) <= 1 + len(drafts[s] or []), (s, committed[s], drafts[s])
-            mode = f"spec{res.plan}[{self.spec.ladder.drafter_for(res.plan)}]{' flush' if res.flush else ''}{' migrate' if res.migrated else ''}"
+            mode = f"spec{res.plan}[{res.drafter}{'/long' if res.long else ''}]{' flush' if res.flush else ''}{' migrate' if res.migrated else ''}"
         wall = time.perf_counter() - t0
         for s, toks in committed.items():
             r = self.req[rows[s]]
@@ -172,7 +176,7 @@ class Engine:
                 self.drafter in ("dflash2", "hybrid")
                 and rows[s] == NO_CONTEXT_REQ
                 and res is not None
-                and self.spec.ladder.drafter_for(res.plan) == "dflash2"
+                and res.drafter == "dflash2"
             ):
                 assert r["drafts"] == [], (rows[s], r["drafts"])  # no context -> no DFlash2 drafts, ever
         for s in range(BMAX):
@@ -227,9 +231,17 @@ def test_spec_serving(mesh_device):
             mtp_head = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=32)
         head = HybridHeads(mtp_head, df2_head) if DRAFTER == "hybrid" else (df2_head or mtp_head)
         ladder = ss.Ladder.for_drafter(
-            DRAFTER, K, BMAX, spec=os.environ.get("SPEC_LADDER"), allow_fractured=os.environ.get("SPEC_ALLOW_FRACTURED")
+            DRAFTER,
+            K,
+            BMAX,
+            spec=os.environ.get("SPEC_LADDER"),
+            allow_fractured=os.environ.get("SPEC_ALLOW_FRACTURED"),
+            dflash2_max_ctx=os.environ.get("SPEC_DFLASH2_MAX_CTX"),
+            ctx_hysteresis=os.environ.get("SPEC_DFLASH2_CTX_HYST"),
         )
         results["ladder"] = [f"{p}:{ladder.drafter_for(p)}" for p in ladder.plans]
+        results["long_ladder"] = [f"{p}:{ladder.drafter_for(p, long=True)}" for p in ladder.long_plans]
+        results["ctx_rule"] = {"max_ctx": ladder.dflash2_max_ctx, "hysteresis": ladder.ctx_hysteresis}
         results["fractured_plans"] = [str(p) for p in ladder.fractured_plans]
         spec = SpecDecoder(model, head, ladder, BMAX, page_tables.shape[1], log_every=20)
         # --- compile everything first ---
@@ -479,3 +491,9 @@ def test_spec_serving(mesh_device):
     if DRAFTER == "hybrid":
         assert set(results["steps_by_drafter"]) == {"mtp", "dflash2"}, results["steps_by_drafter"]
         assert results["stats"]["drafter_switches"] >= 2, results["stats"]
+        if ladder.has_ctx_rule and ladder.dflash2_max_ctx < 400:
+            # a limit inside the scenario's context range: users grow past it (mode changes; the long ladder's plans
+            # run; the machine's own flush fires only when > 3 rows are pending at a crossing no admission hold
+            # covers -- the CPU tests drive that case deterministically, here it is logged in the stats)
+            assert results["stats"]["ctx_switches"] >= 1, results["stats"]
+            assert any("/long" in e["mode"] for e in eng.log), "no step ran the long ladder"

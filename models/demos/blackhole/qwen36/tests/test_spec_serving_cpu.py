@@ -209,7 +209,9 @@ def test_ladder_hybrid_default_and_drafter_by_width(expect_error):
         (16, 2, "mtp"),
     ]
     assert lad.max_rows == 32 and lad.fractured_plans == [] and all(p.R <= 32 for p in lad.plans)
-    assert lad.widths_for("dflash2") == [1, 2, 4] and lad.widths_for("mtp") == [8, 10, 16]
+    # the MTP head drafts at every width: the mtp bands, and the long ladder's (1,4) / (2,4) / (4,4) (context rule)
+    assert lad.widths_for("dflash2") == [1, 2, 4] and lad.widths_for("mtp") == [1, 2, 4, 8, 10, 16]
+    assert lad.widths == [1, 2, 4, 8, 10, 16]
     assert lad.drafter_for(lad.plan_for(3)) == "dflash2" and lad.drafter_for(lad.plan_for(4)) == "dflash2"
     assert lad.drafter_for(lad.plan_for(5)) == "mtp" and lad.drafter_for(lad.plan_for(16)) == "mtp"
     assert lad.plan_for(17) is None and lad.drafter_for(None) is None
@@ -239,7 +241,227 @@ def test_ladder_hybrid_default_and_drafter_by_width(expect_error):
 
 def _drafter_log(sim, lad):
     """(mode, drafter, plan, flush, migrate) per step of a Sim."""
-    return [(m, lad.drafter_for(p), p, fl, mg) for m, p, fl, mg, _ in sim.step_log]
+    return [(m, d, p, fl, mg) for m, p, fl, mg, _, d in sim.step_log]
+
+
+def test_ladder_hybrid_context_rule_plans(expect_error):
+    """The hybrid context rule (QWEN36_SPEC_DFLASH2_MAX_CTX): the long ladder is the mtp ladder, its (1,4) / (2,4) /
+    (4,4) plans are extra verify plans (all_plans), drafted by the MTP head; the wider plans are shared; the knobs
+    parse (0 = off, custom limit / hysteresis / long ladder); QWEN36_SPEC_K=3 clamps both ladders onto the same
+    plans and the mode alone picks the drafter."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32)
+    assert lad.has_ctx_rule and lad.dflash2_max_ctx == ss.HYBRID_DFLASH2_MAX_CTX
+    assert lad.ctx_hysteresis == ss.HYBRID_DFLASH2_CTX_HYSTERESIS
+    assert [(p.w, p.T) for p in lad.long_plans] == [(1, 4), (2, 4), (4, 4), (8, 4), (10, 3), (16, 2)]
+    assert [(p.w, p.T) for p in lad.all_plans] == [
+        (1, 8),
+        (2, 8),
+        (4, 8),
+        (8, 4),
+        (10, 3),
+        (16, 2),
+        (1, 4),
+        (2, 4),
+        (4, 4),
+    ]
+    assert all(lad.drafter_for(p, long=True) == "mtp" for p in lad.long_plans)
+    assert all(lad.drafter_for(p) == "mtp" for p in lad.long_plans)  # never a DFlash2 plan, whatever the mode
+    assert lad.drafter_for(ss.Plan(4, 8)) == "dflash2" and lad.drafter_for(ss.Plan(4, 8), long=True) == "dflash2"
+    assert lad.plan_for(3, long=True) == ss.Plan(4, 4) and lad.plan_for(3) == ss.Plan(4, 8)
+    assert lad.plan_for(5, long=True) == ss.Plan(8, 4) and lad.plan_for(17, long=True) is None
+    assert lad.band_max(4, long=True) == 8 and lad.band_max(3, long=True) == 10
+    assert (
+        lad.min_T_above(8, long=True) == 1
+        and lad.min_T_above(4, long=True) == 1
+        and lad.min_T_above(16, long=True) == 1
+    )
+    assert lad.fractured_plans == []
+    # knobs
+    off = ss.Ladder.from_env("hybrid", 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "0"})
+    assert (
+        not off.has_ctx_rule
+        and off.long_plans == []
+        and off.all_plans == off.plans
+        and off.widths_for("mtp") == [8, 10, 16]
+    )
+    assert (
+        off.plan_for(3, long=True) == ss.Plan(4, 8)
+        and off.drafter_for(off.plan_for(3, long=True), long=True) == "dflash2"
+    )
+    env = {
+        "QWEN36_SPEC_DFLASH2_MAX_CTX": "4096",
+        "QWEN36_SPEC_DFLASH2_CTX_HYST": "512",
+        "QWEN36_SPEC_LADDER_LONG": "1:4,4:4,8:2",
+    }
+    custom = ss.Ladder.from_env("hybrid", 7, 32, env)
+    assert custom.dflash2_max_ctx == 4096 and custom.ctx_hysteresis == 512
+    assert [(p.w, p.T) for p in custom.long_plans] == [(1, 4), (4, 4), (8, 2)]
+    with expect_error(AssertionError, "CTX_HYST"):
+        ss.Ladder.from_env(
+            "hybrid", 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "1000", "QWEN36_SPEC_DFLASH2_CTX_HYST": "1000"}
+        )
+    tail = ss.Ladder.for_drafter("hybrid", 7, 32, allow_fractured="1")
+    assert (
+        tail.long_plans[-1] == ss.Plan(32, 2)
+        and tail.plans[-1] == ss.Plan(32, 2)
+        and tail.fractured_plans == [ss.Plan(32, 2)]
+    )
+    # single-drafter ladders ignore the rule
+    for d in ("mtp", "dflash2"):
+        single = ss.Ladder.from_env(d, 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "100"})
+        assert not single.has_ctx_rule and single.long_plans == [] and single.all_plans == single.plans
+    # k_max = 3: both ladders clamp onto (1,4) / (2,4) / (4,4); the plan is shared, the mode names the drafter
+    k3 = ss.Ladder.for_drafter("hybrid", 3, 32)
+    assert k3.all_plans == k3.plans and k3.long_plans == k3.plans
+    assert k3.drafter_for(ss.Plan(4, 4)) == "dflash2" and k3.drafter_for(ss.Plan(4, 4), long=True) == "mtp"
+    assert k3.drafter_for(ss.Plan(8, 4)) == "mtp" and k3.widths_for("dflash2") == [1, 2, 4]
+
+
+def test_hybrid_user_grows_past_the_context_limit_switches_once():
+    """One user at (1,8) DFlash2 with full prefixes pending grows past QWEN36_SPEC_DFLASH2_MAX_CTX mid-generation:
+    the state machine runs ONE flush step of its own at (1,8) (the pending 7 rows do not fit the (1,4) plan), the next
+    step is (1,4) with the MTP head, and the mode never changes again while the user lives (no flapping); the
+    stream stays the greedy one."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32, dflash2_max_ctx=64, ctx_hysteresis=16)
+    sim = Sim(lad, 32, "oracle", seed=5)
+    sim.submit("r0", list(range(1, 21)), want=300)  # 20-token prompt: crosses 64 after ~44 generated tokens
+    log = []
+    while sim.live_count() or sim.pending_join:
+        sp = sim.step()
+        log.append((sp.plan, sp.drafter, sp.flush, sp.migrate, sp.long, sp.ctx_max, sim.state.long, sp.ctx_flush))
+    sim.check_streams()
+    st = sim.state.stats
+    assert st["ctx_switches"] == 1 and st["ctx_flushes"] == 1 and st["drafter_switches"] == 1, st
+    assert st["flushes"] == 1 and st["migrations"] == 0 and st["plain_steps"] == 0, st
+    # before the crossing: (1,8) DFlash2 in short mode; the crossing step: the machine is in long mode already but
+    # the flush runs at the short mode's (1,8) plan with the DFlash2 drafter (StepPlan.long = the plan's mode);
+    # after it: (1,4) MTP for good
+    i = next(i for i, e in enumerate(log) if e[7])
+    assert all(e[0] == ss.Plan(1, 8) and e[1] == "dflash2" and not e[2] and not e[4] and not e[6] for e in log[:i])
+    assert log[i][:5] == (ss.Plan(1, 8), "dflash2", True, False, False) and log[i][6] and log[i][5] > 64
+    assert all(e[0] == ss.Plan(1, 4) and e[1] == "mtp" and not e[2] and e[4] and e[6] for e in log[i + 1 :])
+    assert not log[i + 1][3], "nothing pending after the flush: no migration"
+    assert log[i - 1][5] <= 64 < log[i][5]
+    # with the pending rows fitting (random drafts accept little) the switch needs no flush: a plain migration
+    lad2 = ss.Ladder.for_drafter("hybrid", 7, 32, dflash2_max_ctx=64, ctx_hysteresis=16)
+    sim2 = Sim(lad2, 32, "random", seed=6)
+    sim2.submit("r0", list(range(1, 21)), want=120)
+    while sim2.live_count() or sim2.pending_join:
+        sim2.step()
+    sim2.check_streams()
+    st2 = sim2.state.stats
+    assert (
+        st2["ctx_switches"] == 1 and st2["drafter_switches"] == 1 and st2["plan_changes"] == 2
+    ), st2  # None -> (1,8) -> (1,4)
+    assert st2["ctx_flushes"] <= 1, st2  # a flush only when rows > 3 were pending at the crossing
+
+
+def test_hybrid_long_prompt_admission_into_the_dflash2_band_and_hysteresis_on_the_way_back():
+    """Two short users at (2,8) DFlash2 with 7 pending rows; a LONG-prompt user is admitted at slot 2 (w_grid 3 ->
+    the (4,8) bucket: not a width crossing, so the scheduler does not hold it): the state machine flushes at (4,8)
+    with the new user on the grid, then runs (4,4) with the MTP head. When the long user leaves, the longest context
+    is far below the limit minus the hysteresis: back to (2,8) DFlash2 by migration (the MTP rows <= 3 fit). A
+    second long user whose context sits inside the hysteresis band keeps the MTP head after the first one leaves."""
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32, dflash2_max_ctx=200, ctx_hysteresis=50)
+    sim = Sim(lad, 32, "oracle", seed=7)
+    sim.submit("r0", [1, 2, 3], want=400)
+    sim.submit("r1", [4, 5, 6], want=400)
+    sim.step()
+    sim.step()
+    assert sim.state.plan == ss.Plan(2, 8) and sim.state.max_pending() == 7 and not sim.state.long
+    h = sim.state.hold_info()
+    assert h.pending_any and h.slots_before_crossing == 2  # 2 free slots below the T=8 band's width 4
+    sim.submit("long", list(range(1, 301)), want=40)  # 300-token prompt > 200
+    sp = sim.step()
+    assert "long" in sim.owner and sp.plan == ss.Plan(4, 8) and sp.drafter == "dflash2" and sp.flush and sp.ctx_flush
+    assert sp.migrate, "the (2,8) -> (4,8) flush carries the pending rows within the T=8 band"
+    assert sim.state.long and not sp.long, "the machine is in long mode; the flush runs at the short mode's plan"
+    assert sp.ctx_max == 300 and sp.live == [True, True, True, False] and sp.n_drafts == [0, 0, 0, 0]
+    assert not sim.state.pending_any
+    sp = sim.step()
+    assert sp.plan == ss.Plan(4, 4) and sp.drafter == "mtp" and not sp.flush and not sp.migrate and sp.long
+    assert sim.state.stats["ctx_switches"] == 1 and sim.state.stats["ctx_flushes"] == 1
+    h = sim.state.hold_info()
+    assert h.T == 4 and h.band_max == 8  # the long ladder's T=4 band
+    while "long" in sim.owner:
+        sp = sim.step()
+        assert sp.plan == ss.Plan(4, 4) and sp.drafter == "mtp"
+    sp = sim.step()  # 2 users again, longest context ~20 < 150: back to DFlash2 by migration
+    assert sp.plan == ss.Plan(2, 8) and sp.drafter == "dflash2" and sp.migrate and not sp.flush and not sp.long
+    assert sim.state.stats["ctx_switches"] == 2 and sim.state.stats["drafter_switches"] == 2
+    # hysteresis: a 180-token user (inside (150, 200]) plus a 260-token user; when the 260 one leaves the 180 one
+    # keeps the grid in long mode, and it flips back only when that one is gone too
+    sim.submit("mid", list(range(1, 181)), want=120)
+    sim.submit("big", list(range(1, 261)), want=30)
+    for _ in range(2):
+        sim.step()
+    assert sim.state.long and sim.state.plan == ss.Plan(4, 4)
+    while "big" in sim.owner:
+        sim.step()
+    assert sim.state.long, "the 180 + generated context sits above the limit minus the hysteresis"
+    for _ in range(3):
+        assert sim.step().drafter == "mtp"
+    sim.req["mid"]["want"] = len(sim.req["mid"]["stream"]) - 1
+    sim.step()
+    sp = sim.step()
+    assert not sim.state.long and sp.drafter == "dflash2" and sp.plan == ss.Plan(2, 8)
+    for _ in range(4):
+        sim.step()
+    sim.check_streams()
+    assert sim.state.stats["ctx_switches"] == 4, sim.state.stats
+
+
+@pytest.mark.parametrize("policy", ["mixed", "oracle", "random"])
+def test_hybrid_context_rule_never_flaps_between_ownership_changes(policy):
+    """Random churn of short and long prompts through the 3 -> 5 -> 9 -> 17 ramp with a small context limit: the
+    mode can change only when the set of live requests changes or a live user grows past the limit -- between two
+    consecutive steps with the same owners the mode changes at most once, and never twice in a row -- every switch is
+    a legal transition (flush before a shrinking T with pending rows, migration otherwise), every stream greedy."""
+    rng = random.Random(11 + len(policy))
+    lad = ss.Ladder.for_drafter("hybrid", 7, 32, dflash2_max_ctx=160, ctx_hysteresis=32)
+    sim = Sim(lad, 32, policy, seed=3)
+    # (step, [(prompt tokens, wanted tokens)]): short prompts never cross 160, the 100-token prompts cross it
+    # mid-generation, 170 / 200 are past the limit on admission; the last wave outlives every long user
+    waves = [
+        (0, [(100, 90), (4, 200)]),  # two users in the DFlash2 band: the 100-token one crosses 160 by growth
+        (100, [(200, 40), (170, 60), (8, 50), (4, 90)]),  # past the limit on admission (the first user left)
+        (102, [(8, rng.randrange(40, 100)) for _ in range(8)]),
+        (130, [(4, 100), (8, 100)]),  # outlive every long user: back to short mode at the end
+    ]
+    n, submitted = 0, {}
+    for at, reqs in waves:
+        for plen, want in reqs:
+            submitted.setdefault(at, []).append((f"r{n}", plen, want))
+            n += 1
+    step, owners_prev, long_prev, growth_flips = 0, None, False, 0
+    modes = []
+    while submitted or sim.pending_join or sim.live_count() > 0:
+        for rid, plen, want in submitted.pop(step, []):
+            sim.submit(rid, [rng.randrange(50) for _ in range(plen)], want=want)
+        if sim.live_count() == 0 and not sim.pending_join:
+            step += 1
+            continue
+        sim.step()
+        owners = tuple(sim.last_owners)  # the rows the rule saw this step (admissions in, departures not yet out)
+        mode = sim.state.long
+        if owners == owners_prev and mode != long_prev:
+            growth_flips += 1
+            assert mode, "a flip back to short mode needs a departure (positions only grow)"
+        owners_prev, long_prev = owners, mode
+        modes.append(mode)
+        step += 1
+        assert step < 3000
+    sim.check_streams()
+    st = sim.state.stats
+    assert st["ctx_switches"] == 4 and set(modes) == {True, False}, (st, set(modes))
+    assert growth_flips >= 1, "the 100-token user grew past the limit with the owners unchanged"
+    assert st["drafter_switches"] >= 2 and st["plain_steps"] == 0, st
+    # no two consecutive flips (a flip needs a departure or a growth crossing in between)
+    flips = [i for i in range(1, len(modes)) if modes[i] != modes[i - 1]]
+    assert flips and all(b - a > 1 for a, b in zip(flips, flips[1:])), flips
+    assert st["ctx_switches"] == len(flips) + (1 if modes[0] else 0), (st, flips, modes[:3])
+    if policy == "oracle":
+        assert st["ctx_flushes"] >= 1, st
 
 
 def test_hybrid_switch_4_to_5_is_held_for_a_flush_and_5_to_4_migrates():
@@ -435,6 +657,7 @@ class Sim:
         self.req = {}  # id -> dict(prompt, ref, stream, last, pos, drafts, greedy, want)
         self.pending_join = []
         self.step_log = []
+        self.last_owners = None  # the slot owners begin_step saw on the last step
 
     def submit(self, rid, prompt, want, greedy=True):
         ref = _greedy_stream(prompt, want + 12)
@@ -480,7 +703,11 @@ class Sim:
         eligible = all(self.req[o]["greedy"] for o in self.owner if o is not None)
         row_req_ids = list(self.owner)
         drafts = [self.req[o]["drafts"] if o is not None else None for o in self.owner]
-        sp = self.state.begin_step(row_req_ids, drafts, eligible, flush=flush)
+        ctx = [self.req[o]["pos"] if o is not None else -1 for o in self.owner]  # the rows' decode positions
+        self.last_owners = list(self.owner)
+        sp = self.state.begin_step(row_req_ids, drafts, eligible, flush=flush, ctx_lens=ctx)
+        if sp.mode == "spec":
+            assert sp.drafter == self.state.ladder.drafter_for(sp.plan, sp.long)
         committed_by_slot = {}
         if sp.mode == "spec":
             w, T = sp.plan.w, sp.plan.T
@@ -525,7 +752,7 @@ class Sim:
             o = self.owner[s]
             if o is not None and len(self.req[o]["stream"]) - 1 >= self.req[o]["want"]:
                 self._release(s)
-        self.step_log.append((sp.mode, sp.plan, sp.flush, sp.migrate, sorted(committed_by_slot)))
+        self.step_log.append((sp.mode, sp.plan, sp.flush, sp.migrate, sorted(committed_by_slot), sp.drafter))
         return sp
 
     def check_streams(self):

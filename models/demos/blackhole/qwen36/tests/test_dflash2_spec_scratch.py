@@ -20,8 +20,10 @@ commits) is compiled eagerly, one prompt per masked bucket is prefilled, THEN th
 Env: DF_CONFIGS ("1,7;1,3;4,7;8,7;8,3;16,3;32,3" as w,k), DF_MIN_TOKENS (64), DF_W1_PROMPTS, DF_PCC (1), DF_TIMING (1),
      DF_TIMING_REPLAYS (30), DF_OUT (json path), DF_NEARTIE (1), DF_PROBE_STEPS (8).
 """
+
 import json
 import os
+import random
 import time
 
 import pytest
@@ -351,7 +353,116 @@ def test_dflash2_spec(mesh_device):
                 "exact_vs_decode": i is None,
                 "accept_len_mean": res["accept_len_mean"],
                 "steps": probe["steps"],
+                "prompt_len": PCC_LEN,
+                "divergence": (
+                    None if i is None else {"index": i, "got": res["streams"][0][i], "exp": ref_streams[0][i]}
+                ),
             }
+            if i is not None and DO_NEARTIE:
+                # the long-context bitwise question (DFLASH2_RESULTS.md section 8.3 / 9): classify the divergence --
+                # the plain decode's logit gap at the divergence index (eager one-row decode), and whether the same
+                # divergence appears with OTHER draft policies on the same prompt (random drafts: every step accepts
+                # 0, the token is row 0 of its own step; oracle drafts = the plain stream: every row accepted, the
+                # token is row (i-1) mod 8) -- a divergence that is identical across policies is the R=8 verify's
+                # numerics at that position, not the drafts'
+                cap.enabled = False
+                nt = {
+                    "dflash2": _neartie_probe(
+                        model,
+                        refs[1],
+                        1,
+                        [probe_ids],
+                        page_tables,
+                        [0],
+                        ref_streams,
+                        [(0, i, res["streams"][0][i], ref_streams[0][i])],
+                        _prefill,
+                    )
+                }
+                policies = {}
+                rng = random.Random(1234)
+                for pol in ("random", "oracle"):
+
+                    class _PolicyHead:
+                        """The drafter with its drafts replaced: the block step still runs (its K/V write as in the
+                        real loop), the returned drafts follow the policy."""
+
+                        def __init__(self, h):
+                            self.h = h
+
+                        def write_context(self, *a, **k):
+                            return self.h.write_context(*a, **k)
+
+                        def commit(self, *a, **k):
+                            return self.h.commit(*a, **k)
+
+                        def draft(self, w_, anchors, positions, pad=None, observer=None):
+                            self.h.draft(w_, anchors, positions, pad=pad)
+                            if pol == "random":
+                                return (
+                                    [[rng.randrange(1000, 100000) for _ in range(cfg.n_draft)] for _ in range(w_)],
+                                    None,
+                                    None,
+                                )
+                            # oracle: the plain stream's continuation -- positions[0] = PCC_LEN + m - 1 after m
+                            # committed tokens (ref_streams[0][0] = the prefill's token at position PCC_LEN)
+                            m = int(positions[0]) - PCC_LEN + 1
+                            return (
+                                [
+                                    [
+                                        ref_streams[0][m + t] if m + t < len(ref_streams[0]) else 0
+                                        for t in range(cfg.n_draft)
+                                    ]
+                                ],
+                                None,
+                                None,
+                            )
+
+                    lens_p, first_p, aux_p = _prefill_with_aux(model, [probe_ids], page_tables, [0], cap)
+                    assert first_p == first
+                    steps_needed = i + 2 if pol == "random" else i // 8 + 3
+                    res_p = _spec_loop(
+                        vs, _PolicyHead(head), 1, 7, lens_p, first_p, aux_p, 10**9, max_steps=steps_needed
+                    )
+                    i_p, _ = _stream_compare(res_p["streams"][0], ref_streams[0])
+                    policies[pol] = {
+                        "steps": res_p["steps"],
+                        "accept_len_mean": res_p["accept_len_mean"],
+                        "n_tokens": len(res_p["streams"][0]),
+                        "divergence": (
+                            None
+                            if i_p is None
+                            else {"index": i_p, "got": res_p["streams"][0][i_p], "exp": ref_streams[0][i_p]}
+                        ),
+                    }
+                    if i_p is not None:
+                        nt[pol] = _neartie_probe(
+                            model,
+                            refs[1],
+                            1,
+                            [probe_ids],
+                            page_tables,
+                            [0],
+                            ref_streams,
+                            [(0, i_p, res_p["streams"][0][i_p], ref_streams[0][i_p])],
+                            _prefill,
+                        )
+                results["pcc"]["neartie"] = nt
+                results["pcc"]["policies"] = policies
+                logger.info(
+                    f"[df2] PCC probe ({PCC_LEN}-token prompt) committed stream diverges from the plain decode at token {i} "
+                    f"(got {res['streams'][0][i]} exp {ref_streams[0][i]}); NEAR-TIE probe: "
+                    + "; ".join(
+                        f"{pol}: "
+                        + ", ".join(
+                            f"@{r['token_index']} exp {r['exp']} {r['logit_exp']:.3f} vs got {r['got']} {r['logit_got']:.3f} gap {r['gap']:.4f} "
+                            f"(top2 gap {r['top2_gap']:.4f}, rank of got {r['rank_got']})"
+                            for r in rows_
+                        )
+                        for pol, rows_ in nt.items()
+                    )
+                    + f"; other policies: {policies}"
+                )
             logger.info(
                 f"[df2] PCC probe ({PCC_LEN}-token prompt, window {head.window}, {res['steps']} verify steps, k=7): {len(probe['pcc'])} draft rows, "
                 f"PCC mean {float(pcc_t.mean()):.5f} min {float(pcc_t.min()):.5f}, argmax agreement "
@@ -507,6 +618,11 @@ def test_dflash2_spec(mesh_device):
             f"DF_PCC rows={p['n_draft_rows']} pcc_mean={p['pcc_mean']:.5f} pcc_min={p['pcc_min']:.5f} "
             f"argmax_agree={p['argmax_agree_rate']:.3f} path_agree={p['path_agree_rate']:.3f} exact={p['exact_vs_decode']} "
             f"accept_len={p['accept_len_mean']:.2f}"
+            + (
+                f" divergence={p['divergence']} neartie={ {k: [(r['token_index'], round(r['gap'], 4), r['rank_got']) for r in v] for k, v in p['neartie'].items()} } policies={p.get('policies')}"
+                if p.get("divergence")
+                else ""
+            )
         )
     for key, c in results["configs"].items():
         print(

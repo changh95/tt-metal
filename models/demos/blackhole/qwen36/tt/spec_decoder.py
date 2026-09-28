@@ -27,7 +27,10 @@ Drafters (``QWEN36_SPEC_DRAFTER``, tt/aux_hidden.py ``spec_drafter``), behind on
     the first draft (anchor = the committed token at N + a_s, positions N + a_s + 1 ..) reads a gap-free context.
   * ``hybrid`` -- BOTH drafters resident, the ladder picks one per plan by width (tt/spec_serving.py
     ``Ladder.drafter_for``: DFlash2 at T = 8 up to 4 users, the MTP bands above; the served A/B behind the split is in
-    the plugin's docs/SPECULATIVE.md). Verify plans keep both the post-norm rows and the aux rows. Every spec step
+    the plugin's docs/SPECULATIVE.md) AND by context length (the context rule of spec_serving.py: the decoder hands
+    the state machine the rows' decode positions every step; past QWEN36_SPEC_DFLASH2_MAX_CTX the grid runs the long
+    ladder's MTP plans, so the decoder allocates / compiles / captures the verify plans of BOTH ladders and the
+    migrations between all of them). Verify plans keep both the post-norm rows and the aux rows. Every spec step
     keeps BOTH drafters' per-slot state current so a drafter change (a plan change: flush / migration as usual) is
     exact from the new drafter's point of view without a re-prefill: the DFlash2 context commit runs on every step
     (also when the MTP head drafts), and the MTP head's K/V for the committed rows is written by ``MTPHead.keep_current``
@@ -69,6 +72,8 @@ class SpecStepResult:
     n_catchup: int
     hold: ss.HoldInfo
     times_ms: dict = field(default_factory=dict)
+    drafter: Optional[str] = None  # the drafter that drafted at this plan (hybrid: by width and context)
+    long: bool = False  # the hybrid context rule's mode of this step
 
 
 # ================================================================================================ drafter adapters
@@ -444,7 +449,7 @@ class SpecDecoder:
         t0 = time.perf_counter()
         self.drafter.build_step_buffers(ladder.widths, zeros_pt)
         self.steps = {}
-        for plan in ladder.plans:
+        for plan in ladder.all_plans:  # both modes' plans (the hybrid context rule's long ladder included)
             vs = VerifyStep(model, plan.w, plan.T, zeros_pt[: plan.w], pad_safe=True, **self.drafter.verify_kwargs())
             assert vs.plan.attn_mode == "batched", vs.plan.attn_mode
             self.drafter.bind_plan(vs.plan)
@@ -459,10 +464,16 @@ class SpecDecoder:
         self.acc_accepted = 0
         self.n_no_context = 0  # dflash2: user-steps drafted as padding (no context K/V for the request)
         self.n_steps_by_drafter = {}
+        ctx_rule = (
+            f"; context rule: DFlash2 while the longest live context <= {ladder.dflash2_max_ctx} (hysteresis "
+            f"{ladder.ctx_hysteresis}), long ladder {[f'{p}:{ladder.drafter_for(p, long=True)}' for p in ladder.long_plans]}"
+            if ladder.has_ctx_rule
+            else ""
+        )
         logger.info(
             f"[spec] decoder ({self.drafter.name}): ladder {[f'{p}:{ladder.drafter_for(p)}' for p in ladder.plans]} k_max={ladder.k_max} "
             f"bmax={self.bmax} page table {self.nb} blocks; fractured plans {[str(p) for p in ladder.fractured_plans]}; "
-            f"{len(self.steps)} verify plans + {len(ladder.widths)} draft widths allocated in {time.perf_counter() - t0:.1f}s"
+            f"{len(self.steps)} verify plans + {len(ladder.widths)} draft widths allocated in {time.perf_counter() - t0:.1f}s{ctx_rule}"
         )
 
     # ------------------------------------------------------------------------------------------ warm-up
@@ -536,7 +547,9 @@ class SpecDecoder:
         rows = list(row_req_ids) + [None] * (self.bmax - len(row_req_ids))
         rows = [rows[s] if s < B and pos_all[s] >= 0 else None for s in range(self.bmax)]
         dr = list(drafts) + [None] * (self.bmax - len(drafts))
-        sp = self.state.begin_step(rows, dr, eligible, flush=flush, has_state=self.drafter.has_state)
+        sp = self.state.begin_step(
+            rows, dr, eligible, flush=flush, has_state=self.drafter.has_state, ctx_lens=pos_all[: self.bmax]
+        )
         if sp.mode == "plain":
             self.drafter.note_plain()
             return None
@@ -600,6 +613,8 @@ class SpecDecoder:
             n_catchup=len(sp.catchup),
             hold=hold,
             times_ms=times,
+            drafter=active,
+            long=sp.long,
         )
 
     # ------------------------------------------------------------------------------------------ metrics
@@ -621,7 +636,14 @@ class SpecDecoder:
                 hybrid = (
                     f" [hybrid: commit {hs['commit_ms'] / n:.2f} keep {hs['keep_ms'] / n:.2f} ({hs['keep_steps']} steps) "
                     f"select {hs['select_ms'] / n:.2f} ({hs['select_steps']} steps) ms/step; steps by drafter "
-                    f"{self.n_steps_by_drafter}; switches {st['drafter_switches']}]"
+                    f"{self.n_steps_by_drafter}; switches {st['drafter_switches']}"
+                    + (
+                        f"; ctx rule: {'long' if sp.long else 'short'} mode, max ctx {sp.ctx_max}, "
+                        f"{st['ctx_switches']} mode changes, {st['ctx_flushes']} own flushes"
+                        if self.ladder.has_ctx_rule
+                        else ""
+                    )
+                    + "]"
                 )
                 for key in ("commit_ms", "keep_ms", "select_ms"):
                     hs[key] = 0.0

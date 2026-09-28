@@ -37,6 +37,7 @@ prefill side computes and ships (tt/qwen36_vllm.py ``_install_mtp_prefill_hook``
 prompt (``KV group "dflash2"`` of the version-3 payload), ``hybrid`` = both (the decode side keeps both drafters and
 picks one by batch width, tt/spec_serving.py). Unset / ``mtp`` leaves every byte of the served path as it was.
 """
+
 import os
 import time
 
@@ -73,14 +74,21 @@ def dflash2_selected() -> bool:
 
 def dflash2_context_window() -> int:
     """How many trailing prompt positions of DFlash2 context K/V the prefill side computes and ships
-    (``QWEN36_DFLASH2_CONTEXT_WINDOW``; 0 = every position, the default). Every draft layer of Qwen3.8-27B-DFlash2 is a
-    sliding-attention layer of window 2048 in the reference, so a value of 2048 ships only what the reference drafter
-    can read (an 8k prompt: 32 of 128 blocks, 40 MiB instead of 160 MiB of bf16 context K/V). The device drafter
-    (tt/dflash2_head.py ``dflash2_device_window``) applies the window since 2026-09-28, so ``2048`` is safe on a stack
-    whose decode half runs with the default ``QWEN36_DFLASH2_DEVICE_WINDOW``; the default still ships every position
-    (the D-side ``note_context`` warns when a shipped tail is shorter than the device window)."""
+    (``QWEN36_DFLASH2_CONTEXT_WINDOW``; 0 = every position). Every draft layer of Qwen3.8-27B-DFlash2 is a
+    sliding-attention layer of window 2048 in the reference and the device drafter applies that window
+    (tt/dflash2_head.py ``dflash2_device_window``, ``QWEN36_DFLASH2_DEVICE_WINDOW``: unset = 2048, 0 = the whole
+    context, n = n), so the DEFAULT follows the device window: unset -> 2048 (an 8k prompt: 32 of 128 blocks, 40 MiB
+    instead of 160 MiB of bf16 context K/V; the hook skips the projection of the earlier segments too), device window
+    0 -> 0 (ship everything: the drafter reads it all), device window n -> n. Both engines of a P/D stack read the
+    same environment (scripts/serve_pd.sh), so the shipped tail always covers what D attends; the D-side
+    ``note_context`` warns when a shipped tail is shorter than the device window. An explicit value wins."""
     v = os.environ.get("QWEN36_DFLASH2_CONTEXT_WINDOW")
-    return 0 if v in (None, "") else int(v)
+    if v not in (None, ""):
+        return int(v)
+    dw = os.environ.get("QWEN36_DFLASH2_DEVICE_WINDOW")
+    if dw in (None, ""):
+        return DFLASH2_SLIDING_WINDOW
+    return int(dw)  # 0 = the device drafter attends the whole context -> ship every position
 
 
 def aux_layers_for(model, layers=DFLASH2_TARGET_LAYERS):
@@ -262,15 +270,31 @@ class DFlash2ContextPrefillHook:
             stage.first_pos = max(stage.first_pos, cs + n)  # the next segment continues from here
             return
         positions = torch.arange(cs, cs + int(bucket), dtype=torch.int32)
+        skip = max(0, stage.first_pos - cs)  # rows of this segment before the window start (block aligned)
         t1 = time.perf_counter()
         on_device = getattr(self.projector, "project_device", None)
         fractured = getattr(self.projector, "project_fractured", None)
         if fractured is not None and on_device is None:
             t2 = time.perf_counter()
             kv = fractured(aux_frac, positions)
+            if skip:
+                kv = [(k[skip:], v[skip:]) for k, v in kv]
         else:
             aux_rep = gather_aux_replicated(self.model, aux_frac)
             ttnn.synchronize_device(self.model.mesh_device)
+            drop = 0
+            if skip:
+                # the segment straddles the window start: project only the rows from the window start on, rounded
+                # down to the projector's 256-row chunk (its programs are compiled for whole chunks at warm-up) --
+                # saves most of the ~67 ms projection of a 2048-row chunk at 8k-32k prompts; the <= 192 rows below
+                # the window start are dropped after the projection
+                off = skip - skip % 256
+                drop = skip - off
+                if off:
+                    S, W = int(aux_rep.shape[-2]), int(aux_rep.shape[-1])
+                    sl = ttnn.slice(aux_rep, (0, 0, off, 0), (1, 1, S, W))
+                    ttnn.deallocate(aux_rep)
+                    aux_rep, positions = sl, positions[off:]
             if on_device is None:
                 rows = aux_rows_to_host(self.model, aux_rep)  # [S, n_aux*dim] bf16 host
                 ttnn.deallocate(aux_rep)
@@ -280,10 +304,9 @@ class DFlash2ContextPrefillHook:
                 t2 = time.perf_counter()
                 kv = on_device(aux_rep, positions)
                 ttnn.deallocate(aux_rep)
+            if drop:
+                kv = [(k[drop:], v[drop:]) for k, v in kv]
         t3 = time.perf_counter()
-        skip = max(0, stage.first_pos - cs)  # rows of this segment before the window start
-        if skip:
-            kv = [(k[skip:], v[skip:]) for k, v in kv]
         stage.append(kv, n - skip, cs + skip)
         self.stats["calls"] += 1
         self.stats["tokens"] += n - skip

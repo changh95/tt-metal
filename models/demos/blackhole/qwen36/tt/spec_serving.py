@@ -32,6 +32,22 @@ per drafter (``ladder_from_env``):
     (a band-up crossing 4 -> 5 users is held for a flush like any other, a band-down 5 -> 4 migrates), while the
     device half keeps BOTH drafters' per-slot state current on every step (tt/spec_decoder.py ``_HybridDrafter``).
     ``QWEN36_SPEC_ALLOW_FRACTURED=1`` adds the (32, 2) MTP tail as for mtp.
+    CONTEXT RULE (``QWEN36_SPEC_DFLASH2_MAX_CTX``, default HYBRID_DFLASH2_MAX_CTX; 0 = off): the block drafter's
+    acceptance falls with the context length (its 2048-token sliding window; tests/DFLASH2_RESULTS.md section 9)
+    while the MTP head's does not, so DFlash2 drafts only while the LONGEST live context on the grid (prompt +
+    generated tokens = the row's decode position) is <= the limit. Above it the grid runs the LONG ladder
+    (``QWEN36_SPEC_LADDER_LONG``, default the mtp ladder ``1:4,2:4,4:4,8:4,10:3,16:2``): the MTP head at every
+    width. The mode is a property of the state machine (``SpecServingState.long``), evaluated every step from the
+    live rows' positions: a fixed set of users can only grow, so the mode flips at most ONCE per set (short -> long,
+    when a user grows past the limit or a long-prompt user is admitted) and flips back only when the long users
+    leave AND the longest remaining context is below the limit minus ``QWEN36_SPEC_DFLASH2_CTX_HYST`` (default
+    HYBRID_DFLASH2_CTX_HYSTERESIS) -- no flapping every step. A mode change is a drafter change and a plan change
+    (e.g. (4,8) -> (4,4)) taken through the flush / migration protocol below; when the pending rows do not fit the
+    new plan (a_s up to 7 vs T-1 = 3) the state machine itself runs one FLUSH step at the current mode's plan for
+    the grid width first (a same-band plan: the pending rows always fit it) and switches on the next step -- unlike a
+    width crossing this needs no scheduler hold, because the current band's plan covers every live slot (a join
+    above the band is a width crossing and held as such). ``QWEN36_SPEC_K=3`` clamps both ladders to the same (w,4)
+    plans; then a mode change keeps the plan and only changes the drafter (both states are current every step).
 ``QWEN36_SPEC_LADDER="w:T,..."`` overrides any default (its R must respect the knob's bound; in hybrid mode the
 drafter of an overridden plan is still chosen by its width).
 
@@ -65,7 +81,10 @@ DEFAULT_LADDER_DFLASH2 = (
 )
 DEFAULT_LADDER_DFLASH2_BITWISE = "1:8,2:8,4:8,8:4,16:2"  # DFlash2, R <= 32 everywhere (QWEN36_SPEC_ALLOW_FRACTURED=0)
 DEFAULT_LADDER_HYBRID = "1:8,2:8,4:8,8:4,10:3,16:2"  # hybrid: DFlash2 T=8 up to 4 users, the MTP bands above
+DEFAULT_LADDER_HYBRID_LONG = DEFAULT_LADDER_MTP  # hybrid past the context limit: the MTP head at every width
 HYBRID_DFLASH2_MAX_W = 4  # hybrid: buckets up to this width draft with DFlash2, wider ones with the MTP head
+HYBRID_DFLASH2_MAX_CTX = 12288  # hybrid: DFlash2 only while the longest live context (tokens) is <= this (0 = no rule)
+HYBRID_DFLASH2_CTX_HYSTERESIS = 1024  # hybrid: back to DFlash2 only below MAX_CTX - this (after the long users left)
 FRACTURED_LADDER_TAIL = "32:2"
 DRAFTERS = ("mtp", "dflash2", "hybrid")
 
@@ -98,17 +117,52 @@ class Ladder:
     bucket that covers the highest live slot, None = plain decode (w_grid above the last bucket)."""
 
     def __init__(
-        self, entries: Sequence[tuple[int, int]], k_max: int, max_batch: int, max_rows: int = TILE, drafter: str = "mtp"
+        self,
+        entries: Sequence[tuple[int, int]],
+        k_max: int,
+        max_batch: int,
+        max_rows: int = TILE,
+        drafter: str = "mtp",
+        long_entries: Optional[Sequence[tuple[int, int]]] = None,
+        dflash2_max_ctx: Optional[int] = None,
+        ctx_hysteresis: Optional[int] = None,
     ):
+        """``long_entries`` / ``dflash2_max_ctx`` / ``ctx_hysteresis``: the hybrid context rule (module docstring) --
+        the plans of the LONG mode and the context limit (None / 0 = no rule: the width rule alone); ignored for the
+        single-drafter ladders."""
         k_max = int(k_max)
         max_rows = int(max_rows)
         assert drafter in DRAFTERS, f"unknown drafter {drafter!r} (expected one of {DRAFTERS})"
         assert k_max >= 1, "speculative decoding needs num_speculative_tokens >= 1"
+        self.k_max = k_max
+        self.max_batch = int(max_batch)
+        self.max_rows = max_rows
+        self.drafter = drafter
+        self.plans = self._build(entries, "ladder")
+        self.dflash2_plans = (
+            frozenset(p for p in self.plans if p.w <= HYBRID_DFLASH2_MAX_W) if drafter == "hybrid" else frozenset()
+        )
+        limit = int(dflash2_max_ctx or 0)
+        if drafter == "hybrid" and limit > 0:
+            assert long_entries, "the hybrid context rule needs the long ladder's entries"
+            self.long_plans = self._build(long_entries, "long ladder")
+            self.dflash2_max_ctx = limit
+            hyst = HYBRID_DFLASH2_CTX_HYSTERESIS if ctx_hysteresis is None else int(ctx_hysteresis)
+            assert 0 <= hyst < limit, f"QWEN36_SPEC_DFLASH2_CTX_HYST={hyst}: expected 0 <= hyst < the limit {limit}"
+            self.ctx_hysteresis = hyst
+        else:
+            self.long_plans = []
+            self.dflash2_max_ctx = None
+            self.ctx_hysteresis = 0
+        self._long_set = frozenset(self.long_plans)
+        self.all_plans = list(self.plans) + [p for p in self.long_plans if p not in set(self.plans)]
+
+    def _build(self, entries, what) -> list:
         plans = []
         for w, T in entries:
             w, T = int(w), int(T)
-            T = min(T, k_max + 1)
-            if w > max_batch or T < 2:
+            T = min(T, self.k_max + 1)
+            if w > self.max_batch or T < 2:
                 continue
             plans.append(Plan(w, T))
         # after clamping T the same (w, T) may repeat: keep the first
@@ -118,30 +172,40 @@ class Ladder:
                 seen.add(p)
                 uniq.append(p)
         plans = uniq
-        assert plans, f"empty ladder for k_max={k_max} max_batch={max_batch}: {list(entries)}"
+        assert plans, f"empty {what} for k_max={self.k_max} max_batch={self.max_batch}: {list(entries)}"
         for a, b in zip(plans, plans[1:]):
-            assert a.w < b.w, f"ladder widths must ascend: {a} {b}"
-            assert a.T >= b.T, f"ladder T must not grow with the width: {a} {b}"
+            assert a.w < b.w, f"{what} widths must ascend: {a} {b}"
+            assert a.T >= b.T, f"{what} T must not grow with the width: {a} {b}"
         for p in plans:
             assert p.R == vg.grid_rows(p.w, p.T), f"{p}: w*T must fill the tile-padded grid (no tile padding rows)"
-            assert p.R <= max_rows, (
-                f"{p}: R = {p.R} > {max_rows} (QWEN36_SPEC_ALLOW_FRACTURED unset/1 allows R <= {FRACTURED_ROWS} for the "
-                "dflash2 drafter and adds the (32,2) tail at 1; 0 = bitwise R <= 32 only)"
+            assert p.R <= self.max_rows, (
+                f"{p}: R = {p.R} > {self.max_rows} (QWEN36_SPEC_ALLOW_FRACTURED unset/1 allows R <= {FRACTURED_ROWS} for "
+                "the dflash2 drafter and adds the (32,2) tail at 1; 0 = bitwise R <= 32 only)"
             )
-        self.plans = plans
-        self.k_max = k_max
-        self.max_batch = int(max_batch)
-        self.max_rows = max_rows
-        self.drafter = drafter
+        return plans
 
-    def drafter_for(self, plan: Optional["Plan"]) -> Optional[str]:
-        """The drafter that drafts at ``plan``: the ladder's single drafter, or in hybrid mode "dflash2" for buckets up
-        to HYBRID_DFLASH2_MAX_W and "mtp" above; None for a plain step (plan None)."""
+    @property
+    def has_ctx_rule(self) -> bool:
+        return self.dflash2_max_ctx is not None
+
+    def plans_of(self, long: bool = False) -> list:
+        """The plans of a mode: the long ladder when the context rule is in its long mode, else the ladder."""
+        return self.long_plans if (long and self.long_plans) else self.plans
+
+    def drafter_for(self, plan: Optional["Plan"], long: bool = False) -> Optional[str]:
+        """The drafter that drafts at ``plan``: the ladder's single drafter, or in hybrid mode "dflash2" for the
+        ladder's buckets up to HYBRID_DFLASH2_MAX_W and "mtp" for every other plan (the wider buckets and the long
+        ladder's); ``long`` = the context rule's long mode, which matters only when k_max clamps a long plan onto a
+        DFlash2 plan (QWEN36_SPEC_K=3: (w,4) in both ladders). None for a plain step (plan None)."""
         if plan is None:
             return None
         if self.drafter != "hybrid":
             return self.drafter
-        return "dflash2" if plan.w <= HYBRID_DFLASH2_MAX_W else "mtp"
+        if plan not in self.dflash2_plans:
+            return "mtp"
+        if long and plan in self._long_set:
+            return "mtp"
+        return "dflash2"
 
     @property
     def drafters(self) -> tuple:
@@ -149,20 +213,17 @@ class Ladder:
         return ("mtp", "dflash2") if self.drafter == "hybrid" else (self.drafter,)
 
     def widths_for(self, drafter: str) -> list:
-        """The bucket widths ``drafter`` drafts at (its draft-step buffers / traces)."""
-        return [p.w for p in self.plans if self.drafter_for(p) == drafter]
+        """The bucket widths ``drafter`` drafts at in some mode (its draft-step buffers / traces)."""
+        return sorted({p.w for p in self.all_plans if drafter in (self.drafter_for(p), self.drafter_for(p, long=True))})
 
     @property
     def fractured_plans(self) -> list:
         """The plans on the fractured (R > 32) verify path: near-tie-bounded, not bitwise."""
-        return [p for p in self.plans if p.R > TILE]
+        return [p for p in self.all_plans if p.R > TILE]
 
-    @classmethod
-    def from_spec(
-        cls, spec: str, k_max: int, max_batch: int, allow_fractured: bool = False, max_rows=None, drafter: str = "mtp"
-    ):
-        """``spec`` = "w:T,w:T,..."; ``allow_fractured`` appends the (32, 2) tail; ``max_rows`` (default 64 with the
-        tail, 32 without) bounds every plan's R; ``drafter`` names the ladder's drafter policy (DRAFTERS)."""
+    @staticmethod
+    def parse_spec(spec: str, allow_fractured: bool = False) -> list:
+        """ "w:T,w:T,..." -> [(w, T), ...]; ``allow_fractured`` appends the (32, 2) tail."""
         entries = []
         for item in spec.split(","):
             item = item.strip()
@@ -172,9 +233,38 @@ class Ladder:
             entries.append((int(w), int(T)))
         if allow_fractured:
             entries += [tuple(int(v) for v in FRACTURED_LADDER_TAIL.split(":"))]
+        return entries
+
+    @classmethod
+    def from_spec(
+        cls,
+        spec: str,
+        k_max: int,
+        max_batch: int,
+        allow_fractured: bool = False,
+        max_rows=None,
+        drafter: str = "mtp",
+        long_spec: Optional[str] = None,
+        dflash2_max_ctx: Optional[int] = None,
+        ctx_hysteresis: Optional[int] = None,
+    ):
+        """``spec`` = "w:T,w:T,..."; ``allow_fractured`` appends the (32, 2) tail (to the long ladder too); ``max_rows``
+        (default 64 with the tail, 32 without) bounds every plan's R; ``drafter`` names the ladder's drafter policy
+        (DRAFTERS); ``long_spec`` / ``dflash2_max_ctx`` / ``ctx_hysteresis`` = the hybrid context rule."""
+        entries = cls.parse_spec(spec, allow_fractured)
+        long_entries = cls.parse_spec(long_spec, allow_fractured) if long_spec else None
         if max_rows is None:
             max_rows = FRACTURED_ROWS if allow_fractured else TILE
-        return cls(entries, k_max, max_batch, max_rows=int(max_rows), drafter=drafter)
+        return cls(
+            entries,
+            k_max,
+            max_batch,
+            max_rows=int(max_rows),
+            drafter=drafter,
+            long_entries=long_entries,
+            dflash2_max_ctx=dflash2_max_ctx,
+            ctx_hysteresis=ctx_hysteresis,
+        )
 
     @classmethod
     def default(cls, k_max: int, max_batch: int, allow_fractured: bool = False, drafter: str = "mtp"):
@@ -183,13 +273,27 @@ class Ladder:
         return cls.for_drafter(drafter, k_max, max_batch, allow_fractured="1" if allow_fractured else None)
 
     @classmethod
-    def for_drafter(cls, drafter: str, k_max: int, max_batch: int, spec=None, allow_fractured=None):
+    def for_drafter(
+        cls,
+        drafter: str,
+        k_max: int,
+        max_batch: int,
+        spec=None,
+        allow_fractured=None,
+        long_spec=None,
+        dflash2_max_ctx=None,
+        ctx_hysteresis=None,
+    ):
         """``drafter`` in DRAFTERS; ``spec`` = a QWEN36_SPEC_LADDER override or None; ``allow_fractured`` = the raw
-        QWEN36_SPEC_ALLOW_FRACTURED value: None (unset), "0" or "1" (see the module docstring)."""
+        QWEN36_SPEC_ALLOW_FRACTURED value: None (unset), "0" or "1" (see the module docstring); hybrid only:
+        ``long_spec`` = a QWEN36_SPEC_LADDER_LONG override, ``dflash2_max_ctx`` = the raw QWEN36_SPEC_DFLASH2_MAX_CTX
+        (None / "" = the default HYBRID_DFLASH2_MAX_CTX, 0 = no context rule), ``ctx_hysteresis`` = the raw
+        QWEN36_SPEC_DFLASH2_CTX_HYST (None = the default)."""
         assert drafter in DRAFTERS, f"unknown drafter {drafter!r} (expected one of {DRAFTERS})"
         af = None if allow_fractured in (None, "") else str(allow_fractured).strip()
         assert af in (None, "0", "1"), f"QWEN36_SPEC_ALLOW_FRACTURED={allow_fractured!r}: expected 0 or 1"
         tail = af == "1"
+        long_default = None
         if drafter == "dflash2":
             bitwise_only = af == "0"
             default = DEFAULT_LADDER_DFLASH2_BITWISE if bitwise_only else DEFAULT_LADDER_DFLASH2
@@ -198,13 +302,27 @@ class Ladder:
             # mtp, and hybrid (bitwise by construction: every default plan has R <= 32; the knob's 1 adds the tail)
             default = DEFAULT_LADDER_HYBRID if drafter == "hybrid" else DEFAULT_LADDER_MTP
             max_rows = FRACTURED_ROWS if tail else TILE
+            if drafter == "hybrid":
+                long_default = DEFAULT_LADDER_HYBRID_LONG
+        limit = HYBRID_DFLASH2_MAX_CTX if dflash2_max_ctx in (None, "") else int(str(dflash2_max_ctx).strip())
+        assert limit >= 0, f"QWEN36_SPEC_DFLASH2_MAX_CTX={dflash2_max_ctx!r}: expected >= 0 (0 = no context rule)"
+        hyst = None if ctx_hysteresis in (None, "") else int(str(ctx_hysteresis).strip())
         return cls.from_spec(
-            spec or default, k_max, max_batch, allow_fractured=tail, max_rows=max_rows, drafter=drafter
+            spec or default,
+            k_max,
+            max_batch,
+            allow_fractured=tail,
+            max_rows=max_rows,
+            drafter=drafter,
+            long_spec=(long_spec or long_default) if drafter == "hybrid" else None,
+            dflash2_max_ctx=limit if drafter == "hybrid" else None,
+            ctx_hysteresis=hyst,
         )
 
     @classmethod
     def from_env(cls, drafter: str, k_max: int, max_batch: int, env=None):
-        """The served ladder: QWEN36_SPEC_LADDER / QWEN36_SPEC_ALLOW_FRACTURED of ``env`` (default os.environ)."""
+        """The served ladder: QWEN36_SPEC_LADDER / QWEN36_SPEC_ALLOW_FRACTURED (+ the hybrid's QWEN36_SPEC_LADDER_LONG /
+        QWEN36_SPEC_DFLASH2_MAX_CTX / QWEN36_SPEC_DFLASH2_CTX_HYST) of ``env`` (default os.environ)."""
         env = os.environ if env is None else env
         return cls.for_drafter(
             drafter,
@@ -212,31 +330,36 @@ class Ladder:
             max_batch,
             spec=env.get("QWEN36_SPEC_LADDER"),
             allow_fractured=env.get("QWEN36_SPEC_ALLOW_FRACTURED"),
+            long_spec=env.get("QWEN36_SPEC_LADDER_LONG"),
+            dflash2_max_ctx=env.get("QWEN36_SPEC_DFLASH2_MAX_CTX"),
+            ctx_hysteresis=env.get("QWEN36_SPEC_DFLASH2_CTX_HYST"),
         )
 
     @property
     def widths(self) -> list:
-        return [p.w for p in self.plans]
+        """Every bucket width of every mode (the draft-step buffers are built per width)."""
+        return sorted({p.w for p in self.all_plans})
 
-    def plan_for(self, w_grid: int) -> Optional[Plan]:
-        for p in self.plans:
+    def plan_for(self, w_grid: int, long: bool = False) -> Optional[Plan]:
+        for p in self.plans_of(long):
             if p.w >= w_grid:
                 return p
         return None
 
-    def band_max(self, T: int) -> int:
+    def band_max(self, T: int, long: bool = False) -> int:
         """The widest bucket running at T (a join landing at a slot >= band_max leaves the band)."""
-        ws = [p.w for p in self.plans if p.T == T]
+        ws = [p.w for p in self.plans_of(long) if p.T == T]
         assert ws, f"no bucket at T={T}"
         return max(ws)
 
-    def min_T_above(self, w: int) -> int:
+    def min_T_above(self, w: int, long: bool = False) -> int:
         """The smallest T a batch wider than w can run at: min over the buckets above, 1 when plain decode is
         reachable (the ladder stops below max_batch). Pending rows a_s fit every reachable band iff a_s <= that - 1."""
-        above = [p.T for p in self.plans if p.w > w]
-        if self.plans[-1].w < self.max_batch:
+        plans = self.plans_of(long)
+        above = [p.T for p in plans if p.w > w]
+        if plans[-1].w < self.max_batch:
             above.append(1)
-        return min(above) if above else self.plans[-1].T
+        return min(above) if above else plans[-1].T
 
 
 @dataclass
@@ -271,6 +394,9 @@ class StepPlan:
     accept_prev: list = field(default_factory=list)  # [plan.w] the previous step's a_s (0 for pads / fresh)
     catchup: list = field(default_factory=list)  # fresh slots with drafter state (MTP: hidden row -> catch-up step)
     drafter: Optional[str] = None  # the drafter that drafts at this plan (Ladder.drafter_for; None for plain)
+    long: bool = False  # the context rule's mode this step runs in (hybrid: the long ladder / the MTP head)
+    ctx_max: int = 0  # the longest live context (decode position) the rule saw this step
+    ctx_flush: bool = False  # this flush was the state machine's own (a mode change whose pending rows did not fit)
 
 
 @dataclass
@@ -288,6 +414,10 @@ class SpecServingState:
         self.bmax = int(bmax)
         self.slots = [SlotState() for _ in range(self.bmax)]
         self.plan: Optional[Plan] = None
+        self.plan_long = False  # the context-rule mode the installed plan was chosen in
+        self.drafter_last: Optional[str] = None  # the drafter of the last spec step (kept across plain steps)
+        self.long = False  # the context rule's current mode (module docstring)
+        self.ctx_max = 0
         self.stats = {
             "steps": 0,
             "spec_steps": 0,
@@ -296,6 +426,8 @@ class SpecServingState:
             "migrations": 0,
             "plan_changes": 0,
             "drafter_switches": 0,  # hybrid: consecutive spec steps drafted by different drafters
+            "ctx_switches": 0,  # hybrid context rule: mode changes (short <-> long)
+            "ctx_flushes": 0,  # hybrid context rule: the state machine's own flush steps before a mode change
         }
 
     # ------------------------------------------------------------------------------------------ queries
@@ -313,8 +445,8 @@ class SpecServingState:
     def hold_info(self) -> HoldInfo:
         if not self.pending_any or self.plan is None:
             return HoldInfo(pending_any=False)
-        band_max = self.ladder.band_max(self.plan.T)
-        fits = self.max_pending() <= self.ladder.min_T_above(band_max) - 1
+        band_max = self.ladder.band_max(self.plan.T, self.plan_long)
+        fits = self.max_pending() <= self.ladder.min_T_above(band_max, self.plan_long) - 1
         free_below = sum(1 for s in range(min(band_max, self.bmax)) if self.slots[s].owner is None)
         return HoldInfo(
             pending_any=True,
@@ -336,6 +468,21 @@ class SpecServingState:
                 st.accept_prev = 0
                 st.seen = False
 
+    def _update_mode(self, live_all, ctx_lens) -> None:
+        """The context rule (module docstring): long when the longest live context is above the limit; back to short
+        only below the limit minus the hysteresis. Positions are the rows' decode positions (prompt + generated)."""
+        lad = self.ladder
+        if ctx_lens is None or not lad.has_ctx_rule:
+            return
+        n = min(len(ctx_lens), self.bmax)
+        self.ctx_max = max((int(ctx_lens[s]) for s in range(n) if live_all[s]), default=0)
+        if not self.long and self.ctx_max > lad.dflash2_max_ctx:
+            self.long = True
+            self.stats["ctx_switches"] += 1
+        elif self.long and self.ctx_max <= lad.dflash2_max_ctx - lad.ctx_hysteresis:
+            self.long = False
+            self.stats["ctx_switches"] += 1
+
     def begin_step(
         self,
         row_req_ids: Sequence[Optional[str]],
@@ -344,12 +491,15 @@ class SpecServingState:
         flush: bool = False,
         has_state: Optional[Callable[[int], bool]] = None,
         has_hidden: Optional[Callable[[int], bool]] = None,
+        ctx_lens: Optional[Sequence[int]] = None,
     ) -> StepPlan:
         """Decide this step. row_req_ids[s] = the request at slot s (None = pad); drafts[s] = its scheduled draft
         tokens (a -1 ends the list: unfilled scheduler placeholders); eligible = every live request may take the
         greedy verify path (else the whole step is plain decode); flush = the scheduler asked for a zero-draft step;
         has_state(s) = the drafter holds imported / prefilled state for the FRESH slot s (the MTP hidden row, the
-        DFlash2 context K/V) -> the slot is listed in ``catchup`` on its first step (``has_hidden`` is the old name).
+        DFlash2 context K/V) -> the slot is listed in ``catchup`` on its first step (``has_hidden`` is the old name);
+        ctx_lens[s] = the decode position of slot s (its context length: prompt + generated), read by the hybrid
+        context rule (None = leave the mode alone).
         Raises SpecProtocolError when a pending prefix cannot survive the transition."""
         if has_state is None:
             has_state = has_hidden
@@ -358,9 +508,31 @@ class SpecServingState:
         live_all = self.live_mask()
         assert any(live_all), "a decode step needs at least one live slot"
         w_grid = max(s for s in range(self.bmax) if live_all[s]) + 1
-        plan = self.ladder.plan_for(w_grid) if eligible else None
+        self._update_mode(live_all, ctx_lens)
+        long = self.long
+        plan = self.ladder.plan_for(w_grid, long) if eligible else None
+        ctx_flush = False
         if flush and self.plan is not None and eligible and self.plan.w >= w_grid:
-            plan = self.plan  # the flush commits the pending rows at the plan that holds them
+            plan, long = self.plan, self.plan_long  # the flush commits the pending rows at the plan that holds them
+        elif (
+            plan is not None
+            and self.plan is not None
+            and self.pending_any
+            and self.drafter_last is not None
+            and self.ladder.drafter_for(plan, long) != self.drafter_last
+            and self.max_pending() > plan.T - 1
+        ):
+            # a drafter change whose pending rows do not fit the new plan. A width crossing is held by the scheduler
+            # (hold_info) and must not get here; a context-rule mode change is the state machine's own: flush first at
+            # the CURRENT mode's plan for this width (same band as the installed plan: the rows fit), switch next step
+            fplan = self.ladder.plan_for(w_grid, self.plan_long)
+            if fplan is None or self.max_pending() > fplan.T - 1:
+                raise SpecProtocolError(
+                    f"plan change {self.plan} -> {plan} ({self.drafter_last} -> {self.ladder.drafter_for(plan, long)}) "
+                    f"with pending prefixes up to {self.max_pending()} > T-1 = {plan.T - 1}: the scheduler must hold "
+                    "the admission for a flush"
+                )
+            plan, long, flush, ctx_flush = fplan, self.plan_long, True, True
         if plan is None:
             if self.pending_any:
                 raise SpecProtocolError(
@@ -372,8 +544,11 @@ class SpecServingState:
                 if live_all[s]:
                     self.slots[s].seen = True
                     self.slots[s].accept_prev = 0
-            return StepPlan(mode="plain", w_grid=w_grid, prev_plan=self.plan, flush=flush)
+            return StepPlan(
+                mode="plain", w_grid=w_grid, prev_plan=self.plan, flush=flush, long=long, ctx_max=self.ctx_max
+            )
         prev = self.plan
+        drafter = self.ladder.drafter_for(plan, long)
         migrate = False
         if prev != plan:
             if self.pending_any:
@@ -388,8 +563,8 @@ class SpecServingState:
                 migrate = True
                 self.stats["migrations"] += 1
             self.stats["plan_changes"] += 1
-            if self.ladder.drafter_for(prev) not in (None, self.ladder.drafter_for(plan)):
-                self.stats["drafter_switches"] += 1
+        if self.drafter_last is not None and drafter != self.drafter_last:
+            self.stats["drafter_switches"] += 1
         w, k = plan.w, plan.k
         live = live_all[:w]
         n_drafts, dr, acc, catchup = [], [], [], []
@@ -410,6 +585,8 @@ class SpecServingState:
         self.stats["spec_steps"] += 1
         if flush:
             self.stats["flushes"] += 1
+        if ctx_flush:
+            self.stats["ctx_flushes"] += 1
         return StepPlan(
             mode="spec",
             w_grid=w_grid,
@@ -422,7 +599,10 @@ class SpecServingState:
             drafts=dr,
             accept_prev=acc,
             catchup=catchup,
-            drafter=self.ladder.drafter_for(plan),
+            drafter=drafter,
+            long=long,
+            ctx_max=self.ctx_max,
+            ctx_flush=ctx_flush,
         )
 
     def grid_tokens(self, sp: StepPlan, last: Sequence[int]) -> list:
@@ -443,6 +623,8 @@ class SpecServingState:
                 accepts[s] = 0
                 committed[s] = []
         self.plan = sp.plan
+        self.plan_long = sp.long
+        self.drafter_last = sp.drafter
         return accepts, committed
 
 
