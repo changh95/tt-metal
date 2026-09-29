@@ -2,7 +2,9 @@
 
 Track "grouped prefill + conv1d block-major", 2026-09-29, P150x8 box, half A (chips 0,1,6,7, TP=4) for the tests, all
 eight chips for the served A/B. Commits (tt-metal, branch qwen38-pd-disagg): `b86337530bb` conv1d block-major,
-`f9dca7d3fa8` grouped traced prefill. Every number below has its log under `logs/` of the experiment root.
+`f9dca7d3fa8` grouped traced prefill, plus the review fixes of section 5 (hook row views compiled per row, the
+(256, 8) / (512, 4) / (128, 2) exactness sets, the trace-region guard, the concurrency-check paragraphs). Every number
+below has its log under `logs/` of the experiment root.
 
 ## 1. conv1d block-major work order (qkv_causal_conv1d_silu, item 11)
 
@@ -19,6 +21,9 @@ kernel at (2048, 512): **18/18 EXACT** (`logs/r4_conv1d_op_before.log`, `logs/r4
 `QWEN36_PK_BITEXACT=1`): prefill logits at ISL 128 / 512 / 4096 / 8192 max|d| = 0 (0 mismatches of 248,320 each) and
 identical greedy tokens over 8 traced decode steps (`logs/r4_conv1d_model_ref_save.log`,
 `logs/r4_conv1d_model_ref_check.log`).
+
+Only the TP=4 shapes (C = 2560) were bit-checked; the served TP=8 shapes (C = 1280 per device) rely on the kernel change
+being shape-independent (the work-item remap touches the (block, mt) order only, not the per-tile arithmetic).
 
 Op timing (one trace of 48 back-to-back ops, 30 replays, per-op wall us, median):
 
@@ -57,6 +62,11 @@ BH = B*Nv variant runs another scan kernel whose fp32 state differs at ~1e-5 in 
 GDN state is assembled in-trace into per-B ROW_MAJOR buffers the pooled host snapshot reads per row; the P/D producer's
 `pd_gdn_capture` / `pd_stage_hook`, the host slot write and the speculative prefill hooks (per-row views of the grouped
 residual and aux copies) are served per user. Rows past the real users are 1-token dummies over the scratch KV block.
+Grouping serves the consumers of the pooled host snapshot: with the device-side slot copy on
+(`QWEN36_PLAIN_GDN_SLOT_DEVICE_COPY_FORCE` / the device-copy modes) and NO P/D capture -- a standalone `tt-model serve` --
+every user keeps the per-user path and the knob is silently inert (the served P/D producer is the consumer). The knob
+belongs on P only: D never prefills, and the eight default bodies hold ~539 MiB of TRACE region at TP=8
+(`logs/pd_P_grp_on.log`), which D's decode / speculative traces need.
 
 ### The round-3 hang, localized and fixed
 Round 3 hung on the first grouped replay twice (`logs/round3/itemK_test.log`, `logs/grp_test_all.log`). Cause (the class
@@ -76,8 +86,22 @@ would corrupt) drove the fix, run by run on half A:
 Model side: `_prepare_prefill_group_traces` (called from `_capture_prefill_trace_chunked_tp` before the chunk capture)
 allocates the shared constants, every (bucket, B) input set, the per-B state outputs and the residual / aux output buffers
 and runs one eager pass per body + readouts; `capture_prefill_group_traces` only captures (largest body first, skipped
-when the TRACE region is short). Trace-region cost at TP=4: 128x8 56.9, 256x8 58.4, 512x4 43.0, 128x4 40.5, 256x4 41.2,
-512x2 32.8, 128x2 30.9, 256x2 31.9 MiB (`logs/grp_trk4.log`).
+when the TRACE region is short -- section 5c). Trace-region cost of the committed bodies, identical at TP=4 and TP=8 and
+with or without the DFlash2 aux copies: 256x8 120.1, 128x8 105.6, 512x4 70.4, 256x4 66.5, 128x4 59.2, 512x2 41.5,
+256x2 39.5, 128x2 35.7 MiB = 539 MiB for the default spec (`logs/grp_trk5.log`, `logs/grp_full_notrk.log`,
+`logs/grp_full_newsets.log`, `logs/grp_hooks_trk1.log` at TP=4; `logs/pd_P_grp_on.log:1931-1938` at TP=8). The smaller
+figures of `logs/grp_trk4.log` (256x8 58.4 MiB ...) belong to that run's intermediate body (before the per-row GDN scan,
+`QWEN36_PREFILL_GROUP_ROWSCAN=1`, became the default), not to the committed body.
+
+Hook row views (review must-fix 1, section 5a): `_run_group_prefill_hooks` hands the speculative prefill hooks row u's
+`ttnn.slice` of the grouped residual output and of every aux copy. `ttnn.slice` hashes `slice_start`
+(`slice_device_operation.cpp` compute_program_hash), so each ROW is its own program; `f9dca7d3fa8` warmed row B-1 only,
+which would have compiled up to (B-1) x (1 + n_aux) slice programs at the first hooks-on grouped step AFTER the captures
+(the served speculative stack took exactly that path: `logs/pd_P_grp_on.log` groups=[(256, 8, 8)] with both hooks
+installed, and survived). `_prepare_prefill_group_traces` now compiles the view for every row of every buffer;
+`test_prefill_grouped_trace.py` with `QWEN36_GRP_TEST_HOOKS=1` installs both hooks (MTP head prefill hook + DFlash2
+context hook, compiled first as `qwen36_vllm._install_mtp_prefill_hook` does) and the run under the tracker is
+`logs/grp_hooks_trk1.log` (section 5a).
 
 The tracker still flags the PRE-EXISTING masked-bucket order at buckets >= 256 (each bucket's input buffers are allocated
 between captures; `logs/grp_full_default.log`: 11 buffers of `_alloc_masked_bucket_bufs(256)`). Those inputs are re-DMA'd
@@ -93,6 +117,11 @@ steps identical:
 
 `logs/grp_full_notrk.log`: **every set exact -- logits / rec / taps 8/8/8, 4/4/4, 2/2/2, 8/8/8, 6/6/6; tokens identical
 for all 28 users** (min PCC 1.000000 everywhere). `logs/grp_trk5.log` (same, b128_B8 under the tracker): exact, PASS.
+These five sets replay the bodies (128, 8), (256, 4), (512, 2), (128, 4), (256, 2). The other three bodies of the default
+spec -- (256, 8), the one the served A/B replayed, (512, 4) and (128, 2) -- were added as sets b256_B8 [130, 160, 192,
+200, 224, 240, 255, 256], b512_B4 [257, 300, 400, 512] and b128_B2 [chat, 77] after review (must-fix 2); section 5b
+has their result (`logs/grp_full_newsets.log`). The "bit-identical per row" claim holds exactly for the (bucket, B)
+pairs listed in that section.
 
 Why exactness needs `QWEN36_PREFILL_SMALLM_MAX=0`: with the serving default (128: item J's AG + 1D matmuls at <= 128 rows,
 a different K accumulation order) the per-user bucket-128 body is not bit-identical to the same rows inside a 1024-row
@@ -152,10 +181,18 @@ here: 128 x 8 = 265 ms vs 8 x 58 ms; 256 x 8 = 435 vs 8 x 80 ms), or when P devi
 at 32 users x 128 tokens: D-bound, throughput unchanged at ~677 tok/s). The plan's -0.3..-0.5 s standalone projection
 assumed a ~2x-per-user grouped body and predates the per-user release.
 
-`scripts/pd_concurrency_check.py` (conc 1-32, 48 greedy tokens, PD proxy vs the D instance): 14 mismatches with the
-knob OFF and 17 with it ON in this speculative env -- the baseline itself no longer self-matches on today's HEAD
-(v12's gate was ALL MATCH; commits after v12 changed the drafting rules: `2acf664d24a` adaptive DFlash2 draft length),
-so this run cannot attribute anything to the grouped path; section 4b isolates it.
+`scripts/pd_concurrency_check.py` as run here (`logs/points_grp_*/conc_check.log`: `--ref http://localhost:8200 --pd
+http://localhost:8000 --max-tokens 48`, i.e. the PD proxy against the D instance decoding the same prompt LOCALLY, conc
+1-32): 14 mismatches with the knob OFF and 17 with it ON in this speculative env. This is NOT the v12 gate's check: the
+gate (`scripts/spec_gate_v12.sh:41-42`, `logs/gate_v12/summary.txt` "pd_concurrency_check self-consistency (ref = the
+proxy itself)") ran `--ref $URL --pd $URL` with 64 tokens -- the proxy against itself, a determinism / batching-invariance
+probe -- and that is the form whose ALL MATCH is on record. The proxy-vs-D form compares two different execution paths
+(P prefill -> transfer -> D decode vs D-local prefill + decode) and had no ALL MATCH record to regress from; its 14
+knob-off mismatches (conc 1/2/4 all match; conc 8: 6/8, 16: 12/16, 32: 24/32; always prompts 6 and 7 from token 91 /
+158) are reproduced identically by the plain stack of section 4b, so they are neither a v12 regression nor attributable
+to the post-v12 drafting-rule commits (`2acf664d24a`), and this run cannot attribute anything to the grouped path
+either; section 4b isolates the knob. The self-consistency form was not rerun for this track (it needs the served
+stack on all eight chips; the in-process torch.equal tests are the exactness evidence).
 
 ### 4b. Plain P/D (no speculative decoding; `QWEN36_PD_SHM=1`)
 `logs/points_grp_nospec_off/`, `logs/points_grp_nospec_on/` (status files carry the RESULT lines):
@@ -165,27 +202,85 @@ so this run cannot attribute anything to the grouped path; section 4b isolates i
 | 128/128 x32 | 953.3 / 338.5 / 5260, 688.4 tok/s | **859.1 / 653.4 / 3724, 707.3 tok/s** (mean -10 %, p99 -29 %, median +93 %, tput +2.7 %) |
 | 1024/128 x32 | 4267 / 4032 / 9111, 405.2 | 4306 / 4093 / 9147, 403.3 (bucket 2048: no grouping; tie) |
 
-`pd_concurrency_check` (PD proxy vs the D instance decoding locally, 48 greedy tokens, conc 1-32): knob off 14
-mismatches -- conc 1/2/4 all match, conc 8: 6/8, 16: 12/16, 32: 24/32, always prompts 6 and 7 ("Give three tips",
-"Summarize ... Romeo") from token 91 / 158 on: a pre-existing width >= 8 divergence of today's HEAD that is identical
-with the knob on, and identical in the speculative env of 4a (the v12 gate had ALL MATCH; not touched by this track).
-Knob on: 17 mismatches = the same 14 plus prompt 0 ("haiku", from token 38) at conc >= 8 -- the documented small-M vs
+`pd_concurrency_check` in the proxy-vs-D form (see 4a for why this is not the v12 gate's self-consistency check): knob
+off 14 mismatches -- conc 1/2/4 all match, conc 8: 6/8, 16: 12/16, 32: 24/32, always prompts 6 and 7 ("Give three tips",
+"Summarize ... Romeo") from token 91 / 158 on: at decode width >= 8 the PD path (P prefill -> transfer -> D decode) and the
+D-local reference land on different sides of near-ties for those two prompts; identical with the knob on, identical in
+the speculative env of 4a, not touched by this track and not a regression of anything on record (no proxy-vs-D ALL
+MATCH exists). Knob on: 17 mismatches = the same 14 plus prompt 0 ("haiku", from token 38) at conc >= 8 -- the documented small-M vs
 2D difference: P (grouping on) forces `QWEN36_PREFILL_SMALLM_MAX=0`, while the reference D instance still prefills
 locally on the small-M path. `logs/points_grp_dsm0_on/` reran the knob-on stack with `QWEN36_PREFILL_SMALLM_MAX=0` on
 D as well: `RESULT 128,128,32,256 completed 256 mean_ttft_ms 854.5 median_ttft_ms 690.2 p99_ttft_ms 3487.3 mean_tpot_ms 37.3 tput 705.2`; 1024/128 x32 4255 / 3956 / 9128 ms, 406.7 tok/s; but the concurrency check got WORSE (24 mismatches,
 the haiku prompt now differing from token 38 even at conc 1, where the knob-off stack matched). So the check's D-local
 reference is itself a near-tie-sensitive quantity: changing D's prefill programs (small-M -> 2D) moves the reference
 continuation of the haiku prompt, and the PD output (P 2D prefill -> transfer -> D decode) lands on the other side of the
-tie. The in-process tests are the exactness evidence (grouped == per-user, torch.equal, 28 users; pd_transfer_repro
-24/24); `pd_concurrency_check` on today's HEAD is not a usable gate for this item (its knob-off baseline already fails at
-conc >= 8) and the P-2D-vs-D-local disagreement at conc 1 deserves its own bisect (transfer/import vs prefill programs;
-not started here).
+tie. The in-process tests are the exactness evidence (grouped == per-user, torch.equal, 28 + 14 users across the eight
+(bucket, B) bodies; pd_transfer_repro 24/24); the proxy-vs-D form of `pd_concurrency_check` is not a usable gate for
+this item (its knob-off baseline differs at conc >= 8 by construction of the comparison, and its D-local reference moves
+with D's own prefill programs), and the P-2D-vs-D-local disagreement at conc 1 deserves its own bisect (transfer/import
+vs prefill programs; not started here). A gate number for this track would have to come from the self-consistency
+form (`--ref $URL --pd $URL`) with the knob off and on; not run.
 
 ### Verdict
-The grouped traces are allocation-safe (tracker-clean flow, no hang in ~40 grouped replays across the runs above) and
-bit-identical per row to the 2D per-user path; they cut the P device time of an 8-user short-prompt step by 40-55 %. At
+The grouped traces are allocation-safe (tracker-clean flow with and without the speculative prefill hooks, no hang in
+the grouped replays across the runs above and in section 5) and bit-identical per row to the 2D per-user path for the
+(bucket, B) pairs listed in section 5b; they cut the P device time of an 8-user short-prompt step by 40-55 %. At
 32 users the client-side gain is small (plain stack: mean TTFT -10 %, p99 -29 %, throughput +2.7 %; median worse because
 the per-user release already hands early users to D) and D-bound in the speculative stack (a wash). The knob therefore
 stays OPT-IN (`QWEN36_PREFILL_GROUP_TRACE` unset = off, the published v12 bundle unchanged). A queue-depth-aware policy
 (group only when >= 6 same-bucket users wait; B <= 4 to shorten the hold) is the natural next step if P becomes the
 bottleneck (short-prompt bursts, prefill-heavy workloads).
+
+## 5. Review fixes (2026-09-29, half A)
+
+### 5a. Hooks-on grouped path compile-first-clean (must-fix 1)
+Fix: `_prepare_prefill_group_traces` compiles `_group_row_view` for every row u in range(B) of `bufs.hidden` and of every
+`bufs.aux` buffer (one `ttnn.slice` program per slice_start). Evidence: `test_prefill_grouped_trace.py` with
+`QWEN36_GRP_TEST_HOOKS=1` (MTP head prefill hook + DFlash2 context hook installed before the warm-up captures, both
+compiled first, exactly the served hybrid stack's hooks) under `TT_METAL_TRACE_ALLOC_TRACKING=1
+TT_METAL_TRACE_ALLOC_TRACEBACKS=1`, sets b128_B8 + b128_B2 (bucket 128: the only bucket whose per-user inputs are
+allocated before the first capture, see section 2): `logs/grp_hooks_trk1.log` -- **rc=0, PASS: every grouped and per-user replay verified clean by the tracker (it raises before
+`execute_trace` on any live unsafe buffer), 10/10 users torch.equal on logits / rec / taps, greedy tokens identical**
+(`GRP_RESULT b128_B8 ... exact logits/rec/taps=8/8/8 of 8 hooks_exact=8/8 | b128_B2 ... 2/2/2 of 2 hooks_exact=2/2`).
+The run's env is on record in `logs/grp_review_chain.sh` / `logs/grp_review_run.sh` (the gated runner:
+`TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1 QWEN36_GRP_TEST_HOOKS=1 QWEN36_GRP_TEST_SETS=b128_B8,b128_B2`);
+later runs print the tracker state at `_setup` (`[grp] trace-allocation tracker ON/off; speculative prefill hooks ON/off`).
+The hooks' per-user products are compared too: the MTP head's pending hidden row (`pending_rows[slot]`, host bf16
+[dim]) and the DFlash2 staged context K/V (`KvGroupStage.rows()`, per drafter layer) grouped vs per-user, torch.equal:
+**EXACT for all 10 users** (`[grp] b128_B8 u0 hooks: mtp_row=EXACT dflash2_ctx[(0, 29)]=EXACT` ... u7,
+b128_B2 u0/u1), so the hooks-on grouped path is both compile-first-clean and bit-identical to the per-user hooks
+(closes caveat 7 of the implementer report). Without the tracker over all eight sets with the hooks installed: `logs/grp_hooks_full.log` --
+**rc=0, PASS, 42/42 users exact on logits / rec / taps AND hook products, greedy tokens identical**,
+groups (128, 8) x2, (256, 4), (512, 2), (128, 4) + (256, 2), (256, 8), (512, 4), (128, 2).
+
+### 5b. Per-row bit-exactness of every body of the default spec (must-fix 2)
+`logs/grp_full_newsets.log` (no hooks, no tracker; the eight sets of `SETS`): **rc=0, PASS -- every set exact: logits / rec / taps 8/8/8, 4/4/4, 2/2/2, 8/8/8, 6/6/6, 8/8/8 (b256_B8),
+4/4/4 (b512_B4), 2/2/2 (b128_B2); greedy tokens identical for all 42 users; min PCC 1.000000 everywhere**.
+Bodies now covered torch.equal per row (logits, GDN rec state, conv taps) with identical greedy continuations:
+(128, 2), (128, 4), (128, 8), (256, 2), (256, 4), (256, 8), (512, 2), (512, 4) -- i.e. all eight bodies of
+the default spec, each with real-text prompts of mixed lengths inside its bucket (b256_B8 lengths 130-256 include the
+full-bucket row; b512_B4 257-512 likewise). `DEFAULT_GROUP_TRACE_SPEC` (`128:2,4,8;256:2,4,8;512:2,4`) is unchanged: every pair it captures has a passing
+set.
+
+### 5c. Trace-region guard (must-fix 4)
+The former `need = 96 MiB` first-trace guard was below the first grouped capture at TP=8 (+120.2 MiB for (256, 8),
+`logs/pd_P_grp_on.log:1931`), so with 96-120 MiB free the capture would have thrown inside `end_trace_capture` -- not
+the "skipped, never fatal" the comments claimed. `capture_prefill_group_traces` now estimates each body from the
+process's OWN masked-bucket trace deltas (`_mb_trace_delta[bucket]`, recorded by `capture_prefill_bucket_traces`):
+`need = 1.25 x delta(bucket) x (1 + 0.5 (B - 1)) x calib`, `calib` = the max measured / estimated ratio of the grouped
+captures so far (only ever raises the estimate). Against the measurements (bucket deltas 25-29 MiB; the grouped
+footprints are the same at TP=4 and TP=8, with or without the aux copies -- see section 2): B=8 bodies take 4.2-4.4x,
+B=4 2.3-2.6x, B=2 1.4-1.5x the bucket delta vs the formula's 4.5 / 2.5 / 1.5 (x 1.25 margin). In `logs/grp_full_newsets.log`
+the guard printed `guard estimate 153 / 88 / 142 / 85 / 53 / 79 / 51 / 47 MiB, calib 1.00` against measured +120.1 / 70.4
+/ 105.6 / 66.5 / 41.5 / 59.2 / 39.5 / 35.7 MiB: every estimate above its body by 19-32 %, none tripped calibration. The 1
+GiB region holds the chunk + five bucket traces (~140 MiB) plus the 539 MiB default spec with ~340 MiB to spare. The guard is an estimate, not a
+guarantee: a capture whose trace buffer still does not fit throws inside `end_trace_capture`, the capture state cannot
+be unwound, and the failure is now logged with the free bytes and RE-RAISED (fatal at warm-up; shrink
+`QWEN36_PREFILL_GROUP_TRACE`). The "never fatal" wording was removed from `model.py` and this doc. Not exercised on
+device (it needs a nearly full TRACE region); the estimate path itself ran in every capture of section 5a/5b (the
+`guard estimate` field of the capture lines in `logs/grp_full_newsets.log` and `logs/grp_hooks_full.log`).
+
+### 5d. Concurrency-check paragraphs (must-fix 3)
+Sections 4a/4b rewritten: the v12 gate's ALL MATCH was `pd_concurrency_check` SELF-consistency (proxy vs proxy, 64
+tokens); this track ran proxy vs the D instance (48 tokens), a different comparison with no ALL MATCH record, whose 14
+knob-off mismatches the plain stack reproduces -- not a regression and not attributable to `2acf664d24a`.
