@@ -271,6 +271,7 @@ class Qwen36Model:
             os.environ.get("QWEN36_PREFILL_BUCKET_TRACE"), self._PREFILL_MASK_BUCKETS
         )
         self._mb_traces = {}  # bucket -> _MaskedBucketTrace (empty unless the gate is on)
+        self._mb_trace_delta = {}  # bucket -> TRACE-region bytes its per-user trace took (grouped-trace size estimate)
         # Scratch physical KV block for the fixed-width fill page table's pad entries; set by
         # allocate_kv_caches (last block, or QWEN36_PREFILL_BUCKET_PAD_BLOCK).
         self._pad_kv_block = None
@@ -279,7 +280,10 @@ class Qwen36Model:
         # Grouped traced prefill (B in {2,4,8} same-bucket users per body; capture_prefill_group_traces). Needs the
         # per-user bucket traces' machinery (pad KV block, shared chunk buffers), so it is inert without them.
         # QWEN36_PREFILL_GROUP_TRACE: unset/"1" = masked_bucket_trace.DEFAULT_GROUP_TRACE_SPEC, "0" = off, or a
-        # "bucket:B,B;bucket:B" spec. Traces the region cannot hold are skipped (largest first), never fatal.
+        # "bucket:B,B;bucket:B" spec. A body whose ESTIMATED trace footprint (capture_prefill_group_traces: the
+        # process's own masked-bucket trace deltas x a per-B factor x 1.25, recalibrated after every grouped capture)
+        # exceeds the free TRACE region is skipped (largest first); a capture that still fails inside
+        # begin/end_trace_capture is FATAL at warm-up (the capture state cannot be unwound; see the doc).
         self._grp_spec = (
             mbt.parse_group_trace_spec(os.environ.get("QWEN36_PREFILL_GROUP_TRACE"), self._PREFILL_MASK_BUCKETS)
             if self._mb_trace_buckets
@@ -2052,8 +2056,12 @@ class Qwen36Model:
         # Grouped traced prefill (capture_prefill_group_traces): same-bucket users of this step run B <= 8 at a
         # time through one trace whose B-row GDN state is read per row into the same pooled host snapshots the
         # per-user path produces -- so it serves the consumers of that snapshot (the P/D producer's pd_gdn_capture
-        # and the host slot write). The device-side slot copy (modes 1/2) reads the B=1 scratch and keeps the
-        # per-user path, as do the speculative-decoding prefill hooks (they observe the per-user bucket body).
+        # and the host slot write). The device-side slot copy (modes 1/2) reads the B=1 scratch, so a stack that
+        # sets QWEN36_PLAIN_GDN_SLOT_DEVICE_COPY_FORCE / the device-copy modes WITHOUT the P/D capture (a standalone
+        # `tt-model serve`) keeps the per-user path for every user: grouping is silently inert there (the served
+        # P/D producer is the consumer). The speculative-decoding prefill hooks (MTP head KV fill, DFlash2 context)
+        # run per row over slices of the grouped outputs (_run_group_prefill_hooks) exactly as the per-user path
+        # runs them after its replay.
         groups, singles = [], list(range(N))
         _hooks = self.prefill_hidden_hook is not None or self.prefill_aux_hook is not None
         if self._grp_traces and self._grp_use and N >= 2 and (_pd_capture is not None or not _dev_copy):
@@ -3184,6 +3192,8 @@ class Qwen36Model:
             self._mb_traces[bucket] = _MaskedBucketTrace(bucket, trace_id, bufs, out)
 
             after = self._trace_region_bytes(device)
+            if None not in (before, after):
+                self._mb_trace_delta[bucket] = after - before
             delta = f"+{(after - before) / (1 << 20):.1f} MiB" if None not in (before, after) else "n/a"
             logger.info(f"Masked-bucket({bucket}) prefill trace (TP) captured; TRACE region {delta}")
         # Both passes advanced the GDN recurrence; the next real request must start from zero.
@@ -3622,9 +3632,14 @@ class Qwen36Model:
             bufs.hidden = ttnn.clone(warm)
             ttnn.copy(warm, bufs.hidden)
             ttnn.deallocate(warm)
-            # The per-row views the speculative prefill hooks read after a replay (same program for every row).
+            # The per-row views the speculative prefill hooks read after a replay (_run_group_prefill_hooks): ONE
+            # slice program per ROW -- ttnn.slice hashes slice_start (slice_device_operation.cpp compute_program_hash),
+            # so every row of the residual output and of every aux copy is compiled here, not at the first grouped
+            # step with the hooks installed (which would compile up to (B-1) x (1 + n_aux) programs after the captures:
+            # the round-3 hang class). Verified under the tracker with both hooks installed: logs/grp_hooks_trk1.log.
             for t in [bufs.hidden] + list(bufs.aux or []):
-                ttnn.deallocate(self._group_row_view(t, B - 1, bucket))
+                for u in range(B):
+                    ttnn.deallocate(self._group_row_view(t, u, bucket))
             warm_lg = self._grouped_logits_tp(bufs.hidden, bucket, B, [max(1, bucket - 1 - u) for u in range(B)])
             self._logits_rows_to_host(warm_lg, B)
             tr_warm = _GroupedBucketTrace(bucket, B, None, bufs, None, self._grp_rec_out[B], self._grp_taps_out[B])
@@ -3641,8 +3656,18 @@ class Qwen36Model:
     def capture_prefill_group_traces(self, device, page_table):
         """Capture one trace per PREPARED (bucket, B) (_prepare_prefill_group_traces ran before the first capture),
         largest body first. No program may compile here: the capture pass replays the compiled programs over the
-        persistent buffers. A body the TRACE region cannot hold is skipped (logged), not fatal: those users keep
-        the per-user trace. Runs after capture_prefill_bucket_traces (shares its pad KV block and chunk buffers)."""
+        persistent buffers.
+
+        TRACE-region guard: a body is SKIPPED (logged; its users keep the per-user trace) when the free region is
+        below its estimated footprint = this process's masked-bucket(bucket) trace delta x (1 + 0.5 (B - 1)) x 1.25
+        (measured, identical at TP=8 served and TP=4 test, with or without the aux copies: 256 x 8 = 120 MiB vs bucket
+        27 MiB -> 4.4x, 512 x 4 70 vs 28 -> 2.5x, 128 x 2 36 vs 25 -> 1.4x; logs/pd_P_grp_on.log,
+        logs/grp_full_newsets.log), recalibrated upward after every grouped
+        capture (max measured / estimated ratio). The guard is an estimate, NOT a guarantee: a capture whose trace
+        buffer does not fit throws inside end_trace_capture, which leaves the capture state unrecoverable, so that
+        failure is logged with the free bytes and re-raised (fatal at warm-up; QWEN36_PREFILL_GROUP_TRACE with a
+        smaller spec is the remedy). Runs after capture_prefill_bucket_traces (shares its pad KV block and chunk
+        buffers)."""
         if not self._grp_spec:
             return
         if not self.grouped_prefill_ready():
@@ -3654,33 +3679,50 @@ class Qwen36Model:
         assert self._paged_kv_caches and self._pad_kv_block is not None, "capture_prefill_bucket_traces must run first"
         assert self._chunk_full_page_table_buf is not None, "the shared chunk-trace input buffers must exist"
         todo = sorted((k for k in self._grp_prepared if k not in self._grp_traces), key=lambda k: -k[0] * k[1])
-        need = 96 << 20  # first-trace requirement; refined from the measured deltas below
-        seen_delta = []
+        calib = 1.0  # max (measured / estimated) over the grouped captures so far; only ever raises the estimate
+
+        def _estimate(bucket, B):
+            base = self._mb_trace_delta.get(bucket)
+            if base is None:  # no per-user delta known (API unavailable / bucket not traced): the TP=8 measurements
+                base = 28 << 20
+            return int(1.25 * calib * base * (1.0 + 0.5 * (B - 1)))
+
         for bucket, B in todo:
             free = self._trace_region_free_bytes(device)
+            need = _estimate(bucket, B)
             if free is not None and free < need:
                 logger.warning(
                     f"[prefill] grouped trace ({bucket} x B={B}) skipped: TRACE region has {free / (1 << 20):.0f} MiB free, "
-                    f"need ~{need / (1 << 20):.0f} MiB"
+                    f"estimated need {need / (1 << 20):.0f} MiB"
                 )
                 continue
             bufs = self._grp_prepared[(bucket, B)]
             before = self._trace_region_bytes(device)
             t1 = time.perf_counter()
-            trace_id = ttnn.begin_trace_capture(device, cq_id=0)
-            out = self._forward_prefill_group_body_tp(bucket, B, bufs)
-            ttnn.end_trace_capture(device, trace_id, cq_id=0)
+            try:
+                trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+                out = self._forward_prefill_group_body_tp(bucket, B, bufs)
+                ttnn.end_trace_capture(device, trace_id, cq_id=0)
+            except Exception:
+                logger.error(
+                    f"[prefill] grouped trace ({bucket} x B={B}) capture FAILED with {free / (1 << 20) if free is not None else -1:.0f} MiB "
+                    f"of TRACE region free (estimated need {need / (1 << 20):.0f} MiB); the capture state cannot be "
+                    "unwound -- fatal. Shrink QWEN36_PREFILL_GROUP_TRACE (drop the largest (bucket, B) first)."
+                )
+                raise
             assert out is bufs.hidden, "the captured grouped body must write the pre-allocated output buffer"
             self._grp_traces[(bucket, B)] = _GroupedBucketTrace(
                 bucket, B, trace_id, bufs, out, self._grp_rec_out[B], self._grp_taps_out[B]
             )
             after = self._trace_region_bytes(device)
             if None not in (before, after):
-                seen_delta.append(after - before)
-                need = int(1.25 * max(seen_delta))
+                est0 = _estimate(bucket, B) / (1.25 * calib)  # the uncalibrated estimate of this body
+                if est0 > 0:
+                    calib = max(calib, (after - before) / est0)
             delta = f"+{(after - before) / (1 << 20):.1f} MiB" if None not in (before, after) else "n/a"
             logger.info(
-                f"Grouped-bucket({bucket} x B={B}) prefill trace (TP) captured; TRACE region {delta}, "
+                f"Grouped-bucket({bucket} x B={B}) prefill trace (TP) captured; TRACE region {delta} "
+                f"(guard estimate {need / (1 << 20):.0f} MiB, calib {calib:.2f}), "
                 f"DRAM free {self._dram_free_mib(device)} (capture {time.perf_counter() - t1:.1f} s)"
             )
         if self._grp_traces:

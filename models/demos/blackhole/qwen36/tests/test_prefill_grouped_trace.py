@@ -18,6 +18,12 @@ Run (half A): MESH_DEVICE=P150x4 TT_VISIBLE_DEVICES=0,1,6,7 QWEN36_PREFILL_GROUP
 First run under the trace-allocation tracker (TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_TRACEBACKS=1): every
 execute_trace then RAISES listing the buffers a replay would corrupt instead of wedging the chips.
 Env: QWEN36_GRP_TEST_STEPS (8), QWEN36_GRP_TEST_SETS (all) -- comma list of set names to run.
+QWEN36_GRP_TEST_HOOKS=1: the served speculative stack's prefill hooks installed before the warm-up captures (the MTP
+head's prefill_hook = model.prefill_hidden_hook and the DFlash2 context hook = model.prefill_aux_hook, both compiled
+first as qwen36_vllm._install_mtp_prefill_hook does) so the grouped path runs _run_group_prefill_hooks per row; the
+hooks' per-user products (the MTP head's pending hidden row, the DFlash2 staged context K/V) are compared torch.equal
+between the grouped and the per-user path too. Run under the tracker (bucket-128 sets: the pre-existing masked-bucket
+input order at buckets >= 256 is flagged regardless) to prove the hooks-on grouped path compile-first-clean.
 """
 
 import os
@@ -39,13 +45,17 @@ CHUNK = 2048
 
 # name -> per-user real lengths (a chat prompt fills slot 0 of every set, see _prompt_sets)
 PCC_MIN = 0.999  # correctness bar: PCC of logits / GDN state vs the per-user path (not bit-identical: M = B*bucket)
-SETS = {
+SETS = {  # every (bucket, B) of masked_bucket_trace.DEFAULT_GROUP_TRACE_SPEC gets a set that replays it
     "b128_B8": [None, 5, 17, 64, 100, 127, 128, 33],
     "b256_B4": [129, 200, 256, 140],
     "b512_B2": [300, 511],
     "b128_B8_full": [128] * 8,
-    "mixed": [None, 40, 128, 129, 250, 600],  # 3 x 128-bucket, 2 x 256-bucket, one 1024-bucket single
+    "mixed": [None, 40, 128, 129, 250, 600],  # 3 x 128-bucket -> (128, 4), 2 x 256-bucket -> (256, 2), one single
+    "b256_B8": [130, 160, 192, 200, 224, 240, 255, 256],  # -> (256, 8): the body the served A/B replayed
+    "b512_B4": [257, 300, 400, 512],  # -> (512, 4)
+    "b128_B2": [None, 77],  # -> (128, 2)
 }
+HOOKS = os.environ.get("QWEN36_GRP_TEST_HOOKS", "0") == "1"
 
 
 def _pcc(a, b):
@@ -125,6 +135,67 @@ def _snap_copy(model, slot):
     return rec_c, taps_c
 
 
+def _hook_products(model, slot):
+    """What the installed prefill hooks left for decode slot `slot` (taken): the MTP head's pending hidden row (host
+    bf16 [dim]) and the DFlash2 context K/V rows (per drafter layer (K, V) host bf16 [n, kv_heads, head_dim]) with the
+    stage's first_pos / n_tokens; None entries when the hook is not installed."""
+    if not HOOKS:
+        return None
+    mtp = model.mtp_head.pending_rows.pop(slot, None) if getattr(model, "mtp_head", None) else None
+    stage = model.prefill_aux_hook.pop(slot) if model.prefill_aux_hook is not None else None
+    df2 = (stage.first_pos, stage.n_tokens, stage.rows()) if stage is not None else None
+    return mtp, df2
+
+
+def _cmp_hooks(name, got, ref):
+    """torch.equal of the hook products of one user (grouped vs per-user path); returns (all_equal, description)."""
+    ok = True
+    parts = []
+    if got[0] is not None or ref[0] is not None:
+        e = got[0] is not None and ref[0] is not None and torch.equal(got[0], ref[0])
+        ok &= e
+        parts.append(
+            "mtp_row=" + ("EXACT" if e else f"DIFF max|d|={float((got[0].float() - ref[0].float()).abs().max()):.3g}")
+        )
+    if got[1] is not None or ref[1] is not None:
+        e = got[1] is not None and ref[1] is not None and got[1][:2] == ref[1][:2]
+        if e:
+            e = all(torch.equal(kg, kr) and torch.equal(vg, vr) for (kg, vg), (kr, vr) in zip(got[1][2], ref[1][2]))
+        ok &= e
+        parts.append(f"dflash2_ctx[{ref[1][:2] if ref[1] else None}]=" + ("EXACT" if e else "DIFF"))
+    logger.info(f"[grp] {name} hooks: {' '.join(parts)}")
+    return ok, " ".join(parts)
+
+
+def _install_hooks(model):
+    """The served speculative stack's prefill hooks (qwen36_vllm._install_mtp_prefill_hook with
+    QWEN36_SPEC_DRAFTER=hybrid): the DFlash2 drafter (owner of the context projector) + MTP prefill-only head built,
+    every hook program compiled (all masked buckets + the 2048 chunk), then installed -- all BEFORE any capture, as
+    served. Returns (mtp_head, dflash2_hook)."""
+    from models.demos.blackhole.qwen36.tt import aux_hidden as ah
+    from models.demos.blackhole.qwen36.tt.dflash2_head import DFlash2Drafter
+    from models.demos.blackhole.qwen36.tt.mtp_head import MTPHead
+    from models.demos.blackhole.qwen36.tt.spec_decoder import RowChunkedProjector
+
+    t0 = time.perf_counter()
+    buckets = sorted(set(model._PREFILL_MASK_BUCKETS) | {CHUNK})
+    df2 = DFlash2Drafter(model, page_tables=None, widths=())
+    model.prefill_aux_layers = ah.aux_layers_for(model)  # BEFORE the warm-up captures (aux copy buffers)
+    hook = ah.DFlash2ContextPrefillHook(model, RowChunkedProjector(df2.projector), block_size=BLOCK_SIZE)
+    hook.compile(buckets)
+    mtp = MTPHead(model, page_tables=None, widths=(), buckets=buckets, sdpa_pt_blocks=32)
+    for b in buckets:
+        mtp.compile_prefill(b)
+    ttnn.synchronize_device(model.mesh_device)
+    model.prefill_aux_hook = hook
+    model.prefill_hidden_hook = mtp.prefill_hook
+    logger.info(
+        f"[grp] speculative prefill hooks installed in {time.perf_counter() - t0:.1f}s: MTP head (buckets {buckets}), "
+        f"DFlash2 context hook (aux layers {model.prefill_aux_layers}, window {hook.window})"
+    )
+    return mtp, hook
+
+
 def _setup(mesh_device):
     from transformers import AutoTokenizer
 
@@ -138,6 +209,14 @@ def _setup(mesh_device):
     model.free_kv_caches()
     model.allocate_kv_caches(kv_shape, ttnn.bfloat16, batch_size=BMAX)
     assert model._grp_spec, "QWEN36_PREFILL_GROUP_TRACE is off; nothing to test (set QWEN36_PREFILL_GROUP_TRACE=1)"
+    from ttnn.trace_allocation_config import TRACE_ALLOC_DIAGNOSTICS, TRACE_ALLOC_TRACKING
+
+    logger.info(
+        f"[grp] trace-allocation tracker {'ON (execute_trace raises on unsafe buffers)' if TRACE_ALLOC_TRACKING else 'off'}"
+        f"{' with tracebacks' if TRACE_ALLOC_DIAGNOSTICS else ''}; speculative prefill hooks {'ON' if HOOKS else 'off'}"
+    )
+    if HOOKS:
+        _install_hooks(model)
     # Compile-first rule (tests/VERIFY_W32_AUDIT.md): every program this process runs is compiled BEFORE the first
     # trace capture. The eager decode at width BMAX (the reference/greedy continuation below) is compiled here; the
     # grouped bodies + readouts are compiled inside capture_prefill_trace_chunked (_prepare_prefill_group_traces)
@@ -151,6 +230,7 @@ def _setup(mesh_device):
     model.pd_gdn_capture = {}
     model.prefill_paged_slots([torch.full((1, 5), 1000, dtype=torch.int32)], page_tables[:1], [0], valid_lens=[5])
     rec0, taps0 = model.pd_gdn_capture.pop(0)
+    _hook_products(model, 0)  # drop what the hooks staged for this warm prefill
     # The host decode-slot write's programs are keyed by the SLOT (slice/concat ranges, fill_cache batch_idx), so
     # every slot this test writes is compiled here (the tracker's second list: 14 slot-1 programs, logs/grp_trk3.log).
     for slot in range(1, BMAX):
@@ -198,13 +278,14 @@ def test_grouped_prefill_matches_per_user(mesh_device):
 
             # ---- reference: per-user path (N=1 calls) ----
             model.pd_gdn_capture = {}
-            ref_lg, ref_snap = [], []
+            ref_lg, ref_snap, ref_hooks = [], [], []
             t0 = time.perf_counter()
             for u in range(n):
                 lg = model.prefill_paged_slots([rows[u]], page_tables[u : u + 1], [u], valid_lens=[lens[u]])
                 assert model._last_prefill_groups == []
                 ref_lg.append(lg[0].reshape(-1)[: model.vocab_size].float().clone())
                 ref_snap.append(_snap_copy(model, u))
+                ref_hooks.append(_hook_products(model, u))
             ttnn.synchronize_device(mesh_device)
             t_ref = time.perf_counter() - t0
             ref_tok = _decode_rows(model, [int(l.argmax()) for l in ref_lg], lens, page_tables, STEPS)
@@ -218,12 +299,13 @@ def test_grouped_prefill_matches_per_user(mesh_device):
             groups = list(model._last_prefill_groups)
             grp_lg = [lg.reshape(-1)[: model.vocab_size].float().clone() for lg in lgs]
             grp_snap = [_snap_copy(model, u) for u in range(n)]
+            grp_hooks = [_hook_products(model, u) for u in range(n)]
             grp_tok = _decode_rows(model, [int(l.argmax()) for l in grp_lg], lens, page_tables, STEPS)
             model.pd_gdn_capture = None
 
             logger.info(f"[grp] set {name}: lens={lens} groups={groups} per-user {t_ref:.2f}s grouped {t_grp:.2f}s")
             assert groups, f"set {name}: the grouped call did not use a grouped trace"
-            n_exact_lg = n_exact_rec = n_exact_taps = 0
+            n_exact_lg = n_exact_rec = n_exact_taps = n_exact_hooks = 0
             worst = (1.0, 1.0, 1.0)
             # Per-GDN-layer divergence of user 0 (rec [n_dev, L, ...] / taps [n_dev, L, K, C]): where along the depth the
             # grouped rows first leave the per-user numerics (layer 0 exact => the divergence is accumulated rounding of
@@ -249,6 +331,11 @@ def test_grouped_prefill_matches_per_user(mesh_device):
                 n_exact_rec += e2
                 n_exact_taps += e3
                 worst = (min(worst[0], p1), min(worst[1], p2), min(worst[2], p3))
+                if HOOKS:
+                    hk_ok, hk_desc = _cmp_hooks(f"{name} u{u}", grp_hooks[u], ref_hooks[u])
+                    n_exact_hooks += hk_ok
+                    if not hk_ok:
+                        failures.append((name, u, "hooks", hk_desc))
                 same = grp_tok[u] == ref_tok[u]
                 logger.info(
                     f"[grp] {name} u{u} T={lens[u]}: tokens {'SAME' if same else 'DIFF'} "
@@ -261,7 +348,8 @@ def test_grouped_prefill_matches_per_user(mesh_device):
             summary.append(
                 f"{name}: users={n} groups={groups} tokens_same={sum(grp_tok[u] == ref_tok[u] for u in range(n))}/{n} "
                 f"exact logits/rec/taps={n_exact_lg}/{n_exact_rec}/{n_exact_taps} of {n} "
-                f"min pcc logits/rec/taps={worst[0]:.6f}/{worst[1]:.6f}/{worst[2]:.6f} "
+                + (f"hooks_exact={n_exact_hooks}/{n} " if HOOKS else "")
+                + f"min pcc logits/rec/taps={worst[0]:.6f}/{worst[1]:.6f}/{worst[2]:.6f} "
                 f"per-user {1e3 * t_ref:.0f} ms grouped {1e3 * t_grp:.0f} ms"
             )
         for line in summary:
