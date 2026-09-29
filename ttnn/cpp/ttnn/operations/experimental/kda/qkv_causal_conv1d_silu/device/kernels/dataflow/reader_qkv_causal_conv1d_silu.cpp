@@ -33,7 +33,9 @@ FORCE_INLINE void load_weight_block(
     weights.push_back(4 * block_ct);
 }
 
-template <uint32_t block_ct, uint32_t num_blocks>
+// Block-major work order (work -> block = work / Mt, mt = work % Mt); see the TILE reader's note. The taps are
+// re-read only on a block change; otherwise the single-slot weights DFB is just re-published.
+template <uint32_t block_ct, uint32_t num_blocks, uint32_t Mt>
 TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
     const auto input = TensorAccessor(tensor::input);
     const auto history = TensorAccessor(tensor::history);
@@ -54,13 +56,21 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
     constexpr uint32_t tile_height = 32;
     constexpr uint32_t block_row_bytes = block_ct * tile_width * sizeof(uint16_t);
     constexpr uint32_t block_offset_scale = tile_width * sizeof(uint16_t);
+    uint32_t loaded_block = num_blocks;  // none yet
     for (uint32_t item = 0; item < wi_count; ++item) {
         const uint32_t work = wi_start + item;
-        const uint32_t mt = work / num_blocks;
-        const uint32_t ct_start = (work % num_blocks) * block_ct;
+        const uint32_t block = work / Mt;
+        const uint32_t mt = work % Mt;
+        const uint32_t ct_start = block * block_ct;
 
         if constexpr (num_blocks > 1) {
-            load_weight_block<block_ct>(noc, weights, tap0, tap1, tap2, tap3, tile_bytes, ct_start);
+            if (block != loaded_block) {
+                load_weight_block<block_ct>(noc, weights, tap0, tap1, tap2, tap3, tile_bytes, ct_start);
+                loaded_block = block;
+            } else {
+                weights.reserve_back(4 * block_ct);
+                weights.push_back(4 * block_ct);
+            }
         }
 
         for (uint32_t tap = 0; tap < 4; ++tap) {

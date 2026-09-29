@@ -94,7 +94,12 @@ FORCE_INLINE void load_weight_block(
     weights.push_back(4 * block_ct);
 }
 
-template <uint32_t block_ct, uint32_t num_blocks>
+// Work order (block-major, round-4 item 11): work -> block = work / Mt, mt = work % Mt, so a core's contiguous
+// item range stays inside one channel block and the 4 x block_ct tap tiles are loaded once per block change
+// instead of once per item. The weights DFB holds exactly one block (tap_count * block_ct entries), so after the
+// compute pops it the next reserve_back lands on the same L1 slot: when the block is unchanged the reader only
+// re-publishes the slot (reserve + push, no NoC traffic) and the compute's per-item wait/pop protocol is untouched.
+template <uint32_t block_ct, uint32_t num_blocks, uint32_t Mt>
 TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
     const auto input = TensorAccessor(tensor::input);
     const auto history = TensorAccessor(tensor::history);
@@ -117,15 +122,15 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
         load_weight_block<block_ct>(noc, weights, tap0, tap1, tap2, tap3, tile_bytes, 0);
     }
 
+    uint32_t loaded_block = num_blocks;  // none yet
     for (uint32_t item = 0; item < wi_count; ++item) {
         const uint32_t work = wi_start + item;
-        const uint32_t mt = work / num_blocks;
-        const uint32_t ct_start = (work % num_blocks) * block_ct;
+        const uint32_t block = work / Mt;
+        const uint32_t mt = work % Mt;
+        const uint32_t ct_start = block * block_ct;
 
-        if constexpr (num_blocks > 1) {
-            load_weight_block<block_ct>(noc, weights, tap0, tap1, tap2, tap3, tile_bytes, ct_start);
-        }
-
+        // Activation first: act_tile is double-buffered, so this read runs ahead while compute finishes the
+        // previous item; the (single-slot) weights hand-off below would otherwise serialize it.
         // Entries [0, block_ct) hold the previous tile-row, [block_ct, 2 * block_ct) the current one.
         activation.reserve_back(2 * block_ct);
         if (mt == 0) {
@@ -154,5 +159,16 @@ TT_KERNEL void reader(uint32_t wi_start, uint32_t wi_count) {
         }
         noc.async_read_barrier();
         activation.push_back(2 * block_ct);
+
+        if constexpr (num_blocks > 1) {
+            if (block != loaded_block) {
+                load_weight_block<block_ct>(noc, weights, tap0, tap1, tap2, tap3, tile_bytes, ct_start);
+                loaded_block = block;
+            } else {
+                // Same block: the slot still holds these taps (nothing else writes the weights DFB).
+                weights.reserve_back(4 * block_ct);
+                weights.push_back(4 * block_ct);
+            }
+        }
     }
 }

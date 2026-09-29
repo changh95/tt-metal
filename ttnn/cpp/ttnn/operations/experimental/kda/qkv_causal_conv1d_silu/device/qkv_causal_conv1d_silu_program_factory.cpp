@@ -153,7 +153,7 @@ ttnn::device_operation::ProgramArtifacts QkvCausalConv1dSiluProgramFactory::crea
                 tt::tt_metal::experimental::TensorBinding{tap2_tensor_name, "tap2"},
                 tt::tt_metal::experimental::TensorBinding{tap3_tensor_name, "tap3"},
             },
-        .compile_time_args = {{"block_ct", block_ct}, {"num_blocks", num_blocks}},
+        .compile_time_args = {{"block_ct", block_ct}, {"num_blocks", num_blocks}, {"Mt", Mt}},
         .runtime_arg_schema = {.runtime_arg_names = {"wi_start", "wi_count"}},
         .hw_config = ttnn::create_reader_datamovement_config(arch),
     };
@@ -171,7 +171,8 @@ ttnn::device_operation::ProgramArtifacts QkvCausalConv1dSiluProgramFactory::crea
                 tt::tt_metal::experimental::TensorBinding{k_tensor_name, "k"},
                 tt::tt_metal::experimental::TensorBinding{v_tensor_name, "v"},
             },
-        .compile_time_args = {{"Qt", Qt}, {"Kt", Kt}, {"Vt", Vt}, {"block_ct", block_ct}, {"num_blocks", num_blocks}},
+        .compile_time_args =
+            {{"Qt", Qt}, {"Kt", Kt}, {"Vt", Vt}, {"block_ct", block_ct}, {"num_blocks", num_blocks}, {"Mt", Mt}},
         .runtime_arg_schema = {.runtime_arg_names = {"wi_start", "wi_count"}},
         .hw_config = ttnn::create_writer_datamovement_config(arch),
     };
@@ -230,7 +231,13 @@ ttnn::device_operation::ProgramArtifacts QkvCausalConv1dSiluProgramFactory::crea
                       "qkv_causal_conv1d_silu.cpp"),
         .compiler_options = {.opt_level = tt::tt_metal::KernelBuildOptLevel::O3},
         .dfb_bindings = std::move(compute_dfb_bindings),
-        .compile_time_args = {{"block_ct", block_ct}, {"num_blocks", num_blocks}},
+        // Block-major work order: the TILE compute derives the first-tile-row test from Mt (the ROW_MAJOR
+        // compute takes no wi_start and needs no Mt).
+        .compile_time_args = tile_in
+                                 ? tt::tt_metal::experimental::KernelSpec::
+                                       CompileTimeArgs{{"block_ct", block_ct}, {"num_blocks", num_blocks}, {"Mt", Mt}}
+                                 : tt::tt_metal::experimental::KernelSpec::
+                                       CompileTimeArgs{{"block_ct", block_ct}, {"num_blocks", num_blocks}},
         .runtime_arg_schema = std::move(compute_arg_schema),
         .hw_config = ttnn::to_compute_hardware_config(arch, attrs.compute_kernel_config),
     };

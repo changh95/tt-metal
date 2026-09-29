@@ -25,7 +25,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "experimental/kernel_args.h"
 
-template <uint32_t block_ct, uint32_t num_blocks>
+template <uint32_t block_ct, uint32_t num_blocks, uint32_t Mt>
 TT_KERNEL void compute(uint32_t wi_start, uint32_t wi_count) {
     // Kimi-K3 uses a fixed four-tap causal convolution, with three preceding rows supplied by history.
     constexpr uint32_t tap_count = 4;
@@ -49,7 +49,8 @@ TT_KERNEL void compute(uint32_t wi_start, uint32_t wi_count) {
         }
         // The first tile-row has no predecessor: its left context is the history tile-row, whose three carry
         // rows sit at tile rows 0-2 rather than 29-31, so it needs the S_hist matrices.
-        const bool first_tile_row = (wi_start + item) / num_blocks == 0;
+        // Block-major work order (work -> block = work / Mt, mt = work % Mt), matching the reader/writer.
+        const bool first_tile_row = (wi_start + item) % Mt == 0;
         activation.wait_front(2 * block_ct);
 
         for (uint32_t tap = 0; tap < tap_count; ++tap) {
