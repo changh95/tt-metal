@@ -107,7 +107,7 @@ HYBRID_DFLASH2_CTX_HYSTERESIS = 1024  # hybrid: back to DFlash2 only below MAX_C
 DEFAULT_LADDER_HYBRID_LOW = DEFAULT_LADDER_MTP  # hybrid, low acceptance: the MTP head's k = 3 plans at every width
 DEFAULT_LADDER_DFLASH2_LOW = "1:4,2:4,4:4,8:4,16:2"  # dflash2, low acceptance: the block's first 3 drafts (T = 4)
 ADAPTIVE_DEFAULT = (
-    True  # QWEN36_SPEC_DFLASH2_ADAPTIVE unset: the acceptance rule is on for the dflash2 / hybrid ladders
+    False  # QWEN36_SPEC_DFLASH2_ADAPTIVE unset: the rule is OFF (opt-in with =1 until the served A/B confirms it)
 )
 ADAPT_DOWN = 2.5  # accepted drafts per user-step (EMA, k = 7 band) below which the grid leaves the full band
 ADAPT_UP = 0.0  # EMA under the low drafter (k = 3) at / above which the full band is retried (0 = off)

@@ -47,6 +47,7 @@ Drafters (``QWEN36_SPEC_DRAFTER``, tt/aux_hidden.py ``spec_drafter``), behind on
 Every program runs compiled before any trace is captured (``compile`` in the first warm-up phase, ``capture`` in the
 second; tests/VERIFY_W32_AUDIT.md).
 """
+
 import os
 import time
 from dataclasses import dataclass, field
@@ -657,6 +658,9 @@ class SpecDecoder:
                     )
                     + "]"
                 )
+                for key in ("commit_ms", "keep_ms", "select_ms"):
+                    hs[key] = 0.0
+                hs["keep_steps"] = hs["select_steps"] = 0
             adapt = ""
             if self.ladder.has_adapt_rule:
                 adapt = (
@@ -665,9 +669,6 @@ class SpecDecoder:
                     f"({st['adapt_left']} left, {st['adapt_probes']} probes), {st['adapt_flushes']} flushes, "
                     f"{st['adapt_deferred']} deferred]"
                 )
-                for key in ("commit_ms", "keep_ms", "select_ms"):
-                    hs[key] = 0.0
-                hs["keep_steps"] = hs["select_steps"] = 0
             logger.info(
                 f"[spec] step {self.n_steps}: w_grid={sp.w_grid} plan={sp.plan} drafter={sp.drafter} live={n_live} "
                 f"flush={sp.flush} | last {n} steps: {self.acc_tokens / max(1, self.acc_users):.2f} tok/user/step "
