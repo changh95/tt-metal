@@ -347,7 +347,8 @@ class DFlash2HostReference:
 def selector_walk(hp, cands, unary, anchor, pred_cb, succ_cb):
     """The greedy candidate-selector walk shared by the host reference and the device path. hp [n, rank] float
     (hidden_projection of the draft rows), cands [n, k] long, unary [n, k] float (the candidates' logits), anchor int,
-    pred_cb / succ_cb [V, rank] (bf16 tables). Returns (path [n], scores [n, k])."""
+    pred_cb / succ_cb [V, rank] (bf16 tables). Returns (path [n], scores [n, k]); ``selector_margins(scores)`` turns the
+    scores into the per-position confidence (the chosen candidate's score minus the runner-up's)."""
     pred = int(anchor)
     path, scores_all = [], []
     for t in range(hp.shape[0]):
@@ -359,6 +360,14 @@ def selector_walk(hp, cands, unary, anchor, pred_cb, succ_cb):
         path.append(pred)
         scores_all.append(scores)
     return path, torch.stack(scores_all)
+
+
+def selector_margins(scores):
+    """Per draft position: the selected candidate's selector score minus the best other candidate's ([n] floats).
+    A DSpark-style confidence of each draft; exposed by ``DFlash2Drafter.draft`` (``last_margins``) for analysis --
+    the served loop does not trim drafts by it (a shorter proposal at the same T saves nothing: tt/spec_serving.py)."""
+    top2 = torch.topk(scores.float(), 2, dim=-1).values
+    return (top2[:, 0] - top2[:, 1]).tolist()
 
 
 # ============================================================================================== device side
@@ -507,6 +516,7 @@ class DFlash2Drafter:
             self.build_step_buffers(widths, self.page_tables)
         self._plans = {}
         self.stats = {"draft_steps": 0, "draft_wall": 0.0, "select_wall": 0.0, "commit_steps": 0, "commit_wall": 0.0}
+        self.last_margins = []  # per user of the last draft step: the selector margin per draft position ([w][7])
         self.projector = DFlash2ContextProjector(self)
         assert getattr(model, "dflash2_drafter", None) is None, "the model already has a DFlash2 drafter"
         model.dflash2_drafter = self  # tt/pd_transfer.py registers kv_layers / pad_block as KV group "dflash2"
@@ -1337,16 +1347,19 @@ class DFlash2Drafter:
             observer(w, anchors, pos, per_user, logits)
         if b.trace_id is None:
             self._free_outs((vals, idxs, hp, logits))
-        drafts, cands_out, unary_out = [], [], []
+        drafts, cands_out, unary_out, margins = [], [], [], []
         for s in range(w):
             cands, unary, hp_s = per_user[s]
             if pad[s]:
                 drafts.append([0] * (self.B - 1))
+                margins.append([0.0] * (self.B - 1))
             else:
-                path, _ = selector_walk(hp_s, cands, unary, int(anchors[s]), self.sel_pred, self.sel_succ)
+                path, scores = selector_walk(hp_s, cands, unary, int(anchors[s]), self.sel_pred, self.sel_succ)
                 drafts.append(path)
+                margins.append(selector_margins(scores))
             cands_out.append(cands)
             unary_out.append(unary)
+        self.last_margins = margins
         self.stats["draft_steps"] += 1
         self.stats["draft_wall"] += time.perf_counter() - t0
         self.stats["select_wall"] += time.perf_counter() - t1

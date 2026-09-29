@@ -25,7 +25,9 @@ Drafters (``QWEN36_SPEC_DRAFTER``, tt/aux_hidden.py ``spec_drafter``), behind on
     request without it decodes with no drafts (its rows are padding in the draft step). No hidden row and no
     catch-up step: the first verify step at P_s = N (row 0 = P's first token) commits the aux row of position N, so
     the first draft (anchor = the committed token at N + a_s, positions N + a_s + 1 ..) reads a gap-free context.
-  * ``hybrid`` -- BOTH drafters resident, the ladder picks one per plan by width (tt/spec_serving.py
+  * ``hybrid`` -- BOTH drafters resident, the ladder picks one per plan by width (tt/spec_serving.py; and by the
+    acceptance rule of spec_serving.py: the DFlash2 band's plans shrink to the low ladder's k = 3 -- the MTP head by
+    default -- while the accepted-drafts EMA of the live users is low; the decoder only reports ``SpecStepResult.low``)
     ``Ladder.drafter_for``: DFlash2 at T = 8 up to 4 users, the MTP bands above; the served A/B behind the split is in
     the plugin's docs/SPECULATIVE.md) AND by context length (the context rule of spec_serving.py: the decoder hands
     the state machine the rows' decode positions every step; past QWEN36_SPEC_DFLASH2_MAX_CTX the grid runs the long
@@ -74,6 +76,7 @@ class SpecStepResult:
     times_ms: dict = field(default_factory=dict)
     drafter: Optional[str] = None  # the drafter that drafted at this plan (hybrid: by width and context)
     long: bool = False  # the hybrid context rule's mode of this step
+    low: bool = False  # the acceptance rule's mode of this step (the low ladder: shorter drafts)
 
 
 # ================================================================================================ drafter adapters
@@ -470,6 +473,14 @@ class SpecDecoder:
             if ladder.has_ctx_rule
             else ""
         )
+        if ladder.has_adapt_rule:
+            ad = ladder.adapt
+            ctx_rule += (
+                f"; acceptance rule: low ladder {[f'{p}:{ladder.drafter_for(p, low=True)}' for p in ladder.low_plans]} "
+                f"at widths <= {ladder.adapt_max_w} once the accepted-drafts EMA < {ad.down} (alpha {ad.alpha}, "
+                f"{ad.min_samples} samples, dwell {ad.dwell}, back when the low users left / every {ad.probe} steps"
+                f"{f' / EMA >= {ad.up}' if ad.up > 0 else ''}; T shrink waits <= {ad.wait} steps for fitting rows)"
+            )
         logger.info(
             f"[spec] decoder ({self.drafter.name}): ladder {[f'{p}:{ladder.drafter_for(p)}' for p in ladder.plans]} k_max={ladder.k_max} "
             f"bmax={self.bmax} page table {self.nb} blocks; fractured plans {[str(p) for p in ladder.fractured_plans]}; "
@@ -615,6 +626,7 @@ class SpecDecoder:
             times_ms=times,
             drafter=active,
             long=sp.long,
+            low=sp.low,
         )
 
     # ------------------------------------------------------------------------------------------ metrics
@@ -645,6 +657,14 @@ class SpecDecoder:
                     )
                     + "]"
                 )
+            adapt = ""
+            if self.ladder.has_adapt_rule:
+                adapt = (
+                    f" [adapt: {'low' if sp.low else 'full'} band, EMA "
+                    f"{'-' if sp.ema_mean is None else f'{sp.ema_mean:.2f}'}, {st['adapt_switches']} switches "
+                    f"({st['adapt_left']} left, {st['adapt_probes']} probes), {st['adapt_flushes']} flushes, "
+                    f"{st['adapt_deferred']} deferred]"
+                )
                 for key in ("commit_ms", "keep_ms", "select_ms"):
                     hs[key] = 0.0
                 hs["keep_steps"] = hs["select_steps"] = 0
@@ -658,6 +678,7 @@ class SpecDecoder:
                 f"flushes {st['flushes']} plan changes {st['plan_changes']} migrations {st['migrations']}"
                 + (f" no-context user-steps {self.n_no_context}" if self.drafter.name in ("dflash2", "hybrid") else "")
                 + hybrid
+                + adapt
             )
             self.acc = {key: 0.0 for key in self.acc}
             self.acc_tokens = self.acc_users = self.acc_accepted = 0

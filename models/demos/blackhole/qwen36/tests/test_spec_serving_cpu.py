@@ -277,7 +277,7 @@ def test_ladder_hybrid_context_rule_plans(expect_error):
     )
     assert lad.fractured_plans == []
     # knobs
-    off = ss.Ladder.from_env("hybrid", 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "0"})
+    off = ss.Ladder.from_env("hybrid", 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "0", "QWEN36_SPEC_DFLASH2_ADAPTIVE": "0"})
     assert (
         not off.has_ctx_rule
         and off.long_plans == []
@@ -308,7 +308,9 @@ def test_ladder_hybrid_context_rule_plans(expect_error):
     )
     # single-drafter ladders ignore the rule
     for d in ("mtp", "dflash2"):
-        single = ss.Ladder.from_env(d, 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "100"})
+        single = ss.Ladder.from_env(
+            d, 7, 32, {"QWEN36_SPEC_DFLASH2_MAX_CTX": "100", "QWEN36_SPEC_DFLASH2_ADAPTIVE": "0"}
+        )
         assert not single.has_ctx_rule and single.long_plans == [] and single.all_plans == single.plans
     # k_max = 3: both ladders clamp onto (1,4) / (2,4) / (4,4); the plan is shared, the mode names the drafter
     k3 = ss.Ladder.for_drafter("hybrid", 3, 32)
@@ -659,7 +661,7 @@ class Sim:
         self.step_log = []
         self.last_owners = None  # the slot owners begin_step saw on the last step
 
-    def submit(self, rid, prompt, want, greedy=True):
+    def submit(self, rid, prompt, want, greedy=True, quality=None):
         ref = _greedy_stream(prompt, want + 12)
         self.req[rid] = dict(
             prompt=list(prompt),
@@ -670,6 +672,7 @@ class Sim:
             drafts=[],
             greedy=greedy,
             want=want,
+            quality=quality,
         )
         self.pending_join.append(rid)
 
@@ -707,7 +710,7 @@ class Sim:
         self.last_owners = list(self.owner)
         sp = self.state.begin_step(row_req_ids, drafts, eligible, flush=flush, ctx_lens=ctx)
         if sp.mode == "spec":
-            assert sp.drafter == self.state.ladder.drafter_for(sp.plan, sp.long)
+            assert sp.drafter == self.state.ladder.drafter_for(sp.plan, sp.long, sp.low)
         committed_by_slot = {}
         if sp.mode == "spec":
             w, T = sp.plan.w, sp.plan.T
@@ -739,6 +742,17 @@ class Sim:
             true_next = r["ref"][n_done : n_done + k_next]
             if sp.mode != "spec" or not r["greedy"]:
                 d = []
+            elif r.get("quality") is not None:
+                # "quality" policy: each draft position is the true continuation with probability q (a prefix-correct
+                # proposal, as a real drafter's), under the drafter named by the state machine (per-drafter quality:
+                # a dict {drafter: q}, or one q for both)
+                q = r["quality"]
+                if isinstance(q, dict):
+                    q = q[sp.drafter]
+                m = 0
+                while m < k_next and self.rng.random() < q:
+                    m += 1
+                d = list(true_next[:m]) + [self.rng.randrange(50) for _ in range(k_next - m)]
             elif self.policy == "oracle":
                 d = list(true_next)
             elif self.policy == "random":
@@ -904,3 +918,214 @@ def test_hold_info_counts_free_slots_below_band():
     am[vg.row(2, 0, 4)] = 1  # slot 2 accepts 1 draft
     st2.commit(sp, am, st2.grid_tokens(sp, [1] * 8))
     assert st2.hold_info().slots_before_crossing is None  # a_s = 1 <= min T above - 1 = 1: migration always fits
+
+
+# ------------------------------------------------------------------------------------------------ acceptance rule
+ADAPT_ENV = {"QWEN36_SPEC_DFLASH2_ADAPTIVE": "1"}
+
+
+def test_adapt_rule_ladders_and_knobs(expect_error):
+    """The acceptance rule's ladders (spec_serving module docstring): hybrid low ladder = the mtp ladder drafted by the
+    MTP head in the DFlash2 band (or by the block drafter with QWEN36_SPEC_ADAPT_DRAFTER=dflash2), the dflash2 ladder's
+    low band = its T=4 plans, the mtp ladder has no rule; the knobs parse and validate; the rule's plans are extra
+    verify plans / draft widths."""
+    lad = ss.Ladder.from_env("hybrid", 7, 32, ADAPT_ENV)
+    assert lad.has_adapt_rule and lad.adapt == ss.AdaptRule() and lad.adapt.drafter == "mtp"
+    assert [(p.w, p.T) for p in lad.low_plans] == [(1, 4), (2, 4), (4, 4), (8, 4), (10, 3), (16, 2)]
+    assert lad.adapt_max_w == 4 and lad.low_plans == lad.long_plans
+    assert [(p.w, p.T) for p in lad.all_plans] == [
+        (1, 8),
+        (2, 8),
+        (4, 8),
+        (8, 4),
+        (10, 3),
+        (16, 2),
+        (1, 4),
+        (2, 4),
+        (4, 4),
+    ]
+    assert lad.plan_for(3, low=True) == ss.Plan(4, 4) and lad.plan_for(3) == ss.Plan(4, 8)
+    assert lad.plan_for(3, long=True, low=True) == ss.Plan(4, 4) and lad.plan_for(5, low=True) == ss.Plan(8, 4)
+    assert lad.drafter_for(ss.Plan(4, 4), low=True) == "mtp" and lad.drafter_for(ss.Plan(4, 4)) == "mtp"
+    assert lad.drafter_for(ss.Plan(4, 8)) == "dflash2" and lad.drafter_for(ss.Plan(4, 8), low=True) == "dflash2"
+    assert lad.band_max(4, low=True) == 8 and lad.min_T_above(4, low=True) == 1
+    assert lad.widths_for("mtp") == [1, 2, 4, 8, 10, 16] and lad.widths_for("dflash2") == [1, 2, 4]
+    # the block drafter at k = 3 in the low band
+    df = ss.Ladder.from_env("hybrid", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_DRAFTER": "dflash2"})
+    assert df.drafter_for(ss.Plan(4, 4), low=True) == "dflash2" and df.drafter_for(ss.Plan(4, 4), long=True) == "mtp"
+    assert df.drafter_for(ss.Plan(4, 4), long=True, low=True) == "mtp"  # the context rule wins
+    assert df.drafter_for(ss.Plan(8, 4), low=True) == "mtp" and df.widths_for("dflash2") == [1, 2, 4]
+    # knobs
+    env = {
+        **ADAPT_ENV,
+        "QWEN36_SPEC_ADAPT_DOWN": "3",
+        "QWEN36_SPEC_ADAPT_UP": "2.4",
+        "QWEN36_SPEC_ADAPT_ALPHA": "0.5",
+        "QWEN36_SPEC_ADAPT_DWELL": "8",
+        "QWEN36_SPEC_ADAPT_MIN_SAMPLES": "2",
+        "QWEN36_SPEC_ADAPT_PROBE": "0",
+        "QWEN36_SPEC_ADAPT_WAIT": "3",
+        "QWEN36_SPEC_LADDER_LOW": "1:2,4:2,8:2,16:2",
+    }
+    custom = ss.Ladder.from_env("hybrid", 7, 32, env)
+    assert custom.adapt == ss.AdaptRule(down=3, up=2.4, alpha=0.5, dwell=8, min_samples=2, probe=0, wait=3)
+    assert [(p.w, p.T) for p in custom.low_plans] == [(1, 2), (4, 2), (8, 2), (16, 2)]
+    assert custom.adapt_max_w == 10  # the low plan differs from the full one up to the (10,3) bucket
+    assert custom.plan_for(2, low=True) == ss.Plan(4, 2) and custom.drafter_for(ss.Plan(4, 2), low=True) == "mtp"
+    with expect_error(AssertionError, "cover"):  # a low ladder must offer a plan wherever the full ladder does
+        ss.Ladder.from_env("hybrid", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_LADDER_LOW": "1:2,4:2"})
+    off = ss.Ladder.from_env("hybrid", 7, 32, {"QWEN36_SPEC_DFLASH2_ADAPTIVE": "0"})
+    assert not off.has_adapt_rule and off.low_plans == [] and off.adapt_max_w == 0
+    assert off.plan_for(3, low=True) == ss.Plan(4, 8) and off.drafter_for(ss.Plan(4, 8), low=True) == "dflash2"
+    for bad in ({"QWEN36_SPEC_DFLASH2_ADAPTIVE": "yes"}, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_DRAFTER": "eagle"}):
+        with expect_error(AssertionError, "QWEN36_SPEC"):
+            ss.Ladder.from_env("hybrid", 7, 32, bad)
+    with expect_error(AssertionError, "ADAPT_ALPHA"):
+        ss.Ladder.from_env("hybrid", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_ALPHA": "0"})
+    # the single dflash2 ladder: its T=4 plans as the low band, drafted by the block drafter
+    d2 = ss.Ladder.from_env("dflash2", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ALLOW_FRACTURED": "0"})
+    assert [(p.w, p.T) for p in d2.low_plans] == [(1, 4), (2, 4), (4, 4), (8, 4), (16, 2)] and d2.adapt_max_w == 4
+    assert [(p.w, p.T) for p in d2.all_plans] == [(1, 8), (2, 8), (4, 8), (8, 4), (16, 2), (1, 4), (2, 4), (4, 4)]
+    assert d2.adapt.drafter == "dflash2" and d2.drafter_for(ss.Plan(1, 4), low=True) == "dflash2"
+    with expect_error(AssertionError, "block drafter"):
+        ss.Ladder.from_env("dflash2", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_DRAFTER": "mtp"})
+    # the mtp ladder ignores the rule entirely
+    mtp = ss.Ladder.from_env("mtp", 3, 32, {**ADAPT_ENV, "QWEN36_SPEC_LADDER_LOW": "1:2"})
+    assert not mtp.has_adapt_rule and mtp.low_plans == [] and mtp.all_plans == mtp.plans
+    assert mtp.plans == ss.Ladder.for_drafter("mtp", 3, 32).plans
+    # k_max = 3: the full and low bands share the (w,4) plans, the mode alone names the drafter
+    k3 = ss.Ladder.from_env("hybrid", 3, 32, ADAPT_ENV)
+    assert k3.all_plans == k3.plans and k3.adapt_max_w == 4
+    assert k3.drafter_for(ss.Plan(4, 4)) == "dflash2" and k3.drafter_for(ss.Plan(4, 4), low=True) == "mtp"
+
+
+def _run_adapt(sim, submitted, max_steps=4000):
+    """Drive ``sim`` through ``submitted`` = {step: [(rid, prompt_len, want, quality)]}; returns the per-step (low,
+    drafter, plan, flush) log."""
+    log, step = [], 0
+    while submitted or sim.pending_join or sim.live_count() > 0:
+        for rid, plen, want, q in submitted.pop(step, []):
+            sim.submit(rid, [sim.rng.randrange(50) for _ in range(plen)], want=want, quality=q)
+        if sim.live_count() == 0 and not sim.pending_join:
+            step += 1
+            continue
+        sp = sim.step()
+        log.append((sp.low, sp.drafter, sp.plan, sp.flush, sp.mode))
+        step += 1
+        assert step < max_steps
+    sim.check_streams()
+    return log
+
+
+def test_adapt_low_quality_users_shrink_the_drafts_once_and_the_band_returns_when_they_leave():
+    """One user whose DFlash2 drafts are rarely accepted (q = 0.3 -> ~0.4 accepted of 7): the grid starts in the full
+    band, measures, switches ONCE to the low ladder (the MTP head at (1,4)) and stays there for the user's lifetime
+    (no flapping: the MTP EMA is never asked while QWEN36_SPEC_ADAPT_UP = 0 and the probe is far); when the user
+    leaves and a fresh one arrives the grid offers the full band again; a good user (q = 0.9) never leaves it. Every
+    stream is the greedy one."""
+    lad = ss.Ladder.from_env("hybrid", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_PROBE": "0"})
+    sim = Sim(lad, 32, "mixed", seed=5)
+    log = _run_adapt(sim, {0: [("bad", 8, 400, 0.3)], 2000: [("good", 8, 300, 0.9)]})  # the good one after the bad
+    st = sim.state.stats
+    lows = [e[0] for e in log]
+    # the bad user: full band for the dwell + samples, then low for good; back to full only once it left
+    first_low = lows.index(True)
+    assert ss.ADAPT_MIN_SAMPLES <= first_low <= ss.ADAPT_DWELL + 2, first_low
+    drafters = [e[1] for e in log]
+    assert drafters[0] == "dflash2" and drafters[first_low] == "mtp" and log[first_low][2] == ss.Plan(1, 4)
+    back = [i for i in range(1, len(log)) if lows[i - 1] and not lows[i]]
+    assert len(back) == 1 and st["adapt_switches"] == 2 and st["adapt_left"] == 1 and st["adapt_probes"] == 0, st
+    assert all(lows[first_low : back[0]]), "the low mode held for the bad user's lifetime"
+    assert not any(lows[back[0] :]), "the good user never leaves the full band"
+    assert all(d == "dflash2" for d in drafters[back[0] :]) and st["plain_steps"] == 0
+    # exactly one T shrink: taken with fitting rows (deferred at most ADAPT_WAIT steps) or by the own flush
+    assert st["adapt_flushes"] + (1 if st["adapt_deferred"] == 0 else 0) <= 1
+    plans = [e[2] for e in log]
+    distinct = [p for i, p in enumerate(plans) if i == 0 or p != plans[i - 1]]
+    assert distinct == [ss.Plan(1, 8), ss.Plan(1, 4), ss.Plan(1, 8)] and st["ctx_switches"] == 0, (distinct, st)
+
+
+def test_adapt_shrinking_T_waits_for_fitting_rows_then_flushes_on_its_own():
+    """The T shrink (1,8) -> (1,4) needs the pending rows to fit (a_s <= 3): with oracle-quality drafts every step
+    accepts 7 -- the rule would never go low; force it with a low threshold on a user whose drafts alternate: the
+    shrink is deferred while a_s > 3 and, when the wait runs out, the state machine flushes on its own (one zero-draft
+    step at (1,8), `adapt_flushes` = 1) -- never a SpecProtocolError, never a corrupted stream."""
+    env = {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_DOWN": "7.5", "QWEN36_SPEC_ADAPT_WAIT": "2", "QWEN36_SPEC_ADAPT_PROBE": "0"}
+    lad = ss.Ladder.from_env("hybrid", 7, 32, env)
+    sim = Sim(lad, 32, "oracle", seed=1)  # every DFlash2 draft accepted: EMA 7 < 7.5 -> low, rows never fit
+    log = _run_adapt(sim, {0: [("a", 6, 200, None)]})
+    st = sim.state.stats
+    assert st["adapt_switches"] == 1 and st["adapt_deferred"] == 2 and st["adapt_flushes"] == 1 == st["ctx_flushes"]
+    i = [j for j, e in enumerate(log) if e[3]][0]  # the own flush step
+    assert log[i][2] == ss.Plan(1, 8) and log[i][1] == "dflash2" and not log[i][0]
+    assert log[i + 1][2] == ss.Plan(1, 4) and log[i + 1][1] == "mtp" and log[i + 1][0]
+    assert st["migrations"] == 0 and st["flushes"] == 1
+    # the same shrink with the block drafter drafting the low band (no drafter change, only T): identical protocol
+    lad2 = ss.Ladder.from_env("hybrid", 7, 32, {**env, "QWEN36_SPEC_ADAPT_DRAFTER": "dflash2"})
+    sim2 = Sim(lad2, 32, "oracle", seed=2)
+    log2 = _run_adapt(sim2, {0: [("a", 6, 200, None)]})
+    st2 = sim2.state.stats
+    assert st2["adapt_flushes"] == 1 and st2["drafter_switches"] == 0
+    j = [k for k, e in enumerate(log2) if e[3]][0]
+    assert log2[j + 1][2] == ss.Plan(1, 4) and log2[j + 1][1] == "dflash2" and log2[j + 1][0]
+
+
+def test_adapt_growing_T_migrates_and_the_probe_clock_retries_the_full_band():
+    """Back to the full band (T 4 -> 8) is a migration (the rows always fit); with the probe clock set the low mode is
+    retried every N steps even while the low users stay: a bad user living 400 tokens sees probes, each followed by a
+    return to low; the switch count is bounded by the clock (no per-step flapping)."""
+    env = {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_PROBE": "40", "QWEN36_SPEC_ADAPT_DWELL": "8"}
+    lad = ss.Ladder.from_env("hybrid", 7, 32, env)
+    sim = Sim(lad, 32, "mixed", seed=9)
+    log = _run_adapt(sim, {0: [("bad", 8, 500, 0.25)]})
+    st = sim.state.stats
+    assert st["adapt_probes"] >= 2 and st["adapt_switches"] == 2 * st["adapt_probes"] + 1, st
+    assert st["migrations"] >= st["adapt_probes"], st  # every return to T=8 migrated the pending rows
+    n = len(log)
+    flips = [i for i in range(1, n) if log[i][0] != log[i - 1][0]]
+    assert all(b - a >= 8 for a, b in zip(flips, flips[1:])), flips  # the dwell
+    assert sum(1 for e in log if e[0]) > 0.6 * n, "the low mode dominates a low-quality lifetime"
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_adapt_under_churn_of_good_and_bad_users_every_stream_is_greedy(seed):
+    """Random churn of good (q 0.9) and bad (q 0.2) users through 1..3 slots (the DFlash2 band: the rule decides
+    there) with one wave past the band (5 users: the MTP (8,4) band, where the mode is frozen): every stream greedy,
+    no protocol error, the mode changes only at the band's widths, a flip never follows the previous one within the
+    dwell, and the low mode is left again once its voters are gone (adapt_left)."""
+    rng = random.Random(seed)
+    lad = ss.Ladder.from_env(
+        "hybrid", 7, 32, {**ADAPT_ENV, "QWEN36_SPEC_ADAPT_DWELL": "6", "QWEN36_SPEC_ADAPT_PROBE": "50"}
+    )
+    sim = Sim(lad, 32, "mixed", seed=seed)
+    submitted, n = {}, 0
+    for at in range(0, 600, 25):
+        for _ in range(rng.choice([1, 1, 2])):
+            submitted.setdefault(at, []).append(
+                (f"r{n}", rng.randrange(2, 10), rng.randrange(20, 60), rng.choice([0.9, 0.2]))
+            )
+            n += 1
+    submitted.setdefault(300, []).extend((f"w{i}", 4, 20, 0.9) for i in range(5))  # a wave past the band
+    log = _run_adapt(sim, submitted)
+    st = sim.state.stats
+    assert st["adapt_switches"] >= 2 and st["adapt_left"] >= 1 and st["spec_steps"] > 100, st
+    flips = [i for i in range(1, len(log)) if log[i][0] != log[i - 1][0]]
+    assert all(b - a >= 6 for a, b in zip(flips, flips[1:])), flips
+    for i in flips:
+        assert log[i][4] == "spec" and (log[i][2] is None or log[i][2].w <= 4), log[i]
+    # the low band ran the MTP head at a DFlash2 width, the full band the block drafter
+    assert any(e[0] and e[1] == "mtp" and e[2] is not None and e[2].w <= 4 for e in log)
+    assert any(not e[0] and e[1] == "dflash2" for e in log)
+
+
+def test_adapt_rule_off_is_the_2026_09_28_state_machine():
+    """QWEN36_SPEC_DFLASH2_ADAPTIVE=0 (and the mtp ladder regardless): identical plans, drafters and stats keys' values
+    for a low-quality user -- the full band throughout."""
+    for env in ({"QWEN36_SPEC_DFLASH2_ADAPTIVE": "0"},):
+        sim = Sim(ss.Ladder.from_env("hybrid", 7, 32, env), 32, "mixed", seed=4)
+        log = _run_adapt(sim, {0: [("bad", 8, 200, 0.2)]})
+        assert all(not e[0] and e[1] == "dflash2" and e[2] == ss.Plan(1, 8) for e in log)
+        assert sim.state.stats["adapt_switches"] == 0 and sim.state.ema_mean is None
+    sim = Sim(ss.Ladder.from_env("mtp", 3, 32, ADAPT_ENV), 32, "mixed", seed=4)
+    log = _run_adapt(sim, {0: [("bad", 8, 200, 0.2)]})
+    assert all(e[1] == "mtp" and e[2] == ss.Plan(1, 4) for e in log) and sim.state.stats["adapt_switches"] == 0
