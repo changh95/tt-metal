@@ -517,6 +517,9 @@ class TPGatedDeltaNet:
         # norm and sigmoid, one fewer bf16 rounding): gated on prefill-logits PCC + identical greedy tokens
         # (tests/test_prefill_kernels_ref_scratch.py). Prefill only; decode paths are untouched.
         self._fused_gate_norm = os.environ.get("QWEN36_GDN_FUSED_GATE_NORM", "0")
+        # Grouped prefill (forward_prefill_grouped): QWEN36_PREFILL_GROUP_ROWSCAN=1 (default) runs the chunk recurrence
+        # per row (bit-identical to the per-user body); 0 = one batched BH = B*Nv call (a different scan variant).
+        self._grp_row_scan = os.environ.get("QWEN36_PREFILL_GROUP_ROWSCAN", "1") == "1"
         assert self._fused_gate_norm in ("0", "1", "bf16"), f"QWEN36_GDN_FUSED_GATE_NORM={self._fused_gate_norm!r}"
         # packed per-head conv history / taps for the fused-conv op ([Nv, 4, 32, 32] bf16 per device; row 2c of a tile =
         # channel chunk c of the head's [q|k|v] row, slot 3 = newest). Rebuilt from conv_states when they were rewritten.
@@ -1215,49 +1218,69 @@ class TPGatedDeltaNet:
                     ttnn.copy(src, self.conv_states[j + 1])
                     self._hist_packed_valid = False  # rebuilt eagerly after prefill replay (never under capture)
             ttnn.deallocate(conv_new_state)
-        # Gated RMSNorm + SiLU(z); norm/flatten in L1, gated output in DRAM for out-proj
+        gated = self._prefill_gate(o, z, T)
+        out = self._prefill_out_proj(gated, T)
+        if return_state:
+            return out, captured[0], captured[1]
+        return out
+
+    def _prefill_gate(self, o, z, S, B=1):
+        """Gated RMSNorm + SiLU(z) of the chunk recurrence output; norm/flatten in L1, gated output in DRAM for
+        the out-proj. `o` is head-major [B*Nv, T, Dv] (``_gdn_fuse_out``) or token-major [B, T, Nv, Dv];
+        `z` [1, S, value_dim_tp] with S = B*T. Returns gated [1, S, value_dim_tp] (bf16 on the AG out-proj modes).
+        B > 1 (forward_prefill_grouped) only changes the head->token relayout's leading dim: every row is one
+        token of one user, so the per-row math is that of the B=1 call. The fused gated norm (round-4 item 14,
+        QWEN36_GDN_FUSED_GATE_NORM) is a B=1 op; grouped_prefill_ready() excludes it."""
+        tw, Nv, Dv = self.tw, self.Nv, self.Dv
+        T = S // B
         _L1 = ttnn.L1_MEMORY_CONFIG
         if self._gdn_fuse_out and self._fused_gate_norm != "0":
             # Round-4 item 14 stepping stone: one fused norm x weight x sigmoid(z) op (head concat inside) + one
             # multiply by z; consumes o and z. See _fused_gated_norm_prefill.
-            gated = self._fused_gated_norm_prefill(o, z, T)
+            assert B == 1, "the fused gated norm is a single-user (B=1) op"
+            return self._fused_gated_norm_prefill(o, z, T)
+        if self._gdn_fuse_out:
+            # Fuse adapter relayout with per-head rms_norm + head-flatten.
+            # TILE-native head->token relayout (transpose + fold), dropping the
+            # TILE->ROW_MAJOR->TILE round-trip. o is head-major (B*Nv,T,Dv).
+            n = ttnn.rms_norm(o, weight=tw["norm_w"], epsilon=1e-6, memory_config=_L1)
+            ttnn.deallocate(o)
+            n = ttnn.reshape(n, (B, Nv, T, Dv))
+            # Fused head->token relayout: [B,Nv,T,Dv] -> [B,1,T,Nv*Dv] (user-major rows once flattened).
+            n = ttnn.experimental.nlp_concat_heads(n, memory_config=_L1)
+            out_f = ttnn.reshape(n, (1, S, self.value_dim_tp))
         else:
-            if self._gdn_fuse_out:
-                # Fuse adapter relayout with per-head rms_norm + head-flatten.
-                # TILE-native head->token relayout (transpose + fold), dropping the
-                # TILE->ROW_MAJOR->TILE round-trip. o is head-major (1,Nv,T,Dv).
-                n = ttnn.rms_norm(o, weight=tw["norm_w"], epsilon=1e-6, memory_config=_L1)
-                ttnn.deallocate(o)
-                n = ttnn.reshape(n, (1, Nv, T, Dv))
-                # Fused head->token relayout: [1,Nv,T,Dv] -> [1,1,T,Nv*Dv].
-                n = ttnn.experimental.nlp_concat_heads(n, memory_config=_L1)
-                out_f = ttnn.reshape(n, (1, T, self.value_dim_tp))
-            else:
-                out_n = ttnn.rms_norm(o, weight=tw["norm_w"], epsilon=1e-6, memory_config=_L1)
-                ttnn.deallocate(o)
-                out_f = ttnn.reshape(out_n, (1, T, self.value_dim_tp), memory_config=_L1)
-                ttnn.deallocate(out_n)
-            if self._gdn_out_mode in ("agmm", "ag_mm"):
-                # bf16 gated activation for the all-gather + column-parallel out-proj, produced directly by the
-                # gate multiply (output dtype bf16). NOTE: a separate ttnn.typecast(fp32->bf16) here gave wrong
-                # model output under the traced multi-layer path (exact standalone and in a single layer), so the
-                # cast is folded into the multiply instead.
-                gated = ttnn.multiply(
-                    out_f,
-                    ttnn.silu(z, memory_config=ttnn.DRAM_MEMORY_CONFIG),
-                    dtype=ttnn.bfloat16,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-            else:
-                gated = _silu_mul(out_f, z, ttnn.DRAM_MEMORY_CONFIG)
-            ttnn.deallocate(out_f)
-            ttnn.deallocate(z)
-        # AGMM out-proj: all-gather the K-sharded gated activation and multiply by the column-sharded
-        # out_proj -> output already hidden-sharded [1,1,T,dim/tp]; fp32 accumulation, no bf16 partial sums.
+            out_n = ttnn.rms_norm(o, weight=tw["norm_w"], epsilon=1e-6, memory_config=_L1)
+            ttnn.deallocate(o)
+            out_f = ttnn.reshape(out_n, (1, S, self.value_dim_tp), memory_config=_L1)
+            ttnn.deallocate(out_n)
         if self._gdn_out_mode in ("agmm", "ag_mm"):
-            # `gated` is bf16 here (see above): the all-gather+matmul kernels assume bf16 in0 (an fp32 in0
-            # produced garbage) and bf16 halves the gather bytes.
-            x_out = ttnn.reshape(gated, (1, 1, T, gated.shape[-1]))
+            # bf16 gated activation for the all-gather + column-parallel out-proj, produced directly by the
+            # gate multiply (output dtype bf16). NOTE: a separate ttnn.typecast(fp32->bf16) here gave wrong
+            # model output under the traced multi-layer path (exact standalone and in a single layer), so the
+            # cast is folded into the multiply instead.
+            gated = ttnn.multiply(
+                out_f,
+                ttnn.silu(z, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        else:
+            gated = _silu_mul(out_f, z, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(out_f)
+        ttnn.deallocate(z)
+        return gated
+
+    def _prefill_out_proj(self, gated, S):
+        """Row-parallel out projection of the gated activation [1, S, value_dim_tp] -> [1, 1, S, dim_out]
+        (hidden-sharded on the AG modes, reduce-scattered / all-reduced otherwise). Consumes `gated`."""
+        tw = self.tw
+        # AGMM out-proj: all-gather the K-sharded gated activation and multiply by the column-sharded
+        # out_proj -> output already hidden-sharded [1,1,S,dim/tp]; fp32 accumulation, no bf16 partial sums.
+        if self._gdn_out_mode in ("agmm", "ag_mm"):
+            # `gated` is bf16 here (see _prefill_gate): the all-gather+matmul kernels assume bf16 in0 (an fp32
+            # in0 produced garbage) and bf16 halves the gather bytes.
+            x_out = ttnn.reshape(gated, (1, 1, S, gated.shape[-1]))
             if self._gdn_out_mode == "agmm":
                 out = tpc.all_gather_matmul_prefill(
                     x_out, tw["out_col"], self.tt_ccl, self.cfg, self.args.ccl_topology(), role="out"
@@ -1267,12 +1290,10 @@ class TPGatedDeltaNet:
                     x_out, tw["out_col"], self.tt_ccl, self.cfg, self.args.ccl_topology()
                 )
             ttnn.deallocate(gated)
-            if return_state:
-                return out, captured[0], captured[1]
             return out
         # Prefill: fused out-proj matmul + reduce-scatter (matmul_reduce_scatter_async), flag-gated.
         if self._fuse_out_mmrs_prefill:
-            x_out = ttnn.reshape(gated, (1, 1, T, gated.shape[-1]))
+            x_out = ttnn.reshape(gated, (1, 1, S, gated.shape[-1]))
             # fp32 output is load-bearing: o_proj is row-parallel, so the RS SUMS 4 per-device partials
             # across devices — bf16 there tanks PCC to ~0.69 even at ISL 2048 (test_oproj_dtype_isl). Keep fp32.
             out = tpc.matmul_reduce_scatter_prefill(
@@ -1285,13 +1306,11 @@ class TPGatedDeltaNet:
                 ttnn.float32,
             )
             ttnn.deallocate(gated)
-            if return_state:
-                return out, captured[0], captured[1]
             return out
         partial = self._row_proj(gated, tw["out"])
         ttnn.deallocate(gated)
-        partial = ttnn.reshape(partial, (1, 1, T, partial.shape[-1]))
-        out = tt_all_reduce(
+        partial = ttnn.reshape(partial, (1, 1, S, partial.shape[-1]))
+        return tt_all_reduce(
             partial,
             self.mesh,
             self.tt_ccl,
@@ -1300,9 +1319,130 @@ class TPGatedDeltaNet:
             topology=self.args.ccl_topology(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        if return_state:
-            return out, captured[0], captured[1]
-        return out
+
+    def grouped_prefill_ready(self):
+        """True when forward_prefill_grouped can run on this layer's configuration: the fused KDA conv on masked
+        buckets (it is the only masked conv path whose per-row call needs no host write), flat q/k/v, the fused
+        chunk adapter and the persistent zero conv history (reset_state)."""
+        from models.demos.blackhole.qwen36.tt.gdn.fused_chunk import fused_chunk_enabled
+
+        return bool(
+            self._gdn_conv_kda
+            and self._gdn_flat_qkv
+            and self._kda_masked
+            and fused_chunk_enabled()
+            and self._kda_zero_hist is not None
+            and self.tw.get("conv_taps") is not None
+            and self._fused_gate_norm == "0"
+        )
+
+    def forward_prefill_grouped(self, x, B, T, masks, zero_state):
+        """Grouped from-scratch prefill of B right-padded users in ONE pass -- the traced grouped bucket's GDN
+        body (Qwen36Model._forward_prefill_group_body_tp). Device-only: reads its arguments and persistent
+        constants, writes NO self.* state (the caller owns the returned state tensors), so it is capturable.
+
+        x:          [1, 1, B*T, dim] residual-stream norm output, user-major rows (row u*T + t = user u,
+                    position t), K-sharded like forward_prefill's input (the norm skipped its post-AG).
+        masks:      (mask_f32 [B, T, 1] fp32, mask_q [B, T, 1] bf16, sel_x: B x [1, K-1, T] bf16) persistent
+                    device buffers holding masked_bucket_trace.host_group_masks / host_group_conv_sel_x values.
+        zero_state: persistent fp32 zeros [B, Nv, Dk, Dv]: the fused op's (read-only) initial state.
+        Returns (out [1, 1, B*T, dim_out] exactly as forward_prefill lays it out, final_state fp32
+        [B, Nv, Dk, Dv], conv_new bf16 [B, K-1, C] with row u = user u's last K-1 REAL conv inputs).
+
+        The per-token work (in-proj AGMM, gates, gated norm, out-proj) runs over the B*T rows at once; the causal
+        conv runs per row through the same fused KDA op the per-user masked bucket uses (its input is [1, T, C]
+        only, and running the B rows end to end would leak user u's tail into user u+1's first K-1 positions);
+        the chunk recurrence runs batched over BH = B*Nv rows -- each an independent scan -- with the per-row
+        validity masks, which is how forward_prefill_batched was validated bit-exact per user at B=8.
+        """
+        assert self.grouped_prefill_ready(), "forward_prefill_grouped needs the fused KDA masked conv path"
+        tw, Nk, Nv, Dk, Dv = self.tw, self.Nk, self.Nv, self.Dk, self.Dv
+        C = self.qkv_dim_tp
+        mask_f32, mask_q, sel_x = masks
+        assert len(sel_x) >= B, f"{len(sel_x)} decode-window one-hots for {B} rows"
+        assert tuple(zero_state.shape) == (B, Nv, Dk, Dv), f"zero_state {tuple(zero_state.shape)}"
+        S = B * T
+        if len(x.shape) == 4:
+            x = ttnn.reshape(x, (1, x.shape[-2], x.shape[-1]))
+        assert x.shape[1] == S, f"x has {x.shape[1]} rows, expected {B} x {T}"
+        # qkvzab in L1 up to the 2048-row chunk the per-user path keeps there; DRAM above it.
+        _proj_mc = ttnn.L1_MEMORY_CONFIG if S <= 2048 else ttnn.DRAM_MEMORY_CONFIG
+        qkv, z, a, b = self._project_qkvzab(x, S, out_mc=_proj_mc)
+
+        # Causal conv + SiLU + q/k/v split per row (rows are tile-aligned: T % 32 == 0). conv_state=None reads
+        # the persistent zero history, and the decode conv window is sel_x[u] @ qkv_u (the carry half of the
+        # one-hot is all zeros from scratch, so it is not applied).
+        qs, ks, vs, ns = [], [], [], []
+        for u in range(B):
+            qkv_u = ttnn.slice(qkv, (0, u * T, 0), (1, (u + 1) * T, C), memory_config=_proj_mc)
+            (q_u, k_u, v_u), ns_u = self._conv1d_prefill_kda(qkv_u, T, None, conv_sel=(sel_x[u], None))
+            ttnn.deallocate(qkv_u)
+            qs.append(q_u)
+            ks.append(k_u)
+            vs.append(v_u)
+            ns.append(ns_u)
+        ttnn.deallocate(qkv)
+        conv_new = ttnn.concat(ns, dim=0)  # [B, K-1, C]
+        for t in ns:
+            ttnn.deallocate(t)
+
+        beta = ttnn.reshape(ttnn.sigmoid(b), (B, T, Nv))
+        ttnn.deallocate(b)
+        g = ttnn.reshape(ttnn.multiply(tw["neg_exp_A"], _softplus_add(a, tw["dt_bias"])), (B, T, Nv))
+        ttnn.deallocate(a)
+
+        from models.demos.blackhole.qwen36.tt.gdn.fused_chunk import chunk_gated_delta_rule_fused_adapter
+
+        _adapter = dict(
+            chunk_size=self.args.gdn_chunk_size,
+            scale=self.scale,
+            device=self.mesh,
+            cached_masks=self.chunk_seq_masks,
+            valid_len=None,
+            qkv_head_dims=(Nk, Dk, Nv, Dv),
+            return_o_bh=self._gdn_fuse_out,
+            const_tiles=self._fused_const_tiles,
+        )
+        if self._grp_row_scan:
+            # Chunk recurrence PER ROW (B calls at BH = Nv, T rows): exactly the per-user bucket body's call (same
+            # shapes -> same programs -> bit-identical per row). The batched BH = B*Nv call below runs a different
+            # kernel variant (the scan's leader-mcast applies at BH <= Nv only; row-major fallback above) whose
+            # fp32 state differs at ~1e-5 in layer 0 and cascades to ~0.05 by layer 47 (logs/grp_lay1.log). The
+            # per-token programs (in-proj, gates, gated norm, out-proj) stay batched over the B*T rows.
+            os_, fs_ = [], []
+            for u in range(B):
+                m_f = ttnn.slice(mask_f32, (u, 0, 0), (u + 1, T, 1))
+                m_q = ttnn.slice(mask_q, (u, 0, 0), (u + 1, T, 1))
+                z0 = ttnn.slice(zero_state, (u, 0, 0, 0), (u + 1, Nv, Dk, Dv))
+                beta_u = ttnn.slice(beta, (u, 0, 0), (u + 1, T, Nv))
+                g_u = ttnn.slice(g, (u, 0, 0), (u + 1, T, Nv))
+                o_u, fs_u = chunk_gated_delta_rule_fused_adapter(
+                    qs[u], ks[u], vs[u], beta_u, g_u, initial_state=z0, valid_mask=(m_f, m_q), **_adapter
+                )
+                for t in (m_f, m_q, z0, beta_u, g_u):
+                    ttnn.deallocate(t)
+                os_.append(o_u)
+                fs_.append(fs_u)
+            for t in qs + ks + vs + [beta, g]:
+                ttnn.deallocate(t)
+            o = ttnn.concat(os_, dim=0)  # [B*Nv, T, Dv] head-major, user-major heads (== the batched layout)
+            final_state = ttnn.concat(fs_, dim=0)  # [B, Nv, Dk, Dv]
+            for t in os_ + fs_:
+                ttnn.deallocate(t)
+        else:
+            q = ttnn.concat(qs, dim=0)  # [B, T, kd]
+            k = ttnn.concat(ks, dim=0)
+            v = ttnn.concat(vs, dim=0)  # [B, T, vd]
+            for t in qs + ks + vs:
+                ttnn.deallocate(t)
+            o, final_state = chunk_gated_delta_rule_fused_adapter(
+                q, k, v, beta, g, initial_state=zero_state, valid_mask=(mask_f32, mask_q), **_adapter
+            )
+            for t in (q, k, v, beta, g):
+                ttnn.deallocate(t)
+        gated = self._prefill_gate(o, z, S, B=B)
+        out = self._prefill_out_proj(gated, S)
+        return out, final_state, conv_new
 
     def _fused_gated_norm_prefill(self, o, z, T):
         """gated = rmsnorm(o) * norm_w * silu(z) as TILE [1, T, value_dim_tp] bf16 (DRAM), consuming o and z.

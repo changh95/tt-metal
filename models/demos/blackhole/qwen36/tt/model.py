@@ -69,6 +69,40 @@ class _MaskedBucketTrace:
     output: object  # hidden [1, 1, bucket, dim]; owned by the trace, never cloned
 
 
+@dataclass
+class _GroupedBucketBufs:
+    """Persistent replicated device inputs of ONE traced grouped bucket (B same-bucket users per body; see
+    masked_bucket_trace.py "Grouped traced prefill"). Row u of every [B, ...] buffer belongs to user u."""
+
+    token: object  # [B, bucket] uint32 ROW_MAJOR (right-padded token rows; dummy rows all 0)
+    cos: object  # [1, 1, bucket, rope_head_dim] bf16 TILE, positions [0, bucket) (model._grp_cos[bucket]: constant,
+    sin: object  # allocated before any trace capture -- see _prealloc_grouped_consts)
+    fill_pt: object  # [B, bucket//block_size] int32 ROW_MAJOR (paged_fill_cache reads row u for batch_idx=u)
+    pt: list  # B x [1, buf_blocks] int32 ROW_MAJOR (per-row SDPA page table, the chunk buffer's width)
+    mask_f32: object  # [B, bucket, 1] float32 TILE (GDN beta/g validity, all layers)
+    mask_q: object  # [B, bucket, 1] bf16 TILE (GDN q/k/v validity, all layers)
+    sel_x: list  # B x [1, K-1, bucket] bf16 TILE (fused-KDA decode-window one-hot over x, per row)
+    K: int
+    # [1, 1, B*bucket, dim/tp] residual-stream OUTPUT buffer, allocated in the eager (pre-capture) pass and written
+    # in-trace with ttnn.copy, so the captured body allocates nothing persistent (a trace output allocated during
+    # a capture lands in earlier traces' freed-intermediate ranges: the trace-allocation tracker flags it).
+    hidden: object = None
+    aux: object = None  # DFlash2 aux copies: per aux layer [1, 1, B*bucket, dim/tp] (None unless prefill_aux_layers)
+
+
+@dataclass
+class _GroupedBucketTrace:
+    """A captured grouped-bucket prefill trace, its inputs and its outputs (all owned by the trace)."""
+
+    bucket: int
+    B: int
+    trace_id: object
+    bufs: _GroupedBucketBufs
+    hidden: object  # [1, 1, B*bucket, dim] user-major residual stream
+    rec_out: object  # the model's per-B [B, L*Nv, Dk, Dv] fp32 ROW_MAJOR GDN recurrent state (copied in-trace)
+    taps_out: object  # the model's per-B [B, L*K, C] bf16 ROW_MAJOR GDN conv taps, tap 0 (shifted-out zero) included
+
+
 class Qwen36Model:
     """Qwen3.5-9B text LM on Blackhole P150. HF_MODEL env var selects checkpoint."""
 
@@ -242,6 +276,45 @@ class Qwen36Model:
         self._pad_kv_block = None
         if self._mb_trace_buckets:
             logger.info(f"[prefill] masked-bucket trace enabled for buckets {self._mb_trace_buckets}")
+        # Grouped traced prefill (B in {2,4,8} same-bucket users per body; capture_prefill_group_traces). Needs the
+        # per-user bucket traces' machinery (pad KV block, shared chunk buffers), so it is inert without them.
+        # QWEN36_PREFILL_GROUP_TRACE: unset/"1" = masked_bucket_trace.DEFAULT_GROUP_TRACE_SPEC, "0" = off, or a
+        # "bucket:B,B;bucket:B" spec. Traces the region cannot hold are skipped (largest first), never fatal.
+        self._grp_spec = (
+            mbt.parse_group_trace_spec(os.environ.get("QWEN36_PREFILL_GROUP_TRACE"), self._PREFILL_MASK_BUCKETS)
+            if self._mb_trace_buckets
+            else {}
+        )
+        self._grp_spec = {b: bs for b, bs in self._grp_spec.items() if b in self._mb_trace_buckets}
+        self._grp_traces = {}  # (bucket, B) -> _GroupedBucketTrace
+        self._grp_prepared = {}  # (bucket, B) -> _GroupedBucketBufs whose body was compiled before the first capture
+        self._last_prefill_groups = []
+        self._grp_zero_rec = {}  # B -> fp32 zeros [B, Nv, Dk, Dv] (the fused op's read-only initial state)
+        self._grp_zero_tap = {}  # B -> bf16 zeros [B, 1, C] ROW_MAJOR (conv tap 0 of every layer)
+        self._grp_rec_out = {}  # B -> [B, L*Nv, Dk, Dv] fp32 ROW_MAJOR (shared by the B-row traces of every bucket)
+        self._grp_taps_out = {}  # B -> [B, L*K, C] bf16 ROW_MAJOR
+        self._grp_csi = None  # [1] int32 zero: the grouped bodies' chunk_start_idx tensor (always position 0)
+        self._grp_cos = {}  # bucket -> cos/sin [1, 1, bucket, rope_head_dim] for positions [0, bucket)
+        self._grp_sin = {}
+        # QWEN36_PREFILL_GROUP_USE=0: keep the traces but route every user through the per-user path (A/B knob).
+        self._grp_use = os.environ.get("QWEN36_PREFILL_GROUP_USE", "1") == "1"
+        if self._grp_spec:
+            logger.info(f"[prefill] grouped bucket traces enabled: {self._grp_spec}")
+            # Determinism across batching: a grouped body runs the per-token matmuls at M = B*bucket rows on the
+            # AGMM / 2D programs, which is bit-identical to the per-user bucket body ONLY when that body takes the
+            # same programs. The small-M per-user path (tp_common.py item J, QWEN36_PREFILL_SMALLM_MAX=128 serving
+            # default: AG + 1D matmuls at <= 128 rows, a different K accumulation order) is not: the same prompt
+            # would then decode differently depending on whether another user shared its prefill step (measured:
+            # logits PCC 0.9995, greedy flips on 2 of 8 real-text prompts; tests/test_prefill_grouped_trace.py). So
+            # grouping forces the 2D path for singles too (per-user bucket-128 replay ~+25 ms, the grouped step
+            # replaces most of those replays). QWEN36_PREFILL_GROUP_KEEP_SMALLM=1 keeps item J (non-deterministic
+            # across batching; PCC-level equivalence only).
+            if os.environ.get("QWEN36_PREFILL_GROUP_KEEP_SMALLM", "0") != "1":
+                if os.environ.get("QWEN36_PREFILL_SMALLM_MAX", "0") not in ("", "0"):
+                    logger.info(
+                        "[prefill] grouped traces: QWEN36_PREFILL_SMALLM_MAX forced to 0 (bit-identical singles / groups)"
+                    )
+                os.environ["QWEN36_PREFILL_SMALLM_MAX"] = "0"
         # Persistent B=1 GDN prefill scratch (batched serving): allocated once at warmup, its buffer
         # addresses are baked into the chunk-prefill trace and reused by every prefill_paged_slots
         # replay, so it is never freed/reallocated (only zeroed in place). See _bind_gdn_prefill_scratch.
@@ -1290,6 +1363,7 @@ class Qwen36Model:
             self._chunked_trace_id = None
         # Bucket traces read the chunk trace's persistent buffers (reallocated below), so a
         # re-capture must drop them first. No-op unless the gate is on.
+        self.release_prefill_group_traces()
         self.release_prefill_bucket_traces()
         self._chunked_chunk_size = chunk_size
 
@@ -1364,6 +1438,14 @@ class Qwen36Model:
             logger.info("Masked-bucket prefill programs (TP) warmed; chunk trace skipped (batched path).")
             return
 
+        # Grouped traces (QWEN36_PREFILL_GROUP_TRACE): allocate every persistent buffer and COMPILE every grouped body
+        # (one eager pass per (bucket, B), plus the post-replay readouts) NOW, before the FIRST capture of the process
+        # (tests/VERIFY_W32_AUDIT.md: a program compiled, or a persistent buffer allocated, after a capture owns memory
+        # inside that trace's freed-intermediate range and is clobbered by its replays -- the round-3 grouped-replay
+        # hang). capture_prefill_group_traces below then only captures.
+        if self._grp_spec and self.grouped_prefill_ready():
+            self._prepare_prefill_group_traces(device, page_table)
+
         # Capture trace.
         self._reset_gdn_state_for_new_sequence()
         self._chunked_trace_id = ttnn.begin_trace_capture(device, cq_id=0)
@@ -1382,6 +1464,9 @@ class Qwen36Model:
         # QWEN36_PREFILL_BUCKET_TRACE lists a bucket. Runs LAST so the chunk trace, which every
         # long prompt needs, always gets its trace-region bytes first.
         self.capture_prefill_bucket_traces(device, page_table)
+        # Grouped bucket traces (B same-bucket users per body) take whatever trace-region bytes are left,
+        # largest body first; a body that does not fit is skipped (the per-user trace serves those users).
+        self.capture_prefill_group_traces(device, page_table)
 
     # ----------------------------------------------------------------------- #
     # Traced batched SHORT-prompt prefill (B=32 / ISL<=128)
@@ -1950,46 +2035,96 @@ class Qwen36Model:
         _pd_capture = getattr(self, "pd_gdn_capture", None)
         if _pd_capture is not None:
             _dev_copy = 0
-        # QWEN36_PREFILL_LOGITS_FAST=1: read the [1, vocab] logits row from ONE device instead of all replicas.
-        _fast_logits = os.environ.get("QWEN36_PREFILL_LOGITS_FAST", "0") == "1"
         _t0 = _tp()
         prev = self._bind_gdn_prefill_scratch()
         _t["bind"] += _tp() - _t0
         prev_by_dn = {p[0]: p for p in prev}  # dn -> (dn, B, rec_batched, conv_batched, ...)
-        host_logits = []
-        per_user_rec = []
-        per_user_conv = []
+        host_logits = [None] * N
+        per_user_rec = [None] * N
+        per_user_conv = [None] * N
+        actuals = []
+        for u in range(N):
+            toks = token_ids_list[u]
+            assert toks.shape[0] == 1, f"request {u}: token_ids must be [1, T_u]"
+            actual = int(valid_lens[u]) if valid_lens is not None else toks.shape[1]
+            assert actual >= 1, f"request {u}: empty prompt (actual_len={actual})"
+            actuals.append(actual)
+        # Grouped traced prefill (capture_prefill_group_traces): same-bucket users of this step run B <= 8 at a
+        # time through one trace whose B-row GDN state is read per row into the same pooled host snapshots the
+        # per-user path produces -- so it serves the consumers of that snapshot (the P/D producer's pd_gdn_capture
+        # and the host slot write). The device-side slot copy (modes 1/2) reads the B=1 scratch and keeps the
+        # per-user path, as do the speculative-decoding prefill hooks (they observe the per-user bucket body).
+        groups, singles = [], list(range(N))
+        _hooks = self.prefill_hidden_hook is not None or self.prefill_aux_hook is not None
+        if self._grp_traces and self._grp_use and N >= 2 and (_pd_capture is not None or not _dev_copy):
+            groups, singles = self._plan_prefill_groups(actuals)
+        self._last_prefill_groups = groups  # telemetry / tests
+        _hook = getattr(self, "pd_stage_hook", None) if _pd_capture is not None else None
         try:
-            for u in range(N):
+            for bucket, Bg, users in groups:
+                tr = self._grp_traces[(bucket, Bg)]
+                _t1 = _tp()
+                lg = self._replay_prefill_group_trace_tp(
+                    tr,
+                    [token_ids_list[u][:, : actuals[u]] for u in users],
+                    [actuals[u] for u in users],
+                    [pt[u : u + 1] for u in users],
+                )
+                if _hooks:
+                    # speculative decoding: the drafters' prefill side per row (MTP head KV fill / DFlash2 context),
+                    # exactly as the per-user bucket path runs it after its replay, before the logits.
+                    for i, u in enumerate(users):
+                        self._run_group_prefill_hooks(
+                            tr,
+                            i,
+                            (u, int(empty_slots[u]), pt[u : u + 1].clone(), actuals[u]),
+                            token_ids_list[u],
+                            actuals[u],
+                        )
+                _t2 = _tp()
+                for i, hl in enumerate(self._logits_rows_to_host(lg, len(users))):
+                    host_logits[users[i]] = hl
+                _t3 = _tp()
+                _ts = 0.0
+                for i, u in enumerate(users):
+                    _t4 = _tp()
+                    rec_snap, conv_snap = self._snapshot_group_row_host(tr, i)
+                    per_user_rec[u] = rec_snap
+                    per_user_conv[u] = conv_snap
+                    if _pd_capture is not None:
+                        slot_u = int(empty_slots[u])
+                        stale = _pd_capture.pop(slot_u, None)
+                        if stale is not None:
+                            self.pd_gdn_snapshot_release(*stale)
+                        _pd_capture[slot_u] = (rec_snap, conv_snap)
+                    _t5 = _tp()
+                    _t["snapshot"] += _t5 - _t4
+                    if _hook is not None:
+                        # P/D producer: release this request to its consumer now (see the per-user loop below).
+                        try:
+                            _hook(slot_u)
+                        except Exception:
+                            logger.exception(f"[pd] pd_stage_hook failed for slot {slot_u}; request left unstaged")
+                        _ts += _tp() - _t5
+                _t["prefill"] += _t2 - _t1
+                _t["logits"] += _t3 - _t2
+                _t["stage"] += _ts
+            for u in singles:
                 toks = token_ids_list[u]
-                assert toks.shape[0] == 1, f"request {u}: token_ids must be [1, T_u]"
-                actual = int(valid_lens[u]) if valid_lens is not None else toks.shape[1]
-                assert actual >= 1, f"request {u}: empty prompt (actual_len={actual})"
+                actual = actuals[u]
                 # Trace-safe prefill into the B=1 scratch: prefill_traced_chunked runs short prompts in
                 # one masked-bucket forward and chunks longer ones; GDN state carries + is snapshotted below.
-                if self.prefill_hidden_hook is not None or self.prefill_aux_hook is not None:
+                if _hooks:
                     # speculative decoding: who is being prefilled (user, decode slot, its own page-table row, its
                     # total prompt length -- the DFlash2 hook windows its context on it)
                     self._prefill_hook_user = (u, int(empty_slots[u]), pt[u : u + 1].clone(), actual)
                 _t1 = _tp()
                 lg = self.prefill_traced_chunked(toks[:, :actual], pt[u : u + 1], actual_len=actual)
                 _t2 = _tp()
-                if _fast_logits:
-                    # The logits are replicated across the mesh and tile-padded to 32 rows; the default readout
-                    # (ConcatMeshToTensor) pulls all 4 replicas (~64 MB) to keep one row. Untilize on device (drops
-                    # the 31 padding rows: 16 MB -> 0.5 MB per device) and read device 0 only.
-                    lg_rm = ttnn.to_layout(lg, ttnn.ROW_MAJOR_LAYOUT)
-                    lg_row = ttnn.to_torch(ttnn.get_device_tensors(lg_rm)[0])
-                    ttnn.deallocate(lg_rm)
-                    host_logits.append(lg_row.reshape(-1, self.args.vocab_size)[:1].float().view(1, 1, -1))
-                else:
-                    host_logits.append(
-                        ttnn.to_torch(lg, mesh_composer=comp)
-                        .reshape(-1, self.args.vocab_size)[:1]
-                        .float()
-                        .view(1, 1, -1)
-                    )
-                ttnn.deallocate(lg)
+                # The logits are replicated across the mesh and tile-padded to 32 rows; the default readout
+                # (ConcatMeshToTensor) pulls all 4 replicas (~64 MB) to keep one row. QWEN36_PREFILL_LOGITS_FAST=1
+                # untilizes on device (drops the 31 padding rows: 16 MB -> 0.5 MB per device) and reads device 0 only.
+                host_logits[u] = self._logits_rows_to_host(lg, 1)[0]
                 _t3 = _tp()
                 if _dev_copy == 2 and os.environ.get("QWEN36_GDN_SLOT_SYNC", "0") == "1":
                     # Probe: fence the (non-blocking) prefill trace replay before the device-side slot copy reads the
@@ -2089,8 +2224,8 @@ class Qwen36Model:
                 # Snapshot this user's B=1 scratch state (host round trip — the next user's reset
                 # overwrites the scratch in place; see prefill_traced_bucket_batched for why not clone).
                 rec_snap, conv_snap = self._snapshot_gdn_scratch_host(dn_states)
-                per_user_rec.append(rec_snap)
-                per_user_conv.append(conv_snap)
+                per_user_rec[u] = rec_snap
+                per_user_conv[u] = conv_snap
                 if _pd_capture is not None:
                     # A capture nobody staged (a request P prefilled that never got a StageReq) sits under its
                     # slot until the slot is reused: give its pooled buffers back before parking the new one,
@@ -2099,7 +2234,7 @@ class Qwen36Model:
                     stale = _pd_capture.pop(slot_u, None)
                     if stale is not None:
                         self.pd_gdn_snapshot_release(*stale)
-                    _pd_capture[slot_u] = (per_user_rec[-1], per_user_conv[-1])
+                    _pd_capture[slot_u] = (rec_snap, conv_snap)
                 _t4 = _tp()
                 _t["prefill"] += _t2 - _t1
                 _t["logits"] += _t3 - _t2
@@ -2143,8 +2278,9 @@ class Qwen36Model:
         if _pd_capture is None:
             # Nobody else holds the snapshots (a P/D producer releases them after staging): return the
             # pooled host buffers so the next request's snapshot reuses them.
-            for u in range(len(per_user_rec)):
-                self.pd_gdn_snapshot_release(per_user_rec[u], per_user_conv[u])
+            for u in range(N):
+                if per_user_rec[u] is not None:
+                    self.pd_gdn_snapshot_release(per_user_rec[u], per_user_conv[u])
         _t["write_slot"] += _tp() - _t6
         if _dev_copy and _PREFILL_DRAIN:
             # Drain the mesh before returning to the decode path. The device-side slot write + history repack enqueue
@@ -2179,7 +2315,8 @@ class Qwen36Model:
         if _timing:
             lens = [int(v) for v in valid_lens] if valid_lens is not None else [int(t.shape[1]) for t in token_ids_list]
             logger.info(
-                f"[PREFILL_TIMING] N={N} T={lens} dev_copy={int(_dev_copy)} total={1e3 * (_tp() - _t0):.1f} ms "
+                f"[PREFILL_TIMING] N={N} T={lens} dev_copy={int(_dev_copy)} "
+                f"groups={[(b, Bg, len(us)) for b, Bg, us in groups]} total={1e3 * (_tp() - _t0):.1f} ms "
                 + " ".join(f"{k}={1e3 * v:.1f}" for k, v in _t.items())
             )
         return host_logits
@@ -3136,6 +3273,505 @@ class Qwen36Model:
                     for t in buf:
                         ttnn.deallocate(t)
         self._mb_traces = {}
+
+    # ----------------------------------------------------------------------- #
+    # Grouped traced prefill: B same-bucket users per trace (QWEN36_PREFILL_GROUP_TRACE, opt-in)
+    # ----------------------------------------------------------------------- #
+    # Trace-safety contract (tests/VERIFY_W32_AUDIT.md): every persistent buffer of the grouped traces (inputs, the
+    # per-B state outputs, the residual/aux output buffers) is allocated and every program they run (the bodies at
+    # each (bucket, B), the logits select, the per-row snapshot slices, the hook row views) is compiled in
+    # _prepare_prefill_group_traces BEFORE the process captures its first trace; capture_prefill_group_traces only
+    # captures. The round-3 version compiled each grouped body after the chunk/bucket captures and hung on its first
+    # grouped replay (logs/round3/itemK_test.log); under TT_METAL_TRACE_ALLOC_TRACKING=1 the reordered flow replays
+    # clean (logs/grp_trk4.log, logs/grp_smallm0.log: 0 unsafe buffers at every replay of the b128_B8 set).
+    # prefill_paged_slots used to prefill the N users of one serving step one after another: per user one
+    # masked-bucket trace replay (~73 ms of kernels at 128 tokens, mostly weight-bound matmuls at M=128 that
+    # would run little slower at M=1024) plus ~25 ms of host work and snapshot, so eight 128-token users cost
+    # ~0.8 s. The grouped traces run B in {2, 4, 8} same-bucket users through ONE body over B*bucket
+    # user-major rows: batched embedding / norms / MLP / GDN in-proj and out-proj over all rows, the GDN causal
+    # conv per row (the fused KDA op is [1,T,C]-only), the GDN chunk recurrence batched over B*Nv independent
+    # scans with per-row validity masks (gdn/tp.py forward_prefill_grouped), attention per row over per-row
+    # page tables (the same forward_prefill_paged call the per-user body makes, user_id = row), then ONE
+    # in-trace assembly of the B-row GDN state into the per-B ROW_MAJOR output buffers the snapshot reads.
+    # Rows past the real users are dummies (1-token prompt over the scratch KV block, outputs dropped), so a
+    # step's users only have to share the bucket, not the count. Everything a request changes is a value in a
+    # persistent [B, ...] buffer DMA'd before execute_trace; nothing is allocated between replays except the
+    # per-step readout temporaries (a row slice of the state, the logits select).
+
+    def _gdn_layers(self):
+        return [layer.attention for layer in self.layers if not layer.is_full_attention]
+
+    def grouped_prefill_ready(self):
+        """True when grouped traces can be captured: the gate is on, TP, and every GDN layer runs the fused KDA
+        masked conv (gdn/tp.py grouped_prefill_ready)."""
+        return (
+            bool(self._grp_spec)
+            and self.num_devices > 1
+            and all(dn.grouped_prefill_ready() for dn in self._gdn_layers())
+        )
+
+    def _grp_dims(self):
+        dns = self._gdn_layers()
+        dn0 = dns[0]
+        return len(dns), dn0.Nv, dn0.Dk, dn0.Dv, dn0.K, dn0.qkv_dim_tp
+
+    def _prealloc_grouped_consts(self, device):
+        """Allocate every grouped-trace constant BEFORE the first trace of the process is captured: the fused
+        op's zero initial state and zero conv tap 0 per B, the ROW_MAJOR [B, L*Nv, Dk, Dv] / [B, L*K, C]
+        buffers every B-row trace copies its assembled GDN state into (one set per B, shared by all buckets),
+        the zero chunk_start_idx and the position-0 cos/sin per bucket. These are read by replays WITHOUT being
+        re-uploaded, so they must not sit in any trace's freed-intermediate address range: a device buffer
+        allocated after a capture can land there and be overwritten by that trace's replays (the pack_hist
+        constants hit exactly this, gdn/tp.py __init__). The per-request inputs (_alloc_grouped_bucket_bufs) are
+        DMA'd before every replay and may be allocated later. Idempotent."""
+        if not self._grp_spec or self._grp_csi is not None:
+            return
+        L, Nv, Dk, Dv, K, C = self._grp_dims()
+        rep = ttnn.ReplicateTensorToMesh(device)
+        for B in sorted({B for bs in self._grp_spec.values() for B in bs}):
+            self._grp_zero_rec[B] = ttnn.from_torch(
+                torch.zeros(B, Nv, Dk, Dv, dtype=torch.float32),
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=rep,
+            )
+            self._grp_zero_tap[B] = ttnn.from_torch(
+                torch.zeros(B, 1, C, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=device,
+                mesh_mapper=rep,
+            )
+            self._grp_rec_out[B] = ttnn.zeros(
+                (B, L * Nv, Dk, Dv),
+                dtype=ttnn.float32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            self._grp_taps_out[B] = ttnn.zeros(
+                (B, L * K, C),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        for bucket in sorted(self._grp_spec):
+            cos_t, sin_t = self._rope_tp_cos_sin_torch(0, bucket)
+            self._grp_cos[bucket] = ttnn.from_torch(
+                cos_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=rep
+            )
+            self._grp_sin[bucket] = ttnn.from_torch(
+                sin_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=rep
+            )
+        self._grp_csi = ttnn.from_torch(
+            torch.zeros(1, dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            mesh_mapper=rep,
+        )
+        logger.info(
+            f"[prefill] grouped-trace constants allocated for B={sorted(self._grp_rec_out)} buckets={sorted(self._grp_cos)} "
+            f"({sum(t.shape[0] for t in self._grp_rec_out.values()) * L * Nv * Dk * Dv * 4 / (1 << 20):.0f} MiB state outputs/device)"
+        )
+
+    def _pt_row_to_buf_width(self, row):
+        """One request's page-table row, zero-padded / clipped to the shared chunk buffer's width (the width the
+        SDPA page-table buffers were captured with; vLLM pads to its own max_num_blocks_per_req)."""
+        buf_blocks = int(self._chunk_full_page_table_buf.shape[-1])
+        pt = row.reshape(1, -1)
+        if pt.shape[1] < buf_blocks:
+            pt = torch.cat([pt, torch.zeros(1, buf_blocks - pt.shape[1], dtype=pt.dtype)], dim=1)
+        elif pt.shape[1] > buf_blocks:
+            pt = pt[:, :buf_blocks]
+        return pt.contiguous().to(torch.int32)
+
+    def _alloc_grouped_bucket_bufs(self, device, bucket, B, page_table):
+        """Allocate one (bucket, B) trace's persistent inputs, primed with warm values: B distinct interior
+        lengths (bucket-1-u) so the masks hold 0s and 1s in every row and the one-hots sit in the interior."""
+        rep = ttnn.ReplicateTensorToMesh(device)
+        block_size = get_block_size(self._paged_kv_caches)
+        K = self._grp_dims()[4]
+        warm = [max(1, bucket - 1 - u) for u in range(B)]
+        pt0 = self._pt_row_to_buf_width(page_table.reshape(1, -1)[0])
+        m = mbt.host_group_masks(warm, bucket, B)
+
+        def _up(t, dtype, layout):
+            return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, mesh_mapper=rep)
+
+        return _GroupedBucketBufs(
+            token=_up(
+                mbt.host_group_tokens([torch.zeros(1, w, dtype=torch.int32) for w in warm], bucket, B),
+                ttnn.uint32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            cos=self._grp_cos[bucket],
+            sin=self._grp_sin[bucket],
+            fill_pt=_up(
+                mbt.host_group_fill_pt([pt0] * B, warm, bucket, B, self._pad_kv_block, block_size),
+                ttnn.int32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            pt=[_up(pt0.clone(), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT) for _ in range(B)],
+            mask_f32=_up(m, ttnn.float32, ttnn.TILE_LAYOUT),
+            mask_q=_up(m, ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            sel_x=[_up(s, ttnn.bfloat16, ttnn.TILE_LAYOUT) for s in mbt.host_group_conv_sel_x(warm, bucket, K, B)],
+            K=K,
+            aux=self._alloc_prefill_aux_bufs(device, B * bucket),
+        )
+
+    def _forward_prefill_group_body_tp(self, bucket, B, bufs):
+        """The traced grouped body: B users x `bucket` positions, user-major rows, device-only (see the section
+        comment). Returns the residual stream [1, 1, B*bucket, dim]; the assembled GDN state is copied into
+        self._grp_rec_out[B] / self._grp_taps_out[B] (row u = user u; taps [L*K, C] per row with the
+        shifted-out zero as tap 0 of every layer -- the GdnSnapshotPool layout)."""
+        block_size = get_block_size(self._paged_kv_caches)
+        self._assert_sdpa_pt_covers(0, bucket, block_size)
+        assert int(bufs.fill_pt.shape[-1]) * block_size == bucket, "fill page table must span the whole bucket"
+        assert int(bufs.fill_pt.shape[0]) == B and len(bufs.pt) == B and len(bufs.sel_x) == B
+        zero_rec, zero_tap = self._grp_zero_rec[B], self._grp_zero_tap[B]
+        S = B * bucket
+
+        x = self.embd(bufs.token)  # [B, bucket, d]
+        x = ttnn.reshape(x, (1, 1, S, x.shape[-1]))
+        x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
+        rec_rows, tap_rows = [], []
+        for layer in self.layers:
+            attn_cfg, ff_cfg = layer.norm_configs(Mode.PREFILL)
+            attn_in = layer.attention_norm(x, mode=Mode.PREFILL, norm_config=attn_cfg)
+            if layer.is_full_attention:
+                # Per row: the same paged prefill call the per-user body makes, over this row's page table
+                # (SDPA) and row u of the shared fill table (paged_fill_cache batch_idx=u).
+                outs = []
+                for u in range(B):
+                    xi = ttnn.slice(
+                        attn_in,
+                        (0, 0, u * bucket, 0),
+                        (1, 1, (u + 1) * bucket, attn_in.shape[-1]),
+                        memory_config=attn_in.memory_config(),
+                    )
+                    oi = layer.attention.forward_prefill_paged(
+                        xi,
+                        bufs.cos,
+                        bufs.sin,
+                        bufs.pt[u],
+                        chunk_page_table=bufs.fill_pt,
+                        chunk_start_idx=0,
+                        chunk_start_idx_tensor=self._grp_csi,
+                        user_id=u,
+                    )
+                    ttnn.deallocate(xi)
+                    outs.append(oi)
+                attn_out = ttnn.concat(outs, dim=2)  # [1, 1, S, d_out], user-major
+                for o in outs:
+                    ttnn.deallocate(o)
+            else:
+                attn_out, fs, cn = layer.attention.forward_prefill_grouped(
+                    attn_in, B, bucket, (bufs.mask_f32, bufs.mask_q, bufs.sel_x), zero_rec
+                )
+                # Assemble the state in the snapshot's ROW_MAJOR layout as we go (one small untilize per layer
+                # instead of one large one at the end; the TILE originals are freed immediately).
+                fs_rm = ttnn.to_layout(fs, ttnn.ROW_MAJOR_LAYOUT)
+                ttnn.deallocate(fs)
+                rec_rows.append(fs_rm)  # [B, Nv, Dk, Dv]
+                cn_rm = ttnn.to_layout(cn, ttnn.ROW_MAJOR_LAYOUT)
+                ttnn.deallocate(cn)
+                tap = ttnn.concat([zero_tap, cn_rm], dim=1)  # [B, K, C]: tap 0 = shifted-out zero
+                ttnn.deallocate(cn_rm)
+                tap_rows.append(tap)
+            ttnn.deallocate(attn_in)
+            h = ttnn.add(x, attn_out)
+            ttnn.deallocate(x)
+            ttnn.deallocate(attn_out)
+            ff_in = layer.ffn_norm(h, mode=Mode.PREFILL, norm_config=ff_cfg)
+            ff_out = layer.feed_forward.forward(ff_in)
+            ttnn.deallocate(ff_in)
+            x = ttnn.add(h, ff_out)
+            ttnn.deallocate(h)
+            ttnn.deallocate(ff_out)
+            self._aux_capture(layer, x, bufs.aux)  # DFlash2 aux copies over the B*bucket rows (no-op unless configured)
+
+        rec = ttnn.concat(rec_rows, dim=1)  # [B, L*Nv, Dk, Dv]
+        for r in rec_rows:
+            ttnn.deallocate(r)
+        ttnn.copy(rec, self._grp_rec_out[B])
+        ttnn.deallocate(rec)
+        taps = ttnn.concat(tap_rows, dim=1)  # [B, L*K, C]
+        for t in tap_rows:
+            ttnn.deallocate(t)
+        ttnn.copy(taps, self._grp_taps_out[B])
+        ttnn.deallocate(taps)
+        if bufs.hidden is not None:
+            ttnn.copy(x, bufs.hidden)  # the pre-allocated trace output (see _GroupedBucketBufs.hidden)
+            ttnn.deallocate(x)
+            return bufs.hidden
+        return x
+
+    def _grouped_logits_tp(self, hidden, bucket, B, actual_lens):
+        """One-hot select each row's last real position from the user-major hidden [1, 1, B*bucket, dim] (rows
+        past len(actual_lens) are dummies), norm, lm_head. Returns replicated logits [1, 1, B, vocab]."""
+        sel = mbt.host_group_logit_sel(actual_lens, bucket, B)
+        sel_tt = ttnn.from_torch(
+            sel,
+            dtype=hidden.dtype,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
+        )
+        x_last = ttnn.matmul(sel_tt, hidden)  # [1, 1, B, dim]
+        ttnn.deallocate(sel_tt)
+        x_last = ttnn.to_memory_config(x_last, ttnn.DRAM_MEMORY_CONFIG)
+        x_last = self.norm(x_last, mode=Mode.PREFILL)
+        logits = self._lm_head(x_last)
+        return ttnn.reshape(logits, (1, 1, logits.shape[-2], logits.shape[-1]))
+
+    def _group_row_view(self, t, u, bucket):
+        """Row u's [1, 1, bucket, dim/tp] slice of a user-major [1, 1, B*bucket, dim/tp] grouped buffer (a per-step
+        temporary the caller deallocates; the slice program is compiled in _prepare_prefill_group_traces)."""
+        return ttnn.slice(t, (0, 0, u * bucket, 0), (1, 1, (u + 1) * bucket, t.shape[-1]))
+
+    def _run_group_prefill_hooks(self, tr, u, user_ctx, token_row, actual_len):
+        """Speculative-decoding prefill hooks for row u of a replayed grouped trace: the same calls the per-user
+        bucket path makes (_run_prefill_hidden_hook / _run_prefill_aux_hook) over row u's slice of the grouped
+        residual output and of every aux copy, with the per-user right-padded token row."""
+        if self.prefill_hidden_hook is None and self.prefill_aux_hook is None:
+            return
+        bucket = tr.bucket
+        token_buf = torch.zeros(1, bucket, dtype=torch.int32)
+        token_buf[0, :actual_len] = token_row.reshape(-1)[:actual_len].to(torch.int32)
+        self._prefill_hook_user = user_ctx
+        hid = self._group_row_view(tr.hidden, u, bucket)
+        self._run_prefill_hidden_hook(hid, token_buf, actual_len, bucket, 0)
+        ttnn.deallocate(hid)
+        if tr.bufs.aux:
+            aux = [self._group_row_view(a, u, bucket) for a in tr.bufs.aux]
+            self._run_prefill_aux_hook(aux, token_buf, actual_len, bucket, 0)
+            for t in aux:
+                ttnn.deallocate(t)
+
+    def _logits_rows_to_host(self, lg, n):
+        """The first n rows of replicated device logits [.., rows, vocab] as host float [n, 1, vocab] rows
+        (list of n [1, 1, vocab]). QWEN36_PREFILL_LOGITS_FAST=1 untilizes on device and reads device 0 only
+        (the default composer read pulls every replica). Deallocates `lg`."""
+        if os.environ.get("QWEN36_PREFILL_LOGITS_FAST", "0") == "1":
+            lg_rm = ttnn.to_layout(lg, ttnn.ROW_MAJOR_LAYOUT)
+            rows = ttnn.to_torch(ttnn.get_device_tensors(lg_rm)[0])
+            ttnn.deallocate(lg_rm)
+        else:
+            rows = ttnn.to_torch(lg, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh_device, dim=0))
+        ttnn.deallocate(lg)
+        rows = rows.reshape(-1, self.args.vocab_size)[:n].float()
+        return [rows[i : i + 1].clone().view(1, 1, -1) for i in range(n)]
+
+    def _snapshot_group_row_host(self, tr, u):
+        """Host snapshot of row u of a grouped trace's assembled GDN state, in the GdnSnapshotPool layout the
+        per-user _snapshot_gdn_scratch_host produces (rec [n_dev, L, Nv, Dk, Dv], taps [n_dev, L, K, C]): one
+        ROW_MAJOR row slice per state type (per-step temporaries) and the pooled DMA read."""
+        L, Nv, Dk, Dv, K, C = self._grp_dims()
+        pool = getattr(self, "_gdn_snapshot_pool", None)
+        if pool is None:
+            pool = self._gdn_snapshot_pool = GdnSnapshotPool(self)
+        rec_row = ttnn.slice(tr.rec_out, (u, 0, 0, 0), (u + 1, L * Nv, Dk, Dv))
+        taps_row = ttnn.slice(tr.taps_out, (u, 0, 0), (u + 1, L * K, C))
+        try:
+            return pool.read(ttnn.reshape(rec_row, (L, Nv, Dk, Dv)), ttnn.reshape(taps_row, (L * K, 1, C)))
+        finally:
+            ttnn.deallocate(rec_row)
+            ttnn.deallocate(taps_row)
+
+    @staticmethod
+    def _dram_free_mib(device):
+        try:
+            mv = ttnn.get_memory_view(device, ttnn.BufferType.DRAM)
+            return f"{int(mv.total_bytes_free_per_bank) * int(mv.num_banks) / (1 << 20):.0f} MiB"
+        except Exception:
+            return "n/a"
+
+    @staticmethod
+    def _trace_region_free_bytes(device):
+        try:
+            mv = ttnn.get_memory_view(device, ttnn.BufferType.TRACE)
+            return int(mv.total_bytes_free_per_bank) * int(mv.num_banks)
+        except Exception:
+            return None
+
+    def _prepare_prefill_group_traces(self, device, page_table):
+        """Allocate + COMPILE every grouped bucket body of self._grp_spec before the first trace capture of the
+        process: the shared constants (_prealloc_grouped_consts), one persistent input set per (bucket, B)
+        (_alloc_grouped_bucket_bufs), then ONE eager pass per (bucket, B) through the body + the post-replay
+        readouts (the B-row logits select and the per-row snapshot slices). Every program a replay or its readout
+        will run is compiled here and every lazily-created per-M CCL/matmul buffer exists before any capture (the
+        compile-first rule of tests/VERIFY_W32_AUDIT.md). Largest body first; idempotent per (bucket, B)."""
+        if not self._grp_spec or not self.grouped_prefill_ready():
+            return
+        assert self._paged_kv_caches and self._pad_kv_block is not None, "allocate_kv_caches must run first"
+        assert self._chunk_full_page_table_buf is not None, "the shared chunk-trace input buffers must exist"
+        self._prealloc_grouped_consts(device)
+        todo = sorted(
+            ((b, B) for b, bs in self._grp_spec.items() for B in bs if (b, B) not in self._grp_prepared),
+            key=lambda k: -k[0] * k[1],
+        )
+        for bucket, B in todo:
+            t0 = time.perf_counter()
+            bufs = self._alloc_grouped_bucket_bufs(device, bucket, B, page_table)
+            warm = self._forward_prefill_group_body_tp(bucket, B, bufs)
+            # The trace's output buffer: allocated NOW (before any capture) with the body output's spec; the copy
+            # program the captured body ends with is compiled here too.
+            bufs.hidden = ttnn.clone(warm)
+            ttnn.copy(warm, bufs.hidden)
+            ttnn.deallocate(warm)
+            # The per-row views the speculative prefill hooks read after a replay (same program for every row).
+            for t in [bufs.hidden] + list(bufs.aux or []):
+                ttnn.deallocate(self._group_row_view(t, B - 1, bucket))
+            warm_lg = self._grouped_logits_tp(bufs.hidden, bucket, B, [max(1, bucket - 1 - u) for u in range(B)])
+            self._logits_rows_to_host(warm_lg, B)
+            tr_warm = _GroupedBucketTrace(bucket, B, None, bufs, None, self._grp_rec_out[B], self._grp_taps_out[B])
+            snaps = [self._snapshot_group_row_host(tr_warm, u) for u in range(B)]
+            for s_ in snaps:
+                self.pd_gdn_snapshot_release(*s_)
+            ttnn.synchronize_device(device)
+            self._grp_prepared[(bucket, B)] = bufs
+            logger.info(
+                f"[prefill] grouped bucket ({bucket} x B={B}) body compiled (eager pass {time.perf_counter() - t0:.1f} s, "
+                f"DRAM free {self._dram_free_mib(device)})"
+            )
+
+    def capture_prefill_group_traces(self, device, page_table):
+        """Capture one trace per PREPARED (bucket, B) (_prepare_prefill_group_traces ran before the first capture),
+        largest body first. No program may compile here: the capture pass replays the compiled programs over the
+        persistent buffers. A body the TRACE region cannot hold is skipped (logged), not fatal: those users keep
+        the per-user trace. Runs after capture_prefill_bucket_traces (shares its pad KV block and chunk buffers)."""
+        if not self._grp_spec:
+            return
+        if not self.grouped_prefill_ready():
+            logger.warning("[prefill] grouped bucket traces skipped: GDN layers lack the fused KDA masked conv path")
+            return
+        if not self._grp_prepared:
+            logger.warning("[prefill] grouped bucket traces skipped: no body was prepared before the captures")
+            return
+        assert self._paged_kv_caches and self._pad_kv_block is not None, "capture_prefill_bucket_traces must run first"
+        assert self._chunk_full_page_table_buf is not None, "the shared chunk-trace input buffers must exist"
+        todo = sorted((k for k in self._grp_prepared if k not in self._grp_traces), key=lambda k: -k[0] * k[1])
+        need = 96 << 20  # first-trace requirement; refined from the measured deltas below
+        seen_delta = []
+        for bucket, B in todo:
+            free = self._trace_region_free_bytes(device)
+            if free is not None and free < need:
+                logger.warning(
+                    f"[prefill] grouped trace ({bucket} x B={B}) skipped: TRACE region has {free / (1 << 20):.0f} MiB free, "
+                    f"need ~{need / (1 << 20):.0f} MiB"
+                )
+                continue
+            bufs = self._grp_prepared[(bucket, B)]
+            before = self._trace_region_bytes(device)
+            t1 = time.perf_counter()
+            trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+            out = self._forward_prefill_group_body_tp(bucket, B, bufs)
+            ttnn.end_trace_capture(device, trace_id, cq_id=0)
+            assert out is bufs.hidden, "the captured grouped body must write the pre-allocated output buffer"
+            self._grp_traces[(bucket, B)] = _GroupedBucketTrace(
+                bucket, B, trace_id, bufs, out, self._grp_rec_out[B], self._grp_taps_out[B]
+            )
+            after = self._trace_region_bytes(device)
+            if None not in (before, after):
+                seen_delta.append(after - before)
+                need = int(1.25 * max(seen_delta))
+            delta = f"+{(after - before) / (1 << 20):.1f} MiB" if None not in (before, after) else "n/a"
+            logger.info(
+                f"Grouped-bucket({bucket} x B={B}) prefill trace (TP) captured; TRACE region {delta}, "
+                f"DRAM free {self._dram_free_mib(device)} (capture {time.perf_counter() - t1:.1f} s)"
+            )
+        if self._grp_traces:
+            logger.info(f"[prefill] grouped bucket traces ready: {sorted(self._grp_traces)}")
+
+    def release_prefill_group_traces(self):
+        """Release every grouped trace, its inputs and the per-B constants/outputs (the trace-region bytes come
+        back; the next capture reallocates everything, so nothing baked survives)."""
+        for tr in self._grp_traces.values():
+            ttnn.release_trace(self.device, tr.trace_id)
+        self._grp_traces = {}
+        for bufs in self._grp_prepared.values():
+            for f in fields(bufs):
+                if f.name in ("cos", "sin"):
+                    continue  # the shared per-bucket constants, released below
+                buf = getattr(bufs, f.name)
+                for t in buf if isinstance(buf, list) else [buf]:
+                    if isinstance(t, ttnn.Tensor):
+                        ttnn.deallocate(t)
+        self._grp_prepared = {}
+        for d in (
+            self._grp_zero_rec,
+            self._grp_zero_tap,
+            self._grp_rec_out,
+            self._grp_taps_out,
+            self._grp_cos,
+            self._grp_sin,
+        ):
+            for t in d.values():
+                ttnn.deallocate(t)
+            d.clear()
+        if self._grp_csi is not None:
+            ttnn.deallocate(self._grp_csi)
+            self._grp_csi = None
+
+    def _plan_prefill_groups(self, actual_lens):
+        """masked_bucket_trace.plan_prefill_groups over the captured (bucket, B) traces."""
+        available = {}
+        for b, B in self._grp_traces:
+            available.setdefault(b, []).append(B)
+        available = {b: tuple(sorted(v)) for b, v in available.items()}
+        return mbt.plan_prefill_groups([self._mask_bucket_for(int(a)) for a in actual_lens], available)
+
+    def _replay_prefill_group_trace_tp(self, tr, token_rows, actual_lens, pt_rows):
+        """Refresh one grouped trace's persistent inputs with n <= B real users (rows n..B-1 become dummies),
+        replay it, and return the device logits [1, 1, B, vocab] (rows 0..n-1 real). The assembled GDN state is
+        then in tr.rec_out / tr.taps_out (read per row with _snapshot_group_row_host).
+
+        token_rows: n x [1, T_u] real tokens; actual_lens: n ints; pt_rows: n x [1, blocks] page-table rows."""
+        bucket, B = tr.bucket, tr.B
+        n = len(token_rows)
+        assert 1 <= n <= B and len(actual_lens) == n and len(pt_rows) == n
+        block_size = get_block_size(self._paged_kv_caches)
+        self._assert_sdpa_pt_covers(0, bucket, block_size)
+        rep = ttnn.ReplicateTensorToMesh(self.device)
+        K = tr.bufs.K
+        rows_pt = [self._pt_row_to_buf_width(p) for p in pt_rows]
+        pad_pt = torch.full((1, rows_pt[0].shape[1]), int(self._pad_kv_block), dtype=torch.int32)
+        # Host tensors stay referenced until after the synchronize (execute_trace is non-blocking; their DMAs
+        # are in flight until then).
+        refs = []
+
+        def _dma(host_t, dst, dtype, layout):
+            h = ttnn.from_torch(host_t, dtype=dtype, layout=layout, device=None, mesh_mapper=rep)
+            ttnn.copy_host_to_device_tensor(h, dst)
+            refs.append(h)
+
+        _dma(
+            mbt.host_group_tokens([t[:, :a] for t, a in zip(token_rows, actual_lens)], bucket, B),
+            tr.bufs.token,
+            ttnn.uint32,
+            ttnn.ROW_MAJOR_LAYOUT,
+        )
+        m = mbt.host_group_masks(actual_lens, bucket, B)
+        _dma(m, tr.bufs.mask_f32, ttnn.float32, ttnn.TILE_LAYOUT)
+        _dma(m, tr.bufs.mask_q, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        _dma(
+            mbt.host_group_fill_pt(rows_pt, actual_lens, bucket, B, self._pad_kv_block, block_size),
+            tr.bufs.fill_pt,
+            ttnn.int32,
+            ttnn.ROW_MAJOR_LAYOUT,
+        )
+        for u in range(B):
+            _dma(rows_pt[u] if u < n else pad_pt, tr.bufs.pt[u], ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        for u, s in enumerate(mbt.host_group_conv_sel_x(actual_lens, bucket, K, B)):
+            _dma(s, tr.bufs.sel_x[u], ttnn.bfloat16, ttnn.TILE_LAYOUT)
+
+        ttnn.execute_trace(self.device, tr.trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(self.device)
+        refs.clear()
+        return self._grouped_logits_tp(tr.hidden, bucket, B, actual_lens)
 
     def warmup_prefill_masked_buckets(self, page_table, buckets=None):
         """Compile every masked-bucket prefill program up front, so a request never compiles after

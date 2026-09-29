@@ -231,6 +231,31 @@ class Qwen36DecoderLayer:
         ttnn.deallocate(ff_output)
         return output
 
+    def norm_configs(self, norm_mode):
+        """(attention_norm, ffn_norm) norm_config dicts for `norm_mode` -- the SAME ones forward() uses, exposed
+        so a body that drives the sub-modules itself (model._forward_prefill_group_body_tp) runs the norms on the
+        programs the per-user forward compiled."""
+        if self.num_devices > 1:
+            # TP: DistributedNorm uses the framework's per-norm memory configs.
+            _attn_norm_config = self.args.get_norm_config("attn", norm_mode)
+            # PREFILL: distributed rmsnorm outputs in L1 so the fused in-proj AGMM gathers from L1, not DRAM.
+            if norm_mode == Mode.PREFILL:
+                _attn_norm_config = {**_attn_norm_config, "distributed_output_mem_config": ttnn.L1_MEMORY_CONFIG}
+            # DECODE ff_norm uses the attn_norm layout (act_shard_hidden, 32-core) so Qwen36MLP's input reshard is a no-op and the norm runs on 32 cores not 8; PREFILL keeps the framework ff config.
+            if norm_mode == Mode.DECODE:
+                _ff_norm_config = self.args.get_norm_config("attn", norm_mode)
+            else:
+                # ff_norm output stays DRAM: L1 keeps the full-width norm resident across the whole MLP,
+                # clashing with each matmul's CBs (w1/w3/w2) for no gain. Verified dead end; keep DRAM.
+                _ff_norm_config = self.args.get_norm_config("ff", norm_mode)
+        else:
+            # In decode the norm output stays in L1 (as the old rms_norm_ttnn(memory_config=L1) did);
+            # in prefill the framework RMSNorm returns interleaved DRAM (matches the old None default).
+            _attn_norm_config = _ff_norm_config = (
+                {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if norm_mode == Mode.DECODE else None
+            )
+        return _attn_norm_config, _ff_norm_config
+
     def forward(
         self,
         x,
@@ -250,25 +275,7 @@ class Qwen36DecoderLayer:
         # gdn_masks: persistent device (mask_f32, mask_q, conv_sel) for the traced masked-bucket
         # prefill; only the TP GDN prefill branch consumes it (None => unchanged everywhere).
         _norm_mode = Mode.PREFILL if mode == "prefill" else Mode.DECODE
-        if self.num_devices > 1:
-            # TP: DistributedNorm uses the framework's per-norm memory configs.
-            _attn_norm_config = self.args.get_norm_config("attn", _norm_mode)
-            # PREFILL: distributed rmsnorm outputs in L1 so the fused in-proj AGMM gathers from L1, not DRAM.
-            if _norm_mode == Mode.PREFILL:
-                _attn_norm_config = {**_attn_norm_config, "distributed_output_mem_config": ttnn.L1_MEMORY_CONFIG}
-            # DECODE ff_norm uses the attn_norm layout (act_shard_hidden, 32-core) so Qwen36MLP's input reshard is a no-op and the norm runs on 32 cores not 8; PREFILL keeps the framework ff config.
-            if _norm_mode == Mode.DECODE:
-                _ff_norm_config = self.args.get_norm_config("attn", _norm_mode)
-            else:
-                # ff_norm output stays DRAM: L1 keeps the full-width norm resident across the whole MLP,
-                # clashing with each matmul's CBs (w1/w3/w2) for no gain. Verified dead end; keep DRAM.
-                _ff_norm_config = self.args.get_norm_config("ff", _norm_mode)
-        else:
-            # In decode the norm output stays in L1 (as the old rms_norm_ttnn(memory_config=L1) did);
-            # in prefill the framework RMSNorm returns interleaved DRAM (matches the old None default).
-            _attn_norm_config = _ff_norm_config = (
-                {"output_mem_config": ttnn.L1_MEMORY_CONFIG} if mode == "decode" else None
-            )
+        _attn_norm_config, _ff_norm_config = self.norm_configs(_norm_mode)
         # DECODE fused all-reduce path (model._decode_residual_in): x is the REPLICATED residual [1,1,B,dim], L1
         # width-sharded in the decode norm layout -> the norms run directly on it (the wrapped sharded RMSNorm, no
         # DistributedNorm all-gather) and the residual adds stay in that layout. Fractured x keeps the old path.

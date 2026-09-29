@@ -9,6 +9,7 @@ device test would only surface as a PCC drop. Pure torch, no ttnn, no device:
     python -m pytest models/demos/blackhole/qwen36/tests/test_masked_bucket_trace_helpers_scratch.py \
         -p no:cacheprovider -q
 """
+
 import pytest
 import torch
 
@@ -43,9 +44,9 @@ def test_host_masks_all_ones_at_full_bucket():
 
 
 def test_host_masks_rejects_out_of_range():
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
         host_masks(0, 128)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
         host_masks(129, 128)
 
 
@@ -146,13 +147,13 @@ def test_fill_pt_row_falls_back_to_scratch_past_the_end_of_the_row():
 
 def test_fill_pt_row_rejects_block_zero_as_scratch():
     pt = torch.arange(64, dtype=torch.int32).reshape(1, 64)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
         fill_pt_row(pt, 0, 33, 128, 0, BLOCK)
 
 
 def test_fill_pt_row_rejects_an_unmapped_real_block():
     pt = torch.arange(1, 3, dtype=torch.int32).reshape(1, 2)  # 2 blocks
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
         fill_pt_row(pt, 0, 200, 256, 63, BLOCK)  # needs 4 real blocks
 
 
@@ -173,5 +174,88 @@ def test_parse_bucket_trace_gate_list():
 
 
 def test_parse_bucket_trace_gate_rejects_unknown_bucket():
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
         parse_bucket_trace_gate("192", BUCKETS)
+
+
+# --------------------------------------------------------------------------- grouped traces
+from models.demos.blackhole.qwen36.tt.masked_bucket_trace import (  # noqa: E402
+    MAX_GROUP_ROWS,
+    host_conv_sel_split,
+    host_group_conv_sel_x,
+    host_group_fill_pt,
+    host_group_logit_sel,
+    host_group_masks,
+    host_group_tokens,
+    parse_group_trace_spec,
+    plan_prefill_groups,
+)
+
+
+def test_host_group_masks_rows_match_per_user_masks():
+    m = host_group_masks([3, 128, 64], 128, 4)
+    assert m.shape == (4, 128, 1)
+    for u, a in enumerate([3, 128, 64, 1]):  # row 3 is a dummy (1 valid token)
+        assert torch.equal(m[u : u + 1], host_masks(a, 128))
+
+
+def test_host_group_conv_sel_x_rows_match_split_one_hot():
+    rows = host_group_conv_sel_x([2, 100], 128, 4, 2)
+    assert len(rows) == 2 and rows[0].shape == (1, 3, 128)
+    assert torch.equal(rows[0], host_conv_sel_split(2, 128, 4)[0])
+    assert torch.equal(rows[1], host_conv_sel_split(100, 128, 4)[0])
+
+
+def test_host_group_tokens_right_pads_each_row():
+    t = host_group_tokens([torch.tensor([[5, 6, 7]]), torch.tensor([9])], 128, 4)
+    assert t.shape == (4, 128) and t.dtype == torch.int32
+    assert t[0, :4].tolist() == [5, 6, 7, 0] and t[1, :2].tolist() == [9, 0]
+    assert int(t[2:].abs().sum()) == 0
+
+
+def test_host_group_logit_sel_picks_each_rows_last_real_position():
+    sel = host_group_logit_sel([3, 128], 128, 4)
+    assert sel.shape == (1, 1, 4, 512)
+    nz = sel.nonzero().tolist()
+    assert nz == [[0, 0, 0, 2], [0, 0, 1, 255], [0, 0, 2, 256], [0, 0, 3, 384]]
+
+
+def test_host_group_fill_pt_real_rows_and_dummy_rows():
+    pt = torch.arange(0, 16, dtype=torch.int32).reshape(1, 16)
+    out = host_group_fill_pt([pt, pt + 16], [70, 1], 128, 4, pad_block=999, block_size=64)
+    assert out.shape == (4, 2)
+    assert torch.equal(out[0:1], fill_pt_row(pt, 0, 70, 128, 999, 64))
+    assert torch.equal(out[1:2], fill_pt_row(pt + 16, 0, 1, 128, 999, 64))
+    assert out[2:].tolist() == [[999, 999], [999, 999]]
+
+
+def test_parse_group_trace_spec():
+    all_b = (128, 256, 512, 1024, 2048)
+    assert parse_group_trace_spec(None, all_b) == {}  # opt-in: unset = per-user traces only
+    assert parse_group_trace_spec("1", all_b) == {128: (2, 4, 8), 256: (2, 4, 8), 512: (2, 4)}
+    # every default body stays within MAX_GROUP_ROWS (= the 2048 chunk size)
+    assert all(b * bucket <= MAX_GROUP_ROWS for bucket, bs in parse_group_trace_spec("1", all_b).items() for b in bs)
+    assert parse_group_trace_spec("default", all_b) == parse_group_trace_spec("1", all_b)
+    assert parse_group_trace_spec("0", all_b) == {}
+    assert parse_group_trace_spec("128:8,2; 512:4", all_b) == {128: (2, 8), 512: (4,)}
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
+        parse_group_trace_spec("128:3", all_b)
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
+        parse_group_trace_spec("96:2", all_b)
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
+        parse_group_trace_spec("512:8", all_b)  # 4096 rows > MAX_GROUP_ROWS
+    with pytest.raises(AssertionError):  # allow-pytest.raises: host-only value builder asserts, no device error text
+        parse_group_trace_spec("1024:4", all_b)  # 4096 rows
+    assert parse_group_trace_spec("1024:2", all_b) == {1024: (2,)}  # exactly MAX_GROUP_ROWS is allowed
+
+
+def test_plan_prefill_groups_same_bucket_users_share_a_trace():
+    avail = {128: (2, 4, 8), 256: (2, 4, 8), 512: (2, 4)}
+    groups, singles = plan_prefill_groups([128, 128, 256, 128, 512, 2048, 128, 128, 128, 128, 128, 128, 256], avail)
+    assert groups == [(128, 8, [0, 1, 3, 6, 7, 8, 9, 10]), (256, 2, [2, 12])]
+    assert singles == [4, 5, 11]  # lone 512 user, the 2048 user (no group trace), the 9th 128 user
+    # the smallest captured B that fits, dummies fill the rest
+    assert plan_prefill_groups([128, 128, 128], avail) == ([(128, 4, [0, 1, 2])], [])
+    assert plan_prefill_groups([512] * 6, avail) == ([(512, 4, [0, 1, 2, 3]), (512, 2, [4, 5])], [])
+    assert plan_prefill_groups([128], avail) == ([], [0])
+    assert plan_prefill_groups([128, 128], {}) == ([], [0, 1])
