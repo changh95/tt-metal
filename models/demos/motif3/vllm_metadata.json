@@ -1,0 +1,4 @@
+{
+  "arch": "MotifForCausalLM",
+  "main_class": "models.demos.motif3.tt.generator_vllm:MotifForCausalLM"
+}

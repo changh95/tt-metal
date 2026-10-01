@@ -1,0 +1,36 @@
+{"case": "block32/update/step0", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [5, 31, 32, 127, -1, 500, 991, 1023], "status": "pass", "ts": "2026-10-01T17:43:53"}
+{"case": "block32/update/step1", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [6, 32, 33, 128, -1, 501, 992, 0], "status": "pass", "ts": "2026-10-01T17:43:53"}
+{"case": "block32/fill/S256/user1/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:43:53"}
+{"case": "block32/fill/S256/user6/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:43:54"}
+{"case": "block32/fill/S1024/user3/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:43:54"}
+{"case": "block32/fill/S256/user0/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:43:54"}
+{"case": "block32/fill/S256/user7/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:43:55"}
+{"case": "perf/decode_update/block64", "eager_us": 45.90265161823481, "gate": "G7", "samples": {"n1": 32, "n2": 64, "raw": 5.487016096594743, "slope": 4.844812792725861, "t1_us": [194.9, 195.5, 196.1, 196.5, 198.0], "t2_us": [349.3, 350.9, 351.2, 351.2, 363.7]}, "status": "measured", "traced_raw_us": 5.487016096594743, "traced_us": 4.844812792725861, "ts": "2026-10-01T17:43:57"}
+{"case": "perf/prefill_fill/S1024/block64", "eager_us": 38.6431987863034, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:43:57"}
+{"case": "perf/prefill_fill/S4096/block64", "eager_us": 294.42040249705315, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:43:57"}
+{"blocks": 516, "bytes_per_chip": 20210688, "case": "alloc/kv_pool_eighth_layer", "empty_plus_fill_s": 0.002844414033461362, "extrapolated_53_layers_full_pool_fill_s": 1.2060315501876175, "extrapolated_53_layers_full_pool_zeros_s": 19.89007319137454, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:43:58", "ttnn_zeros_s": 0.046910549979656935}
+{"case": "block64/update/step0", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [5, 63, 64, 127, -1, 500, 991, 1023], "status": "pass", "ts": "2026-10-01T17:44:13"}
+{"case": "block64/update/step1", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [6, 64, 65, 128, -1, 501, 992, 0], "status": "pass", "ts": "2026-10-01T17:44:14"}
+{"case": "block64/fill/S256/user1/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:44:14"}
+{"case": "block64/fill/S256/user6/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:44:14"}
+{"case": "block64/fill/S1024/user3/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:44:15"}
+{"case": "block64/fill/S256/user0/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:44:15"}
+{"case": "block64/fill/S256/user7/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:44:15"}
+{"case": "block32/update/step0", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [5, 31, 32, 127, -1, 500, 991, 1023], "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/update/step1", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [6, 32, 33, 128, -1, 501, 992, 0], "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/fill/S256/user1/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/fill/S256/user6/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/fill/S1024/user3/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/fill/S256/user0/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "block32/fill/S256/user7/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:52:58"}
+{"case": "perf/decode_update/block64", "eager_us": 50.318799912929535, "gate": "G7", "samples": {"n1": 32, "n2": 64, "raw": 5.817984856548719, "slope": 4.820376489078626, "t1_us": [218.1, 218.2, 219.0, 219.8, 220.5, 220.8, 222.1, 222.1, 224.3], "t2_us": [372.4, 372.6, 373.1, 373.8, 374.4, 375.2, 376.0, 376.7, 386.0]}, "status": "measured", "traced_raw_us": 5.817984856548719, "traced_us": 4.820376489078626, "ts": "2026-10-01T17:53:00"}
+{"case": "perf/prefill_fill/S1024/block64", "eager_us": 56.021398631855845, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:53:00"}
+{"case": "perf/prefill_fill/S4096/block64", "eager_us": 108.7707991246134, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:53:00"}
+{"blocks": 516, "bytes_per_chip": 20210688, "case": "alloc/kv_pool_eighth_layer", "empty_plus_fill_s": 0.00042833504267036915, "extrapolated_53_layers_full_pool_fill_s": 0.18161405809223652, "extrapolated_53_layers_full_pool_zeros_s": 17.517883497755975, "gate": "G7", "status": "measured", "ts": "2026-10-01T17:53:00", "ttnn_zeros_s": 0.0413157629664056}
+{"case": "block64/update/step0", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [5, 63, 64, 127, -1, 500, 991, 1023], "status": "pass", "ts": "2026-10-01T17:53:14"}
+{"case": "block64/update/step1", "gate": "G7", "mismatching_elements": 0, "note": "pos -1 lane must be untouched", "positions": [6, 64, 65, 128, -1, 501, 992, 0], "status": "pass", "ts": "2026-10-01T17:53:14"}
+{"case": "block64/fill/S256/user1/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:53:14"}
+{"case": "block64/fill/S256/user6/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:53:14"}
+{"case": "block64/fill/S1024/user3/batch_idx", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:53:14"}
+{"case": "block64/fill/S256/user0/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:53:15"}
+{"case": "block64/fill/S256/user7/batch_idx_tensor", "gate": "G7", "mismatching_elements": 0, "status": "pass", "ts": "2026-10-01T17:53:15"}
