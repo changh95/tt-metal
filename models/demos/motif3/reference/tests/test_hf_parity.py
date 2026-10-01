@@ -153,3 +153,38 @@ def test_hf_decode_cache_pitfall_and_reference_decode():
     window = args.effective_sliding_window
     assert err[: window - 1].max() < 1e-4  # identical while the context fits the (wrong) window
     assert err[window:].max() > 1e-2  # wrong past it
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_default_generator_decode_matches_hf_cached_decode(dtype):
+    """Batched (B=2) prefill + decode past the window vs HF's own cached decode (config-less ``DynamicCache()``).
+    In bf16 cached decode and full forward differ by bf16 rounding (in HF too), so decode goldens must come from the
+    HF cast points: ``MotifGenerator``'s DEFAULT (expanded) form reproduces them. The absorbed (MLA) form computes
+    the same math but rounds differently in bf16; in fp32 both forms match HF."""
+    from transformers.cache_utils import DynamicCache
+
+    args = tiny_random_args(sliding_window=8)
+    ref, hf, _ = make_ref_and_hf(args, seed=1, dtype=dtype)
+    T, P = 24, 6  # window 9: most decode steps attend past it
+    ids = rand_ids(args, 2, T, seed=8)
+    with hf_cpu_flash_attention(), torch.no_grad():
+        cache = DynamicCache()
+        hf_dec = [hf(ids[:, :P], past_key_values=cache, use_cache=True).logits]
+        hf_dec += [hf(ids[:, t : t + 1], past_key_values=cache, use_cache=True).logits for t in range(P, T)]
+    hf_dec = torch.cat(hf_dec, dim=1)
+
+    def ref_decode(**kwargs):
+        gen = MotifGenerator(ref, 2, T, **kwargs)
+        return torch.cat([gen.prefill(ids[:, :P])] + [gen.decode(ids[:, t])[:, None] for t in range(P, T)], dim=1)
+
+    default, absorbed = ref_decode(), ref_decode(attn_mode="absorbed")
+    print(
+        f"\n[{dtype}] decode vs HF DynamicCache() decode: default exact={torch.equal(default, hf_dec)} "
+        f"max={max_abs(default, hf_dec):.3e}; absorbed max={max_abs(absorbed, hf_dec):.3e}"
+    )
+    if dtype == torch.float32:
+        torch.testing.assert_close(default, hf_dec, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(absorbed, hf_dec, atol=1e-4, rtol=1e-4)
+    else:
+        assert pcc(default, hf_dec) > 0.99999 and max_abs(default, hf_dec) < 5e-2
+        assert pcc(absorbed, hf_dec) > 0.999

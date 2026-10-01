@@ -180,3 +180,35 @@ def test_moe_and_mlp_match_hf(mm, dtype):
     mlp_hf.load_state_dict(mlp_ref.state_dict(), strict=True)
     with torch.no_grad():
         assert torch.equal(mlp_ref(x), mlp_hf(x))
+
+
+def test_differential_combine_rounds_like_training_eager():
+    """Training's ``attn1 - torch.sigmoid(lambda_full).unsqueeze(-1) * attn2`` on bf16 tensors, then
+    ``* torch.sigmoid(gate_score)`` (attention.py:405-407, :487-488), rounds exactly like HF's
+    ``sigmoid(lambda.float()).to(bf16)`` (modeling_motif.py:765-769), so it is not a precision difference (README
+    "Known deviations" #4). torch's bf16 sigmoid computes in fp32 and rounds once, for every bf16 input, and the
+    reference's gated differential output equals training's formula applied to its own per-head outputs."""
+    x = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)  # all 65536 values
+    nan = torch.isnan(x)
+    a, b = torch.sigmoid(x), torch.sigmoid(x.float()).to(torch.bfloat16)
+    assert torch.equal(a[~nan].view(torch.int16), b[~nan].view(torch.int16)) and torch.isnan(a[nan]).all()
+
+    from models.demos.motif3.reference import build_random_model
+    from models.demos.motif3.reference.golden import TensorRecorder
+
+    args = tiny_random_args(sliding_window=8)
+    attn = build_random_model(args, layer_ids=[1], seed=0, dtype=torch.bfloat16).model.layers["1"].self_attn
+    B, S = 2, 12
+    h = (torch.randn(B, S, args.hidden_size, generator=_g(15))).to(torch.bfloat16)
+    rec = TensorRecorder()
+    with torch.no_grad():
+        attn(h, torch.arange(S)[None].expand(B, S), tap=rec)
+    heads, lam, gate = rec.tensors["attn_heads"], rec.tensors["lambda"], rec.tensors["gate"]
+    assert heads.dtype == lam.dtype == gate.dtype == torch.bfloat16
+    # training _split_heads (attention.py:87-103) + _repeat_kv + post_attn + output gate, verbatim
+    gr, d = args.grouped_ratio, args.v_head_dim
+    grouped = heads.reshape(B, S, args.num_noise_heads, gr + 1, d)
+    attn1 = grouped[..., :gr, :].reshape(B, S, -1, d)
+    attn2 = torch.repeat_interleave(grouped[..., gr:, :].reshape(B, S, -1, d), dim=2, repeats=gr)
+    training = (attn1 - torch.sigmoid(lam).unsqueeze(-1) * attn2) * torch.sigmoid(gate)
+    assert torch.equal(rec.tensors["gated"], training)

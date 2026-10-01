@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""(d) Real-weight smoke + HF parity: embed + layers 0-2 (global/dense, swa/dense, swa/moe) + final norm + lm_head.
+"""(d) Real-weight smoke + HF parity: embed + layers 0-2 (global/dense, swa/dense, swa/moe) + final norm + lm_head,
+and the MTP head.
 
 A chat-templated prompt longer than the 129-key window runs through the reference prefix model in bf16 and fp32.
 Each layer's output is compared with an HF ``MotifDecoderLayer`` that holds the SAME real tensors (built on the meta
 device, then ``load_state_dict(assign=True)`` - constructing a decoder layer never runs ``_init_weights``, so
-nothing zeroes the loaded parameters). Skipped when the local shards are missing.
+nothing zeroes the loaded parameters). The MTP head is compared with ``hf_reference.HFMTPOracle`` (HF blocks with
+the fork's MTP wiring). Skipped when the local shards are missing.
 """
 
 import pytest
@@ -24,7 +26,7 @@ from models.demos.motif3.reference.golden import (
 from models.demos.motif3.reference.tokenizer import encode_chat, load_tokenizer
 
 from .common import REAL_LAYERS, max_abs, pcc, real_checkpoint
-from .hf_reference import hf_config_from_json, hf_cpu_flash_attention, load_hf_modules
+from .hf_reference import HFMTPOracle, hf_config_from_json, hf_cpu_flash_attention, load_hf_modules
 
 pytestmark = pytest.mark.timeout(3600)
 
@@ -172,23 +174,47 @@ def test_real_lazy_experts_match_materialized(ckpt, models, prompt_ids):
         assert torch.equal(lazy(prompt_ids[:, :64]), models[torch.bfloat16](prompt_ids[:, :64]))
 
 
-def test_real_mtp_smoke(ckpt, models, prompt_ids):
-    if not all(ckpt.is_local(n) for n in ckpt.names_with_prefix("model.mtp_layers.")):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_real_mtp_matches_hf_oracle(ckpt, models, prompt_ids, dtype):
+    """Real MTP weights vs the HF-block oracle (fork wiring, ``hf_reference.HFMTPOracle``; tensors read straight from
+    the shards). Inputs are the prefix model's post-norm hidden states of the chat prompt and the next-token
+    embeddings, S = 144 > 129 keys, so the SWA window, plain RoPE and the 192^-0.5 scale are all exercised."""
+    prefix = "model.mtp_layers.0."
+    names = ckpt.names_with_prefix(prefix)
+    if not names or not all(ckpt.is_local(n) for n in names):
         pytest.skip("MTP shard not local")
-    mtp = load_mtp(dtype=torch.bfloat16, checkpoint=ckpt)
-    model = models[torch.bfloat16]
+    mtp = load_mtp(dtype=dtype, checkpoint=ckpt)
+    model = models[dtype]
+    cfg_mod, mm = load_hf_modules()
+    raw = {n[len(prefix) :]: t for n, t in ckpt.get_many(names, dtype).items()}
+    oracle = HFMTPOracle(mm, hf_config_from_json(ckpt.dir, cfg_mod), raw, dtype)
     S = prompt_ids.shape[1] - 1
-    rec = TensorRecorder(lambda n: n == "final.norm")
-    with torch.no_grad():
+    pos = torch.arange(S)[None]
+    rec = TensorRecorder(lambda n: n in ("final.norm", "input_proj.out"))
+    with hf_cpu_flash_attention(), torch.no_grad():
         model(prompt_ids[:, :S], tap=rec)
+        h_main = rec.tensors["final.norm"]
         next_emb = model.model.embed_tokens(prompt_ids[:, 1 : S + 1])
-        pos = torch.arange(S)[None]
-        h_e = mtp(rec.tensors["final.norm"], next_emb, pos, attn_mode="expanded")
-        h_a = mtp(rec.tensors["final.norm"], next_emb, pos, attn_mode="absorbed")
-        logits = model.lm_head(h_e).float()
-    assert h_e.shape == (1, S, 4096) and torch.isfinite(logits).all()
-    assert pcc(h_a, h_e) > 0.999
-    assert mtp.self_attn.window == 129 and not mtp.self_attn.uses_yarn and abs(mtp.self_attn.scale - 192**-0.5) < 1e-12
+        h_in, expect = oracle(h_main, next_emb, pos)
+        out = mtp(h_main, next_emb, pos, tap=rec)
+        absorbed = mtp(h_main, next_emb, pos, attn_mode="absorbed")
+        logits = model.lm_head(out).float()
+    print(
+        f"\n[{dtype}] real MTP vs HF-block oracle: exact={torch.equal(out, expect)} "
+        f"max|d|={max_abs(out, expect):.3e} pcc={pcc(out, expect):.8f}; absorbed pcc={pcc(absorbed, out):.6f}"
+    )
+    assert out.shape == (1, S, 4096) and torch.isfinite(logits).all()
+    assert torch.equal(rec.tensors["input_proj.out"], h_in)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, expect, atol=1e-4, rtol=1e-4)
+        assert max_abs(absorbed, out) <= 1e-4 * float(out.abs().max())
+    else:
+        assert pcc(out, expect) > 0.99999
+        assert pcc(absorbed, out) > 0.999
+    hf_attn = oracle.block.self_attn
+    assert mtp.self_attn.window == hf_attn.sliding_window == 129
+    assert mtp.self_attn.scale == hf_attn.scaling and abs(mtp.self_attn.scale - 192**-0.5) < 1e-12
+    assert not mtp.self_attn.uses_yarn and torch.equal(mtp.self_attn.inv_freq(), hf_attn.swa_rotary_emb.inv_freq)
 
 
 def test_real_golden_capture(models, prompt_ids, tmp_path):

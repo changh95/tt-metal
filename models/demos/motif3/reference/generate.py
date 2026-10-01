@@ -5,12 +5,24 @@
 HF ``generate()`` is NOT a valid Motif-3 decode reference past 128 tokens: it builds ``DynamicCache(config=...)``,
 which turns all 53 layers (including the 14 global ones) into 127-token sliding layers (study §3.12). This module
 keeps one latent cache per layer, indexed by absolute position, and masks with each layer's own window (global:
-full causal; SWA: 129 keys incl. the current one), so decode equals the full-sequence forward at every position.
+full causal; SWA: 129 keys incl. the current one), so decode computes the same function as the full-sequence
+forward at every position.
 
     gen = MotifGenerator(model, batch_size=1, max_seq_len=4096)
     logits = gen.prefill(prompt_ids)          # [B, S, V] fp32, positions 0..S-1
     next_logits = gen.decode(next_ids)        # [B, V] fp32, one token per user
     tokens = gen.generate(prompt_ids, max_new_tokens=32)  # greedy unless sample=True
+
+Numerics. In an fp32 model, decode equals the full-sequence forward to fp32 round-off (a few 1e-6 on the logits) in
+both attention forms. In a bf16 model, decode and full forward differ by bf16 rounding (cached decode runs other GEMM
+shapes; HF behaves the same way). The default ``attn_mode="expanded"`` reproduces HF's bf16 cached decode (with a
+config-less ``DynamicCache()``) op for op, bit-exact in the CPU tests. ``"absorbed"`` (the MLA form) computes the
+same math but rounds differently in bf16, so use it for bf16 goldens only when the TT side computes the absorbed
+form too.
+
+``cache_dtype`` (default: the model dtype) is the storage precision of the latent cache only: entries are rounded
+to it on write and read back in the model dtype. An fp32 cache on a bf16 model is lossless; a bf16 cache on an
+fp32 model emulates a bf16 KV cache.
 
 Prefill of a batch needs equal-length prompts (no padding support); prefill can be chunked by calling
 ``prefill`` repeatedly. Users of one batch may be advanced to different positions with ``decode(positions=...)``.
@@ -31,9 +43,11 @@ class MotifGenerator:
         model: MotifForCausalLM,
         batch_size: int = 1,
         max_seq_len: int = 4096,
-        attn_mode: str = "absorbed",
+        attn_mode: str = "expanded",
         cache_dtype: Optional[torch.dtype] = None,
     ):
+        if attn_mode not in ("expanded", "absorbed"):
+            raise ValueError(f"unknown attention mode {attn_mode!r}")
         self.model = model
         self.attn_mode = attn_mode
         self.cache = model.new_cache(batch_size, max_seq_len, cache_dtype)

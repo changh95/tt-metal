@@ -32,6 +32,7 @@ Afterwards it checks that the oracle really uses the torch ops (:func:`assert_hf
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib
 import json
 import os
@@ -40,6 +41,7 @@ import types
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 HF_META_DIR = Path(os.environ.get("MOTIF3_HF_META_DIR", "/home/ttuser/hchang/experiments/motif-3/hf_meta"))
 _PKG = "motif3_hf_reference_pkg"
@@ -179,3 +181,63 @@ def hf_config_from_json(path, cfg_mod=None):
     cfg = cfg_mod.MotifConfig(**json.loads(path.read_text()))
     cfg._attn_implementation = "flash_attention_2"
     return cfg
+
+
+def hf_mtp_config(cfg):
+    """The fork's ``_make_mtp_hf_config`` (motif_mtp.py:66-83), training's ``dense_args`` (model.py:973-982): the MTP
+    block is a dense-FFN, mHC-free decoder layer with sliding-window attention on every layer (pattern "all")."""
+    mtp_cfg = copy.copy(cfg)
+    mtp_cfg.interleave_moe_layer_step = 0
+    mtp_cfg.mhc_enabled = False
+    mtp_cfg.use_sliding_window = True
+    mtp_cfg.sliding_window_pattern = "all"
+    return mtp_cfg
+
+
+class HFMTPOracle:
+    """MTP oracle from HF ``modeling_motif`` blocks. HF ships no MTP module, so the wiring is spelled out here as the
+    fork's ``MotifMultiTokenPredictorLayer.forward`` (motif_mtp.py:160-170) and training's ``_run_mtp_block``
+    (model.py:865-876, embed path :878-892) define it::
+
+        h   = input_proj(cat([h_main, embed_norm(embed(t + 1))]))   # h_main: main model post-norm hidden at t
+        h   = MotifDecoderLayer(hf_mtp_config(cfg), num_hidden_layers)(h)   # pre-norm block, both residuals inside
+        out = final_layernorm(h)
+
+    ``sd`` holds the MTP tensors with checkpoint names minus ``model.mtp_layers.0.``. The modules are built on the
+    meta device and ``assign``-loaded, so real weights are used in place. Call it inside ``hf_cpu_flash_attention()``.
+    """
+
+    OWN = ("embed_norm.", "input_proj.", "final_layernorm.")
+
+    def __init__(self, mm, cfg, sd, dtype: torch.dtype):
+        self.cfg = hf_mtp_config(cfg)
+        sd = {k: v.to(dtype) for k, v in sd.items()}
+        D, eps = cfg.hidden_size, cfg.rms_norm_eps
+        with torch.device("meta"):
+            self.block = mm.MotifDecoderLayer(self.cfg, cfg.num_hidden_layers)
+            self.embed_norm = mm.MotifRMSNorm(D, eps=eps)
+            self.final_layernorm = mm.MotifRMSNorm(D, eps=eps)
+            # the model-level (global, YaRN) table HF would pass; an SWA layer must ignore it for its own plain RoPE
+            self.rotary = mm.MotifRotaryEmbedding(self.cfg, rope_head_dim=cfg.qk_rope_head_dim)
+        self.block.load_state_dict(
+            {k: v for k, v in sd.items() if not k.startswith(self.OWN)}, strict=True, assign=True
+        )
+        self.embed_norm.load_state_dict({"weight": sd["embed_norm.weight"]}, strict=True, assign=True)
+        self.final_layernorm.load_state_dict({"weight": sd["final_layernorm.weight"]}, strict=True, assign=True)
+        self.input_proj_weight = sd["input_proj.weight"]
+        self.block.eval()
+
+    @torch.no_grad()
+    def __call__(self, h_main: torch.Tensor, next_embeds: torch.Tensor, positions: torch.Tensor):
+        """``(input_proj output, MTP output)``, both ``[B, S, D]``; ``positions [B or 1, S]``, equal for all rows."""
+        h = F.linear(torch.cat([h_main, self.embed_norm(next_embeds)], dim=-1), self.input_proj_weight)
+        out = self.block(
+            h,
+            attention_mask=None,
+            position_ids=positions,
+            past_key_value=None,
+            use_cache=False,
+            cache_position=positions[0],
+            position_embeddings=self.rotary(h, positions),
+        )[0]
+        return h, self.final_layernorm(out)

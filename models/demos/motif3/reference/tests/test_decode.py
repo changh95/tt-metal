@@ -5,10 +5,17 @@
 import pytest
 import torch
 
-from models.demos.motif3.reference import attention_mask, build_random_model, tiny_random_args
+from models.demos.motif3.reference import (
+    GDLAttention,
+    attention_mask,
+    build_random_model,
+    random_state_dict,
+    tiny_random_args,
+)
 from models.demos.motif3.reference.generate import MotifGenerator
+from models.demos.motif3.reference.weights import round_state_dict
 
-from .common import max_abs, rand_ids
+from .common import max_abs, pcc, rand_ids
 
 T = 300
 
@@ -107,3 +114,41 @@ def test_generate_sampling_is_seeded_and_valid(model_and_full):
         )
     assert outs[0] == outs[1] and len(outs[0]) == 8
     assert all(0 <= t < model.args.vocab_size for t in outs[0])
+
+
+@pytest.mark.parametrize("attn_mode", ["expanded", "absorbed"])
+def test_cache_dtype_is_storage_precision_only(attn_mode, monkeypatch):
+    """``cache_dtype`` != model dtype works in both attention forms and only changes how the cache stores entries.
+    An fp32 cache on a bf16 model is lossless (bit-identical to the bf16 cache); a bf16 cache on an fp32 model equals
+    the fp32 model with its cache entries (kv_norm(c), roped k_pe) rounded to bf16."""
+    args = tiny_random_args(sliding_window=8)
+    sd = round_state_dict(random_state_dict(args, seed=1), torch.bfloat16)
+    T, P = 16, 6  # window 9
+    ids = rand_ids(args, 2, T, seed=2)
+
+    def run(model, cache_dtype=None):
+        gen = MotifGenerator(model, 2, T, attn_mode=attn_mode, cache_dtype=cache_dtype)
+        assert gen.cache[0].c.dtype == (cache_dtype or model.dtype)
+        steps = [gen.prefill(ids[:, :P])] + [gen.decode(ids[:, t])[:, None] for t in range(P, T)]
+        return torch.cat(steps, dim=1)
+
+    bf16_model = build_random_model(args, dtype=torch.bfloat16, state_dict=sd)
+    assert torch.equal(run(bf16_model, torch.float32), run(bf16_model))
+
+    fp32_model = build_random_model(args, dtype=torch.float32, state_dict=sd)
+    bf16_cache, fp32_cache = run(fp32_model, torch.bfloat16), run(fp32_model)
+    assert not torch.equal(bf16_cache, fp32_cache) and pcc(bf16_cache, fp32_cache) > 0.999  # rounds, slightly
+    project_kv = GDLAttention.project_kv
+
+    def project_kv_rounded(self, x, cos, sin):
+        c, k_pe = project_kv(self, x, cos, sin)
+        return c.bfloat16().float(), k_pe.bfloat16().float()
+
+    monkeypatch.setattr(GDLAttention, "project_kv", project_kv_rounded)
+    assert torch.equal(bf16_cache, run(fp32_model))
+
+
+def test_generator_rejects_unknown_attn_mode():
+    model = build_random_model(tiny_random_args(num_hidden_layers=1), seed=0)
+    with pytest.raises(ValueError, match="attention mode"):
+        MotifGenerator(model, 1, 8, attn_mode="mla")

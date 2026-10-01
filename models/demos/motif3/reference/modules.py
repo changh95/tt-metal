@@ -318,7 +318,9 @@ class GDLAttention(nn.Module):
       * ``"absorbed"``: MQA over the latent: q_lat_h = W_UK,g(h)^T q_nope_h (512), keys [c ; k_pe] (576),
         values c (512); the differential combine happens in latent space, then W_UV,g is applied once per signal
         head (64 up-projections instead of 80). W_UV cannot be folded into wo because of the elementwise gate.
-    Both read the same :class:`LatentKVCache` (c = kv_norm(latent) incl. gamma, roped k_pe).
+    Both read the same :class:`LatentKVCache` (c = kv_norm(latent) incl. gamma, roped k_pe), in any cache dtype.
+    In fp32 the two forms agree to ~1e-5. In bf16 they round differently (same math); only "expanded" reproduces
+    HF's bf16 rounding, which is why it is the default everywhere (forward, ``MotifGenerator``, goldens).
     """
 
     def __init__(self, args: MotifArgs, layer_idx: int, *, swa: Optional[bool] = None):
@@ -472,6 +474,12 @@ class GDLAttention(nn.Module):
         if cache is not None:
             cache.update(c, k_pe, positions)
             c_keys, kpe_keys, k_pos = cache.keys(int(positions.max()) + 1)
+            # The cache dtype is storage precision only: entries are rounded to it on write and read back in the
+            # activation dtype, so both attention forms compute exactly as with a cache in the model dtype (an fp32
+            # cache on a bf16 model is lossless; a bf16 cache on an fp32 model emulates a bf16 KV cache). Contiguous,
+            # so the GEMMs see one memory layout whatever the cache dtype: with B > 1 a strided cache view takes
+            # another fp32 summation path than the contiguous copy a dtype cast makes.
+            c_keys, kpe_keys = c_keys.to(dtype).contiguous(), kpe_keys.to(dtype).contiguous()
         else:
             c_keys, kpe_keys, k_pos = c, k_pe, positions
 
@@ -841,6 +849,8 @@ class MotifForCausalLM(nn.Module):
         return self.model.norm.weight.dtype
 
     def new_cache(self, batch_size: int, max_seq_len: int, dtype: Optional[torch.dtype] = None) -> MotifKVCache:
+        """Latent KV cache for the built layers. ``dtype`` (default: the model dtype) is storage precision only;
+        attention reads the entries back in the activation dtype."""
         return MotifKVCache.create(self.args, self.model.layer_ids, batch_size, max_seq_len, dtype or self.dtype)
 
     def forward(

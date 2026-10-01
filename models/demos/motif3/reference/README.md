@@ -9,11 +9,11 @@ Pure-PyTorch, device-free reference for `Motif-Technologies/Motif-3` (314B MoE: 
 | `rope.py` | YaRN / plain `inv_freq`, cos/sin tables, half-split `rotate_half`, `apply_rope` |
 | `modules.py` | `RMSNorm`, `PolyNorm`, `GroupedPolyNorm`, `MHCLayer` + `sinkhorn`, `GDLAttention` (expanded + absorbed), `attention_mask`, `MLP`, `Router`, `RoutedExperts`, `MoE`, `DecoderLayer`, `MotifModel`, `MotifForCausalLM`, `MotifMTP` |
 | `cache.py` | `LatentKVCache` (576 values/token/layer: `kv_norm(c)` 512 + roped `k_pe` 64), `MotifKVCache` |
-| `generate.py` | `MotifGenerator`: `prefill` / `decode` / `generate` with a correct KV cache |
+| `generate.py` | `MotifGenerator`: `prefill` / `decode` / `generate` with a correct KV cache (default `attn_mode="expanded"`, HF's bf16 rounding; `cache_dtype` = storage precision only) |
 | `weights.py` | `MotifCheckpoint` (lazy, index-driven safetensors access, `MissingWeightsError`), HF<->reference name mapping, `load_reference_model`, `load_mtp`, `random_state_dict` |
 | `golden.py` | `TensorRecorder`, `capture_layer_goldens`, `capture_model_goldens`, `export_real_goldens` (+ CLI), `save_golden` / `load_golden`, `random_streams`, `pcc` |
 | `tokenizer.py` | tokenizer + chat template without `trust_remote_code` |
-| `tests/` | HF parity, attention forms, decode, ops, weights/golden, real weights, no-device guard, harness hygiene (`test_harness.py`: no hub kernels in the HF oracle, README commands write no shared report) |
+| `tests/` | HF parity, attention forms, decode, ops, MTP (vs HF blocks wired like the fork, `hf_reference.HFMTPOracle`), weights/golden, real weights, no-device guard, harness hygiene (`test_harness.py`: no hub kernels in the HF oracle, README commands write no shared report) |
 
 ## API
 
@@ -30,8 +30,9 @@ logits = model(ids)                                    # [B, S, V] fp32; attn_mo
 # real weights: exact prefix model (embed, layers 0..2, final norm, lm_head); bf16 tensors are memory-mapped
 model = load_reference_model(layer_ids=(0, 1, 2), dtype=torch.bfloat16, lazy_experts=True)
 
-# KV-cache decode that is correct past the 129-key window (do NOT use HF generate(), see below)
-gen = MotifGenerator(model, batch_size=1, max_seq_len=4096, attn_mode="absorbed")
+# KV-cache decode that is correct past the 129-key window (do NOT use HF generate(), see below). The default
+# attn_mode="expanded" has HF's bf16 rounding; "absorbed" (MLA form) is the same math with other bf16 rounding
+gen = MotifGenerator(model, batch_size=1, max_seq_len=4096)
 logits = gen.prefill(prompt_ids)                       # [1, S, V]
 step = gen.decode(next_token)                          # [1, V]; prefill(..., user=b) for per-user prompts
 
@@ -82,6 +83,14 @@ so the reference reproduces HF op for op: **bit-exact in fp32 and bf16** on tiny
   `q_lat = W_UK,g^T q_nope` and the differential combine done in latent space, then `W_UV,g` once per signal head. Both
   read the same cache: `kv_norm(c_raw)` *with* gamma (fork `motif.py:694`) + roped `k_pe`. Attention core: fp32 scores,
   softmax and PV, one cast of the output (the real FA2 kernel also rounds P to bf16; not reproduced on purpose).
+  The forms agree to ~1e-5 in fp32 but round differently in bf16 (max |Δlogit| 0.5 on the tiny decode test). Only
+  expanded has HF's bf16 cast points, so it is the default of `forward`, `MotifGenerator` and the golden
+  capture/export; pass `attn_mode="absorbed"` only when the TT side computes the absorbed form in bf16.
+* **Decode**: in an fp32 model cached decode equals the full-sequence forward to a few 1e-6 on the logits. In bf16
+  the two differ by bf16 rounding (in HF too); the default `MotifGenerator` reproduces HF's bf16 cached decode
+  (config-less `DynamicCache()`) op for op, bit-exact on the tiny B=2 test
+  (`test_default_generator_decode_matches_hf_cached_decode`). `cache_dtype` only sets how the latent cache stores
+  entries; they are read back in the model dtype (`test_cache_dtype_is_storage_precision_only`).
 * **mHC**: merged projection rows `[pre 4 | post 4 | res 16 (i*4+j)]` (fork/training `proj_merged` layout) applied to
   `RMSNorm_{1e-6}` of the 16384-wide stream; `sigmoid(clamp(alpha*p + b, +-10))`; `h_post` coefficient 1.0 (HF `:1090`,
   fork `:1282`); Sinkhorn 20 x (rows then columns), `exp(clamp(+-20))`, sums clamped at 1e-8, fp32 (`:226-233`, training
@@ -94,7 +103,10 @@ so the reference reproduces HF op for op: **bit-exact in fp32 and bf16** on tiny
   loop (`:929-944`), plus the shared expert in fp32, one cast (`:1003-1008`). Experts can be fetched lazily per expert.
 * **Final head**: mean over the 4 streams, RMSNorm, untied `lm_head`, fp32 logits (`:1435-1439`, `:1667-1668`).
 * **MTP** (not in HF): `input_proj(cat[h_main_postnorm, embed_norm(embed(t+1))])`, one pre-norm block with SWA "all"
-  attention (window 129, plain RoPE, scale 192^-0.5) and a dense PolyNorm MLP, `final_layernorm` (fork `motif_mtp.py:106-170`).
+  attention (window 129, plain RoPE, scale 192^-0.5) and a dense PolyNorm MLP, `final_layernorm` (fork `motif_mtp.py:106-170`,
+  training `model.py:865-892`). `test_mtp.py` and `test_real_mtp_matches_hf_oracle` compare it with an oracle made of
+  HF blocks (`MotifDecoderLayer` with the fork's `_make_mtp_hf_config` overrides, `MotifRMSNorm`) in the fork's wiring:
+  bit-exact on tiny fp32/bf16, and wiring or attention-config mutations are shown to fail.
 
 ## Known deviations from HF and why
 
@@ -117,9 +129,14 @@ so the reference reproduces HF op for op: **bit-exact in fp32 and bf16** on tiny
      (`fused_moe/runner/moe_runner.py:647`); HF and the reference add it in fp32 with one cast;
    * the attention kernels round P to bf16 before the PV MMA (see GDLA above). The fork uses the flash diff-KV backend on
      SWA layers and an MLA backend on global layers (`motif.py:617-660`); training uses FA;
-   * training multiplies routing scores before W2 and scatter-adds in bf16 (`moe.py:801`, `:829`), rounds
-     `sigmoid(PolyNorm weight)` to the param dtype (`moe.py:143`, `:254`) and takes `sigmoid(lambda)` in bf16
-     (`attention.py:407`);
+   * training multiplies routing scores before W2 and scatter-adds in bf16 (`moe.py:801`, `:829`) and rounds
+     `sigmoid(PolyNorm weight)` to the param dtype (`moe.py:143`, `:254`). Its bf16 `torch.sigmoid(lambda)`
+     (`attention.py:407`) is *not* a difference: torch's bf16 sigmoid computes in fp32 and rounds once, which is
+     exactly HF's `sigmoid(lambda.float()).to(bf16)` (`modeling_motif.py:765`); `test_ops.py` checks all 65536 bf16
+     inputs and the whole gated combine. Separately, training compiles every block (`torch.compile`,
+     `parallelize.py:463-534`), and inductor fuses torch-native elementwise chains such as this combine and the
+     output gate (`attention.py:407`, `:488`) without their intermediate bf16 casts (`emulate_precision_casts=False`
+     by default), so the compiled training kernels round differently from eager HF;
    * the fork's dense MLP has no `hidden_clamp` (a no-op at 1e6).
 5. `polynorm_output_scale_per_layer` (fork) is supported; it is empty for Motif-3, so HF (which ignores it) agrees.
 
@@ -136,7 +153,7 @@ report:
 cd /home/ttuser/hchang/experiments/motif-3/tt-metal
 python_env/bin/python -m pytest -p no:cacheprovider --noconftest -o addopts="" --import-mode=importlib \
     models/demos/motif3/reference/tests
-# fast subset (~25 s, no checkpoint needed):
+# fast subset (~30 s, no checkpoint needed):
 python_env/bin/python -m pytest -p no:cacheprovider --noconftest -o addopts="" --import-mode=importlib \
     models/demos/motif3/reference/tests --ignore=models/demos/motif3/reference/tests/test_real_weights.py
 ```
