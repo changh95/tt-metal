@@ -1,0 +1,129 @@
+{
+ "version": 1,
+ "about": "Source conversations of the Motif-3 streaming-golden prompt set. Rendered with the Motif chat template by `python -m models.demos.motif3.reference.golden_stream --render-prompts` into rendered.json (token ids, text, per-token roles) and <name>.txt. Reasoning goes in `reasoning_content`; the template emits <think>...</think> only for the last assistant turn.",
+ "prompts": [
+  {
+   "name": "chat_default",
+   "description": "golden.DEFAULT_PROMPT_MESSAGES with the generation prompt (<|assistant|><think>), exactly the prompt of golden.export_real_goldens",
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Tenstorrent Blackhole Galaxy systems connect thirty-two accelerator chips in a two-dimensional mesh. Explain, step by step, how a mixture-of-experts transformer with three hundred eighty-four routed experts and one shared expert per layer could be partitioned across such a mesh, which collective communication patterns are required to dispatch tokens to experts and to combine their outputs, and how sliding-window attention layers differ from global attention layers in their key-value cache requirements when the context grows to many thousands of tokens. Keep the answer concise but technically precise, mention the numerical precision concerns for the sigmoid router with its expert bias, for the polynomial normalization inside the experts, and for the Sinkhorn iterations of the hyper-connection mixing matrices, and finish with a short list of the three most important things to validate first when porting such a model."
+    }
+   ]
+  },
+  {
+   "name": "en_technical",
+   "description": "English technical explanation (LSM-tree storage engines) in the assistant turn",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a knowledgeable systems engineer who explains things clearly."
+    },
+    {
+     "role": "user",
+     "content": "How does a log-structured merge-tree (LSM-tree) storage engine work? Please cover the write path, the read path, compaction strategies and their trade-offs, and the role of Bloom filters. Write it as a cohesive explanation rather than a list of bullet points."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The user wants a cohesive explanation of LSM-tree engines: the write path (WAL, memtable, flush to SSTables), the read path, size-tiered versus leveled compaction and their amplification trade-offs, and Bloom filters. I'll write structured prose with short headed paragraphs.",
+     "content": "A log-structured merge-tree turns random writes into sequential ones by buffering updates in memory and periodically writing them out as immutable, sorted files. LevelDB, RocksDB, Cassandra and ScyllaDB are all built on this idea, and although their details differ, the core mechanics are the same.\n\n**The write path.** When a client writes a key-value pair, the engine first appends the record to a write-ahead log on disk. The log is purely sequential, so the append is cheap, and it provides durability: if the process crashes, replaying the log rebuilds the in-memory state. The record is then inserted into the memtable, an in-memory sorted structure that is usually a skip list or a balanced tree. Deletes take the same path: instead of removing anything, the engine writes a special marker called a tombstone. Once the memtable reaches its configured size, typically a few tens of megabytes, it is frozen and a fresh memtable takes over new writes. A background thread then writes the frozen memtable to disk as a sorted string table, or SSTable. Because the memtable is already sorted, the flush is a single sequential write, after which the corresponding part of the write-ahead log can be discarded.\n\n**The read path.** Reads are more involved, because the newest version of a key may live in several places. The engine checks the active memtable first, then any frozen memtables that are still being flushed, and finally the SSTables on disk from newest to oldest. The first version it finds wins; if that version is a tombstone, the key is reported as missing. Each SSTable carries a sparse index of its data blocks, so a lookup inside a file needs only a binary search over the index followed by a single block read, and that block is often already in the block cache. Range scans merge iterators over the memtables and all relevant SSTables, which is efficient precisely because every source is sorted.\n\n**Compaction.** Without further work, the number of SSTables would grow without bound and every read would have to consult more and more files. Compaction is the background process that merges SSTables, drops overwritten values and expired tombstones, and keeps the structure shallow. Two families of strategies dominate. Size-tiered compaction groups files of similar size and merges them once enough have accumulated, producing a larger file in the next tier. Each byte is rewritten relatively few times, so write amplification is low, but several files may cover overlapping key ranges at any moment, which raises read amplification and can temporarily require a lot of free disk space. Leveled compaction, popularized by LevelDB, organizes files into levels whose total size grows by a fixed factor, commonly ten. Within every level below the first, files have non-overlapping key ranges, so a point lookup touches at most one file per level. The price is higher write amplification, because data is rewritten each time it moves down a level and must be merged with the overlapping files it meets there. Many production systems use hybrids, for example tiering the upper levels and leveling the lower ones, to balance these costs for a particular workload. Whatever the strategy, compaction has to keep up with the incoming write rate: if it falls behind, files pile up in the first level, reads slow down, and engines such as RocksDB eventually throttle or stall writes until compaction catches up, so reserving enough background I/O bandwidth matters as much as choosing the strategy itself.\n\n**Bloom filters.** Even with leveled compaction, a lookup for a key that does not exist would otherwise probe every level. To avoid this, each SSTable stores a Bloom filter over its keys: a compact bit array that answers either \"definitely not present\" or \"possibly present\". With about ten bits per key the false-positive rate is roughly one percent, so the vast majority of unnecessary disk reads are skipped. Bloom filters do not help range scans, which is why some engines add prefix or range filters for those queries.\n\n**Putting it together.** The appeal of the design lies in its trade-offs. Writes are fast and sequential, flash devices are spared from small random writes, and the data on disk compresses well because the files are immutable and sorted. The costs are read amplification, write amplification and space amplification, and tuning an LSM-tree engine is largely a matter of deciding where on that triangle a workload should sit. The memtable size, the level size ratio, the compaction strategy and the number of Bloom filter bits per key are the main knobs, and understanding how each of them shifts the balance is the key to operating these systems well."
+    }
+   ]
+  },
+  {
+   "name": "ko_passage",
+   "description": "Korean explanation (Hunminjeongeum / Hangul) in the assistant turn",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "system",
+     "content": "당신은 친절하고 정확한 한국어 어시스턴트입니다."
+    },
+    {
+     "role": "user",
+     "content": "훈민정음이 만들어진 배경과 창제 원리, 그리고 한글이 오늘날까지 갖는 의의를 자세히 설명해 주세요."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "사용자는 훈민정음의 창제 배경, 제자 원리, 그리고 오늘날의 의의를 묻고 있다. 시대적 배경, 자음과 모음의 원리, 반포 이후의 역사, 현대적 의미 순서로 정리하겠다.",
+     "content": "훈민정음은 조선의 네 번째 임금인 세종이 1443년에 창제하고 1446년에 반포한 문자로, '백성을 가르치는 바른 소리'라는 뜻을 담고 있습니다.\n\n**창제 배경**\n당시 조선에서는 한자를 빌려 글을 썼지만, 한자는 익히기 어렵고 우리말의 소리를 그대로 적기에도 알맞지 않았습니다. 이두나 구결 같은 표기법이 있었으나 여전히 한자에 대한 지식이 필요했기 때문에, 대부분의 백성은 글을 읽고 쓸 수 없었습니다. 세종은 『훈민정음』 서문에서 \"어리석은 백성이 이르고자 하는 바가 있어도 마침내 제 뜻을 펴지 못하는 사람이 많다\"라고 밝히며, 누구나 쉽게 익혀 날마다 편하게 쓰도록 새 문자를 만든다고 하였습니다.\n\n**제자 원리**\n훈민정음의 가장 큰 특징은 글자를 만든 원리가 분명하게 기록되어 있다는 점입니다. 『훈민정음 해례본』에 따르면 자음의 기본자 ㄱ, ㄴ, ㅁ, ㅅ, ㅇ은 소리를 낼 때의 발음 기관 모양을 본떠 만들었습니다. 예를 들어 ㄱ은 혀뿌리가 목구멍을 막는 모양을, ㄴ은 혀가 윗잇몸에 닿는 모양을 본뜬 것입니다. 여기에 소리가 세질 때마다 획을 더하는 가획의 원리를 적용하여 ㅋ, ㄷ, ㅌ 같은 글자를 만들었습니다. 모음은 하늘, 땅, 사람을 상징하는 ㆍ, ㅡ, ㅣ를 기본으로 삼고, 이들을 서로 결합하여 ㅗ, ㅏ, ㅜ, ㅓ 등을 만들었습니다. 이처럼 적은 수의 기본 글자에서 나머지 글자를 체계적으로 이끌어 낸 덕분에, 스물여덟 자만으로도 우리말의 다양한 소리를 적을 수 있었습니다.\n\n**반포 이후의 역사**\n훈민정음이 처음부터 환영받은 것은 아니었습니다. 최만리를 비롯한 일부 학자들은 중국의 문자 질서에서 벗어난다는 이유로 반대 상소를 올렸고, 그 뒤에도 오랫동안 공식 문서에는 주로 한문이 쓰였습니다. 그러나 한글은 편지, 소설, 노래 가사, 그리고 불경과 유교 경전의 언해를 통해 여성과 서민 사이에서 꾸준히 퍼져 나갔습니다. 19세기 말에는 한글이 공식 문자로 인정되었고, 주시경을 비롯한 학자들이 문법을 연구하며 '한글'이라는 이름을 널리 알렸습니다.\n\n**오늘날의 의의**\n한글은 만든 사람과 만든 때, 그리고 만든 원리가 분명하게 알려진 드문 문자입니다. 1997년에는 『훈민정음 해례본』이 유네스코 세계기록유산으로 등재되었고, 매년 10월 9일은 한글날로 기념되고 있습니다. 배우기 쉬운 문자 덕분에 한국은 매우 높은 문해율을 이루었으며, 자음과 모음을 모아 쓰는 구조는 디지털 환경에서도 효율적인 입력과 처리를 가능하게 합니다. 결국 훈민정음은 백성을 위한 문자라는 창제 정신과 과학적인 체계를 함께 갖춘, 한국 문화의 가장 소중한 유산이라고 할 수 있습니다."
+    }
+   ]
+  },
+  {
+   "name": "math_word_problem",
+   "description": "rate word problem with a worked solution in the assistant turn",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "A water tank can be filled by pipe A in 6 hours and by pipe B in 4 hours, and drain C can empty a full tank in 8 hours. The tank is empty when all three are opened at 8:00 a.m. At 9:30 a.m. pipe B is closed, while pipe A and drain C stay open. At what time will the tank be full?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Work with rates in tanks per hour: A adds 1/6, B adds 1/4, C removes 1/8. Find how much is filled in the first 1.5 hours with all three, then how long A and C alone need for the rest.",
+     "content": "Let's measure every rate in tanks per hour.\n\n**Step 1: Rates.**\n- Pipe A fills 1/6 of the tank per hour.\n- Pipe B fills 1/4 of the tank per hour.\n- Drain C empties 1/8 of the tank per hour.\n\n**Step 2: All three open, from 8:00 to 9:30 a.m.**\nThe combined rate is 1/6 + 1/4 - 1/8 = 4/24 + 6/24 - 3/24 = 7/24 of the tank per hour.\nIn 1.5 hours the tank receives 7/24 × 3/2 = 21/48 = 7/16 of its volume.\n\n**Step 3: Only A and C open, from 9:30 a.m. on.**\nThe combined rate is 1/6 - 1/8 = 4/24 - 3/24 = 1/24 of the tank per hour.\nThe part still to fill is 1 - 7/16 = 9/16, so the time needed is (9/16) ÷ (1/24) = (9 × 24) / 16 = 13.5 hours.\n\n**Step 4: Clock time.**\n13.5 hours after 9:30 a.m. is 11:00 p.m.\n\n**Check:** A runs for 15 hours and adds 15/6 = 2.5 tanks, B runs for 1.5 hours and adds 1.5/4 = 0.375 tanks, and C runs for 15 hours and removes 15/8 = 1.875 tanks. The net amount is 2.5 + 0.375 - 1.875 = 1 tank, as required.\n\n**Answer:** The tank is full at **11:00 p.m.**"
+    }
+   ]
+  },
+  {
+   "name": "python_code",
+   "description": "Python coding question with a code answer (merge intervals) in the assistant turn",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a Python function `merge_intervals(intervals)` that takes a list of `[start, end]` pairs and returns the merged, non-overlapping intervals sorted by start. Intervals that touch, like `[1, 4]` and `[4, 5]`, should be merged. Please include a few tests."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Sort by start, then sweep once: extend the last merged interval while the next one starts at or before its end, otherwise start a new one. Avoid mutating the caller's lists.",
+     "content": "Sort the intervals by their start, then sweep through them once, keeping a list of merged intervals. Each new interval either overlaps the last merged one (its start is at or before the last end), in which case the last interval is extended, or it begins a new merged interval.\n\n```python\nfrom typing import List\n\n\ndef merge_intervals(intervals: List[List[int]]) -> List[List[int]]:\n    \"\"\"Merge overlapping or touching closed intervals and return them sorted by start.\"\"\"\n    if not intervals:\n        return []\n    ordered = sorted(intervals, key=lambda pair: pair[0])\n    merged = [list(ordered[0])]\n    for start, end in ordered[1:]:\n        last = merged[-1]\n        if start <= last[1]:\n            last[1] = max(last[1], end)\n        else:\n            merged.append([start, end])\n    return merged\n\n\nif __name__ == \"__main__\":\n    assert merge_intervals([]) == []\n    assert merge_intervals([[1, 3], [2, 6], [8, 10], [15, 18]]) == [[1, 6], [8, 10], [15, 18]]\n    assert merge_intervals([[1, 4], [4, 5]]) == [[1, 5]]\n    assert merge_intervals([[5, 7], [1, 2], [2, 4]]) == [[1, 4], [5, 7]]\n    assert merge_intervals([[1, 10], [2, 3], [4, 5]]) == [[1, 10]]\n    print(\"all tests passed\")\n```\n\nA few notes:\n- Sorting dominates the cost, so the function runs in O(n log n) time and uses O(n) extra space for the result.\n- `list(ordered[0])` and `[start, end]` create new lists, so the input intervals are never modified.\n- Because the comparison is `start <= last[1]`, touching intervals such as `[1, 4]` and `[4, 5]` are merged. Use `<` instead if they should stay separate."
+    }
+   ]
+  },
+  {
+   "name": "multi_turn_chat",
+   "description": "short three-turn chat; earlier assistant turns are history, the last one has a think block",
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a friendly assistant. Keep your answers short."
+    },
+    {
+     "role": "user",
+     "content": "Hi! Can you suggest a name for my new cat? She's gray with white paws."
+    },
+    {
+     "role": "assistant",
+     "content": "How about \"Socks\"? It's a classic for a cat with white paws. If you'd like something more elegant, \"Misty\" or \"Pearl\" would suit her gray coat."
+    },
+    {
+     "role": "user",
+     "content": "I like Misty! What should I buy before I bring her home?"
+    },
+    {
+     "role": "assistant",
+     "content": "Great choice! Before Misty arrives, get a litter box and litter, food and water bowls, food suited to her age, a scratching post, a few toys, a cozy bed and a carrier for trips to the vet."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. How often should she see a vet in her first year?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The user asks about vet visits in a kitten's first year: vaccination series, spaying, then yearly check-ups. Keep it short.",
+     "content": "If Misty is a young kitten, expect a visit every three to four weeks until she is about sixteen weeks old to finish her vaccinations and deworming, then one around five or six months for spaying. After that, a yearly check-up is usually enough. If she is already an adult, one wellness visit soon after adoption and then yearly check-ups will do."
+    }
+   ]
+  }
+ ]
+}

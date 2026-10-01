@@ -1,0 +1,21 @@
+<|beginoftext|><|startofturn|><|user|>A water tank can be filled by pipe A in 6 hours and by pipe B in 4 hours, and drain C can empty a full tank in 8 hours. The tank is empty when all three are opened at 8:00 a.m. At 9:30 a.m. pipe B is closed, while pipe A and drain C stay open. At what time will the tank be full?<|endofturn|><|startofturn|><|assistant|><think>Work with rates in tanks per hour: A adds 1/6, B adds 1/4, C removes 1/8. Find how much is filled in the first 1.5 hours with all three, then how long A and C alone need for the rest.</think>Let's measure every rate in tanks per hour.
+
+**Step 1: Rates.**
+- Pipe A fills 1/6 of the tank per hour.
+- Pipe B fills 1/4 of the tank per hour.
+- Drain C empties 1/8 of the tank per hour.
+
+**Step 2: All three open, from 8:00 to 9:30 a.m.**
+The combined rate is 1/6 + 1/4 - 1/8 = 4/24 + 6/24 - 3/24 = 7/24 of the tank per hour.
+In 1.5 hours the tank receives 7/24 × 3/2 = 21/48 = 7/16 of its volume.
+
+**Step 3: Only A and C open, from 9:30 a.m. on.**
+The combined rate is 1/6 - 1/8 = 4/24 - 3/24 = 1/24 of the tank per hour.
+The part still to fill is 1 - 7/16 = 9/16, so the time needed is (9/16) ÷ (1/24) = (9 × 24) / 16 = 13.5 hours.
+
+**Step 4: Clock time.**
+13.5 hours after 9:30 a.m. is 11:00 p.m.
+
+**Check:** A runs for 15 hours and adds 15/6 = 2.5 tanks, B runs for 1.5 hours and adds 1.5/4 = 0.375 tanks, and C runs for 15 hours and removes 15/8 = 1.875 tanks. The net amount is 2.5 + 0.375 - 1.875 = 1 tank, as required.
+
+**Answer:** The tank is full at **11:00 p.m.**<|endofturn|><|endoftext|>
