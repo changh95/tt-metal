@@ -84,7 +84,7 @@ GOLDEN_DIR = Path(os.environ.get("MOTIF3_GOLDEN_STREAM_DIR", "/home/ttuser/hchan
 GOLDEN_FP32_L7_DIR = GOLDEN_DIR / "fp32_sanity_L0-7"  # the reference's fp32 run of layers 0-7 (states after 3, 7)
 GOLDEN_FP32_DIR = Path(os.environ.get(
     "MOTIF3_GOLDEN_FP32_DIR",
-    "/home/ttuser/hchang/experiments/motif-3/tt_cache/test/integration/goldens_c2_fp32_L0-35"))  # head + state after 35
+    "/home/ttuser/hchang/experiments/motif-3/goldens/c2_fp32"))  # head + state after 35 (+ the stream to 52)
 MAX_MODEL_LEN = 2048
 NUM_BLOCKS = 512
 BLOCK = 64

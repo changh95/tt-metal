@@ -23,6 +23,9 @@ conversion runs the converter 7 times)::
   converter lock, without ``--delete-converted``, or for a non-serving cache.
 * ``test_host_pipeline_conversion_steps``: converter exit codes (3 -> one deletion pass + one retry -> 3, 4 -> 4, else
   7) and the rebuild of a layer converted by other code before its shards can go.
+* ``test_host_pipeline_extra_golden``: ``--extra-golden-out`` (the fp32 golden): shards go only for layers EVERY golden
+  lists; each pending golden is resumed for the layer (C2 first); an extra golden more than one layer behind stops the
+  layer (exit 6) before anything runs or is deleted.
 * ``test_host_runner_commands``: every converter command is pinned to ``--mesh 4x8 --cache-root --weights-dir``, the
   golden gets ``--ckpt-dir``, only variant options pass ``--convert-arg``, the downloader / verifier refuse another dir.
 * ``test_host_verified_shards_stat``: a sha256 record counts only while the file has the size and mtime that were hashed.
@@ -424,12 +427,14 @@ class _FakeRunner:
                 self.calls.append(("verify_sha",))
                 return 0
 
-            def golden(self, layer):
-                self.calls.append(("golden", layer))
+            def golden(self, layer, out=None):
+                self.calls.append(("golden", layer) if out is None else ("golden", layer, Path(out).name))
+                if self.on_golden is not None:
+                    self.on_golden(self, layer, out)
                 return 0
 
         r = _R(**kw)
-        r.doc, r.calls, r.convert_rc, r.on_convert = doc, [], [], None
+        r.doc, r.calls, r.convert_rc, r.on_convert, r.on_golden = doc, [], [], None, None
         return r
 
 
@@ -549,6 +554,68 @@ def test_host_pipeline_conversion_steps(tmp_path):
     r.on_convert = lambda runner, layer, force: setattr(runner, "doc", _status(root, [_part(5), _part(None)]))
     p.do_layer(5)
     assert ("convert", 5, False) in r.calls and not (wdir / "model-00006-of-00008.safetensors").exists()
+
+
+def test_host_pipeline_extra_golden(tmp_path):
+    sw = _load_script("stream_weights")
+    idx, wdir = _toy_index(sw, tmp_path)
+    root = tmp_path / "cache"
+    _verify_all(wdir, idx)
+    doc = _status(root, [_part(l) for l in range(7)] + [_part(None)])
+    shard = {l: f"model-{l + 1:05d}-of-00008.safetensors" for l in range(1, 7)}
+
+    def golden_dir(name, layers):
+        g = tmp_path / name
+        g.mkdir(exist_ok=True)
+        (g / "manifest.json").write_text(json.dumps({"layers_done": sorted(layers), "last_layer": max(layers)}))
+        return g
+
+    def advance(runner, layer, out):  # what golden_stream --resume --layers L does to the manifest
+        g = Path(runner.golden_out if out is None else out)
+        m = json.loads((g / "manifest.json").read_text())
+        (g / "manifest.json").write_text(json.dumps({"layers_done": sorted(set(m["layers_done"]) | {layer}),
+                                                     "last_layer": layer}))
+
+    def pipe(extra):
+        r = _FakeRunner(sw, doc, weights_dir=wdir, golden_out=c2, cache_root=root, extra_golden_outs=extra)
+        r.on_golden = advance
+        plan = sw.Plan(layers=list(range(7)), with_globals=False, delete=True, min_free_gb=0, keep_layers=set())
+        p = sw.Pipeline(plan, r, index=idx, state_path=tmp_path / "state.json")
+        p.refresh_status()
+        return p, r
+
+    c2 = golden_dir("c2", range(6))  # the C2 golden has 0-5
+    fp32 = golden_dir("c2_fp32", range(5))  # the fp32 one 0-4
+    with pytest.raises(ValueError):  # the same run twice
+        sw.Runner(cache_root=root, golden_out=c2, extra_golden_outs=[tmp_path / "c2"])
+    g = [str(c) for c in sw.Runner(cache_root=root, golden_out=c2, extra_golden_outs=[fp32]).golden_cmd(40, fp32)]
+    assert g[g.index("--out") + 1] == str(fp32) and g[g.index("-n") + 1] == "golden_c2_fp32_L40"
+    assert "--resume" in g and g[g.index("--layers") + 1] == "40" and g[g.index("--ckpt-dir") + 1] == str(sw.WEIGHTS)
+    # an extra golden behind by more than one layer: the layer stops (exit 6) before any golden runs or shard goes
+    p, r = pipe([golden_dir("stale", range(4))])
+    with pytest.raises(sw.StreamError) as e:
+        p.do_layer(5)
+    assert e.value.code == sw.EXIT_GOLDEN and not [c for c in r.calls if c[0] == "golden"]
+    assert all((wdir / shard[l]).exists() for l in range(1, 7))
+    # the gate is the intersection: L5 (C2 only) and L6 (neither) stay; L1-L4 go (L0's shard holds the embedding)
+    p, r = pipe([fp32])
+    assert p.golden_done() == set(range(5)) and p.done_layers() == set(range(5))
+    assert p.delete_consumed() == sum(idx.sizes[shard[l]] for l in range(1, 5))
+    assert (wdir / shard[5]).exists() and (wdir / shard[6]).exists()
+    # L5: only the pending golden (fp32) is resumed, then its shard goes
+    p.do_layer(5)
+    assert [c for c in r.calls if c[0] == "golden"] == [("golden", 5, "c2_fp32")] and not (wdir / shard[5]).exists()
+    # L6: both, the C2 golden first; then the shard goes
+    p.do_layer(6)
+    assert [c for c in r.calls if c[0] == "golden"][1:] == [("golden", 6), ("golden", 6, "c2_fp32")]
+    assert not (wdir / shard[6]).exists() and sw.goldens_done_layers([c2, fp32]) == set(range(7))
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert "golden:c2_fp32" in state["layers"]["6"] and "golden" in state["layers"]["6"]
+    assert sw.goldens_done_layers([]) == set() and sw.goldens_done_layers([c2, tmp_path / "absent"]) == set()
+    # the dry-run timeline scales the golden step with the number of goldens
+    rows = sw.simulate(idx, [6], with_globals=False, parts={6: _part(6)}, fingerprint=FP, golden_done=range(6),
+                       delete=False, free_gb0=100.0, min_free_gb=0.0, present=set(idx.shards), n_goldens=2)
+    assert [r["step"] for r in rows if r["unit"] == 6] == ["golden x2"]
 
 
 def test_host_runner_commands(tmp_path):
