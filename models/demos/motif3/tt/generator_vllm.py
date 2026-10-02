@@ -22,8 +22,22 @@ the bare name must come from ``TT_MODEL_CLASS_OVERRIDES``, which registers both 
 
 Launch flags (design 00 §5.1): ``--trust-remote-code --max-num-seqs 32 --block-size 64 --max-model-len 32768
 --no-enable-prefix-caching --additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456,
-"fabric_config": "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col"}}'``. Never ``--tensor-parallel-size`` or
-``--disable-sliding-window``. Optional parsers: see ``models/demos/motif3/vllm_plugins``.
+"fabric_config": "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col", "l1_small_size": 32768}}'``
+(``generator_api.SERVING_TT_CONFIG`` / ``serving_additional_config()``). Never ``--tensor-parallel-size`` or
+``--disable-sliding-window``. Optional parsers: see ``models/demos/motif3/vllm_plugins``. ``--block-size`` must be 32
+or 64 (the sizes gates G1/G7 validated) and ``--max-model-len`` a multiple of 256 (the last prefill bucket is
+``max_model_len`` itself); both are refused in ``get_max_tokens_all_users``, before any weight is loaded.
+
+L1_SMALL (attention P0, ``generator_api.L1_SMALL_SIZE``): the plugin opens the mesh with the ``"l1_small_size"`` of the
+``"tt"`` config (``vllm_tt_plugin/worker.py`` ``device_params_from_tt_config``) and with no L1_SMALL region when the key
+is absent; the model's CCL semaphores need one (>= 32768 B per core). ``get_max_tokens_all_users`` (inside
+``init_device``, before the weights load) refuses a ``"tt"`` config without it, and ``initialize_vllm_model`` refuses a
+mesh whose L1_SMALL region is smaller, so a misconfigured server fails at boot instead of at the first prefill after a
+decode step.
+
+Weights: ``MOTIF3_WEIGHTS_DIR`` > ``HF_MODEL`` (dir) > the HF-cache snapshot of a repo-id ``HF_MODEL`` at
+``TT_MODEL_WEIGHTS_REVISION`` > ``hf_config._name_or_path`` (``generator_api.resolve_weights_location``, the same
+order ``MotifTTConfig`` uses); the resolved path and the rule that matched are logged at model init.
 
 What the plugin calls, and what this class does
 ------------------------------------------------
@@ -59,24 +73,36 @@ import numpy as np
 import torch
 from loguru import logger
 
-from .generator_api import (
+from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL_BLOCK_RESERVE_TOKENS etc.)
+    DEFAULT_KV_POOL_TOKENS,
     KV_LATENT_DIM,
     KV_LORA_RANK,
+    KV_POOL_ALIGNMENT,
+    L1_SMALL_SIZE,
     LANES_PER_GROUP,
     MAX_CONTEXT,
+    MAX_KV_POOL_TOKENS,
     MESH_SHAPES,
+    NULL_BLOCK_RESERVE_TOKENS,
     NUM_HIDDEN_LAYERS,
     NUM_LANES,
     QK_ROPE_HEAD_DIM,
+    SERVING_TT_CONFIG,
     SUPPORTED_BLOCK_SIZES,
     DecodeBatch,
     GeneratorSettings,
     MotifGenerator,
     PrefillRequest,
     cdiv,
+    check_block_size,
     check_logits,
+    check_max_model_len,
+    check_tt_config,
     kv_cache_bytes_per_chip,
     kv_cache_dtype_from_env,
+    kv_pool_tokens_from_env,
+    plugin_num_blocks,
+    serving_additional_config,
 )
 
 ARCHITECTURE = "MotifForCausalLM"
@@ -85,12 +111,14 @@ MAIN_CLASS = "models.demos.motif3.tt.generator_vllm:MotifForCausalLM"
 TT_MODEL_CLASS_OVERRIDES = f"{ARCHITECTURE}={MAIN_CLASS}"
 DEFAULT_GENERATOR_CLASS = "models.demos.motif3.tt.generator:MotifGenerator"
 
-DEFAULT_KV_POOL_TOKENS = 262144  # usable pool = TIS max_tokens_all_users_override (design 00 §5.2)
-KV_POOL_ALIGNMENT = 128  # pool multiple of the largest supported block -> the reserve below adds exactly 1 block
-NULL_BLOCK_RESERVE_TOKENS = 32  # <= one block for every supported block size (32/64/128)
-MAX_KV_POOL_TOKENS = 4 * 1024 * 1024
 DEFAULT_KV_MAX_GB_PER_CHIP = 16.0  # 34.2 GB DRAM - 14.2 GB weights - ~4 GB activations/trace/CCL (design 00 §1.1)
 REQUIRED_NUM_DEVICES = 32
+
+# The --block-size of the VllmConfig this process serves, as seen by ``get_max_tokens_all_users`` (which the plugin
+# calls in ``init_device`` inside ``set_current_vllm_config``). ``initialize_vllm_model`` runs later, in
+# ``load_model``, where vLLM sets no current config, so this is how the block size reaches GeneratorSettings
+# (BRIDGE-4). A hint only: allocate_kv_cache's hint is authoritative.
+_SEEN_VLLM_BLOCK_SIZE: Optional[int] = None
 
 # Keyword arguments the plugin can send that this draft-1 adapter cannot honour.
 _UNSUPPORTED_KWARGS = {
@@ -105,26 +133,9 @@ _UNSUPPORTED_KWARGS = {
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Pool / spec helpers (pure; unit-tested on the host)
+# Pool / spec helpers (pure; unit-tested on the host). kv_pool_tokens_from_env / plugin_num_blocks live in
+# generator_api (shared with MotifTTConfig) and are re-exported here.
 # ----------------------------------------------------------------------------------------------------------------
-def kv_pool_tokens_from_env(environ=None) -> int:
-    """Usable KV pool in tokens: ``MOTIF3_KV_POOL_TOKENS`` (default 262,144), a multiple of 128."""
-    env = os.environ if environ is None else environ
-    raw = env.get("MOTIF3_KV_POOL_TOKENS")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_KV_POOL_TOKENS
-    raw = raw.strip()
-    if not raw.isascii() or not raw.isdecimal():
-        raise ValueError(f"MOTIF3_KV_POOL_TOKENS must be a positive decimal token count, got {raw!r}")
-    tokens = int(raw)
-    if tokens % KV_POOL_ALIGNMENT or not KV_POOL_ALIGNMENT <= tokens <= MAX_KV_POOL_TOKENS:
-        raise ValueError(
-            f"MOTIF3_KV_POOL_TOKENS={tokens} must be a multiple of {KV_POOL_ALIGNMENT} in "
-            f"[{KV_POOL_ALIGNMENT}, {MAX_KV_POOL_TOKENS}]"
-        )
-    return tokens
-
-
 def kv_max_bytes_per_chip(environ=None) -> int:
     """Per-chip KV budget used for fail-fast checks: ``MOTIF3_KV_MAX_GB_PER_CHIP`` (default 16 GB)."""
     env = os.environ if environ is None else environ
@@ -135,20 +146,19 @@ def kv_max_bytes_per_chip(environ=None) -> int:
     return int(gb * 1e9)
 
 
-def plugin_num_blocks(max_tokens_all_users: int, block_size: int, max_num_seqs: int) -> int:
-    """The block count vllm-tt-plugin allocates (``worker.get_num_available_blocks_tt``, AR model, no hybrid
-    headroom): ``ceil((max_tokens_all_users + block_size * max_num_seqs) / block_size)``; vLLM then keeps block 0."""
-    return cdiv(int(max_tokens_all_users) + int(block_size) * int(max_num_seqs), int(block_size))
-
-
 def validate_block_size(block_size: int) -> int:
-    block_size = int(block_size)
-    if block_size not in SUPPORTED_BLOCK_SIZES:
-        raise ValueError(
-            f"Motif-3 needs --block-size in {SUPPORTED_BLOCK_SIZES} (a multiple of the 32-row tile the paged latent "
-            f"ops support; 64 is the tested default), got {block_size}. vLLM's default of 16 is not usable on TT."
-        )
-    return block_size
+    """``block_size`` if it is in ``SUPPORTED_BLOCK_SIZES`` (32, 64: what gates G1/G7 validated), else ValueError."""
+    return check_block_size(block_size)
+
+
+def _vllm_block_size() -> Optional[int]:
+    """vLLM's --block-size for this process: the current VllmConfig's, else the one ``get_max_tokens_all_users``
+    saw in ``init_device`` (BRIDGE-4); None when neither is known (e.g. a direct test call)."""
+    vllm_config = _current_vllm_config()
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is not None and getattr(cache_config, "block_size", None) is not None:
+        return int(cache_config.block_size)
+    return _SEEN_VLLM_BLOCK_SIZE
 
 
 def _current_vllm_config():
@@ -191,6 +201,45 @@ def _validate_mesh(mesh_device: Any) -> Tuple[int, int]:
             f'plugin opened {shape}. Set MESH_DEVICE="(4, 8)".'
         )
     return shape
+
+
+def _tt_config_of(vllm_config) -> Optional[dict]:
+    """The ``"tt"`` object of ``vllm_config.additional_config`` (what the plugin's ``get_tt_config`` reads), ``{}``
+    when the server was started without one, or None when the object has no ``additional_config`` at all (a partial
+    config in a direct call: nothing to check)."""
+    if vllm_config is None or not hasattr(vllm_config, "additional_config"):
+        return None
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    if not isinstance(additional, dict):
+        raise ValueError(f"--additional-config must be a JSON object, got {type(additional).__name__}")
+    tt = additional.get("tt", {}) or {}
+    if not isinstance(tt, dict):
+        raise ValueError("--additional-config 'tt' must be a JSON object")
+    return tt
+
+
+def _mesh_l1_small_bytes(mesh_device: Any) -> Optional[int]:
+    """L1_SMALL bytes per core of the plugin's mesh, or None when it is not a real ``ttnn.MeshDevice`` (host tests:
+    the plugin imported ttnn to open a real mesh, so a mesh without ttnn loaded is a fake). Never imports ttnn."""
+    ttnn = sys.modules.get("ttnn")
+    mesh_cls = getattr(ttnn, "MeshDevice", None) if ttnn is not None else None
+    if mesh_cls is None or not isinstance(mesh_device, mesh_cls):
+        return None
+    try:
+        return int(ttnn.get_memory_view(mesh_device, ttnn.BufferType.L1_SMALL).total_bytes_per_bank)
+    except Exception:  # pragma: no cover - API drift: do not block serving on the query itself
+        return None
+
+
+def _validate_mesh_l1_small(mesh_device: Any) -> Optional[int]:
+    size = _mesh_l1_small_bytes(mesh_device)
+    if size is not None and size < L1_SMALL_SIZE:
+        raise ValueError(
+            f"the plugin opened the mesh with {size} B of L1_SMALL per core; Motif-3 needs >= {L1_SMALL_SIZE} for its "
+            f"CCL semaphores (generator_api.L1_SMALL_SIZE). Launch with --additional-config "
+            f"'{{\"tt\": {{..., \"l1_small_size\": {L1_SMALL_SIZE}}}}}' (TIS: override_tt_config l1_small_size)"
+        )
+    return size
 
 
 def _resolve_generator_class() -> type:
@@ -387,9 +436,11 @@ class MotifForCausalLM:
         """Called once in EngineCore by ``vllm_tt_plugin/loader.py:38-45`` after the plugin opened the mesh.
 
         Opens nothing itself. ``hf_config`` is vLLM's (trust-remote-code) ``MotifConfig``; ``mesh_device`` the
-        plugin's ``ttnn.MeshDevice``; ``max_batch_size`` = ``max_num_seqs``; ``max_seq_len`` = ``max_model_len``.
-        Weights: ``HF_MODEL`` (dir or repo id + ``TT_MODEL_WEIGHTS_REVISION``), else ``hf_config._name_or_path``;
-        TT cache: ``TT_CACHE_PATH``. The runtime class is ``MOTIF3_GENERATOR_CLASS`` (default
+        plugin's ``ttnn.MeshDevice``; ``max_batch_size`` = ``max_num_seqs``; ``max_seq_len`` = ``max_model_len``
+        (a multiple of 256). Weights (``generator_api.resolve_weights_location``): ``MOTIF3_WEIGHTS_DIR`` >
+        ``HF_MODEL`` (dir) > HF-cache snapshot of a repo-id ``HF_MODEL`` at ``TT_MODEL_WEIGHTS_REVISION`` >
+        ``hf_config._name_or_path``; TT cache: ``TT_CACHE_PATH``. ``settings.block_size`` carries vLLM's
+        ``--block-size`` when it was visible (BRIDGE-4). The runtime class is ``MOTIF3_GENERATOR_CLASS`` (default
         ``models.demos.motif3.tt.generator:MotifGenerator``), imported here, never at module import time.
         """
         if int(tt_data_parallel) != 1:
@@ -398,21 +449,31 @@ class MotifForCausalLM:
                 f"tt_data_parallel={tt_data_parallel}"
             )
         _validate_mesh(mesh_device)
+        l1_small = _validate_mesh_l1_small(mesh_device)
         _validate_hf_config(hf_config)
         settings = GeneratorSettings.from_env(
-            hf_config, max_batch_size=max_batch_size, max_seq_len=max_seq_len, optimizations=optimizations
+            hf_config,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            optimizations=optimizations,
+            block_size=_vllm_block_size(),
         )
         impl = _resolve_generator_class()
         logger.info(
-            "Motif-3 vLLM bridge: generator={}.{} layers={}/{} max_batch={} max_seq_len={} kv_dtype={} weights={}",
+            "Motif-3 vLLM bridge: generator={}.{} layers={}/{} max_batch={} max_seq_len={} block_size={} kv_dtype={} "
+            "weights={} ({}, revision {}) l1_small={}",
             impl.__module__,
             impl.__name__,
             settings.num_layers,
             getattr(hf_config, "num_hidden_layers", "?"),
             settings.max_batch_size,
             settings.max_seq_len,
+            settings.block_size,
             settings.kv_cache_dtype,
             settings.weights_path,
+            settings.weights_source,
+            settings.weights_revision,
+            l1_small,
         )
         generator = impl.create(hf_config=hf_config, mesh_device=mesh_device, settings=settings)
         if int(generator.vocab_size) != int(getattr(hf_config, "vocab_size", generator.vocab_size)):
@@ -435,9 +496,12 @@ class MotifForCausalLM:
         Returns ``MOTIF3_KV_POOL_TOKENS`` (default 262,144, which must equal TIS ``max_tokens_all_users_override``)
         plus ``NULL_BLOCK_RESERVE_TOKENS``. The plugin adds ``block_size * max_num_seqs`` and rounds up to whole
         blocks; the 32-token reserve makes that exactly one extra block for every supported block size, which vLLM's
-        ``BlockPool`` then takes as its null block. Net: 32 users x (pool/32 tokens + one output block) fit exactly.
-        Raises early (before an hour of weight loading) on configurations draft 1 cannot serve.
+        ``BlockPool`` then takes as its null block. Net: 32 users x (pool/32 tokens + one output block) fit exactly
+        (4129 blocks of 64 for the defaults). Raises early (before an hour of weight loading) on configurations
+        draft 1 cannot serve, including a ``max_model_len`` that is not a multiple of 256 (BRIDGE-3) and, when vLLM's
+        current config is visible, a ``"tt"`` additional config without ``l1_small_size >= L1_SMALL_SIZE``.
         """
+        global _SEEN_VLLM_BLOCK_SIZE
         if int(tt_data_parallel) != 1:
             raise ValueError(f"Motif-3 needs tt_data_parallel=1 (one engine over the mesh), got {tt_data_parallel}")
         if int(num_devices) != REQUIRED_NUM_DEVICES:
@@ -453,6 +517,7 @@ class MotifForCausalLM:
                     f"max_model_len={max_model_len} exceeds the draft-1 context of {MAX_CONTEXT} (largest prefill "
                     f"bucket); pass --max-model-len {MAX_CONTEXT} or less"
                 )
+            check_max_model_len(int(max_model_len))  # multiple of 256: bucket + SDPA-chunk alignment (BRIDGE-3)
             if int(max_model_len) > pool:
                 raise ValueError(f"max_model_len={max_model_len} does not fit the {pool}-token KV pool")
 
@@ -461,8 +526,12 @@ class MotifForCausalLM:
         block_size = max(SUPPORTED_BLOCK_SIZES)
         num_layers = NUM_HIDDEN_LAYERS
         vllm_config = _current_vllm_config()
+        tt_config = _tt_config_of(vllm_config)
+        if tt_config is not None:  # the plugin opened (or will open) the mesh with exactly this l1_small_size
+            check_tt_config(tt_config, where="vLLM --additional-config 'tt'")
         if vllm_config is not None and getattr(vllm_config, "cache_config", None) is not None:
             block_size = validate_block_size(vllm_config.cache_config.block_size)
+            _SEEN_VLLM_BLOCK_SIZE = block_size  # for initialize_vllm_model, which runs without a current config
             try:
                 num_layers = int(vllm_config.model_config.hf_text_config.num_hidden_layers)
             except Exception:  # pragma: no cover - partial configs
@@ -545,6 +614,13 @@ class MotifForCausalLM:
             raise ValueError(f"KV pool of {num_blocks} blocks cannot hold the null block plus one request")
         if self._kv is not None:
             raise RuntimeError("allocate_kv_cache called twice")
+        if self.settings.block_size is not None and int(self.settings.block_size) != block_size:
+            logger.warning(
+                "Motif-3: the KV hint's block size {} differs from the --block-size {} seen at model init; the hint "
+                "wins (the generator must take num_blocks / block_size from allocate_kv_cache)",
+                block_size,
+                self.settings.block_size,
+            )
         vllm_layers = int(num_layers)
         layers = self.generator.num_layers
         if vllm_layers < layers:
@@ -893,13 +969,19 @@ __all__ = [
     "ARCHITECTURE",
     "DEFAULT_GENERATOR_CLASS",
     "DEFAULT_KV_POOL_TOKENS",
+    "KV_POOL_ALIGNMENT",
+    "L1_SMALL_SIZE",
     "LaneMap",
     "MAIN_CLASS",
+    "MAX_KV_POOL_TOKENS",
     "MotifForCausalLM",
     "MotifKVCache",
     "NULL_BLOCK_RESERVE_TOKENS",
+    "SERVING_TT_CONFIG",
     "TT_MODEL_CLASS_OVERRIDES",
+    "kv_max_bytes_per_chip",
     "kv_pool_tokens_from_env",
     "plugin_num_blocks",
+    "serving_additional_config",
     "validate_block_size",
 ]

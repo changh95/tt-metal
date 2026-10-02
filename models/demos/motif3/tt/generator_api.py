@@ -29,6 +29,11 @@ null block (padding in every page table, never holds a valid position); real blo
 Device dtype is ``settings.kv_cache_dtype`` (``"bfp8"`` -> ``ttnn.bfloat8_b``, ``"bf16"`` -> ``ttnn.bfloat16``),
 TILE layout, DRAM. The torch dtype vLLM hands the bridge is bookkeeping only.
 
+``num_blocks`` is whatever ``allocate_kv_cache`` receives, never a config constant: the plugin allocates
+``plugin_num_blocks(pool + NULL_BLOCK_RESERVE_TOKENS, block_size, max_num_seqs)`` blocks, i.e. 4129 for the default
+pool of 262,144 tokens, block 64 and ``--max-num-seqs 32`` (4105 with ``--max-num-seqs 8``).
+:func:`expected_num_blocks` reproduces that number for planning and tests only.
+
 Positions
 ---------
 A position is the absolute token index in the request (0-based). For decode, ``positions[l]`` is the index of
@@ -43,7 +48,9 @@ Every tensor crossing this interface is a CPU torch tensor. Inputs: ``torch.int3
 
 Import rule (design 00 §2.1): this module is imported by vLLM's API server, its registry-inspection subprocess and
 EngineCore before any mesh exists. It imports only the standard library and torch, never ttnn or other
-``models/demos/**`` packages, and never touches a device.
+``models/demos/**`` packages, and never touches a device (``huggingface_hub`` is imported lazily, only to locate the
+HF-cache snapshot of a repo-id ``HF_MODEL``). ``tt/model_config.py`` imports the KV-pool and weights-location helpers
+from here, so the bridge and the TT config share one implementation.
 """
 
 from __future__ import annotations
@@ -51,7 +58,8 @@ from __future__ import annotations
 import abc
 import os
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -70,13 +78,84 @@ NUM_HIDDEN_LAYERS = 53
 VOCAB_SIZE = 220160
 MAX_CONTEXT = 32768  # draft-1 max_model_len (largest prefill bucket)
 MIN_PREFILL_BUCKET = 128
-SUPPORTED_BLOCK_SIZES = (32, 64, 128)  # multiples of the 32-row tile that the paged ops are tested with
+# The last prefill bucket is max_model_len itself, so it must be a whole number of SDPA prefill chunks (256 on global
+# layers, gate G2) and of KV blocks (<= 64): vLLM's --max-model-len must be a multiple of this (BRIDGE-3).
+MAX_MODEL_LEN_ALIGNMENT = 256
+# Block sizes the paged latent ops are validated with on this Galaxy: G1 (paged FlashMLA decode) and G7 (paged
+# update / fill) ran blocks 32 and 64 only. Re-add 128 only after GATE-4 covers it (WAVE_A_REVIEW M4, BRIDGE-1).
+SUPPORTED_BLOCK_SIZES = (32, 64)
 DEFAULT_BLOCK_SIZE = 64
 
 KV_CACHE_DTYPES = ("bfp8", "bf16")
 DEFAULT_KV_CACHE_DTYPE = "bfp8"
 _TILE = 32
 _TILE_BYTES = {"bfp8": 1088, "bf16": 2048}  # one 32x32 tile: bfp8_b = 1024 mantissa + 64 exponent bytes
+
+# ---- KV pool sizing shared by the bridge (vllm-tt-plugin contract) and MotifTTConfig ---------------------------
+DEFAULT_KV_POOL_TOKENS = 262144  # usable pool = TIS max_tokens_all_users_override (design 00 §5.2)
+KV_POOL_ALIGNMENT = 128  # pool multiple of every supported block (and of 128) -> the reserve below adds exactly 1 block
+NULL_BLOCK_RESERVE_TOKENS = 32  # <= one block for every supported block size: pays for vLLM's null block 0
+MAX_KV_POOL_TOKENS = 4 * 1024 * 1024
+
+# ---- Device memory regions the mesh must be opened with (vllm-tt-plugin "tt" additional config) ---------------
+# L1_SMALL bytes per core. Every CCL keeps its global semaphores (64 B each) there: ttnn's direct reduce-scatter and
+# all-gather pick L1_SMALL by themselves when the region exists, and tt/ccl.py MotifCCL routes every other CCL path
+# there explicitly. Without the region the semaphores land in main L1 at whatever address is free when the program is
+# first built (~1.0 MB next to a decode all_reduce's 512 KB staging buffer) and stay there for the life of the program
+# cache; the first later program whose static circular buffers reach that address throws "Statically allocated
+# circular buffers ... clash with L1 buffers": a global-layer prefill at S >= 1024 after any decode step, or the
+# bf16-KV FlashMLA decode (tt/attention.py docstring, "L1_SMALL is required"). 32 KiB = 512 semaphores; attention alone
+# uses 16-18. pytest: model_config.device_params() sets it; vLLM: --additional-config '{"tt": {"l1_small_size": ...}}'
+# (vllm-tt-plugin worker.py device_params_from_tt_config); TIS: override_tt_config.l1_small_size.
+L1_SMALL_SIZE = 32768
+
+# The "tt" additional config a Motif-3 server is launched with (design 00 §5.1; TIS override_tt_config):
+#   --additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456,
+#                                "fabric_config": "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col",
+#                                "l1_small_size": 32768}}'
+# Only l1_small_size is enforced (check_tt_config); the rest are the validated defaults (decode traced, prefill eager).
+SERVING_TT_CONFIG = {
+    "trace_mode": "decode_only",
+    "trace_region_size": 268435456,
+    "fabric_config": "FABRIC_2D_TORUS_XY",
+    "dispatch_core_axis": "col",
+    "l1_small_size": L1_SMALL_SIZE,
+}
+
+
+def serving_additional_config(**overrides: Any) -> Dict[str, Any]:
+    """``{"tt": SERVING_TT_CONFIG | overrides}``: the value of vLLM's ``--additional-config`` for Motif-3 (pass it
+    through ``json.dumps`` on a command line)."""
+    tt = dict(SERVING_TT_CONFIG)
+    tt.update(overrides)
+    return {"tt": tt}
+
+
+def check_tt_config(tt_config: Optional[Mapping[str, Any]], *, where: str = "--additional-config") -> Dict[str, Any]:
+    """Validate the plugin's ``"tt"`` additional config for Motif-3 and return it as a dict.
+
+    Raises ``ValueError`` unless ``l1_small_size >= L1_SMALL_SIZE`` (the plugin opens the mesh with exactly the
+    ``l1_small_size`` given there, and with none when the key is absent; see :data:`L1_SMALL_SIZE` for why the model
+    cannot run without it). ``tt_config`` is the ``"tt"`` object of vLLM's ``additional_config`` (``None`` or ``{}``
+    when the server was started without one)."""
+    tt = dict(tt_config or {})
+    fix = (
+        f'pass --additional-config \'{{"tt": {{..., "l1_small_size": {L1_SMALL_SIZE}}}}}\' (TIS: override_tt_config '
+        f"l1_small_size: {L1_SMALL_SIZE}); recommended: {SERVING_TT_CONFIG}"
+    )
+    raw = tt.get("l1_small_size")
+    if raw is None:
+        raise ValueError(
+            f"Motif-3 needs an L1_SMALL region of >= {L1_SMALL_SIZE} B per core for its CCL semaphores, but {where} "
+            f'has no "l1_small_size" (the mesh would open without one); {fix}'
+        )
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: l1_small_size must be an integer byte count, got {raw!r}; {fix}") from None
+    if size < L1_SMALL_SIZE:
+        raise ValueError(f"{where}: l1_small_size={size} is below the {L1_SMALL_SIZE} B Motif-3 needs; {fix}")
+    return tt
 
 
 def prefill_buckets(max_seq_len: int = MAX_CONTEXT, min_bucket: int = MIN_PREFILL_BUCKET) -> Tuple[int, ...]:
@@ -109,6 +188,198 @@ def kv_cache_bytes_per_chip(
     return int(num_layers) * int(num_blocks) * tiles_per_block * _TILE_BYTES[kv_cache_dtype]
 
 
+def plugin_num_blocks(max_tokens_all_users: int, block_size: int, max_num_seqs: int) -> int:
+    """The block count vllm-tt-plugin allocates (``worker.get_num_available_blocks_tt``, AR model, no hybrid
+    headroom): ``ceil((max_tokens_all_users + block_size * max_num_seqs) / block_size)``; vLLM then keeps block 0."""
+    return cdiv(int(max_tokens_all_users) + int(block_size) * int(max_num_seqs), int(block_size))
+
+
+def expected_num_blocks(
+    pool_tokens: int = DEFAULT_KV_POOL_TOKENS, block_size: int = DEFAULT_BLOCK_SIZE, max_num_seqs: int = NUM_LANES
+) -> int:
+    """``num_blocks`` that ``allocate_kv_cache`` receives under the bridge's sizing: the usable pool plus
+    ``NULL_BLOCK_RESERVE_TOKENS`` from ``get_max_tokens_all_users``, plus the plugin's ``block_size * max_num_seqs``
+    reservation, in whole blocks. 4129 for the defaults (262,144 / 64 / 32), 4105 with ``max_num_seqs=8``.
+
+    Planning only: a generator must use the ``num_blocks`` it is given (WAVE_A_REVIEW M2/M3)."""
+    return plugin_num_blocks(int(pool_tokens) + NULL_BLOCK_RESERVE_TOKENS, block_size, max_num_seqs)
+
+
+def kv_pool_tokens_from_env(environ: Optional[Mapping[str, str]] = None) -> int:
+    """Usable KV pool in tokens: ``MOTIF3_KV_POOL_TOKENS`` (default 262,144), a multiple of 128."""
+    env = os.environ if environ is None else environ
+    raw = env.get("MOTIF3_KV_POOL_TOKENS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_KV_POOL_TOKENS
+    raw = raw.strip()
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError(f"MOTIF3_KV_POOL_TOKENS must be a positive decimal token count, got {raw!r}")
+    tokens = int(raw)
+    if tokens % KV_POOL_ALIGNMENT or not KV_POOL_ALIGNMENT <= tokens <= MAX_KV_POOL_TOKENS:
+        raise ValueError(
+            f"MOTIF3_KV_POOL_TOKENS={tokens} must be a multiple of {KV_POOL_ALIGNMENT} in "
+            f"[{KV_POOL_ALIGNMENT}, {MAX_KV_POOL_TOKENS}]"
+        )
+    return tokens
+
+
+def check_block_size(block_size: int) -> int:
+    """``block_size`` if it is in ``SUPPORTED_BLOCK_SIZES``, else ``ValueError`` (vLLM's default 16 included)."""
+    block_size = int(block_size)
+    if block_size not in SUPPORTED_BLOCK_SIZES:
+        raise ValueError(
+            f"Motif-3 needs --block-size in {SUPPORTED_BLOCK_SIZES} (the block sizes the paged latent ops are "
+            f"validated with on this Galaxy, gates G1/G7; 64 is the default), got {block_size}. vLLM's default of 16 "
+            f"is not usable on TT."
+        )
+    return block_size
+
+
+def check_max_model_len(max_model_len: int) -> int:
+    """``max_model_len`` if it is in ``[MAX_MODEL_LEN_ALIGNMENT, MAX_CONTEXT]`` and a multiple of
+    ``MAX_MODEL_LEN_ALIGNMENT`` (256), else ``ValueError``. The last prefill bucket is ``max_model_len`` itself, so it
+    must be a whole number of SDPA prefill chunks (256 on global layers) and of KV blocks (BRIDGE-3, M6)."""
+    n = int(max_model_len)
+    if not 1 <= n <= MAX_CONTEXT:
+        raise ValueError(f"max_model_len must be in [1, {MAX_CONTEXT}] in draft 1, got {n}")
+    if n % MAX_MODEL_LEN_ALIGNMENT:
+        hint = max(MAX_MODEL_LEN_ALIGNMENT, n // MAX_MODEL_LEN_ALIGNMENT * MAX_MODEL_LEN_ALIGNMENT)
+        raise ValueError(
+            f"max_model_len={n} must be a multiple of {MAX_MODEL_LEN_ALIGNMENT}: the last prefill bucket is "
+            f"max_model_len itself and must align to the SDPA prefill chunk (256 on global layers) and the KV block; "
+            f"pass e.g. --max-model-len {hint}"
+        )
+    return n
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Weights location (one precedence order for the bridge and MotifTTConfig; design 00 §2.3.11; WAVE_A_REVIEW M7)
+# ----------------------------------------------------------------------------------------------------------------
+class WeightsLocation(NamedTuple):
+    """Where the checkpoint is. ``path`` is a local directory when ``is_local``; otherwise a HF repo id that the
+    generator must resolve (download) at ``revision`` itself, or ``None`` (nothing given: use the generator's
+    default snapshot). ``source`` names the rule that matched (logged by the bridge)."""
+
+    path: Optional[str]
+    source: str
+    revision: Optional[str]
+    is_local: bool
+
+
+def _looks_like_repo_id(value: str) -> bool:
+    """``org/name`` (one slash, no leading path marker): what HF_MODEL holds when it is not a snapshot directory."""
+    v = value.strip()
+    if not v or v.startswith(("/", ".", "~")):
+        return False
+    parts = v.split("/")
+    return len(parts) == 2 and all(parts)
+
+
+def _hf_hub_cache_dir(environ: Optional[Mapping[str, str]] = None) -> Path:
+    """The HF hub cache: ``HF_HUB_CACHE``, else ``$HF_HOME/hub``, else huggingface_hub's default."""
+    env = os.environ if environ is None else environ
+    if env.get("HF_HUB_CACHE"):
+        return Path(env["HF_HUB_CACHE"]).expanduser()
+    if env.get("HF_HOME"):
+        return Path(env["HF_HOME"]).expanduser() / "hub"
+    try:
+        from huggingface_hub import constants as _hf_constants
+
+        return Path(_hf_constants.HF_HUB_CACHE)
+    except Exception:  # pragma: no cover - huggingface_hub missing
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def hf_cache_snapshot(
+    repo_id: str, revision: Optional[str] = None, *, cache_dir: Optional[Union[str, os.PathLike]] = None
+) -> Optional[Path]:
+    """Local HF-cache snapshot directory of ``repo_id`` at ``revision`` (full or >= 7-char commit hash, a branch/tag
+    with a ``refs/`` entry, or ``None`` = ``main``), or ``None`` if it is not in the cache (never downloads).
+    ``cache_dir`` defaults to :func:`_hf_hub_cache_dir` (``HF_HUB_CACHE`` / ``HF_HOME`` / huggingface_hub).
+
+    A pinned ``snapshot_download(revision=<sha>)`` leaves no ``refs/main`` (design 00 §2.3.11), so with no revision
+    and no ``refs/main`` the single cached snapshot, if there is exactly one, is used."""
+    cache = Path(cache_dir) if cache_dir is not None else _hf_hub_cache_dir()
+    repo_dir = cache / ("models--" + repo_id.strip().replace("/", "--"))
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    cands = sorted(p for p in snapshots.iterdir() if p.is_dir() and (p / "config.json").is_file())
+    rev = (revision or "").strip() or "main"
+    ref = repo_dir / "refs" / rev
+    if ref.is_file():
+        rev = ref.read_text().strip()
+    match = [p for p in cands if p.name == rev or (len(rev) >= 7 and p.name.startswith(rev))]
+    if not match and not revision and len(cands) == 1:
+        match = cands
+    return match[0] if len(match) == 1 else None
+
+
+def resolve_weights_location(hf_config: Any = None, environ: Optional[Mapping[str, str]] = None) -> WeightsLocation:
+    """The checkpoint location, first match wins:
+
+    1. ``MOTIF3_WEIGHTS_DIR`` (must be a directory; a set but missing directory raises);
+    2. ``HF_MODEL`` when it is a directory (TIS sets it to a symlinked snapshot dir);
+    3. ``HF_MODEL`` as a repo id: its local HF-cache snapshot at ``TT_MODEL_WEIGHTS_REVISION``; if the snapshot is
+       not cached, the repo id itself (``is_local=False``: the generator must download it at that revision);
+    4. ``hf_config._name_or_path`` (vLLM's ``--model``) when it is a directory, or a repo id resolved as in 3;
+    5. nothing: ``WeightsLocation(None, "default", ...)`` (``MotifTTConfig`` then uses its local default snapshot).
+
+    ``HF_MODEL`` holding a path (``/...``, ``./...``) that does not exist raises: a typo must not silently fall
+    through to another checkpoint."""
+    env = os.environ if environ is None else environ
+    revision = (env.get("TT_MODEL_WEIGHTS_REVISION") or "").strip() or None
+
+    explicit = (env.get("MOTIF3_WEIGHTS_DIR") or "").strip()
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_dir():
+            raise ValueError(f"MOTIF3_WEIGHTS_DIR={explicit!r} is not a directory")
+        return WeightsLocation(str(p), "MOTIF3_WEIGHTS_DIR", revision, True)
+
+    def from_value(value: str, name: str) -> Optional[WeightsLocation]:
+        p = Path(value).expanduser()
+        if p.is_dir():
+            return WeightsLocation(str(p), name, revision, True)
+        if _looks_like_repo_id(value):
+            snap = hf_cache_snapshot(value, revision, cache_dir=_hf_hub_cache_dir(env))
+            if snap is not None:
+                return WeightsLocation(
+                    str(snap), f"{name} repo id {value}@{revision or 'main'} (HF cache)", revision, True
+                )
+            return WeightsLocation(
+                value.strip(), f"{name} repo id {value}@{revision or 'main'} (not cached)", revision, False
+            )
+        return None
+
+    hf_model = (env.get("HF_MODEL") or "").strip()
+    if hf_model:
+        loc = from_value(hf_model, "HF_MODEL")
+        if loc is None:
+            raise ValueError(f"HF_MODEL={hf_model!r} is neither a directory nor a 'org/name' HF repo id")
+        return loc
+
+    name = getattr(hf_config, "_name_or_path", None) or getattr(hf_config, "name_or_path", None)
+    if name:
+        loc = from_value(str(name), "hf_config._name_or_path")
+        if loc is not None:
+            return loc
+    return WeightsLocation(None, "default", revision, False)
+
+
+def resolve_tt_cache_path(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """TT weight-cache root: ``MOTIF3_TT_CACHE_PATH`` > ``TT_CACHE_PATH`` (TIS sets it under its host volume) > None
+    (the generator's / ``MotifTTConfig``'s default ``motif-3/tt_cache``). The Motif-specific variable lets the
+    converter and a TIS server share one converted cache without the symlink of TIS_RUNBOOK §2.4 (WAVE_A_REVIEW CONV-2;
+    the cache path inside is ``<root>/<version-tag>/mesh<R>x<C>/...``)."""
+    env = os.environ if environ is None else environ
+    for name in ("MOTIF3_TT_CACHE_PATH", "TT_CACHE_PATH"):
+        v = (env.get(name) or "").strip()
+        if v:
+            return v
+    return None
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------------------------------------------
@@ -126,21 +397,33 @@ def _env_int(environ: Mapping[str, str], name: str) -> Optional[int]:
 class GeneratorSettings:
     """Serving-time choices the bridge hands to ``MotifGenerator.create`` (all validated).
 
-    The integration wave maps them onto ``MotifTTConfig.from_hf_config(hf_config, mesh_device=..., num_layers=...,
-    max_model_len=max_seq_len, ...)``; the KV pool geometry itself arrives later through ``allocate_kv_cache``.
+    The integration wave maps them onto the TT config with ``MotifTTConfig.from_settings(settings,
+    mesh_device=mesh_device, hf_config=hf_config)`` (``tt/model_config.py``): config from
+    ``<weights_path>/config.json``, ``num_layers``, ``max_model_len = max_seq_len``, ``max_num_seqs =
+    max_batch_size`` (the decode batch stays ``max_batch = NUM_LANES = 32``), the KV dtype, the block size when known,
+    the fabric from the device. The KV pool geometry itself arrives later through ``allocate_kv_cache``.
 
     Fields:
         max_batch_size: vLLM ``max_num_seqs`` (1..32). The decode trace always runs ``NUM_LANES`` lanes; this
-            only bounds how many lanes can be active.
-        max_seq_len: vLLM ``max_model_len`` (1..``MAX_CONTEXT``): largest prompt and largest decode position + 1.
+            only bounds how many lanes can be active (and sizes the plugin's per-sequence block reservation).
+        max_seq_len: vLLM ``max_model_len`` (``MAX_MODEL_LEN_ALIGNMENT``..``MAX_CONTEXT``, a multiple of 256):
+            largest prompt and largest decode position + 1.
         num_layers: decoder layers to run (``hf_config.num_hidden_layers``, or fewer for a truncated bring-up
             run via ``MOTIF3_NUM_LAYERS``; the final norm and LM head always run).
         kv_cache_dtype: ``"bfp8"`` (default) or ``"bf16"`` (``MOTIF3_KV_CACHE_DTYPE``; bf16 is the A/B lever of
             design 00 §7.1 risk 8 and needs a smaller pool).
-        weights_path: ``HF_MODEL`` (snapshot dir or repo id), else ``hf_config._name_or_path``.
-        weights_revision: ``TT_MODEL_WEIGHTS_REVISION`` (pinned snapshot when ``weights_path`` is a repo id).
-        cache_path: ``TT_CACHE_PATH`` (TT weight-cache root), or None for the generator's default.
+        weights_path: the checkpoint per :func:`resolve_weights_location` -- ``MOTIF3_WEIGHTS_DIR`` > ``HF_MODEL``
+            (directory) > the HF-cache snapshot of a repo-id ``HF_MODEL`` at ``TT_MODEL_WEIGHTS_REVISION`` >
+            ``hf_config._name_or_path``. A local directory, except for an uncached repo id (``weights_source`` then
+            says "not cached" and the generator must download it at ``weights_revision``); ``None`` = the
+            generator's default snapshot.
+        weights_revision: ``TT_MODEL_WEIGHTS_REVISION`` (pinned snapshot when ``HF_MODEL`` is a repo id).
+        cache_path: TT weight-cache root (:func:`resolve_tt_cache_path`: ``MOTIF3_TT_CACHE_PATH`` > ``TT_CACHE_PATH``),
+            or None for the generator's default.
         optimizations: plugin ``tt.optimizations`` (None | "performance" | "accuracy"); draft 1 may ignore it.
+        block_size: vLLM ``--block-size`` when the bridge could see it at model init (BRIDGE-4), else None. Only a
+            hint for ``create``: ``allocate_kv_cache(block_size=...)`` is authoritative.
+        weights_source: which precedence rule produced ``weights_path`` (logged by the bridge).
     """
 
     max_batch_size: int = NUM_LANES
@@ -151,18 +434,28 @@ class GeneratorSettings:
     weights_revision: Optional[str] = None
     cache_path: Optional[str] = None
     optimizations: Optional[str] = None
+    block_size: Optional[int] = None
+    weights_source: Optional[str] = None
 
     def __post_init__(self):
         if not 1 <= int(self.max_batch_size) <= NUM_LANES:
             raise ValueError(f"max_batch_size must be in [1, {NUM_LANES}], got {self.max_batch_size}")
         if not 1 <= int(self.max_seq_len) <= MAX_CONTEXT:
             raise ValueError(f"max_seq_len must be in [1, {MAX_CONTEXT}] in draft 1, got {self.max_seq_len}")
+        check_max_model_len(self.max_seq_len)
         if int(self.num_layers) < 1:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
         if self.kv_cache_dtype not in KV_CACHE_DTYPES:
             raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}, got {self.kv_cache_dtype!r}")
         if self.optimizations not in (None, "performance", "accuracy"):
             raise ValueError(f"optimizations must be None, 'performance' or 'accuracy', got {self.optimizations!r}")
+        if self.block_size is not None:
+            check_block_size(self.block_size)
+
+    @property
+    def weights_are_local(self) -> bool:
+        """``weights_path`` is a local checkpoint directory (False for an uncached repo id or None)."""
+        return self.weights_path is not None and Path(self.weights_path).is_dir()
 
     @classmethod
     def from_env(
@@ -172,6 +465,7 @@ class GeneratorSettings:
         max_batch_size: int,
         max_seq_len: int,
         optimizations: Optional[str] = None,
+        block_size: Optional[int] = None,
         environ: Optional[Mapping[str, str]] = None,
     ) -> "GeneratorSettings":
         """Resolve settings from the vLLM arguments plus the documented environment variables."""
@@ -182,18 +476,18 @@ class GeneratorSettings:
         if not 1 <= num_layers <= hf_layers:
             raise ValueError(f"MOTIF3_NUM_LAYERS={num_layers} outside [1, {hf_layers}]")
         kv_dtype = (env.get("MOTIF3_KV_CACHE_DTYPE") or DEFAULT_KV_CACHE_DTYPE).strip().lower()
-        weights = (
-            env.get("HF_MODEL") or getattr(hf_config, "_name_or_path", None) or getattr(hf_config, "name_or_path", None)
-        )
+        loc = resolve_weights_location(hf_config, env)
         return cls(
             max_batch_size=int(max_batch_size),
             max_seq_len=int(max_seq_len),
             num_layers=num_layers,
             kv_cache_dtype=kv_dtype,
-            weights_path=str(weights) if weights else None,
-            weights_revision=env.get("TT_MODEL_WEIGHTS_REVISION") or None,
-            cache_path=env.get("TT_CACHE_PATH") or None,
+            weights_path=loc.path,
+            weights_revision=loc.revision,
+            cache_path=resolve_tt_cache_path(env),
             optimizations=optimizations,
+            block_size=None if block_size is None else int(block_size),
+            weights_source=loc.source,
         )
 
 
@@ -318,12 +612,22 @@ class MotifGenerator(abc.ABC):
     def create(cls, *, hf_config: Any, mesh_device: Any, settings: GeneratorSettings) -> "MotifGenerator":
         """Build the runtime on an already-open mesh.
 
+        Build the TT config with ``MotifTTConfig.from_settings(settings, mesh_device=mesh_device,
+        hf_config=hf_config)``: it reads ``<settings.weights_path>/config.json`` (+ ``generation_config.json`` for
+        the EOS set) when the weights are local, else the ``hf_config`` object (safe since INFRA-1: ``rope_scaling``
+        or transformers-5 ``rope_parameters``, EOS from the generation config next to ``_name_or_path``), keeps the
+        decode batch at ``NUM_LANES`` whatever ``max_batch_size`` is, and takes the fabric from the device.
+
         Args:
             hf_config: vLLM's ``model_config.hf_config``: the trust-remote-code ``MotifConfig`` instance (dynamic
                 class; duck-type it, never ``isinstance``). ``hf_config.architectures`` has already been rewritten
                 to ``["TTMotifForCausalLM"]`` by the plugin.
             mesh_device: the ``ttnn.MeshDevice`` the plugin opened from ``MESH_DEVICE``: shape (4, 8) or (8, 4)
-                (the TP axis is the size-8 dim), fabric ``FABRIC_2D_TORUS_XY`` by default.
+                (the TP axis is the size-8 dim), fabric ``FABRIC_2D_TORUS_XY`` by default, with an L1_SMALL region of
+                at least :data:`L1_SMALL_SIZE` bytes per core (``"l1_small_size"`` in the plugin's ``"tt"`` config;
+                the bridge refuses a mesh without it before calling ``create``). Standalone runs open the mesh with
+                ``model_config.open_motif_mesh()`` (same fabric, dispatch axis, trace region and L1_SMALL); a
+                generator may assert the region with ``model_config.require_l1_small(mesh_device)``.
             settings: validated ``GeneratorSettings``.
         """
 
@@ -358,6 +662,11 @@ class MotifGenerator(abc.ABC):
         ``ttnn.bfloat16``), TILE layout, DRAM, replicated on every chip of the mesh, zero-filled. Block 0 is the
         null block. ``block_size`` is in ``SUPPORTED_BLOCK_SIZES``. Bytes per chip:
         ``kv_cache_bytes_per_chip(num_blocks, block_size, num_layers, settings.kv_cache_dtype)``.
+
+        ``num_blocks`` / ``block_size`` given here are authoritative (4129 / 64 for the default serving flags; 4105
+        with ``--max-num-seqs 8``): record them in the TT config (``cfg.set_kv_geometry(num_blocks, block_size)``),
+        never recompute them from the config. Allocate with ``ttnn.empty`` + on-device ``ttnn.fill(0)`` per layer
+        (gate G7: ``ttnn.zeros`` of the pool takes ~20 s).
 
         The handle is passed back unchanged as ``kv_cache=`` to every later call; the bridge never looks inside.
         """
@@ -455,26 +764,44 @@ def cdiv(a: int, b: int) -> int:
 __all__ = [
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_KV_CACHE_DTYPE",
+    "DEFAULT_KV_POOL_TOKENS",
     "DecodeBatch",
     "GeneratorSettings",
     "KV_CACHE_DTYPES",
     "KV_LATENT_DIM",
     "KV_LORA_RANK",
+    "KV_POOL_ALIGNMENT",
+    "L1_SMALL_SIZE",
     "LANES_PER_GROUP",
     "MAX_CONTEXT",
+    "MAX_KV_POOL_TOKENS",
+    "MAX_MODEL_LEN_ALIGNMENT",
     "MESH_SHAPES",
     "MIN_PREFILL_BUCKET",
     "MotifGenerator",
+    "NULL_BLOCK_RESERVE_TOKENS",
     "NUM_DP_GROUPS",
     "NUM_HIDDEN_LAYERS",
     "NUM_LANES",
     "PrefillRequest",
     "QK_ROPE_HEAD_DIM",
+    "SERVING_TT_CONFIG",
     "SUPPORTED_BLOCK_SIZES",
     "VOCAB_SIZE",
+    "WeightsLocation",
     "cdiv",
+    "check_block_size",
     "check_logits",
+    "check_max_model_len",
+    "check_tt_config",
+    "expected_num_blocks",
+    "hf_cache_snapshot",
     "kv_cache_bytes_per_chip",
     "kv_cache_dtype_from_env",
+    "kv_pool_tokens_from_env",
+    "plugin_num_blocks",
     "prefill_buckets",
+    "resolve_tt_cache_path",
+    "resolve_weights_location",
+    "serving_additional_config",
 ]

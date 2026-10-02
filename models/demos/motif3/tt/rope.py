@@ -37,7 +37,19 @@ Two ways to apply it:
 * composite ``x * cos + (x @ R) * sin`` with the signed permutation ``R`` (``x @ R == rotate_half(x)``),
   :meth:`MotifRope.apply_composite`; broadcasting handles the head dim.
 
-G8 (``tests/unit/gates``) decides which one the attention module uses; both are kept here. See README.
+Gate G8 decided (``tests/unit/gates/GATES_RESULTS.md`` §10): attention uses the **fused**
+``rotary_embedding_hf`` with the ``rope`` compute role (HiFi4 + fp32 acc: PCC >= 0.999996, <= 3 us traced in decode,
+halves the max error vs the op default). Wave B1 (``tt/attention.py``) runs it in **prefill mode in decode too**: the
+heads-on-dim-1 / lanes-on-rows ``q_pe [1, 10, 8, 64]`` and ``k_pe`` with ``decode_cos_sin(kind, rot, layout="rows")``
+(row t rotated by lane t's position; the decode-mode variant would need a transpose + reshard of q_pe and k_pe, 4 extra
+ops). The tables are built ONCE per decode step for all 53 layers (``MotifAttention.decode_rope_tables(rope,
+rot_idxs)``). The decode-mode layout (q_pe ``[1, 8, 10, 64]`` / k_pe ``[1, 8, 1, 64]`` HEIGHT_SHARDED ``[32, 64]`` on 8
+cores, :meth:`MotifRope.batch_sharded_memory_config`, ``layout="batch_sharded"``) stays available and tested; prefill:
+``[1, H, S, 64]`` with ``prefill_cos_sin(kind, S)``. The composite (19 us traced) stays here as the fallback.
+
+The tables come from the config's YaRN fields, which ``MotifTTConfig.from_hf_config`` reads from ``rope_scaling`` or
+the transformers-5 ``rope_parameters`` (INFRA-1), so a config built from vLLM's ``hf_config`` object gives the same
+``inv_freq_for_kind(cfg, "yarn")`` as one built from ``config.json``.
 """
 
 from __future__ import annotations

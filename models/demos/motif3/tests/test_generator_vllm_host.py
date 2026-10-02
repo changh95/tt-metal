@@ -537,7 +537,8 @@ def motif_vllm_config(tmp_path_factory):
             ),
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
-            additional_config={"tt": {"trace_mode": "decode_only"}},
+            # l1_small_size is mandatory (get_max_tokens_all_users refuses a "tt" config without it)
+            additional_config={"tt": {"trace_mode": "decode_only", "l1_small_size": api.L1_SMALL_SIZE}},
         )
         yield SimpleNamespace(vllm_config=vllm_config, model_config=model_config, resolved_arch=resolved_arch)
 
@@ -620,6 +621,46 @@ def test_kv_spec_pool_and_allocation_chain(motif_vllm_config):
     assert gv.plugin_num_blocks(262144, 64, 32) - 1 < 32 * per_user
 
 
+def test_motif_tt_config_from_vllm_hf_config(motif_vllm_config, monkeypatch):
+    """INFRA-1 + INFRA-2 on the real vLLM chain. ``MotifTTConfig`` built from vLLM's ``hf_config`` object (what
+    ``MotifGenerator.create`` receives; transformers 5 moved YaRN into ``rope_parameters``), from a plain
+    ``AutoConfig(trust_remote_code)`` object and from ``config.json`` are identical (fields, layer schedule, YaRN
+    ``inv_freq``), and the config's expected KV block count is the one the plugin really allocates (4129)."""
+    import dataclasses
+
+    from transformers import AutoConfig
+    from vllm.config import set_current_vllm_config
+
+    from models.demos.motif3.tt.model_config import MotifTTConfig
+    from models.demos.motif3.tt.rope import inv_freq_for_kind
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    for var in ("MOTIF3_MAX_MODEL_LEN", "MOTIF3_WEIGHTS_DIR", "HF_MODEL", "TT_MODEL_WEIGHTS_REVISION", "MOTIF3_FABRIC"):
+        monkeypatch.delenv(var, raising=False)
+    vc, mc = motif_vllm_config.vllm_config, motif_vllm_config.model_config
+    path = _motif_dir()
+    by_path = MotifTTConfig.from_hf_config(str(path), mesh_shape=(4, 8))
+    by_vllm = MotifTTConfig.from_hf_config(mc.hf_config, mesh_shape=(4, 8))
+    by_auto = MotifTTConfig.from_hf_config(
+        AutoConfig.from_pretrained(str(path), trust_remote_code=True), mesh_shape=(4, 8)
+    )
+    ref = {f.name: getattr(by_path, f.name) for f in dataclasses.fields(by_path)}
+    for name, cfg in (("vllm hf_config", by_vllm), ("AutoConfig", by_auto)):
+        got = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
+        assert got == ref, f"{name}: {[k for k in ref if got[k] != ref[k]]}"
+        assert cfg.layers == by_path.layers, name
+        assert torch.equal(inv_freq_for_kind(cfg, "yarn"), inv_freq_for_kind(by_path, "yarn")), name
+    assert by_vllm.rope_type == "yarn" and by_vllm.yarn_factor == 64.0 and by_vllm.eos_token_ids == (0, 3, 6)
+
+    with set_current_vllm_config(vc):
+        num_blocks = get_num_available_blocks_tt(vc, 32)
+    assert by_vllm.kv_num_blocks == num_blocks == 4129 == api.expected_num_blocks()
+    settings = api.GeneratorSettings.from_env(mc.hf_config, max_batch_size=32, max_seq_len=32768, block_size=64)
+    tt_cfg = MotifTTConfig.from_settings(settings, hf_config=mc.hf_config, mesh_shape=(4, 8))
+    assert tt_cfg.kv_cache_shape == (num_blocks, 1, 64, 576) and tt_cfg.kv_blocks_per_seq == 512
+    assert tt_cfg.kv_cache_bytes_per_chip() == api.kv_cache_bytes_per_chip(num_blocks, 64, 53, "bfp8")
+
+
 def test_tokenizer_resolves_with_trust_remote_code(motif_vllm_config):
     from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -662,6 +703,13 @@ def test_get_max_tokens_all_users_validation(monkeypatch):
         monkeypatch.setenv("MOTIF3_KV_POOL_TOKENS", bad)
         with pytest.raises(ValueError, match="MOTIF3_KV_POOL_TOKENS"):
             f(num_devices=32)
+    monkeypatch.delenv("MOTIF3_KV_POOL_TOKENS")
+    for bad_len in (5000, 32767, 128):  # BRIDGE-3: last bucket = max_model_len must be a whole number of SDPA chunks
+        with pytest.raises(ValueError, match="multiple of 256"):
+            f(num_devices=32, max_model_len=bad_len)
+    with pytest.raises(ValueError, match="multiple of 256"):
+        api.GeneratorSettings(max_seq_len=1000)
+    assert f(num_devices=32, max_model_len=4096, max_num_seqs=32) == 262144 + 32
     monkeypatch.setenv("MOTIF3_KV_POOL_TOKENS", "16384")
     with pytest.raises(ValueError, match="does not fit"):
         f(num_devices=32, max_model_len=32768)
@@ -691,6 +739,32 @@ def test_get_max_tokens_all_users_rejects_bad_block_size_early(monkeypatch):
     )
     with set_current_vllm_config(fake), pytest.raises(ValueError, match="block-size"):
         gv.MotifForCausalLM.get_max_tokens_all_users(num_devices=32, max_model_len=32768)
+
+
+def test_get_max_tokens_all_users_requires_l1_small(monkeypatch):
+    """Attention P0: the plugin opens the mesh with the "tt" config's l1_small_size (none when absent), and the CCL
+    semaphores need >= 32 KiB of L1_SMALL. A server started without it fails in init_device, before the weights load,
+    with the fix in the message."""
+    from vllm.config import set_current_vllm_config
+
+    monkeypatch.delenv("MOTIF3_KV_POOL_TOKENS", raising=False)
+
+    def fake(tt):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=64),
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(num_hidden_layers=53)),
+            additional_config=tt,
+        )
+
+    f = gv.MotifForCausalLM.get_max_tokens_all_users
+    for bad in ({}, {"tt": {"trace_mode": "decode_only"}}, {"tt": {"l1_small_size": 16384}}):
+        with set_current_vllm_config(fake(bad)), pytest.raises(ValueError, match="l1_small_size") as ei:
+            f(num_devices=32, max_model_len=32768, max_num_seqs=32)
+        assert "32768" in str(ei.value)
+    with set_current_vllm_config(fake({"tt": dict(api.SERVING_TT_CONFIG)})):
+        assert f(num_devices=32, max_model_len=32768, max_num_seqs=32) == 262144 + gv.NULL_BLOCK_RESERVE_TOKENS
+    with set_current_vllm_config(fake({"tt": "not a dict"})), pytest.raises(ValueError, match="JSON object"):
+        f(num_devices=32, max_model_len=32768)
 
 
 def test_kv_cache_bytes_per_chip():
@@ -795,7 +869,8 @@ def fake_generator_class(monkeypatch):
     module.FakeMotifGenerator = FakeMotifGenerator
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setenv("MOTIF3_GENERATOR_CLASS", f"{module.__name__}:FakeMotifGenerator")
-    for var in ("MOTIF3_NUM_LAYERS", "MOTIF3_KV_CACHE_DTYPE", "TT_CACHE_PATH", "TT_MODEL_WEIGHTS_REVISION"):
+    for var in ("MOTIF3_NUM_LAYERS", "MOTIF3_KV_CACHE_DTYPE", "TT_CACHE_PATH", "MOTIF3_TT_CACHE_PATH",
+                "TT_MODEL_WEIGHTS_REVISION"):  # fmt: skip
         monkeypatch.delenv(var, raising=False)
     return FakeMotifGenerator
 
@@ -808,8 +883,11 @@ def motif_hf_config():
 
 
 def test_initialize_vllm_model_builds_the_generator(fake_generator_class, motif_hf_config, monkeypatch):
-    monkeypatch.setenv("HF_MODEL", "/snapshots/motif-3")
+    snapshot = str(_motif_dir())
+    monkeypatch.setenv("HF_MODEL", snapshot)
     monkeypatch.setenv("TT_CACHE_PATH", "/tt_cache/motif3")
+    monkeypatch.delenv("MOTIF3_WEIGHTS_DIR", raising=False)
+    monkeypatch.setattr(gv, "_SEEN_VLLM_BLOCK_SIZE", None)  # no init_device ran in this process for this test
     mesh = SimpleNamespace(shape=(4, 8))
     model = gv.MotifForCausalLM.initialize_vllm_model(
         motif_hf_config, mesh, max_batch_size=32, max_seq_len=32768, tt_data_parallel=1, optimizations=None
@@ -819,8 +897,15 @@ def test_initialize_vllm_model_builds_the_generator(fake_generator_class, motif_
     assert isinstance(gen, fake_generator_class) and gen.mesh_device is mesh and gen.hf_config is motif_hf_config
     s = gen.settings
     assert (s.max_batch_size, s.max_seq_len, s.num_layers, s.kv_cache_dtype) == (32, 32768, 53, "bfp8")
-    assert (s.weights_path, s.cache_path) == ("/snapshots/motif-3", "/tt_cache/motif3")
+    assert (s.weights_path, s.weights_source, s.cache_path) == (snapshot, "HF_MODEL", "/tt_cache/motif3")
+    assert s.weights_are_local and s.block_size is None
     assert model.vocab_size == 220160
+    monkeypatch.setenv("HF_MODEL", "/snapshots/does-not-exist")  # a path typo must not fall through to another source
+    with pytest.raises(ValueError, match="HF_MODEL"):
+        gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+    monkeypatch.setenv("HF_MODEL", snapshot)
+    with pytest.raises(ValueError, match="multiple of 256"):  # BRIDGE-3, also before any weight is loaded
+        gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 5000)
 
     # The plugin's BH-Galaxy preset opens (8, 4); the model detects the TP axis itself.
     gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, SimpleNamespace(shape=(8, 4)), 32, 32768)
@@ -840,6 +925,122 @@ def test_initialize_vllm_model_builds_the_generator(fake_generator_class, motif_
     monkeypatch.setenv("MOTIF3_GENERATOR_CLASS", "models.demos.motif3.tt.generator_api:GeneratorSettings")
     with pytest.raises(TypeError, match="MotifGenerator"):
         gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+
+
+def test_block_size_reaches_generator_settings(fake_generator_class, motif_hf_config, monkeypatch):
+    """BRIDGE-4: vLLM's --block-size reaches GeneratorSettings, either from a current VllmConfig or from the one
+    get_max_tokens_all_users saw in init_device (initialize_vllm_model runs in load_model, with no current config).
+    The allocation hint stays authoritative: a different block size there only warns."""
+    from vllm.config import set_current_vllm_config
+
+    monkeypatch.setenv("HF_MODEL", str(_motif_dir()))
+    for var in ("MOTIF3_KV_POOL_TOKENS", "MOTIF3_KV_MAX_GB_PER_CHIP", "MOTIF3_WEIGHTS_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(gv, "_SEEN_VLLM_BLOCK_SIZE", None)
+    mesh = SimpleNamespace(shape=(4, 8))
+    fake = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=32),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(num_hidden_layers=53)),
+    )
+    with set_current_vllm_config(fake):
+        assert gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768).settings.block_size == 32
+        gv.MotifForCausalLM.get_max_tokens_all_users(num_devices=32, max_model_len=32768, max_num_seqs=32)
+    model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)  # what load_model sees
+    assert model.settings.block_size == 32
+    kv = model.allocate_kv_cache((4129, 1, 64, 576), torch.bfloat16, 53)  # hint wins (warning logged)
+    assert model.generator.alloc_args["block_size"] == 64 and kv.block_size == 64
+    with pytest.raises(ValueError, match="block-size"):
+        api.GeneratorSettings(block_size=128)  # BRIDGE-1
+
+
+def test_initialize_vllm_model_requires_an_l1_small_mesh(fake_generator_class, motif_hf_config, monkeypatch):
+    """The bridge checks the mesh the plugin really opened (whatever launcher started it) before create()."""
+    monkeypatch.setenv("HF_MODEL", str(_motif_dir()))
+    monkeypatch.delenv("MOTIF3_WEIGHTS_DIR", raising=False)
+    mesh = SimpleNamespace(shape=(4, 8))
+    assert gv._mesh_l1_small_bytes(mesh) is None  # a host fake is never queried (ttnn is not even needed)
+    for size in (0, 16384):
+        monkeypatch.setattr(gv, "_mesh_l1_small_bytes", lambda m, size=size: size)
+        with pytest.raises(ValueError, match="l1_small_size"):
+            gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+    for size in (32768, 65536, None):
+        monkeypatch.setattr(gv, "_mesh_l1_small_bytes", lambda m, size=size: size)
+        model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+        assert model.generator.mesh_device is mesh
+
+
+def test_real_generator_class_imports_device_free():
+    """GEN-7(c): the default MOTIF3_GENERATOR_CLASS module imports without a device and without other demo packages
+    (checked once the integration wave's tt/generator.py exists)."""
+    path = METAL_ROOT / "models" / "demos" / "motif3" / "tt" / "generator.py"
+    if not path.is_file():
+        pytest.skip("models/demos/motif3/tt/generator.py does not exist yet (integration wave)")
+    module, _, cls = gv.DEFAULT_GENERATOR_CLASS.partition(":")
+    probe = (
+        "import json, sys, importlib\n"
+        f"m = importlib.import_module({module!r})\n"
+        "from models.demos.motif3.tt.generator_api import MotifGenerator\n"
+        f"c = getattr(m, {cls!r})\n"
+        "mods = sorted(k for k in sys.modules if k.startswith('models.'))\n"
+        "print(json.dumps({'models': mods, 'subclass': issubclass(c, MotifGenerator), 'vllm': 'vllm' in sys.modules}))\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(METAL_ROOT))
+    res = subprocess.run([sys.executable, "-c", probe], cwd=METAL_ROOT, env=env, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr[-3000:]
+    info = json.loads(res.stdout.strip().splitlines()[-1])
+    foreign = [m for m in info["models"] if m not in ("models", "models.demos") and not m.startswith("models.demos.motif3")]
+    assert not foreign and info["subclass"] and info["vllm"] is False, info
+    for marker in ("Opening user mode device driver", "Starting devices in cluster"):
+        assert marker not in res.stderr and marker not in res.stdout
+
+
+def test_supported_block_sizes_are_the_gated_ones():
+    """BRIDGE-1: only the block sizes gates G1 / G7 validated (32, 64)."""
+    assert api.SUPPORTED_BLOCK_SIZES == (32, 64)
+    for bs in (16, 128, 48):
+        with pytest.raises(ValueError, match="block-size"):
+            gv.validate_block_size(bs)
+        with pytest.raises(ValueError, match="block-size"):
+            gv.MotifForCausalLM.get_kv_cache_spec(_fake_vllm_config(block_size=bs))
+    bridge, _ = _bridge()
+    with pytest.raises(ValueError, match="block-size"):
+        bridge.allocate_kv_cache((4129, 1, 128, 576), torch.bfloat16, 3)
+
+
+def test_weights_location_precedence(tmp_path):
+    """BRIDGE-2: MOTIF3_WEIGHTS_DIR > HF_MODEL (dir) > HF-cache snapshot of a repo-id HF_MODEL at
+    TT_MODEL_WEIGHTS_REVISION > hf_config._name_or_path; the same order MotifTTConfig uses."""
+    f = api.resolve_weights_location
+    a, b, c = (tmp_path / n for n in "abc")
+    for d in (a, b, c):
+        d.mkdir()
+    hub = tmp_path / "hub"
+    sha = "2ed2ed5cfabffa10fdabb2fc0d0288f8e6de893a"
+    snap = hub / "models--Motif-Technologies--Motif-3" / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    cfg_obj = SimpleNamespace(_name_or_path=str(c))
+    base = {"HF_HUB_CACHE": str(hub)}
+    assert f(cfg_obj, base) == api.WeightsLocation(str(c), "hf_config._name_or_path", None, True)
+    assert f(None, base) == api.WeightsLocation(None, "default", None, False)
+    assert f(cfg_obj, {**base, "HF_MODEL": str(b)}).path == str(b)
+    assert f(cfg_obj, {**base, "HF_MODEL": str(b), "MOTIF3_WEIGHTS_DIR": str(a)}).source == "MOTIF3_WEIGHTS_DIR"
+    repo = {**base, "HF_MODEL": "Motif-Technologies/Motif-3", "TT_MODEL_WEIGHTS_REVISION": sha}
+    loc = f(cfg_obj, repo)
+    assert (loc.path, loc.is_local, loc.revision) == (str(snap), True, sha) and "HF cache" in loc.source
+    assert f(cfg_obj, {**repo, "TT_MODEL_WEIGHTS_REVISION": sha[:8]}).path == str(snap)  # short hashes resolve too
+    (hub / "models--Motif-Technologies--Motif-3" / "refs").mkdir()
+    (hub / "models--Motif-Technologies--Motif-3" / "refs" / "main").write_text(sha)
+    assert f(cfg_obj, {**base, "HF_MODEL": "Motif-Technologies/Motif-3"}).path == str(snap)  # refs/main
+    missing = f(cfg_obj, {**repo, "TT_MODEL_WEIGHTS_REVISION": "0" * 40})
+    assert (missing.path, missing.is_local) == ("Motif-Technologies/Motif-3", False) and "not cached" in missing.source
+    with pytest.raises(ValueError, match="MOTIF3_WEIGHTS_DIR"):
+        f(cfg_obj, {**base, "MOTIF3_WEIGHTS_DIR": str(tmp_path / "nope")})
+    with pytest.raises(ValueError, match="HF_MODEL"):
+        f(cfg_obj, {**base, "HF_MODEL": str(tmp_path / "nope")})
+    s = api.GeneratorSettings.from_env(cfg_obj, max_batch_size=8, max_seq_len=4096, environ=repo)
+    assert (s.weights_path, s.weights_revision, s.weights_are_local) == (str(snap), sha, True)
+    assert "HF cache" in s.weights_source and s.block_size is None
 
 
 # ================================================================================================================
@@ -1155,15 +1356,17 @@ def test_vllm_serve_cli_accepts_the_motif_flags():
 
     from models.demos.motif3 import vllm_plugins as vp
 
-    tt = {"trace_mode": "decode_only", "trace_region_size": 268435456, "fabric_config": "FABRIC_2D_TORUS_XY"}
-    tt["dispatch_core_axis"] = "col"
+    tt = dict(api.SERVING_TT_CONFIG)  # the documented "tt" config, incl. the mandatory l1_small_size
+    assert tt == {"trace_mode": "decode_only", "trace_region_size": 268435456, "fabric_config": "FABRIC_2D_TORUS_XY",
+                  "dispatch_core_axis": "col", "l1_small_size": 32768}  # fmt: skip
     argv = ["--model", str(_motif_dir()), "--trust-remote-code", "--max-num-seqs", "32", "--block-size", "64"]
     argv += ["--max-model-len", "32768", "--no-enable-prefix-caching", "--additional-config", json.dumps({"tt": tt})]
     args = make_arg_parser(FlexibleArgumentParser()).parse_args(argv + vp.vllm_cli_args())
     validate_parsed_serve_args(args)
     assert (args.max_num_seqs, args.block_size, args.max_model_len) == (32, 64, 32768)
     assert args.trust_remote_code and args.enable_prefix_caching is False
-    assert args.additional_config == {"tt": tt}
+    assert args.additional_config == {"tt": tt} == api.serving_additional_config()
+    assert gv.check_tt_config(args.additional_config["tt"])["l1_small_size"] == gv.L1_SMALL_SIZE
     assert (args.reasoning_parser, args.reasoning_parser_plugin) == ("motif", vp.REASONING_PARSER_PLUGIN)
     assert (args.tool_call_parser, args.tool_parser_plugin) == ("motif", vp.TOOL_PARSER_PLUGIN)
     assert args.enable_auto_tool_choice
@@ -1288,9 +1491,11 @@ def test_vllm_offline_engine_end_to_end(fake_generator_class, monkeypatch, tmp_p
     monkeypatch.setenv("PYTHONPATH", str(METAL_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     for var in ("EXTRA_MODELS_DIR", "MOTIF3_KV_POOL_TOKENS", "MOTIF3_KV_CACHE_DTYPE"):
         monkeypatch.delenv(var, raising=False)
-    meshes = []
+    meshes, opened_with = [], []
 
-    def open_fake_mesh(*args, **kwargs):
+    def open_fake_mesh(tt_config, trace_mode, *args, **kwargs):
+        # what the real open_mesh_device would pass to ttnn.open_mesh_device
+        opened_with.append(tt_worker.device_params_from_tt_config(tt_config, trace_mode))
         meshes.append(_FakeMesh())
         return meshes[-1]
 
@@ -1307,9 +1512,11 @@ def test_vllm_offline_engine_end_to_end(fake_generator_class, monkeypatch, tmp_p
         block_size=64,
         enable_prefix_caching=False,
         seed=0,
-        additional_config={"tt": {"trace_mode": "decode_only"}},
+        additional_config={"tt": {"trace_mode": "decode_only", "l1_small_size": api.L1_SMALL_SIZE}},
     )
     try:
+        # the plugin opens the mesh with the L1_SMALL region the model's CCL semaphores need
+        assert opened_with and opened_with[0].get("l1_small_size") == api.L1_SMALL_SIZE, opened_with
         bridge = llm.llm_engine.model_executor.driver_worker.model_runner.model
         assert isinstance(bridge, gv.MotifForCausalLM)
         gen = bridge.generator
