@@ -31,17 +31,26 @@ see ``models/demos/motif3/vllm_plugins``. ``--block-size`` must be 32 or 64 (the
 ``--max-model-len`` a multiple of 256 (the last prefill bucket is ``max_model_len`` itself); both are refused in
 ``get_max_tokens_all_users``, before any weight is loaded.
 
-Chunked prefill + prefix caching + MTP speculation (``docs/features/FEATURES_DESIGN.md`` §1.1;
-:data:`FEATURE_VLLM_ARGS`), with ``MOTIF3_PREFIX_CACHING=1 MOTIF3_CHUNKED_PREFILL=1 MOTIF3_SPEC_DECODE=1`` exported in
-the API server and EngineCore alike: ``--enable-chunked-prefill --max-num-batched-tokens 8128
---long-prefill-token-threshold 8128 --enable-prefix-caching --speculative-config '{"method": "custom_class", "model":
-"vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}' --no-async-scheduling`` plus ``"tt":
-{..., "decode_interleave_prefill_steps": 1, "decode_interleave_decode_steps": 1}``. The budget and the threshold are
-``prefill_plan.recommended_budget(span cap 8192, A)`` = 8128 (A = 64; 8064 if gate G9 moves the large buckets to
-q/k 128). Honest benchmarks add ``--no-enable-prefix-caching`` (or a per-request ``cache_salt``); sampled traffic
-before the plugin's PS-1 (``SpecPlan.verify_requires_speculable_rows``) is installed, and evals that need logprobs or
-structured output, drop ``--speculative-config``. Features off (draft 1): ``MOTIF3_*=0``, or
-``--no-enable-chunked-prefill --no-enable-prefix-caching`` and no ``--speculative-config``.
+Production launch (lead decision 1): chunked prefill + prefix caching + exact device sampling, no speculation
+(``docs/features/FEATURES_DESIGN.md`` §1.1; :data:`FEATURE_VLLM_ARGS` without its ``--speculative-config`` pair), with
+the feature switches unset (all on) or ``MOTIF3_PREFIX_CACHING=1 MOTIF3_CHUNKED_PREFILL=1`` exported in the API server
+and EngineCore alike: ``--enable-chunked-prefill --max-num-batched-tokens 8064 --long-prefill-token-threshold 8064
+--enable-prefix-caching --no-async-scheduling`` plus ``"tt": {..., "decode_interleave_prefill_steps": 1,
+"decode_interleave_decode_steps": 1, "sample_on_device_mode": "decode_only"}`` (:data:`DEVICE_SAMPLING_TT_CONFIG`) and
+``OMP_WAIT_POLICY=PASSIVE``. The budget and the threshold are ``prefill_plan.recommended_budget(span cap 8192, A)`` =
+8064 (A = 128: gate G9's per-bucket sp1 q/k, lead decision F5). MTP speculation is an OPT-IN launch for
+greedy / agentic / low-concurrency serving (and the TIS greedy benchmark variant): add ``--speculative-config
+'{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}'``
+(``MOTIF3_SPEC_DECODE`` unset or 1); sampled rows of such a launch decode without speculation (the plugin's PS-1,
+``SpecPlan.verify_requires_speculable_rows``), sampled on device as well. Honest benchmarks add
+``--no-enable-prefix-caching`` (or a per-request ``cache_salt``); evals that need logprobs (N > 0) or structured output
+are served on any launch without ``--speculative-config`` (those steps sample on the host).
+
+Rollback (FEATURES_REVIEW F2 / F6(d)): ``MOTIF3_*=0`` (or ``--no-enable-chunked-prefill --no-enable-prefix-caching``,
+no ``--speculative-config``, no ``sample_on_device_mode``) turns the features off, but it is NOT draft 1: the span cap
+8192 (design D8) still splits every prompt longer than 8192 tokens into sp0 + sp1 chunks inside the generator (other
+numerics, other TTFT). Draft-1 behaviour needs the rollback PAIR ``MOTIF3_*=0`` + ``MOTIF3_PREFILL_MAX_BUCKET=32768``
+(and ``MOTIF3_DEVICE_SAMPLING=0`` or no ``sample_on_device_mode`` for draft 1's host sampling).
 
 L1_SMALL (attention P0, ``generator_api.L1_SMALL_SIZE``): the plugin opens the mesh with the ``"l1_small_size"`` of the
 ``"tt"`` config (``vllm_tt_plugin/worker.py`` ``device_params_from_tt_config``) and with no L1_SMALL region when the key
@@ -57,11 +66,14 @@ order ``MotifTTConfig`` uses); the resolved path and the rule that matched are l
 What the plugin calls, and what this class does
 ------------------------------------------------
 * ``model_capabilities`` (class level, read before any instance exists, :func:`model_capabilities_from_env`): no
-  device sampling, no async decode, ``supports_device_penalties: False`` explicitly (the plugin's default for that key
-  is True); ``supports_prefix_caching`` / ``supports_chunked_prefill`` / ``supports_spec_decode`` follow the feature
-  switches ``MOTIF3_PREFIX_CACHING`` / ``MOTIF3_CHUNKED_PREFILL`` / ``MOTIF3_SPEC_DECODE`` (they only *allow* a
-  feature; vLLM's flags enable it). Speculation declares the model-owned drafter: ``spec_requirements``
-  ``(device_propose, hidden_feed)`` with ``spec_hidden_handoff`` ``(on_device,)``.
+  async decode, ``supports_device_penalties: False`` explicitly (the plugin's default for that key is True);
+  ``supports_sample_on_device`` follows ``MOTIF3_DEVICE_SAMPLING`` (default on; NO ``max_device_top_k``: the sampler
+  is exact for every top-k / top-p, flagging what it cannot certify for the exact host fallback, and ``top_p = 1``
+  lanes without top-k take its full-vocab Gumbel path); ``supports_prefix_caching`` / ``supports_chunked_prefill`` /
+  ``supports_spec_decode`` follow the feature switches ``MOTIF3_PREFIX_CACHING`` / ``MOTIF3_CHUNKED_PREFILL`` /
+  ``MOTIF3_SPEC_DECODE`` (they only *allow* a feature; vLLM's flags -- ``sample_on_device_mode`` for sampling --
+  enable it). Speculation declares the model-owned drafter: ``spec_requirements`` ``(device_propose, hidden_feed)``
+  with ``spec_hidden_handoff`` ``(on_device,)``.
 * ``spec_plan`` (classmethod, config time, never raises): K = 1, packed verify (``lanes_per_request=2``), the MTP
   latent cache as ``extra_bytes_per_token`` (612 B per chip in bfp8), ``supports_narrow_decode=True`` and, when the
   installed plugin has it, ``verify_requires_speculable_rows=True`` (PS-1). Refuses K < 1, ``max_num_seqs > 32``,
@@ -79,9 +91,13 @@ What the plugin calls, and what this class does
   vLLM leaves past each request's blocks in reused block-table rows (a bucket-padded prefill would otherwise overwrite
   another live request's KV), and makes ONE ``generator.prefill_forward_batch`` call with every row of the step (new,
   resumed after a prefix hit, or a chunk continuation: ``PrefillRequest.start`` = vLLM ``num_computed_tokens``).
-* ``decode_forward``: an ordinary step returns host logits ``[B, 1, vocab]`` (host sampling); in a speculating launch
-  it runs ``generator.decode_forward_spec`` and a verify step (``[B, 2]`` block + ``num_valid_drafts`` /
-  ``accepted_counts`` / ``spec_mode="argmax_ids"``) returns ``VerifyOutput(argmax_ids [B, 2])``.
+* ``decode_forward``: a host-sampled step returns host logits ``[B, 1, vocab]``; a device-sampled step (the plugin
+  sends ``sampling_params``: ``sample_on_device_mode`` ``"decode_only"`` and no host-only request in the step) returns
+  the tokens ``int32 [B, 1]`` (plus the raw logprobs ``float32 [B]`` when a row asked for ``logprobs=0``) from
+  ``generator.decode_forward_sampled`` (``docs/sampling/DEVICE_SAMPLER.md``); in a speculating launch every step runs
+  ``generator.decode_forward_spec`` (ordinary device-sampled steps with ``sampling``) and a verify step (``[B, 2]``
+  block + ``num_valid_drafts`` / ``accepted_counts`` / ``spec_mode="argmax_ids"``) returns ``VerifyOutput(argmax_ids
+  [B, 2])`` whether or not it carries ``sampling_params`` (PS-1 keeps sampled rows out of verify steps).
 * ``propose_draft_tokens``: host only; the drafts are the MTP predictions the last decode step already computed.
 * ``warmup_model_prefill`` / ``warmup_model_decode`` / ``release_request`` / ``release_persistent_capture``.
 
@@ -186,7 +202,19 @@ SPECULATIVE_CONFIG = {"method": SPEC_METHOD, "model": MODEL_OWNED_DRAFTER, "num_
 MTP_WEIGHT_PREFIX = "model.mtp_layers.0."
 CHECKPOINT_INDEX = "model.safetensors.index.json"
 
-# The vLLM flags of the production launch (features design §1.1 with the lead decision: threshold = budget).
+# Exact device sampling (docs/sampling/DEVICE_SAMPLER.md; lead decision 1: on in the production launch). The class
+# switch only allows it; the server enables it with "sample_on_device_mode": "decode_only" in --additional-config "tt"
+# (prefill steps keep host sampling: one row, a few ms against a TTFT >= 0.7 s).
+DEVICE_SAMPLING_SWITCH = "MOTIF3_DEVICE_SAMPLING"
+SAMPLE_ON_DEVICE_MODE = "decode_only"
+DEVICE_SAMPLING_TT_CONFIG = {"sample_on_device_mode": SAMPLE_ON_DEVICE_MODE}
+# The bridge logs the device sampler's counters every this many decode steps of a device-sampling launch (device-sampled
+# or host-routed) and at shutdown; MOTIF3_SAMPLING_LOG_EVERY overrides it (0 = at shutdown only).
+SAMPLING_LOG_EVERY = 2000
+
+# The vLLM flags of the features launch WITH the opt-in MTP speculation (features design §1.1 with the lead decision:
+# threshold = budget). The production default launch (lead decision 1) is these flags WITHOUT the
+# "--speculative-config" pair, plus DEVICE_SAMPLING_TT_CONFIG in --additional-config "tt" (module docstring).
 FEATURE_VLLM_ARGS = (
     "--enable-chunked-prefill",
     "--max-num-batched-tokens",
@@ -205,6 +233,10 @@ FEATURE_VLLM_ARGS = (
 # reach GeneratorSettings. ``allocate_kv_cache``'s hint stays authoritative for the block size.
 _SEEN_VLLM_BLOCK_SIZE: Optional[int] = None
 _SEEN_VLLM_SERVING: Optional[Dict[str, Any]] = None
+# vLLM's --seed (``model_config.seed``), seen there as well: it seeds the device sampler's host RNG behind unseeded
+# lanes, so a server run repeats its unseeded draws for the same sequence of steps, as vLLM's host sampler does with its
+# global generator. None = not seen (direct calls, tests): OS entropy.
+_SEEN_VLLM_SEED: Optional[int] = None
 
 # Keyword arguments the plugin can send that this adapter cannot honour. The speculative ones
 # (num_valid_drafts / accepted_counts / spec_mode) are explicit parameters of decode_forward: honoured on a
@@ -212,8 +244,8 @@ _SEEN_VLLM_SERVING: Optional[Dict[str, Any]] = None
 _UNSUPPORTED_KWARGS = {
     "page_tables_per_layer": "multi-group (hybrid) KV cache configs; Motif-3 declares one uniform MLA spec",
     "rope_deltas_all_users": "M-RoPE",
-    "prompt_tokens": "device-side penalties (no device sampling in draft 1)",
-    "output_tokens": "device-side penalties (no device sampling in draft 1)",
+    "prompt_tokens": "device-side penalties (supports_device_penalties is False: penalized steps sample on the host)",
+    "output_tokens": "device-side penalties (supports_device_penalties is False: penalized steps sample on the host)",
 }
 
 
@@ -227,18 +259,42 @@ def feature_switches(environ: Optional[Mapping[str, str]] = None) -> Dict[str, b
     return {name: feature_switch_from_env(name, env, default=FEATURE_SWITCH_DEFAULT) for name in FEATURE_SWITCHES}
 
 
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def device_sampling_switch(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """``MOTIF3_DEVICE_SAMPLING`` (``1/true/yes/on`` or ``0/false/no/off``; unset = on, lead decision 1): whether the
+    class declares ``supports_sample_on_device``. It only *allows* device sampling; the server enables it with
+    ``"sample_on_device_mode": "decode_only"`` (a mode without the capability makes the plugin refuse to start). A typo
+    raises instead of silently turning it off."""
+    env = os.environ if environ is None else environ
+    raw = env.get(DEVICE_SAMPLING_SWITCH)
+    if raw is None or raw.strip() == "":
+        return True
+    v = raw.strip().lower()
+    if v in _TRUE_VALUES:
+        return True
+    if v in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{DEVICE_SAMPLING_SWITCH} must be one of {_TRUE_VALUES + _FALSE_VALUES}, got {raw!r}")
+
+
 def model_capabilities_from_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """The class-level ``model_capabilities`` for this environment (the API server and EngineCore must see the same
     switches: the plugin reads the dict from the class in both, before any instance exists, ``platform.py:1817-1822``).
 
     The switches only *allow* a feature; vLLM's own flags decide (vLLM 0.26 enables chunked prefill and prefix caching
-    by default for a model that allows them). With every switch off this is exactly the draft-1 dict."""
+    by default for a model that allows them; device sampling needs ``sample_on_device_mode``). With every switch off
+    (``MOTIF3_*=0``, ``MOTIF3_DEVICE_SAMPLING=0``) this is exactly the draft-1 dict. Device sampling declares no
+    ``max_device_top_k`` (the sampler is exact for every top-k / top-p; a declared bound would only send requests to
+    the host) and keeps ``supports_device_penalties`` False (penalized steps sample on the host)."""
     sw = feature_switches(environ)
     caps: Dict[str, Any] = {
         "supports_prefix_caching": sw["MOTIF3_PREFIX_CACHING"],
         "supports_chunked_prefill": sw["MOTIF3_CHUNKED_PREFILL"],
         "supports_async_decode": False,
-        "supports_sample_on_device": False,  # v1: True + "max_device_top_k": 32
+        "supports_sample_on_device": device_sampling_switch(environ),
         "supports_device_penalties": False,  # the plugin's default for an absent key is True
         "supports_spec_decode": sw["MOTIF3_SPEC_DECODE"],
         "supports_async_spec_decode": False,
@@ -443,6 +499,18 @@ def check_serving_config(
     )
 
 
+def check_sample_on_device_mode(mode: Any) -> Optional[str]:
+    """The ``"sample_on_device_mode"`` of the ``"tt"`` config: None (host sampling) or ``"decode_only"`` (exact device
+    sampling of decode steps). ``"all"`` is refused (the bridge samples prefill rows on the host: their single row
+    costs a few ms against a TTFT >= 0.7 s, and an intermediate chunk must not draw at all), before any weight loads."""
+    if mode is None or mode == SAMPLE_ON_DEVICE_MODE:
+        return mode
+    raise ValueError(
+        f"Motif-3 samples decode steps on device and prefill rows on the host: sample_on_device_mode must be "
+        f"{SAMPLE_ON_DEVICE_MODE!r} (or unset for host sampling), got {mode!r}"
+    )
+
+
 def _inherits_default(impl: type, name: str) -> bool:
     """``impl`` does not override ``MotifGenerator.<name>`` (whose default says "unsupported")."""
     return inspect.getattr_static(impl, name, None) is MotifGenerator.__dict__[name]
@@ -508,6 +576,22 @@ def _vllm_serving_config() -> Optional[Dict[str, Any]]:
     if serving is not None:
         return serving
     return None if _SEEN_VLLM_SERVING is None else dict(_SEEN_VLLM_SERVING)
+
+
+def _seed_of(vllm_config: Any) -> Optional[int]:
+    """``vllm_config.model_config.seed`` as an int, or None (no config, no seed)."""
+    seed = getattr(getattr(vllm_config, "model_config", None), "seed", None)
+    try:
+        return None if seed is None else int(seed)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _vllm_seed() -> Optional[int]:
+    """vLLM's ``--seed`` for this process: the current VllmConfig's, else the one ``get_max_tokens_all_users`` saw in
+    ``init_device``; None = unknown (the device sampler then seeds its unseeded lanes from OS entropy)."""
+    seed = _seed_of(_current_vllm_config())
+    return seed if seed is not None else _SEEN_VLLM_SEED
 
 
 def _current_vllm_config():
@@ -740,6 +824,60 @@ class SpecStats:
         return dataclasses.asdict(self)
 
 
+@dataclass
+class SamplingStats:
+    """Device-sampling counters of one bridge (logged every :data:`SAMPLING_LOG_EVERY` device steps and at shutdown,
+    next to the generator's sampler counters; read by tests)."""
+
+    device_steps: int = 0  # decode steps sampled on device (plain, or ordinary spec steps)
+    device_rows: int = 0  # ... their active rows
+    logprob_steps: int = 0  # ... that returned the raw logprobs (a row asked for logprobs=0)
+    host_steps: int = 0  # decode steps the plugin sampled on the host (no sampling_params) on a device-sampling launch
+    verify_steps_with_params: int = 0  # verify steps that carried sampling_params (the argmax path is kept)
+    nongreedy_verify_rows: int = 0  # ... their non-greedy active rows (PS-1 keeps this at 0)
+
+    def as_dict(self) -> Dict[str, int]:
+        return dataclasses.asdict(self)
+
+
+def _param_list(sampling_params: Any, name: str) -> List[Any]:
+    v = getattr(sampling_params, name, None)
+    if v is None:
+        return []
+    if isinstance(v, torch.Tensor):
+        return v.reshape(-1).tolist()
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return [v]
+
+
+def lane_sampling_lists(
+    sampling_params: Any, lanes: Sequence[int], *, num_lanes: int = NUM_LANES
+) -> Tuple[List[float], List[float], List[int], List[Optional[int]]]:
+    """The plugin's per-ROW ``TTSamplingParams`` (lists of length B: the rows of the step, padding rows included) and
+    each row's lane -> lane-ordered ``(temperature, top_p, top_k, seeds)`` lists of length ``num_lanes`` for the
+    generator's device sampler; lanes without a row get the plugin's padding defaults (greedy: temperature 0, top_p 1,
+    top_k 1, seed None). The pure-Python twin of ``tt/sampling.lane_lists_from_rows`` (the bridge must not import
+    ttnn at module import; ``test_generator_vllm_host`` checks they agree)."""
+    T, P, K, S = (_param_list(sampling_params, n) for n in ("temperature", "top_p", "top_k", "seed"))
+    rows = len(lanes)
+    if not (len(T) == len(P) == len(K) == len(S) == rows):
+        raise ValueError(
+            f"sampling_params have ({len(T)}, {len(P)}, {len(K)}, {len(S)}) entries for {rows} decode rows"
+        )
+    t, p, k, sd = [0.0] * num_lanes, [1.0] * num_lanes, [1] * num_lanes, [None] * num_lanes
+    for row, lane in enumerate(lanes):
+        t[lane], p[lane], k[lane] = float(T[row]), float(P[row]), int(K[row])
+        sd[lane] = None if S[row] is None else int(S[row])
+    return t, p, k, sd
+
+
+def wants_logprobs(sampling_params: Any) -> bool:
+    """A row of the step asked for ``logprobs=0`` (the sampled token's raw logprob; N > 0 never reaches a device
+    step): the plugin then expects ``(tokens, logprobs)``."""
+    return any(bool(e) for e in _param_list(sampling_params, "enable_log_probs"))
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The vLLM model class
 # ----------------------------------------------------------------------------------------------------------------
@@ -801,6 +939,11 @@ class MotifForCausalLM:
         self._retained: Dict[int, SpecRetained] = {}
         self._propose_calls = 0
         self.spec_stats = SpecStats()
+        # Device sampling (sample_on_device_mode "decode_only"): turned on in warmup_model_decode(can_sample_on_device)
+        self._device_sampling = False
+        self.sampling_stats = SamplingStats()
+        raw = os.environ.get("MOTIF3_SAMPLING_LOG_EVERY", "").strip()
+        self.sampling_log_every = int(raw) if raw.isdecimal() else SAMPLING_LOG_EVERY  # 0 = shutdown only
 
     # ---- vLLM model-inspection protocol (registry._ModelInfo); never executed on TT ---------------------------
     def embed_input_ids(self, input_ids):
@@ -955,7 +1098,7 @@ class MotifForCausalLM:
         (:func:`check_serving_config`: raises on prefix caching without KV-R or a foreign ``--prefix-match-unit``,
         logs performance warnings); the memory check then counts the MTP layer's cache when vLLM speculates.
         """
-        global _SEEN_VLLM_BLOCK_SIZE, _SEEN_VLLM_SERVING
+        global _SEEN_VLLM_BLOCK_SIZE, _SEEN_VLLM_SERVING, _SEEN_VLLM_SEED
         if int(tt_data_parallel) != 1:
             raise ValueError(f"Motif-3 needs tt_data_parallel=1 (one engine over the mesh), got {tt_data_parallel}")
         if int(num_devices) != REQUIRED_NUM_DEVICES:
@@ -981,9 +1124,13 @@ class MotifForCausalLM:
         num_layers = NUM_HIDDEN_LAYERS
         mtp_layers = 0
         vllm_config = _current_vllm_config()
+        seed = _seed_of(vllm_config)
+        if seed is not None:  # vLLM's --seed, for the device sampler's unseeded lanes (_enable_device_sampling)
+            _SEEN_VLLM_SEED = seed
         tt_config = _tt_config_of(vllm_config)
         if tt_config is not None:  # the plugin opened (or will open) the mesh with exactly this l1_small_size
             check_tt_config(tt_config, where="vLLM --additional-config 'tt'")
+            check_sample_on_device_mode(tt_config.get("sample_on_device_mode"))
         if vllm_config is not None and getattr(vllm_config, "cache_config", None) is not None:
             block_size = validate_block_size(vllm_config.cache_config.block_size)
             try:
@@ -1238,7 +1385,7 @@ class MotifForCausalLM:
                 hit: a block multiple; a chunk continuation: any integer). Must be 0 unless vLLM enabled chunked
                 prefill or prefix caching for this launch (``settings.resumed_prefill``).
             enable_trace: plugin ``trace_mode == "all"``; passed through (prefill is eager).
-            sampling_params: only with device sampling (never declared) -> raises if given.
+            sampling_params: only with ``sample_on_device_mode`` "all" (refused: prefill rows sample on the host).
             empty_slots: ``list[int]`` destination state slot per row (always sent outside lane mode). A chunked
                 request may get another slot (lane) for each chunk: no lane state crosses chunks.
 
@@ -1249,7 +1396,10 @@ class MotifForCausalLM:
         kv = self._check_kv(kv_cache)
         self._reject_unsupported(kwargs, "prefill_forward")
         if sampling_params is not None:
-            raise NotImplementedError("Motif-3 samples on the host; sampling_params implies device sampling")
+            raise NotImplementedError(
+                "Motif-3 samples prefill rows on the host (sample_on_device_mode 'decode_only'); sampling_params on a "
+                "prefill step means sample_on_device_mode 'all', which is not supported"
+            )
         ends = np.asarray(prompt_lens, dtype=np.int64).reshape(-1)
         rows = int(ends.shape[0])
         if rows < 1:
@@ -1340,19 +1490,26 @@ class MotifForCausalLM:
             kv_cache: the ``MotifKVCache``.
             enable_trace: plugin ``trace_mode in ("all", "decode_only")``.
             read_from_device: ignored; the result is always a host tensor (the plugin then skips its read hooks).
-            sampling_params: device sampling only -> raises if given.
+            sampling_params: ``TTSamplingParams`` of the step's rows (lists of length B, padding rows greedy) when the
+                plugin samples this step on device (``sample_on_device_mode`` "decode_only" and no host-only request
+                in the step): the step is sampled by the generator's exact device sampler. On a verify step they are
+                ignored (argmax ids; PS-1 keeps sampled rows out of verify steps: a non-greedy row is counted and
+                logged).
             slot_remap: ``torch.int32 [max_num_seqs]`` or None: row ``i`` reads state slot ``slot_remap[i]``. Applied
                 to the lane map exactly once, after the generator accepted the step.
             reload_inputs / reload_page_table / reload_sampling_params / reset_sampling_state: contract-v1 commands.
-                Without async decode the plugin always sends ``reload_inputs=True`` and False for the rest; there is
-                no device sampler state to reload or reset.
+                Without async decode the plugin always sends ``reload_inputs=True``. The device sampler needs no
+                reload or reset: it compares the lane parameters every step (a device write only on change) and its
+                RNG has no hidden state (counters derived from (seed, position) every step).
             num_valid_drafts / accepted_counts: ``torch.int32 [B]``, a verify step only (``SPEC_DECODE_CONTRACT.md``
                 §4a; refused on a launch without speculation). ``accepted_counts`` is informational: Motif's
                 speculative state is the retained ids (``propose_draft_tokens`` receives the counts itself).
             spec_mode: ``"argmax_ids"`` on a verify step.
 
         Returns:
-            Host logits ``[B, 1, vocab]`` in row order (rows of padding are don't-care); a verify step returns
+            Host logits ``[B, 1, vocab]`` in row order (rows of padding are don't-care); a device-sampled step returns
+            the sampled tokens ``int32 [B, 1]``, or ``(tokens, logprobs float32 [B])`` when a row asked for
+            ``logprobs=0`` (vLLM's raw logprob of the sampled token); a verify step returns
             ``VerifyOutput(spec_mode="argmax_ids", argmax_ids=int32 [B, 2], hidden=None)``: column 0 = the target's
             choice after the row's last committed token, column 1 = its choice after the draft (``-1`` on rows without
             one). In a speculating launch every step runs ``generator.decode_forward_spec`` (one decode trace) and the
@@ -1373,8 +1530,6 @@ class MotifForCausalLM:
                 f"decode_forward: a verify step carries num_valid_drafts, accepted_counts and spec_mode together; "
                 f"missing {missing}"
             )
-        if sampling_params is not None:
-            raise NotImplementedError("Motif-3 samples on the host; sampling_params implies device sampling")
         if not reload_inputs:
             raise NotImplementedError(
                 "MotifForCausalLM is a partial decode-reload v1 adapter: every decode must reload its inputs "
@@ -1382,10 +1537,12 @@ class MotifForCausalLM:
             )
         if reload_page_table:
             raise ValueError("reload_page_table is only legal with reload_inputs=False (plugin contract)")
+        if sampling_params is not None:
+            self._require_device_sampling()
         if is_verify:
             return self._decode_verify(
                 kv, tokens, start_pos, page_table, slot_remap, num_valid_drafts, accepted_counts, spec_mode,
-                bool(enable_trace),
+                bool(enable_trace), sampling_params,
             )  # fmt: skip
         tok = torch.as_tensor(tokens)
         if tok.ndim == 2:
@@ -1415,31 +1572,126 @@ class MotifForCausalLM:
         lane_pt[lane_idx] = pt
         batch = DecodeBatch(tokens=lane_tokens, positions=lane_pos, page_table=lane_pt)
         retained: Dict[int, SpecRetained] = {}
+        sampling = None if sampling_params is None else lane_sampling_lists(sampling_params, lanes)
+        sample = logits = None
         if self._spec:
+            spec_kw = {} if sampling is None else {"sampling": sampling}
             result = self.generator.decode_forward_spec(
                 SpecDecodeBatch.from_decode_batch(batch),
                 kv_cache=kv.device_cache,
                 enable_trace=bool(enable_trace),
-                want_logits=True,
+                want_logits=sampling is None,
+                **spec_kw,
             )
             check_spec_result(
-                "MotifGenerator.decode_forward_spec", result, want_logits=True, vocab_size=self.vocab_size
+                "MotifGenerator.decode_forward_spec", result, want_logits=sampling is None, vocab_size=self.vocab_size
             )
             retained = self._spec_retained(result, lanes, pos.tolist(), active.tolist(), [False] * rows)
-            logits = result.logits
+            if sampling is None:
+                logits = result.logits
+            else:
+                sample = getattr(result, "sample", None)
+        elif sampling is not None:
+            sample = self.generator.decode_forward_sampled(
+                batch, sampling, kv_cache=kv.device_cache, enable_trace=bool(enable_trace)
+            )
         else:
             logits = self.generator.decode_forward(batch, kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
             check_logits("MotifGenerator.decode_forward", logits, (NUM_LANES, self.vocab_size))
+        if sampling is not None:
+            tokens_out = self._sampled_tokens(sample, lane_idx, active)
         # Accepted: commit the slot move exactly once (the plugin settles its own map right after we return).
         self._lanes.commit(slot_remap)
         if self._spec:
             self._retained.update(retained)
             self.spec_stats.ordinary_steps += 1
+        if sampling is not None:
+            return self._sampled_output(sample, tokens_out, lane_idx, active, sampling_params)
+        if self._device_sampling:
+            self.sampling_stats.host_steps += 1
+            self._maybe_log_sampling()
         if lanes == list(range(rows)):
             out = logits[:rows]
         else:
             out = logits.index_select(0, lane_idx)
         return out.unsqueeze(1)
+
+    # ---- device sampling ----------------------------------------------------------------------------------------
+    def _require_device_sampling(self) -> None:
+        """A step carries ``sampling_params``: the device sampler must be on (``warmup_model_decode`` turns it on
+        with ``can_sample_on_device``). Without warmup (``enable_model_warmup`` false) it is turned on lazily here,
+        before any decode trace exists."""
+        if self._device_sampling:
+            return
+        if not self.model_capabilities.get("supports_sample_on_device"):
+            raise NotImplementedError(
+                f"decode_forward got sampling_params, but {DEVICE_SAMPLING_SWITCH}=0 (supports_sample_on_device is "
+                f"False): unset sample_on_device_mode"
+            )
+        self._enable_device_sampling()
+
+    def _enable_device_sampling(self) -> None:
+        if self._device_sampling:
+            return
+        if not getattr(self.generator, "supports_device_sampling", False):
+            raise NotImplementedError(
+                f"sample_on_device_mode={SAMPLE_ON_DEVICE_MODE!r}, but the generator {type(self.generator).__name__} "
+                f"has no device sampler (enable_device_sampling / decode_forward_sampled): unset sample_on_device_mode "
+                f"or set {DEVICE_SAMPLING_SWITCH}=0"
+            )
+        seed = _vllm_seed()
+        self.generator.enable_device_sampling(**({} if seed is None else {"rng_seed": seed}))
+        self._device_sampling = True
+        logger.info(
+            "Motif-3 device sampling: on (sample_on_device_mode {}): exact top-k / top-p / temperature, full-vocab "
+            "Gumbel-max for top_p = 1 without top-k, host fallback of uncertified lanes; unseeded lanes from {}; "
+            "logged every {} device steps",
+            SAMPLE_ON_DEVICE_MODE,
+            "OS entropy" if seed is None else f"vLLM's --seed {seed}",
+            self.sampling_log_every,
+        )
+
+    def _sampled_tokens(self, sample: Any, lane_idx: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        """Validate the generator's lane-order sample and return the row-order tokens ``int32 [B, 1]`` (0 on padding
+        rows), before anything is committed."""
+        toks = getattr(sample, "tokens", None)
+        if not isinstance(toks, torch.Tensor) or toks.reshape(-1).shape[0] != NUM_LANES:
+            raise TypeError(f"the generator's device sample must carry tokens [{NUM_LANES}], got {type(sample)}")
+        rows_t = toks.reshape(-1).index_select(0, lane_idx).to(torch.int64)
+        rows_t = torch.where(active, rows_t, torch.zeros_like(rows_t))
+        if bool(((rows_t < 0) | (rows_t >= self.vocab_size))[active].any()):
+            raise ValueError(f"device-sampled tokens outside [0, {self.vocab_size}): {rows_t[active].tolist()}")
+        return rows_t.to(torch.int32).reshape(-1, 1)
+
+    def _sampled_output(self, sample: Any, tokens: torch.Tensor, lane_idx, active, sampling_params):
+        """What the plugin reads from a device-sampled step: tokens ``[B, 1]``, plus the raw logprobs ``float32 [B]``
+        when a row asked for them; counters and the periodic log."""
+        st = self.sampling_stats
+        st.device_steps += 1
+        st.device_rows += int(active.sum())
+        out: Any = tokens
+        if wants_logprobs(sampling_params):
+            lp = sample.logprobs.reshape(-1).index_select(0, lane_idx).to(torch.float32)
+            out = (tokens, torch.where(active, lp, torch.zeros_like(lp)))
+            st.logprob_steps += 1
+        self._maybe_log_sampling()
+        return out
+
+    def _maybe_log_sampling(self) -> None:
+        """The periodic counter line: every ``sampling_log_every`` decode steps of a device-sampling launch, device-
+        sampled or host-routed (so a phase of host-only traffic shows up too)."""
+        st = self.sampling_stats
+        if self.sampling_log_every and (st.device_steps + st.host_steps) % self.sampling_log_every == 0:
+            self.log_sampling_stats()
+
+    def log_sampling_stats(self) -> None:
+        """One log line with the bridge's and the generator's device-sampling counters (host fallbacks, Gumbel lanes,
+        the sampler's flags and parameter uploads)."""
+        gen = getattr(self.generator, "sampling_stats", None)
+        logger.info(
+            "Motif-3 device sampling: {}",
+            json.dumps({**self.sampling_stats.as_dict(), **(gen() if callable(gen) else {})}, sort_keys=True),
+        )
 
     def _decode_verify(
         self,
@@ -1452,9 +1704,13 @@ class MotifForCausalLM:
         accepted_counts,
         spec_mode,
         enable_trace: bool,
+        sampling_params=None,
     ):
         """A verify step (``SPEC_DECODE_CONTRACT.md`` §4a, §6): ``[B, 1+K]`` candidate block -> ``generator.
-        decode_forward_spec(want_logits=False)`` -> ``VerifyOutput(argmax_ids [B, 1+K])``."""
+        decode_forward_spec(want_logits=False)`` -> ``VerifyOutput(argmax_ids [B, 1+K])``. ``sampling_params`` (a
+        device-sampling launch sends them on every step its routing samples on device, verify steps included) do not
+        change the argmax path: PS-1 keeps sampled rows out of verify steps, so every active row is greedy; a
+        non-greedy row is counted (``sampling_stats.nongreedy_verify_rows``) and logged once."""
         from vllm_tt_plugin.spec_decode import (
             ACCEPT_MODE_ARGMAX_IDS,
             PLACEHOLDER_TOKEN_ID,
@@ -1498,6 +1754,19 @@ class MotifForCausalLM:
             drafted.append(d)
             anchor.append(p0)
             need.append(((p1 if d else p0) // bs + 1) if p0 >= 0 else 0)
+        if sampling_params is not None:
+            temps = _param_list(sampling_params, "temperature")
+            hot = sum(1 for i in range(min(rows, len(temps))) if active[i] and float(temps[i]) >= 1e-5)
+            self.sampling_stats.verify_steps_with_params += 1
+            if hot:
+                self.sampling_stats.nongreedy_verify_rows += hot
+                if "nongreedy_verify" not in self._warned:
+                    self._warned.add("nongreedy_verify")
+                    logger.warning(
+                        "Motif-3 verify step with {} non-greedy row(s): a verify returns the target argmax ids, so "
+                        "those rows commit the argmax (the plugin's PS-1 should keep them out of verify steps)",
+                        hot,
+                    )
         pt = self._fit_page_table(page_table, kv, torch.tensor(need, dtype=torch.int64), "decode_forward (verify)")
         lanes = self._lanes.decode_lanes(rows, slot_remap)
         lane_tokens, lane_pos, lane_draft = [0] * NUM_LANES, [-1] * NUM_LANES, [-1] * NUM_LANES
@@ -1667,17 +1936,24 @@ class MotifForCausalLM:
         drafts = torch.tensor(draft_l, dtype=torch.int32).reshape(B, K)
         return DraftOutput(draft_token_ids=drafts, num_valid=torch.tensor(valid_l, dtype=torch.int32))
 
+    @staticmethod
+    def _is_host_output(tt_out) -> bool:
+        if isinstance(tt_out, torch.Tensor):
+            return True
+        return isinstance(tt_out, tuple) and all(t is None or isinstance(t, torch.Tensor) for t in tt_out)
+
     def read_decode_output(self, tt_out, async_read=False):
-        """``decode_forward`` already returns host logits; nothing is outstanding on the device."""
-        if not isinstance(tt_out, torch.Tensor):
-            raise TypeError(f"expected the host logits decode_forward returned, got {type(tt_out)}")
+        """``decode_forward`` already returns host tensors (logits, device-sampled tokens, or ``(tokens, logprobs)``);
+        nothing is outstanding on the device."""
+        if not self._is_host_output(tt_out):
+            raise TypeError(f"expected the host output decode_forward returned, got {type(tt_out)}")
         return (tt_out, []) if async_read else tt_out
 
     def process_decode_output_host(self, tt_out, is_tokens=False):
-        if is_tokens:
-            raise NotImplementedError("Motif-3 has no device sampling; decode returns logits")
-        if not isinstance(tt_out, torch.Tensor):
-            raise TypeError(f"expected host logits, got {type(tt_out)}")
+        """Host logits (``is_tokens=False``) or the device-sampled tokens / ``(tokens, logprobs)`` (``is_tokens``),
+        returned unchanged (``decode_forward`` already read them from the device)."""
+        if not self._is_host_output(tt_out):
+            raise TypeError(f"expected host {'tokens' if is_tokens else 'logits'}, got {type(tt_out)}")
         return tt_out
 
     # ---- warmup ---------------------------------------------------------------------------------------------------
@@ -1685,11 +1961,12 @@ class MotifForCausalLM:
         """Plugin phase 1 (eager) and, only with ``trace_mode="all"``, phase 2 (``model_runner.py:3727-3781``).
 
         Compiles every prefill shape (every ``(path, bucket)`` up to the span cap with resumed prefill) before any
-        decode trace exists (a prefill shape compiled after capture can corrupt the trace).
+        decode trace exists (a prefill shape compiled after capture can corrupt the trace). ``can_sample_on_device``
+        (``sample_on_device_mode`` "all") is refused: prefill rows sample on the host (``"decode_only"``).
         """
         kv = self._check_kv(kv_cache)
         if can_sample_on_device:
-            raise ValueError("Motif-3 does not sample on device (unset sample_on_device_mode)")
+            check_sample_on_device_mode("all")  # raises: prefill rows sample on the host
         self.generator.warmup_prefill(kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
         self._prefill_warmed = True
 
@@ -1699,11 +1976,13 @@ class MotifForCausalLM:
         """Eager decode warmup, then decode trace capture (``enable_trace=True``; the spec trace when speculating).
 
         ``num_blocks`` is the plugin's page-table width (``max_num_blocks_per_req``), fixed for the server's life;
-        ``max_batch_size`` is ``max_num_seqs``.
+        ``max_batch_size`` is ``max_num_seqs``. ``can_sample_on_device`` (``sample_on_device_mode`` "decode_only"):
+        the generator builds its exact device sampler before the eager warmup, so the warmup compiles it and the
+        capture puts it into the one decode trace (plain or spec).
         """
         kv = self._check_kv(kv_cache)
         if can_sample_on_device:
-            raise ValueError("Motif-3 does not sample on device (unset sample_on_device_mode)")
+            self._enable_device_sampling()
         if not 1 <= int(max_batch_size) <= self._lanes.num_slots:
             raise ValueError(f"decode warmup for {max_batch_size} rows, the bridge has {self._lanes.num_slots} slots")
         width = int(num_blocks)
@@ -1731,12 +2010,14 @@ class MotifForCausalLM:
         self.generator.release_lane(lane)
 
     def release_persistent_capture(self):
-        """Shutdown, mesh still open (``model_runner.py:392-419``): log the bridge's speculation counters and the
-        generator's own counters (``MotifGenerator.stats``: prefill calls / rows / chunks / sp1 chunks / recomputed
-        rows / MTP fills, decode and spec steps, drafts, packed drafts, cross-row partners, overflow passes), then free
-        the decode trace."""
+        """Shutdown, mesh still open (``model_runner.py:392-419``): log the bridge's speculation and device-sampling
+        counters and the generator's own counters (``MotifGenerator.stats``: prefill calls / rows / chunks / sp1
+        chunks / recomputed rows / MTP fills, decode and spec steps, drafts, packed drafts, cross-row partners, overflow
+        passes, device-sampled steps, host fallbacks), then free the decode trace (and the sampler's trace outputs)."""
         if self._spec:
             logger.info("Motif-3 speculation: {}", self.spec_stats.as_dict())
+        if self._device_sampling:
+            self.log_sampling_stats()
         stats = getattr(self.generator, "stats", None)
         if isinstance(stats, Mapping) and stats:
             logger.info("Motif-3 generator: {}", dict(stats))
@@ -1772,8 +2053,16 @@ __all__ = [
     "SpecRetained",
     "SpecStats",
     "TT_MODEL_CLASS_OVERRIDES",
+    "DEVICE_SAMPLING_SWITCH",
+    "DEVICE_SAMPLING_TT_CONFIG",
+    "SAMPLE_ON_DEVICE_MODE",
+    "SamplingStats",
+    "check_sample_on_device_mode",
     "check_serving_config",
+    "device_sampling_switch",
     "feature_switches",
+    "lane_sampling_lists",
+    "wants_logprobs",
     "kv_max_bytes_per_chip",
     "kv_pool_tokens_from_env",
     "model_capabilities_from_env",

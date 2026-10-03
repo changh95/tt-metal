@@ -91,6 +91,7 @@ _CANDIDATE_DIRS = [
 ]
 ALL_ON = {name: "1" for name in api.FEATURE_SWITCHES}
 ALL_OFF = {name: "0" for name in api.FEATURE_SWITCHES}
+DRAFT1_ENV = {**ALL_OFF, gv.DEVICE_SAMPLING_SWITCH: "0"}  # every switch off, host sampling: the draft-1 declaration
 CAPS_ON = gv.model_capabilities_from_env(ALL_ON)
 CAPS_OFF = gv.model_capabilities_from_env(ALL_OFF)
 PLACEHOLDER = -1  # vllm_tt_plugin.spec_decode.PLACEHOLDER_TOKEN_ID
@@ -113,7 +114,9 @@ def _fresh_bridge_process_state(monkeypatch):
     EngineCore) for ``initialize_vllm_model``; every test starts without one, and without the feature env knobs."""
     monkeypatch.setattr(gv, "_SEEN_VLLM_BLOCK_SIZE", None)
     monkeypatch.setattr(gv, "_SEEN_VLLM_SERVING", None)
+    monkeypatch.setattr(gv, "_SEEN_VLLM_SEED", None)
     for var in (
+        "MOTIF3_DEVICE_SAMPLING",
         "MOTIF3_KV_REPLICATED_DECODE",
         "MOTIF3_PREFILL_MAX_BUCKET",
         "MOTIF3_PACKED_PREFILL",
@@ -179,6 +182,36 @@ def greedy_continuation(prompt, n: int, vocab: int):
     return out
 
 
+def fake_device_sample(truth: int, temperature: float, top_p: float, seed, position: int, vocab: int) -> int:
+    """The fake device sampler's rule (deterministic in (seed, position) like the real one): greedy lanes (T < 1e-5)
+    draw the model's token; a seeded sampled lane draws a token derived from (truth, seed, position, full vocab or
+    not); an unseeded one any token (its draws are not checked)."""
+    if temperature < 1e-5:
+        return int(truth)
+    if seed is None:
+        return 100 + random.randrange(vocab - 100)
+    h = (int(seed) * 31 + int(position) * 7 + (1000 if top_p >= 1.0 else 0)) % (vocab - 100)
+    return 100 + ((int(truth) - 100 + 1 + h) % (vocab - 100))
+
+
+def fake_lane_logprob(lane: int) -> float:
+    """The fake device logprob of a lane's token: encodes the lane, so a row -> lane mix-up is visible."""
+    return -(0.25 + 0.01 * int(lane))
+
+
+@dataclasses.dataclass
+class FakeSample:
+    """What ``MotifGenerator.decode_forward_sampled`` returns (the fields the bridge reads): lane order."""
+
+    tokens: torch.Tensor
+    logprobs: torch.Tensor
+
+
+@dataclasses.dataclass(frozen=True)
+class FakeSampledSpecResult(api.SpecDecodeResult):
+    sample: object = None
+
+
 class FakeMotifGenerator(api.MotifGenerator):
     """Emulates what matters to the bridge, draft 1 and the features:
 
@@ -223,6 +256,11 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.released_lanes = []
         self.traces_released = 0
         self.fail_next_decode = False
+        # device sampling (the real generator's enable_device_sampling / decode_forward_sampled contract)
+        self.device_sampling = False
+        self.sampler_kwargs = None  # what the bridge passed to enable_device_sampling (rng_seed = vLLM's --seed)
+        self.sampled_steps = []  # (active lanes, lane-ordered sampling lists, spec?) of every device-sampled step
+        self.host_steps = 0  # decode steps that returned logits (host sampling)
 
     @classmethod
     def create(cls, *, hf_config, mesh_device, settings):
@@ -251,6 +289,41 @@ class FakeMotifGenerator(api.MotifGenerator):
     @property
     def supports_spec_decode(self) -> bool:
         return True
+
+    supports_device_sampling = True
+
+    def enable_device_sampling(self, **kw):
+        assert not any(w[0] == "decode" and w[1] for w in self.warmups), "the sampler must exist before the capture"
+        assert not any(w[0] == "decode" for w in self.warmups), "and before the eager decode warmup that compiles it"
+        self.device_sampling = True
+        self.sampler_kwargs = dict(kw)
+        self.warmups.append(("sampler", None, None))
+
+    def _sample_lanes(self, truths, positions, sampling):
+        T, P, K, S = sampling
+        assert len(T) == len(P) == len(K) == len(S) == api.NUM_LANES
+        toks = torch.zeros(api.NUM_LANES, dtype=torch.int64)
+        for lane, truth in truths.items():
+            toks[lane] = fake_device_sample(truth, T[lane], P[lane], S[lane], positions[lane], self._vocab)
+        lps = torch.tensor([fake_lane_logprob(l) for l in range(api.NUM_LANES)], dtype=torch.float32)
+        return FakeSample(tokens=toks, logprobs=lps)
+
+    def decode_forward_sampled(self, batch, sampling, *, kv_cache, enable_trace):
+        assert self.device_sampling, "decode_forward_sampled before enable_device_sampling"
+        assert kv_cache is self.handle and isinstance(batch, api.DecodeBatch)
+        assert not self.settings.spec_decode, "a speculating launch samples through decode_forward_spec(sampling=)"
+        self._check_lane_inputs(batch)
+        lanes = torch.nonzero(batch.active).reshape(-1).tolist()
+        for lane in lanes:
+            self._write(lane, batch.page_table[lane], int(batch.positions[lane]), int(batch.tokens[lane]))
+        G = api.LANES_PER_GROUP
+        truths = {
+            lane: next_token(self._read(lane // G, batch.page_table[lane], int(batch.positions[lane])), self._vocab)
+            for lane in lanes
+        }
+        self.decode_steps.append((lanes, enable_trace))
+        self.sampled_steps.append((lanes, sampling, False))
+        return self._sample_lanes(truths, batch.positions.tolist(), sampling)
 
     def allocate_kv_cache(self, *, num_blocks, block_size, num_layers):
         assert num_layers == self.num_layers
@@ -368,12 +441,16 @@ class FakeMotifGenerator(api.MotifGenerator):
             seq = self._read(lane // api.LANES_PER_GROUP, batch.page_table[lane], int(batch.positions[lane]))
             out[lane] = one_hot(next_token(seq, self._vocab), self._vocab)
         self.decode_steps.append((lanes, enable_trace))
+        self.host_steps += 1
         return out
 
-    def decode_forward_spec(self, batch, *, kv_cache, enable_trace, want_logits):
+    def decode_forward_spec(self, batch, *, kv_cache, enable_trace, want_logits, sampling=None):
         assert kv_cache is self.handle
         assert isinstance(batch, api.SpecDecodeBatch)
         assert self.settings.spec_decode, "decode_forward_spec on a launch without speculation"
+        if sampling is not None:
+            assert self.device_sampling, "sampling before enable_device_sampling"
+            assert not batch.is_verify and not want_logits, "device sampling on a verify / logits step"
         if self.fail_next_decode:
             self.fail_next_decode = False
             raise RuntimeError("injected decode failure")
@@ -426,9 +503,15 @@ class FakeMotifGenerator(api.MotifGenerator):
                 overflow=list(overflow),
                 want_logits=want_logits,
                 trace=enable_trace,
+                sampled=sampling is not None,
             )
         )
-        return api.SpecDecodeResult(logits=logits, argmax=argmax, mtp_argmax=mtp)
+        if sampling is None:
+            self.host_steps += int(bool(want_logits))
+            return api.SpecDecodeResult(logits=logits, argmax=argmax, mtp_argmax=mtp)
+        self.sampled_steps.append((owners, sampling, True))
+        sample = self._sample_lanes({o: int(argmax[o, 0]) for o in owners}, batch.positions.tolist(), sampling)
+        return FakeSampledSpecResult(logits=None, argmax=argmax, mtp_argmax=mtp, sample=sample)
 
     def warmup_prefill(self, *, kv_cache, enable_trace):
         assert kv_cache is self.handle
@@ -500,7 +583,8 @@ class PluginDriver:
     ``decode_forward`` -> ``accept_greedy_drafts`` -> commit -> ``propose_draft_tokens`` -> ``_publish_draft``).
     """
 
-    def __init__(self, bridge, kv, *, num_slots, block_size, num_blocks, width, vocab, stale_tails=True, ps1=False):
+    def __init__(self, bridge, kv, *, num_slots, block_size, num_blocks, width, vocab, stale_tails=True, ps1=False,
+                 device=False):  # fmt: skip
         from vllm_tt_plugin.model_runner import TTModelRunner
 
         self.R = TTModelRunner
@@ -533,12 +617,61 @@ class PluginDriver:
         self.ps1 = ps1  # SpecPlan.verify_requires_speculable_rows
         self.stats = collections.Counter()
         self.offers = []  # drafts offered per propose call
+        # Device sampling (sample_on_device_mode "decode_only"): decode steps carry the plugin's TTSamplingParams
+        self.device = device
+        self.params = {}  # request -> (temperature, top_p, top_k, seed, logprobs) as the plugin normalises them
 
-    def add(self, rid, prompt, sampled=False):
+    def add(self, rid, prompt, sampled=False, temperature=None, top_p=1.0, top_k=None, seed=None, logprobs=False):
         self.seqs[rid] = list(prompt)
         self.blocks[rid] = []
-        if sampled:
+        t = (1.0 if sampled else 0.0) if temperature is None else float(temperature)
+        if t > 0:
             self.sampled.add(rid)
+        k = self.vocab if top_k is None or not 0 < int(top_k) < self.vocab else int(top_k)  # input_batch.py rule
+        self.params[rid] = (t, 0.0 if k == 1 else float(top_p), k, seed, bool(logprobs))
+
+    def _tt_sampling_params(self, rows):
+        """The ``TTSamplingParams`` ``async_decode.submit_decode`` sends on a device-sampled step: Python lists of the
+        B rows, padding rows with the plugin's defaults (greedy, top_k 1, seed None, no logprobs)."""
+        from vllm_tt_plugin.model_input import TTSamplingParams
+
+        B = self.num_slots
+        T, P, K, S, N = [0.0] * B, [1.0] * B, [1] * B, [None] * B, [-2] * B
+        for i, r in enumerate(rows):
+            T[i], P[i], K[i], S[i], lp = self.params[r]
+            N[i] = 0 if lp else -2
+        return TTSamplingParams(
+            temperature=T, top_k=K, top_p=P, presence_penalty=[0.0] * B, frequency_penalty=[0.0] * B,
+            repetition_penalty=[1.0] * B, seed=S, num_logprobs=N, enable_log_probs=[n >= 0 for n in N],
+        )  # fmt: skip
+
+    def _take_sampled(self, rows, out):
+        """Check a device-sampled step's output (the plugin reads tokens ``[B, 1]`` and, with logprobs, ``(tokens,
+        logprobs [B])``) against the fake device sampler; return the committed tokens."""
+        want_lp = any(self.params[r][4] for r in rows)
+        if want_lp:
+            assert isinstance(out, tuple) and len(out) == 2, type(out)
+            toks, lps = out
+            assert lps.dtype == torch.float32 and tuple(lps.shape) == (self.num_slots,)
+        else:
+            toks, lps = out, None
+        assert torch.is_tensor(toks) and toks.dtype == torch.int32 and tuple(toks.shape) == (self.num_slots, 1)
+        got_all = []
+        for i, r in enumerate(rows):
+            t, p, k, sd, lp = self.params[r]
+            truth = next_token(self.seqs[r], self.vocab)
+            got = int(toks[i, 0])
+            assert 0 <= got < self.vocab
+            if t < 1e-5:
+                assert got == truth, f"request {r}: greedy device token {got}, ground truth {truth}"
+            elif sd is not None:
+                want = fake_device_sample(truth, t, p, sd, len(self.seqs[r]) - 1, self.vocab)
+                assert got == want, f"request {r}: device-sampled {got}, the fake sampler says {want}"
+            if lps is not None:
+                assert float(lps[i]) == pytest.approx(fake_lane_logprob(self.lane_of[r])), (r, float(lps[i]))
+            got_all.append(got)
+        self.stats["device_steps"] += 1
+        return got_all
 
     def _grow(self, rid, n_tokens):
         while len(self.blocks[rid]) < api.cdiv(n_tokens, self.bs):
@@ -662,8 +795,14 @@ class PluginDriver:
         pos = torch.full((self.num_slots,), -1, dtype=torch.int32)
         for i, r in enumerate(rows):
             tokens[i, 0], pos[i] = self.seqs[r][-1], len(self.seqs[r]) - 1
+        if self.device:
+            kwargs["sampling_params"] = self._tt_sampling_params(rows)
         out = self.bridge.decode_forward(tokens=tokens, start_pos=pos, **kwargs)
         self._after_decode(rows)
+        if self.device:
+            for r, t in zip(rows, self._take_sampled(rows, out)):
+                self.seqs[r].append(t)
+            return kwargs.get("slot_remap")
         assert tuple(out.shape) == (self.num_slots, 1, self.vocab)
         self._check_and_append(rows, out[: len(rows), -1, :])
         return kwargs.get("slot_remap")
@@ -682,6 +821,8 @@ class PluginDriver:
         held_back = self.ps1 and any(r in self.sampled for r in rows)
         verify = not held_back and _step_verifies(True, num_valid, counts, n)
         kwargs = self._decode_common(rows)
+        if self.device:  # check_perform_device_sampling ignores speculation: verify steps carry them too
+            kwargs["sampling_params"] = self._tt_sampling_params(rows)
         tok1 = torch.tensor([[self.seqs[r][-1]] for r in rows], dtype=torch.int32)
         pos1 = torch.tensor([len(self.seqs[r]) - 1 for r in rows], dtype=torch.int32)
         if verify:
@@ -719,14 +860,19 @@ class PluginDriver:
             tokens[:n], positions[:n] = tok1, pos1
             out = self.bridge.decode_forward(tokens=tokens, start_pos=positions, **kwargs)
             self._after_decode(rows)
-            assert torch.is_tensor(out) and tuple(out.shape) == (B, 1, self.vocab)
             committed = torch.full((B, 2), PLACEHOLDER, dtype=torch.int32)
             committed[:, 0] = 0
+            sampled = self._take_sampled(rows, out) if self.device else None
+            if not self.device:
+                assert torch.is_tensor(out) and tuple(out.shape) == (B, 1, self.vocab)
             for i, r in enumerate(rows):
-                want = next_token(self.seqs[r], self.vocab)
-                got = int(torch.nan_to_num(out[i, -1].float(), nan=-1e9).argmax())
-                assert got == want, f"request {r}: decode predicted {got}, ground truth {want}"
-                committed[i, 0] = self._sample(r, got)
+                if sampled is not None:
+                    committed[i, 0] = sampled[i]
+                else:
+                    want = next_token(self.seqs[r], self.vocab)
+                    got = int(torch.nan_to_num(out[i, -1].float(), nan=-1e9).argmax())
+                    assert got == want, f"request {r}: decode predicted {got}, ground truth {want}"
+                    committed[i, 0] = self._sample(r, got)
                 self.seqs[r].append(int(committed[i, 0]))
                 self.counts.pop(r, None)  # one token per row: every count is back to 1
                 self.drafts.pop(r, None)  # a held-back step drops the scheduled drafts unverified
@@ -915,13 +1061,16 @@ def test_model_capabilities_are_explicit_class_level():
     caps = gv.MotifForCausalLM.model_capabilities
     assert caps == gv.model_capabilities_from_env()  # the import-time environment (identical in every process)
     assert caps["supports_device_penalties"] is False  # plugin default for an absent key is True
-    for key in ("supports_async_decode", "supports_sample_on_device", "supports_async_spec_decode"):
+    for key in ("supports_async_decode", "supports_async_spec_decode"):
         assert caps[key] is False, key
+    # exact device sampling (lead decision 1): allowed by default, with NO max_device_top_k (a bound would only route
+    # requests to the host: the sampler is exact for every top-k / top-p, full-vocab top_p = 1 included)
+    assert caps["supports_sample_on_device"] is True
     assert caps["output_tokens_per_step"] == 1
     assert "max_device_top_k" not in caps and "fabric_config" not in caps
     assert gv.MotifForCausalLM.decode_input_update_contract == 1
-    # Every switch off is exactly the draft-1 declaration.
-    assert CAPS_OFF == {
+    # Every switch off (MOTIF3_DEVICE_SAMPLING=0 included) is exactly the draft-1 declaration.
+    assert gv.model_capabilities_from_env(DRAFT1_ENV) == {
         "supports_prefix_caching": False,
         "supports_chunked_prefill": False,
         "supports_async_decode": False,
@@ -1199,10 +1348,10 @@ def _engine_config(monkeypatch, tmp_path, caps, **engine_kwargs):
     return EngineArgs(**args).create_engine_config()
 
 
-PRODUCTION_ENGINE_ARGS = dict(
+PRODUCTION_ENGINE_ARGS = dict(  # gv.FEATURE_VLLM_ARGS: budget = threshold = 8192 - A (128, G9 per-bucket q / k)
     enable_chunked_prefill=True,
-    max_num_batched_tokens=8128,
-    long_prefill_token_threshold=8128,
+    max_num_batched_tokens=8064,
+    long_prefill_token_threshold=8064,
     enable_prefix_caching=True,
     speculative_config=dict(gv.SPECULATIVE_CONFIG),
     async_scheduling=False,
@@ -1210,8 +1359,8 @@ PRODUCTION_ENGINE_ARGS = dict(
 
 
 def test_vllm_config_keeps_the_features_the_capabilities_allow(monkeypatch, tmp_path):
-    """Features design §1.1-§1.2 on the real chain: with the switches on, vLLM's flags enable chunked prefill (8128 /
-    8128), prefix caching and the model-owned MTP drafter; the platform admits our ``spec_plan`` (K = 1, PS-1 when the
+    """Features design §1.1-§1.2 on the real chain: with the switches on, vLLM's flags enable chunked prefill (8064 /
+    8064), prefix caching and the model-owned MTP drafter; the platform admits our ``spec_plan`` (K = 1, PS-1 when the
     installed plugin has it); ``init_device``'s pool sizing captures it all and counts the MTP layer."""
     from vllm.config import set_current_vllm_config
 
@@ -1220,7 +1369,7 @@ def test_vllm_config_keeps_the_features_the_capabilities_allow(monkeypatch, tmp_
     vc = _engine_config(monkeypatch, tmp_path, CAPS_ON, **PRODUCTION_ENGINE_ARGS)
     sched, cache = vc.scheduler_config, vc.cache_config
     assert sched.enable_chunked_prefill is True and cache.enable_prefix_caching is True
-    assert (sched.max_num_batched_tokens, sched.long_prefill_token_threshold) == (8128, 8128)
+    assert (sched.max_num_batched_tokens, sched.long_prefill_token_threshold) == (8064, 8064)
     assert not sched.async_scheduling
     plan = get_tt_spec_plan(vc)
     assert plan is not None and plan.effective_k == 1 and vc.speculative_config.num_speculative_tokens == 1
@@ -1234,8 +1383,8 @@ def test_vllm_config_keeps_the_features_the_capabilities_allow(monkeypatch, tmp_
     assert gv._SEEN_VLLM_SERVING == {
         "block_size": 64,
         "enable_chunked_prefill": True,
-        "max_num_batched_tokens": 8128,
-        "long_prefill_token_threshold": 8128,
+        "max_num_batched_tokens": 8064,
+        "long_prefill_token_threshold": 8064,
         "enable_prefix_caching": True,
         "prefix_match_unit": None,
         "spec_tokens": 1,
@@ -1596,7 +1745,7 @@ def test_initialize_vllm_model_requires_an_l1_small_mesh(fake_generator_class, m
 
 
 def _serving_vllm_config(
-    *, block_size=64, chunked=True, budget=8128, threshold=8128, prefix=True, unit=None, spec_k=1, tt=None
+    *, block_size=64, chunked=True, budget=8064, threshold=8064, prefix=True, unit=None, spec_k=1, tt=None
 ):
     """A partial VllmConfig with the scheduler facts ``serving_config_of`` reads (what init_device sees)."""
     return SimpleNamespace(
@@ -1807,7 +1956,9 @@ def test_weights_location_precedence(tmp_path):
 # ================================================================================================================
 # 5. Prefill / decode plumbing with the plugin's slot bookkeeping
 # ================================================================================================================
-def _allocated_bridge(num_slots, block_size=32, num_blocks=640, max_seq_len=1024, vocab=4096, ps1=False, **features):
+def _allocated_bridge(
+    num_slots, block_size=32, num_blocks=640, max_seq_len=1024, vocab=4096, ps1=False, device=False, **features
+):
     bridge, gen = _bridge(num_slots=num_slots, max_seq_len=max_seq_len, vocab=vocab, **features)
     kv = bridge.allocate_kv_cache((num_blocks, 1, block_size, 576), torch.bfloat16, 3)
     driver = PluginDriver(
@@ -1819,7 +1970,13 @@ def _allocated_bridge(num_slots, block_size=32, num_blocks=640, max_seq_len=1024
         width=kv.page_table_width,
         vocab=vocab,
         ps1=ps1,
+        device=device,
     )
+    if device:  # sample_on_device_mode "decode_only": the plugin's warmup turns the device sampler on
+        bridge.warmup_model_prefill(kv_cache=kv, enable_trace=False, can_sample_on_device=False)
+        for trace in (False, True):
+            bridge.warmup_model_decode(kv_cache=kv, enable_trace=trace, max_batch_size=num_slots,
+                                       num_blocks=kv.page_table_width, can_sample_on_device=True)  # fmt: skip
     return bridge, gen, kv, driver
 
 
@@ -1925,8 +2082,15 @@ def test_decode_contract_rejections():
         bridge.decode_forward(**base, reload_inputs=False, reload_page_table=True)
     with pytest.raises(ValueError, match="reload_page_table"):
         bridge.decode_forward(**base, reload_inputs=True, reload_page_table=True)
-    with pytest.raises(NotImplementedError, match="host"):
-        bridge.decode_forward(**base, sampling_params=SimpleNamespace(temperature=[0.0] * 8))
+    with pytest.raises(NotImplementedError, match="device sampler"):  # a generator class without one
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(gen), "supports_device_sampling", False)
+            bridge.decode_forward(**base, sampling_params=SimpleNamespace(temperature=[0.0] * 8))
+    with pytest.MonkeyPatch.context() as mp:  # MOTIF3_DEVICE_SAMPLING=0
+        mp.setattr(gv.MotifForCausalLM, "model_capabilities", gv.model_capabilities_from_env(DRAFT1_ENV))
+        with pytest.raises(NotImplementedError, match="MOTIF3_DEVICE_SAMPLING"):
+            bridge.decode_forward(**base, sampling_params=SimpleNamespace(temperature=[0.0] * 8))
+    assert not gen.device_sampling
     with pytest.raises(NotImplementedError, match="page_tables_per_layer"):
         bridge.decode_forward(**base, page_tables_per_layer=[base["page_table"]])
     with pytest.raises(NotImplementedError, match="speculative"):
@@ -1951,8 +2115,10 @@ def test_decode_contract_rejections():
     bridge.decode_forward(**{**base, "page_table": wide, "start_pos": torch.tensor([4] + [-1] * 7, dtype=torch.int32)})
     assert bridge.read_decode_output(out) is out and bridge.read_decode_output(out, async_read=True) == (out, [])
     assert bridge.process_decode_output_host(out) is out
-    with pytest.raises(NotImplementedError):
-        bridge.process_decode_output_host(out, is_tokens=True)
+    toks = (torch.zeros(8, 1, dtype=torch.int32), torch.zeros(8))  # a device-sampled step's (tokens, logprobs)
+    assert bridge.process_decode_output_host(toks, is_tokens=True) is toks and bridge.read_decode_output(toks) is toks
+    with pytest.raises(TypeError):
+        bridge.process_decode_output_host(["not", "a", "tensor"], is_tokens=True)
 
 
 def test_prefill_contract():
@@ -2200,7 +2366,7 @@ def test_serving_config_fail_fast():
     from vllm.config import set_current_vllm_config
 
     ok = gv.serving_config_of(_serving_vllm_config())
-    assert gv.check_serving_config(ok, max_model_len=32768) == []  # 8128 / 8128 at A = 64: clean
+    assert gv.check_serving_config(ok, max_model_len=32768) == []  # 8064 / 8064 at A = 128: clean
     with pytest.raises(ValueError, match="KV-R"):
         gv.check_serving_config(ok, max_model_len=32768, environ={"MOTIF3_KV_REPLICATED_DECODE": "0"})
     with pytest.raises(ValueError, match="prefix-match-unit"):
@@ -2215,7 +2381,7 @@ def test_serving_config_fail_fast():
         gv.serving_config_of(_serving_vllm_config(budget=32768, threshold=0)), max_model_len=32768
     )
     assert any("span cap" in w for w in span)  # TIS's unpinned max_context budget: rows are split internally
-    single_shot = gv.serving_config_of(_serving_vllm_config(budget=32704, threshold=0))  # 32768 - A
+    single_shot = gv.serving_config_of(_serving_vllm_config(budget=32640, threshold=0))  # 32768 - A (128)
     assert (
         gv.check_serving_config(single_shot, max_model_len=32768, environ={"MOTIF3_PREFILL_MAX_BUCKET": "32768"}) == []
     )
@@ -2230,7 +2396,7 @@ def test_serving_config_fail_fast():
             f(num_devices=32, max_model_len=32768, max_num_seqs=32)
     with set_current_vllm_config(_serving_vllm_config(budget=2048, threshold=2048)), loguru_messages() as seen:
         f(num_devices=32, max_model_len=32768, max_num_seqs=32)
-    assert any("pin 8128" in m for m in seen), seen
+    assert any("pin 8064" in m for m in seen), seen
 
 
 # ================================================================================================================
@@ -2589,6 +2755,202 @@ def test_ps1_holds_back_verify_while_a_sampled_request_is_live(ps1):
 
 
 # ================================================================================================================
+# 7b. Exact device sampling (docs/sampling/DEVICE_SAMPLER.md; lead decision 1: sample_on_device_mode "decode_only")
+# ================================================================================================================
+def test_device_sampling_switch_and_mode():
+    """``MOTIF3_DEVICE_SAMPLING`` gates ``supports_sample_on_device`` (default on, a typo raises); the ``"tt"``
+    config's ``sample_on_device_mode`` must be ``"decode_only"`` or unset: ``"all"`` is refused in ``init_device``
+    (``get_max_tokens_all_users``), before an hour of weight loading."""
+    from vllm.config import set_current_vllm_config
+
+    assert gv.device_sampling_switch({}) is True
+    assert gv.device_sampling_switch({"MOTIF3_DEVICE_SAMPLING": " Off "}) is False
+    with pytest.raises(ValueError, match="MOTIF3_DEVICE_SAMPLING"):
+        gv.device_sampling_switch({"MOTIF3_DEVICE_SAMPLING": "maybe"})
+    caps = gv.model_capabilities_from_env({"MOTIF3_DEVICE_SAMPLING": "0"})
+    assert caps["supports_sample_on_device"] is False and "max_device_top_k" not in caps
+    assert gv.check_sample_on_device_mode(None) is None
+    assert gv.check_sample_on_device_mode("decode_only") == "decode_only" == gv.SAMPLE_ON_DEVICE_MODE
+    with pytest.raises(ValueError, match="decode_only"):
+        gv.check_sample_on_device_mode("all")
+    f = gv.MotifForCausalLM.get_max_tokens_all_users
+    with set_current_vllm_config(_serving_vllm_config(tt={**api.SERVING_TT_CONFIG, "sample_on_device_mode": "all"})):
+        with pytest.raises(ValueError, match="decode_only"):
+            f(num_devices=32, max_model_len=32768, max_num_seqs=32)
+    with set_current_vllm_config(_serving_vllm_config(tt={**api.SERVING_TT_CONFIG, **gv.DEVICE_SAMPLING_TT_CONFIG})):
+        assert f(num_devices=32, max_model_len=32768, max_num_seqs=32) > 0
+
+
+def test_lane_sampling_lists_match_the_sampler_helper():
+    """The bridge's pure-Python row -> lane mapping of the plugin's ``TTSamplingParams`` (the bridge may not import
+    ttnn at module import) equals ``tt/sampling.lane_lists_from_rows``: lanes without a row get the padding defaults
+    (greedy), seeds stay Python ints or None (64-bit seeds included)."""
+    from vllm_tt_plugin.model_input import TTSamplingParams
+
+    from models.demos.motif3.tt.sampling import lane_lists_from_rows
+
+    rng = random.Random(3)
+    for rows in (1, 8, 32):
+        lanes = rng.sample(range(32), rows)
+        sp = TTSamplingParams(
+            temperature=[rng.choice([0.0, 0.6, 1.0, 1.3]) for _ in range(rows)],
+            top_k=[rng.choice([1, 20, 512, api.VOCAB_SIZE]) for _ in range(rows)],
+            top_p=[rng.choice([0.0, 0.9, 0.95, 1.0]) for _ in range(rows)],
+            seed=[rng.choice([None, 0, 7, 2**40 + 3, 2**63 - 1]) for _ in range(rows)],
+            enable_log_probs=[rng.random() < 0.2 for _ in range(rows)],
+        )
+        assert gv.lane_sampling_lists(sp, lanes) == lane_lists_from_rows(sp, lanes)
+        assert gv.wants_logprobs(sp) == any(sp.enable_log_probs)
+    with pytest.raises(ValueError, match="entries"):
+        gv.lane_sampling_lists(SimpleNamespace(temperature=[0.0], top_p=[1.0], top_k=[1], seed=[]), [0])
+    assert not gv.wants_logprobs(SimpleNamespace(enable_log_probs=None))
+
+
+@pytest.mark.parametrize("num_slots", [32, 8])
+def test_device_sampled_decode_plumbing(num_slots):
+    """``sample_on_device_mode`` "decode_only" through the bridge with the plugin's own slot bookkeeping: the warmup
+    turns the generator's device sampler on BEFORE the eager decode warmup (so the warmup compiles it and the capture
+    holds it); every decode step carries the plugin's ``TTSamplingParams`` (rows greedy, T 1.0 / top-p 0.95 seeded,
+    top_p = 1 seeded, top-k, unseeded, logprobs=0) and gets the device tokens ``int32 [B, 1]`` (and the raw logprobs
+    ``[B]``) back in ROW order, across slot remaps, condense, preemption and re-prefill; a step the plugin routes to
+    the host (no ``sampling_params``) gets logits; counters and the periodic log line."""
+    bridge, gen, kv, d = _allocated_bridge(num_slots, device=True)
+    assert gen.warmups[:2] == [("prefill", False, None), ("sampler", None, None)], gen.warmups
+    assert [w[:2] for w in gen.warmups[2:]] == [("decode", False), ("decode", True)]
+    assert bridge._device_sampling and gen.device_sampling
+    assert gen.sampler_kwargs == {}  # no vLLM config seen: the unseeded lanes' host RNG keeps OS entropy
+    bridge.sampling_log_every = 7
+    rng = random.Random(21 + num_slots)
+    kinds = [dict(temperature=0.0), dict(temperature=1.0, top_p=0.95, seed=7),
+             dict(temperature=0.8, top_p=1.0, seed=11), dict(temperature=0.7, top_k=20, seed=3),
+             dict(temperature=1.0, top_p=0.95), dict(temperature=0.6, top_p=0.95, seed=2**40 + 9, logprobs=True),
+             dict(temperature=0.0, logprobs=True)]  # fmt: skip
+    next_id, preempted = 0, []
+
+    def new_request():
+        nonlocal next_id
+        rid = f"r{next_id}"
+        d.add(rid, [1, 5, 3] + [rng.randrange(100, 4000) for _ in range(rng.randrange(2, 60))],
+              **kinds[next_id % len(kinds)])  # fmt: skip
+        next_id += 1
+        return rid
+
+    cap = min(num_slots, 12)
+    d.prefill([new_request() for _ in range(min(6, cap))])
+    host_routed = 0
+    with loguru_messages() as seen:
+        for step in range(70):
+            if preempted and len(d.order) < cap and rng.random() < 0.25:
+                d.prefill([preempted.pop(0)])
+            elif len(d.order) < cap - 2 and rng.random() < 0.25:
+                d.prefill([new_request() for _ in range(rng.randrange(1, 3))])
+            rows = list(d.order)
+            if rng.random() < 0.3:
+                rng.shuffle(rows)
+            if step % 10 == 9:  # a step with a host-only request: the plugin samples it on the host (logits)
+                d.device = False
+                d.decode(rows)
+                d.device = True
+                host_routed += 1
+            else:
+                d.decode(rows)
+            if len(d.order) > 3 and rng.random() < 0.1:
+                d.finish(rng.choice(d.order))
+            if len(d.order) > 3 and rng.random() < 0.05:
+                victim = rng.choice(d.order)
+                d.preempt(victim)
+                preempted.append(victim)
+    st = bridge.sampling_stats
+    assert st.device_steps == d.stats["device_steps"] == len(gen.sampled_steps) == 70 - host_routed
+    assert st.host_steps == host_routed == gen.host_steps and st.logprob_steps > 0 and st.device_rows > 70
+    assert d.remaps > 3 and d.lane_checks > 100
+    for lanes, sampling, spec in gen.sampled_steps:  # lane-ordered lists, padding lanes greedy
+        assert not spec and all(sampling[0][l] == 0.0 and sampling[2][l] == 1 for l in range(32) if l not in lanes)
+    # the periodic line counts every decode step of the launch, device-sampled or host-routed
+    assert sum("Motif-3 device sampling:" in m for m in seen) == (st.device_steps + st.host_steps) // 7, seen[-3:]
+    with loguru_messages() as seen:
+        bridge.release_persistent_capture()
+    assert any("Motif-3 device sampling:" in m and '"device_steps"' in m for m in seen)
+
+
+@pytest.mark.parametrize("kvr", [True, False])
+def test_device_sampling_on_the_spec_launch(kvr):
+    """MTP launch + device sampling (lead decision 1: MTP opt-in): while a sampled request is live, PS-1 makes every
+    step the ordinary decode, sampled on device through ``generator.decode_forward_spec(sampling=...)`` (no logits
+    read) and still retaining the argmax / MTP ids; greedy-only phases verify (the plugin sends ``sampling_params`` on
+    verify steps too: its routing ignores speculation) on the argmax path, losslessly; a verify that holds a non-greedy
+    row (what PS-1 prevents) is counted and logged."""
+    bridge, gen, kv, d = _allocated_bridge(8, ps1=True, device=True, spec_tokens=1, prefix_caching=kvr,
+                                           chunked_prefill=kvr)  # fmt: skip
+    d.add("t", [300, 301, 302], temperature=1.0, top_p=0.95, seed=5)
+    d.add("u", [310, 311], temperature=0.7, top_p=1.0, seed=6)
+    for i in range(3):
+        d.add(f"g{i}", [400 + i] * (5 + i))
+    d.prefill(["t", "u", "g0", "g1", "g2"])
+    for _ in range(12):
+        d.spec_decode()
+    assert d.stats["verify_steps"] == 0 and d.stats["device_steps"] == 12  # held back: every step device-sampled
+    assert all(st["sampled"] and not st["want_logits"] for st in gen.spec_steps)
+    assert all(spec for _, _, spec in gen.sampled_steps)
+    assert bridge.spec_stats.declined_mismatch > 0  # the sampled rows never offer a draft
+    d.finish("t")
+    d.finish("u")
+    before = len(gen.spec_steps)
+    for _ in range(10):
+        d.spec_decode()  # greedy only: speculation resumes, verify steps carry the (greedy) sampling_params
+    assert d.stats["verify_steps"] > 0 and d.stats["draft_count2"] + d.stats["draft_count1"] > 0, d.stats
+    verifies = [st for st in gen.spec_steps[before:] if st["drafted"]]
+    assert verifies and not any(st["sampled"] for st in verifies)
+    st = bridge.sampling_stats
+    assert st.verify_steps_with_params == d.stats["verify_steps"] and st.nongreedy_verify_rows == 0
+    # a verify step holding a non-greedy row (no PS-1): counted and logged, the argmax path is kept
+    d.ps1 = False
+    d.add("h", [500, 501, 502], temperature=1.0, top_p=0.95, seed=1)
+    d.prefill(["h"])
+    with loguru_messages() as seen:
+        for _ in range(8):
+            d.spec_decode()
+    assert st.nongreedy_verify_rows > 0 and any("non-greedy row" in m for m in seen)
+
+
+def test_real_generator_device_sampling_interface():
+    """The default generator class has the device-sampling calls the bridge makes, with the keywords it passes, and
+    frees a ``SamplerOutput`` (``_free`` used to skip it silently: ``is_allocated`` raised on the dataclass) and the
+    sampler's trace outputs in ``release_traces``."""
+    import inspect
+
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tt.sampling import SamplerOutput
+
+    impl = gv._resolve_generator_class()
+    assert impl is G.MotifGenerator and impl.supports_device_sampling.fget(None) is True
+    assert set(inspect.signature(impl.decode_forward_sampled).parameters) >= {
+        "batch", "sampling", "kv_cache", "enable_trace"
+    }  # fmt: skip
+    assert "sampling" in inspect.signature(impl.decode_forward_spec).parameters
+    assert callable(impl.enable_device_sampling)
+
+    class T:
+        def __init__(self, name):
+            self.name, self.alive = name, True
+
+        def is_allocated(self):
+            return self.alive
+
+    freed = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(G.ttnn, "deallocate", lambda t: freed.append(t.name), raising=False)
+        mp.setattr(G.ttnn, "release_trace", lambda mesh, tid: freed.append(("trace", tid)), raising=False)
+        G._free(SamplerOutput(tokens=T("tok"), info=T("info")), T("rm"), None)
+        assert freed == ["tok", "info", "rm"]
+        freed.clear()
+        p = G.DecodePath(kind="plain", mode="all", width=8, trace_id=7, out=T("rm"),
+                         so=SamplerOutput(tokens=T("tok"), info=T("info")))  # fmt: skip
+        G.MotifGenerator.release_traces(SimpleNamespace(_paths={p.key: p}, mesh_device=None))
+        assert freed == [("trace", 7), "rm", "tok", "info"] and p.so is None and p.out is None
+
+
+# ================================================================================================================
 # 8. Motif parser plugins (loaded exactly like --reasoning-parser-plugin / --tool-parser-plugin)
 # ================================================================================================================
 @pytest.fixture(scope="module")
@@ -2677,14 +3039,14 @@ def test_vllm_serve_cli_accepts_the_feature_flags():
     args = make_arg_parser(FlexibleArgumentParser()).parse_args(argv)
     validate_parsed_serve_args(args)
     assert args.enable_chunked_prefill is True and args.enable_prefix_caching is True and args.async_scheduling is False
-    assert (args.max_num_batched_tokens, args.long_prefill_token_threshold) == (8128, 8128)
+    assert (args.max_num_batched_tokens, args.long_prefill_token_threshold) == (8064, 8064)
     spec = args.speculative_config if isinstance(args.speculative_config, dict) else json.loads(args.speculative_config)
     assert spec == {
         "method": "custom_class",
         "model": "vllm_tt_plugin.model_owned_drafter",
         "num_speculative_tokens": 1,
     }
-    serving = gv.serving_config_of(_serving_vllm_config(budget=8128, threshold=8128))
+    serving = gv.serving_config_of(_serving_vllm_config(budget=8064, threshold=8064))
     assert gv.check_serving_config(serving, max_model_len=32768) == []
 
 
@@ -3004,6 +3366,118 @@ def test_vllm_offline_engine_with_chunked_prefill_prefix_caching_and_mtp(fake_ge
             cross_row_partners=sum(o // 8 != p // 8 for st in gen.spec_steps for o, p in st["partners"].items()),
         )
         print("MOTIF3_E2E_FEATURES", json.dumps(summary))
+    finally:
+        _shutdown(llm)
+    assert gen.traces_released == 1
+
+
+def _check_device_sampled(prompt, out_ids, p, vocab):
+    """A device-sampled request's tokens against the fake model and the fake device sampler: the first token comes
+    from the prefill (sampled on the host by vLLM in "decode_only" mode), every later one from a device-sampled decode
+    step at the previous token's position (or from a host-routed step: ``host_ok`` counts those that differ)."""
+    seq = list(prompt) + [int(out_ids[0])]
+    mism = 0
+    for t in out_ids[1:]:
+        want = fake_device_sample(next_token(seq, vocab), p.temperature, p.top_p, p.seed, len(seq) - 1, vocab)
+        mism += int(int(t) != want)
+        seq.append(int(t))
+    return mism
+
+
+@pytest.mark.parametrize("spec", [False, True])
+def test_vllm_offline_engine_device_sampling(fake_generator_class, monkeypatch, tmp_path, spec):
+    """The real engine (``vllm.LLM`` -> TTPlatform -> TTModelRunner -> bridge -> fake generator) with
+    ``sample_on_device_mode`` "decode_only" (lead decision 1) and chunked prefill + prefix caching, without and with
+    the opt-in MTP speculation: the plugin sends its ``TTSamplingParams`` on device-routed decode steps and reads our
+    tokens / logprobs back. Greedy requests stay exact (the fake device greedy = the model's token), seeded sampled
+    requests (top-p 0.95, top_p = 1, top-k) follow the fake device sampler token by token from their second token on
+    (the first is the prefill's host sample), a ``logprobs=0`` request gets the device logprobs, a penalized request
+    sends its steps to the host (logits) and stays correct; with MTP the sampled requests hold speculation back
+    (PS-1, device-sampled ordinary steps) and greedy-only traffic verifies losslessly afterwards."""
+    model_dir = _motif_dir(require_tokenizer=True)
+    meshes, _ = _offline_engine_env(monkeypatch, tmp_path, CAPS_ON)
+    if spec:
+        monkeypatch.setenv("MOTIF3_TT_CACHE_PATH", str(_mtp_cache_marker(tmp_path)))  # spec_plan finds the MTP weights
+
+    from vllm import LLM, SamplingParams
+
+    tt = {"trace_mode": "decode_only", "l1_small_size": api.L1_SMALL_SIZE, **gv.DEVICE_SAMPLING_TT_CONFIG}
+    extra = dict(speculative_config=dict(gv.SPECULATIVE_CONFIG), async_scheduling=False) if spec else {}
+    llm = LLM(
+        model=str(model_dir),
+        trust_remote_code=True,
+        max_model_len=4096,
+        max_num_seqs=8,
+        block_size=64,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        seed=9472,  # the TIS --seed; the bridge passes it to the device sampler (rng_seed)
+        additional_config={"tt": tt},
+        **extra,
+    )
+    V = api.VOCAB_SIZE
+    try:
+        runner = llm.llm_engine.model_executor.driver_worker.model_runner
+        bridge = runner.model
+        gen = bridge.generator
+        assert isinstance(gen, fake_generator_class) and gen.device_sampling and bridge._device_sampling
+        assert runner.sample_on_device_mode == "decode_only"
+        assert gen.warmups[1] == ("sampler", None, None), gen.warmups  # before the eager decode warmup and capture
+        assert gen.sampler_kwargs == {"rng_seed": 9472}, gen.sampler_kwargs  # vLLM's --seed: the unseeded lanes' RNG
+        rng = random.Random(5 + spec)
+
+        def prompt(n):
+            return [1, 5, 3] + [rng.randrange(100, 200000) for _ in range(n)]
+
+        greedy = [(prompt(rng.randrange(5, 120)), SamplingParams(temperature=0.0, max_tokens=14, ignore_eos=True))
+                  for _ in range(3)]  # fmt: skip
+        sampled = [
+            (prompt(40), SamplingParams(temperature=1.0, top_p=0.95, seed=11, max_tokens=16, ignore_eos=True)),
+            (prompt(25), SamplingParams(temperature=0.8, top_p=1.0, seed=12, max_tokens=16, ignore_eos=True)),
+            (prompt(60), SamplingParams(temperature=0.7, top_k=20, seed=13, max_tokens=16, ignore_eos=True)),
+            (prompt(30), SamplingParams(temperature=1.0, top_p=0.95, max_tokens=12, ignore_eos=True)),  # unseeded
+        ]
+        if not spec:  # a speculating launch refuses logprobs (the platform), so only here
+            sampled.append((prompt(33), SamplingParams(temperature=0.6, top_p=0.95, seed=14, max_tokens=12,
+                                                       ignore_eos=True, logprobs=0)))  # fmt: skip
+        reqs = greedy + sampled
+        outs = llm.generate([{"prompt_token_ids": p} for p, _ in reqs], [sp for _, sp in reqs], use_tqdm=False)
+        n_dev = len(gen.sampled_steps)
+        assert n_dev > 10, n_dev
+        for (pr, sp), o in zip(reqs, outs, strict=True):
+            ids = list(o.outputs[0].token_ids)
+            assert len(ids) == sp.max_tokens
+            if sp.temperature == 0:
+                assert ids == greedy_continuation(pr, sp.max_tokens, V)
+            elif sp.seed is not None:
+                assert _check_device_sampled(pr, ids, sp, V) == 0, (sp, ids)
+            if sp.logprobs is not None:
+                lps = o.outputs[0].logprobs
+                assert lps is not None and len(lps) == len(ids)
+                fake = {round(fake_lane_logprob(l), 6) for l in range(32)}
+                for t, entry in list(zip(ids, lps))[1:]:  # decode tokens: the device's raw logprob (the fake's)
+                    assert round(float(entry[t].logprob), 6) in fake, entry
+        if spec:  # PS-1: no verify step held a sampled row; the ordinary steps were device-sampled spec steps
+            assert any(st["sampled"] for st in gen.spec_steps)
+            assert bridge.sampling_stats.nongreedy_verify_rows == 0
+        # a penalized request: its steps sample on the host (logits), the others' tokens stay exact
+        host0 = gen.host_steps
+        mix = [(prompt(20), SamplingParams(temperature=0.0, repetition_penalty=1.2, max_tokens=10, ignore_eos=True)),
+               (prompt(50), SamplingParams(temperature=0.0, max_tokens=10, ignore_eos=True))]  # fmt: skip
+        outs = llm.generate([{"prompt_token_ids": p} for p, _ in mix], [sp for _, sp in mix], use_tqdm=False)
+        for (pr, sp), o in zip(mix, outs, strict=True):
+            assert list(o.outputs[0].token_ids) == greedy_continuation(pr, sp.max_tokens, V)
+        assert gen.host_steps > host0
+        if spec:  # greedy only: speculation verifies again, losslessly (verify steps keep the argmax path)
+            n_spec = len(gen.spec_steps)
+            g2 = [(prompt(rng.randrange(5, 50)), SamplingParams(temperature=0.0, max_tokens=24, ignore_eos=True))
+                  for _ in range(3)]  # fmt: skip
+            outs = llm.generate([{"prompt_token_ids": p} for p, _ in g2], [sp for _, sp in g2], use_tqdm=False)
+            for (pr, sp), o in zip(g2, outs, strict=True):
+                assert list(o.outputs[0].token_ids) == greedy_continuation(pr, sp.max_tokens, V)
+            assert any(st["drafted"] for st in gen.spec_steps[n_spec:]), "no verify step in greedy-only traffic"
+            assert bridge.sampling_stats.nongreedy_verify_rows == 0
+        print("MOTIF3_DEVICE_SAMPLING_ENGINE", json.dumps({"spec": spec, **bridge.sampling_stats.as_dict()}))
     finally:
         _shutdown(llm)
     assert gen.traces_released == 1

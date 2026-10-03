@@ -286,10 +286,11 @@ FEATURE_SWITCHES = ("MOTIF3_PREFIX_CACHING", "MOTIF3_CHUNKED_PREFILL", "MOTIF3_S
 # are split into chunks inside one prefill_forward_batch call (design D8). 32768 compiles every draft-1 bucket (no
 # forced split; the planner's cost-based head split still turns 16,736 into 16384 + 512).
 DEFAULT_PREFILL_SPAN_CAP = 8192
-# Resume alignment A = lcm(block 64, q_chunk 64, k_chunk 64) of the sp1 global op (design D1; gate G9 may move the
-# large buckets to 128/128, then A = 128). Only for checks that run before the generator exists; the generator's
-# ``prefill_alignment`` is authoritative.
-DEFAULT_PREFILL_ALIGNMENT = 64
+# Resume alignment A = lcm(block, every q_chunk / k_chunk) of the sp1 global op: 128 with gate G9's per-bucket chunks
+# (prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS: 128/128 at C = 128 and C >= 2048, 64/64 at 256-1024; lead decision F5), so
+# the vLLM budget = threshold = 8192 - 128 = 8064. Only for checks that run before the generator exists (and
+# FEATURE_VLLM_ARGS); the generator's ``prefill_alignment`` is authoritative (test_prefill_plan checks they agree).
+DEFAULT_PREFILL_ALIGNMENT = 128
 SUPPORTED_SPEC_TOKENS = (0, 1)  # MTP draft tokens per step (num_speculative_tokens): K = 1 only
 MTP_LAYER_IDX = NUM_HIDDEN_LAYERS  # the MTP layer is reference layer 53 (TT-cache part "L53")
 # Decode KV-write modes (tt/kv_write.py): "row" = draft 1 (one 8-lane update per DP row), "row_split" = speculation

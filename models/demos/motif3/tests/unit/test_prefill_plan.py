@@ -4,7 +4,11 @@
 
 * row planning over every ``s < e <= 1100`` (and samples to 32768) for block 32 / 64 and alignment 64 / 128: no write
   below ``w0``; every real row written exactly once per call; chunk starts multiples of ``A``; ``c0 = 0`` below the
-  SWA tail; spans within the cap; padding only in the own last block; the design's worked examples;
+  SWA tail; spans within the cap; padding only in the own last block; the design's worked examples (A = 64);
+* the production geometry of gate G9's per-bucket sp1 global chunks (``DEFAULT_SP1_GLOBAL_CHUNKS``: 128/128 at C = 128
+  and C >= 2048, 64/64 at 256-1024): A = 128 = ``generator_api.DEFAULT_PREFILL_ALIGNMENT``, budget = threshold = 8064;
+  every planned sp1 chunk start is a multiple of its own bucket's q and k (A = 64 would violate it); worked examples
+  at A = 128; the per-bucket sp1 cost model;
 * the per-chunk tables: fill tables (``-1`` for shared and pure-padding blocks), SDPA tables (0-padded, never
   ``-1``), SWA tails (the ``tail`` positions before the chunk), RoPE rows (clamped);
 * writer-first ordering (same-step prefix hits), cycles and write conflicts refused;
@@ -39,6 +43,9 @@ TT_METAL = Path(__file__).resolve().parents[5]
 BUCKETS = api.prefill_buckets(32768)  # 128 ... 32768
 GEOMETRIES = [(32, 64), (64, 64), (32, 128), (64, 128)]  # (block size, alignment A)
 TAIL = pp.DEFAULT_SWA_TAIL
+SPAN_BUCKETS = pp.span_buckets(32768, 8192)  # 128 ... 8192: what the serving generator compiles
+PROD_A = pp.resume_alignment(64, SPAN_BUCKETS)  # 128: gate G9's per-bucket q / k
+PROD_BUDGET = pp.recommended_budget(8192, PROD_A)  # 8064 = --max-num-batched-tokens = --long-prefill-token-threshold
 
 
 def _plan(s, e, *, bs=64, A=64, cap=8192, tail=TAIL, cost=None, buckets=BUCKETS):
@@ -198,6 +205,9 @@ def _check_row(p, s, e, bs, A, cap, tail, usable, cost):
             assert c.end == a + C, "only the last chunk is padded"
         if c.is_sp1:
             assert a >= tail, "an sp1 chunk needs the whole SWA tail before it"
+            if A % PROD_A == 0:  # the sp1 global op of this bucket (G9 per-bucket q / k) accepts the start
+                q, kc = pp.sp1_global_qk(C)
+                assert a % q == 0 and a % kc == 0, (s, e, a, C, q, kc)
         # writes of this chunk (fill-table semantics): logical blocks overlapping [w0, c.end)
         lo, hi = max(a // bs, w0 // bs), min((a + C) // bs, _cdiv(c.end, bs))
         if hi > lo:
@@ -278,6 +288,125 @@ def test_lone_request_chunks_need_no_recompute():
             assert p.recompute < A and _chunks(p) == [(s // A * A, 8192, "sp1")]
     p = _plan(100, 100 + 8128)  # first chunk ended at 100 (< tail): recompute from 0, one extra chunk
     assert p.c0 == 0 and _chunks(p) == [(0, 8192, "sp0"), (8192, 128, "sp1")]
+    p = _plan(100, 100 + PROD_BUDGET, A=PROD_A)  # the same at the production geometry: one 8192 chunk from 0
+    assert p.c0 == 0 and _chunks(p) == [(0, 8192, "sp0")]
+
+
+# ================================================================================================================
+# production geometry: gate G9's per-bucket sp1 global chunks (lead decision F5)
+# ================================================================================================================
+def test_production_geometry_g9_per_bucket():
+    """128/128 at C = 128 and C >= 2048, 64/64 at 256-1024 (GATES_RESULTS §12.2) -> A = 128 for block 32 and 64 ->
+    budget = threshold = 8192 - 128 = 8064; the bridge's pre-generator default agrees (it sets FEATURE_VLLM_ARGS)."""
+    want = {128: (128, 128), 256: (64, 64), 512: (64, 64), 1024: (64, 64), 2048: (128, 128), 4096: (128, 128)}
+    want.update({8192: (128, 128), 16384: (128, 128), 32768: (128, 128), 6144: (128, 128)})
+    assert {c: pp.sp1_global_qk(c) for c in want} == want
+    assert PROD_A == 128 == api.DEFAULT_PREFILL_ALIGNMENT
+    assert pp.resume_alignment(32, SPAN_BUCKETS) == 128 == pp.resume_alignment(64, pp.span_buckets(32768, 32768))
+    assert pp.resume_alignment(64, pp.span_buckets(4096, 8192)) == 128  # any span cap: bucket 128 is always there
+    assert pp.resume_alignment(64, SPAN_BUCKETS, ((32768, (64, 64)),)) == 64  # the pre-G9 all-64/64 table
+    assert PROD_BUDGET == 8064 == pp.recommended_budget(api.DEFAULT_PREFILL_SPAN_CAP, api.DEFAULT_PREFILL_ALIGNMENT)
+    assert pp.check_scheduler_config(
+        chunked=True, budget=PROD_BUDGET, threshold=PROD_BUDGET, align=PROD_A, span_cap=8192, prefix_caching=True,
+        prefix_match_unit=None, block_size=64, kv_replicated=True,
+    ) == []  # fmt: skip
+    # a bf16 latent cache keeps 64/64 everywhere (A = 64): at 128/128 its static CBs overrun L1_SMALL (CCL semaphores)
+    assert pp.sp1_global_chunk_table() == pp.sp1_global_chunk_table("bfp8") == pp.DEFAULT_SP1_GLOBAL_CHUNKS
+    bf16 = pp.sp1_global_chunk_table("bf16")
+    assert bf16 == pp.SP1_GLOBAL_CHUNKS_BF16_KV and all(pp.sp1_global_qk(c, bf16) == (64, 64) for c in want)
+    assert pp.resume_alignment(64, SPAN_BUCKETS, bf16) == 64 == pp.resume_alignment(32, SPAN_BUCKETS, bf16)
+    assert pp.check_scheduler_config(
+        chunked=True, budget=PROD_BUDGET, threshold=PROD_BUDGET, align=64, span_cap=8192, prefix_caching=True,
+        prefix_match_unit=None, block_size=64, kv_replicated=True,
+    ) == []  # fmt: skip  # the production budget is clean for a bf16-cache server too
+    with pytest.raises(ValueError, match="KV cache dtype"):
+        pp.sp1_global_chunk_table("bfp4")
+    for bad in (100, 0, -128):  # q = 128 does not divide 100; non-positive buckets
+        with pytest.raises(ValueError):
+            pp.sp1_global_qk(bad)
+    with pytest.raises(ValueError, match="no sp1 global chunk entry"):
+        pp.sp1_global_qk(65536)
+    with pytest.raises(ValueError):
+        pp.sp1_global_qk(256, ((1024, (0, 64)),))
+    with pytest.raises(ValueError):
+        pp.resume_alignment(0, SPAN_BUCKETS)
+
+
+def test_per_bucket_op_needs_a_128():
+    """Why A = 128: with A = 64 the planner emits sp1 chunks whose start is not a multiple of their own bucket's q / k
+    (the 128 and >= 2048 buckets), which the op would floor silently (G9 negative control); with A = 128 none (the
+    exhaustive tests check every row through ``_check_row``)."""
+    bad = []
+    for s in range(128, 4200, 64):
+        for e in (s + 1, s + 100, s + 1500, s + 3000):
+            for c in _plan(s, e, A=64).chunks:
+                q, k = pp.sp1_global_qk(c.bucket)
+                if c.is_sp1 and (c.start % q or c.start % k):
+                    bad.append((s, e, c.start, c.bucket))
+    assert bad and (192, 193, 192, 128) in bad, bad[:5]
+    assert all(
+        c.start % pp.sp1_global_qk(c.bucket)[0] == 0
+        for s in range(128, 4200, 64)
+        for e in (s + 1, s + 100, s + 1500, s + 3000)
+        for c in _plan(s, e, A=PROD_A).chunks
+    )
+
+
+def test_plan_production_vllm_steps():
+    """Every prompt length (stride 37) to 32768 as a lone request in vLLM steps of 8064, cold and behind a random
+    block-aligned prefix hit: every step's span ``e - c0`` fits one 8192 bucket (no forced split), a cold request never
+    recomputes a row (its chunk ends are multiples of A = 128), a hit at an odd multiple of 64 recomputes 64 rows per
+    step, and every invariant of ``_check_row`` holds (including the per-bucket op alignment)."""
+    cost = pp.prefill_cost_model()
+    usable = set(SPAN_BUCKETS)
+    rng = random.Random(8064)
+    steps = recomputed = 0
+    for L in range(1, 32769, 37):
+        for hit in sorted({0, rng.randrange(0, L) // 64 * 64}):
+            s = hit
+            while s < L:
+                e = min(s + PROD_BUDGET, L)
+                p = _plan(s, e, A=PROD_A, cost=cost)
+                _check_row(p, s, e, 64, PROD_A, 8192, TAIL, usable, cost)
+                assert e - p.c0 <= 8192, (L, hit, s, e)
+                assert p.recompute == s % PROD_A and (hit or p.recompute == 0), (L, hit, s)
+                steps += 1
+                recomputed += p.recompute
+                s = e
+    assert steps > 2000 and recomputed > 0
+
+
+@pytest.mark.parametrize(
+    "s, e, w0, c0, chunks",
+    [
+        # 30,832-token needle prompt, lone, in vLLM steps of 8064 (FEATURES_RESULTS §3.5 at the new budget): every
+        # continuation starts aligned (no recompute) and fits one 8192 bucket; the 6640-row tail splits by cost
+        (0, 8064, 0, 0, [(0, 8192, "sp0")]),
+        (8064, 16128, 8064, 8064, [(8064, 8192, "sp1")]),
+        (16128, 24192, 16128, 16128, [(16128, 8192, "sp1")]),
+        (24192, 30832, 24192, 24192, [(24192, 4096, "sp1"), (28288, 2048, "sp1"), (30336, 512, "sp1")]),
+        # the same prompt with chunking off (one call): the generator's internal split (D8)
+        (0, 30832, 0, 0, [(0, 8192, "sp0"), (8192, 8192, "sp1"), (16384, 8192, "sp1"), (24576, 4096, "sp1"),
+                          (28672, 2048, "sp1"), (30720, 128, "sp1")]),
+        # FEATURES_RESULTS §3.3: a cold 6,196-token row, then the same prompt with 6,144 tokens hit
+        (0, 6196, 0, 0, [(0, 4096, "sp0"), (4096, 2048, "sp1"), (6144, 128, "sp1")]),
+        (6144, 6196, 6144, 6144, [(6144, 128, "sp1")]),
+        # a 64-granular hit (35 blocks, §3.4 multi-turn): c0 = 2176 < w0 = 2240, 64 rows recomputed, block 34 skipped
+        (2240, 2304, 2240, 2176, [(2176, 128, "sp1")]),
+        # a continuation after an unaligned (mixed-step) vLLM chunk end: < 128 rows recomputed, still one bucket
+        (8100, 16164, 8064, 8064, [(8064, 8192, "sp1")]),
+    ],
+)  # fmt: skip
+def test_production_worked_examples(s, e, w0, c0, chunks):
+    p = _plan(s, e, A=PROD_A)
+    assert (p.w0, p.c0) == (w0, c0) and _chunks(p) == chunks
+    for c in p.chunks:
+        q, k = pp.sp1_global_qk(c.bucket)
+        assert not c.is_sp1 or (c.start % q == 0 and c.start % k == 0)
+    if (s, e) == (2240, 2304):
+        pt = _page_table(36, 512, seed=11)
+        fill = pp.fill_table(pt, p.chunks[0], p.w0, 64)
+        assert int(fill[0]) == -1 and int(fill[1]) == int(pt[35])  # block 34 shared (read only), block 35 own
 
 
 def test_custom_cost_models():
@@ -299,9 +428,29 @@ def test_custom_cost_models():
 
 
 def test_cost_model_table_and_prefix_term():
-    m = pp.prefill_cost_model()
+    m = pp.prefill_cost_model()  # gate G9's per-bucket sp1 model (default)
     assert m(128, 0) == pytest.approx(0.642) and m(32768, 0) == pytest.approx(23.396)
-    assert m(2048, 24576) == pytest.approx(1.55 + pp.DEFAULT_SP1_ATTN_S_PER_ROW_KEY * 2048 * 24576)
+    assert m(2048, 24576) == pytest.approx(1.55 + 14 * 0.92e-6 * 24576)
+    assert m(128, 24448) == pytest.approx(0.642 + 14 * 0.43e-6 * 24448)
+    # per (row, key) over 14 layers: K / V streaming makes short chunks behind long prefixes dear (G9 §12.2)
+    per_row_key = {c: pp.sp1_prefix_cost(c, 10000) / (c * 10000) for c in pp.DEFAULT_SP1_GLOBAL_COST}
+    assert per_row_key[128] == pytest.approx(4.70e-8, rel=0.01) and per_row_key[512] == pytest.approx(1.42e-8, rel=0.01)
+    assert all(5e-9 < per_row_key[c] < 8e-9 for c in (1024, 2048, 4096, 8192))
+    assert pp.sp1_prefix_cost(4096, 0) == 0.0 and pp.sp1_prefix_cost(4096, -64) == 0.0
+    assert pp.sp1_prefix_cost(6144, 1000) == pytest.approx(14 * (1.88e-6 + 3.07e-6) / 2 * 1000)  # interpolated
+    assert pp.sp1_prefix_cost(16384, 1000) == pytest.approx(14 * 3.07e-6 * 2 * 1000)  # per token above 8192
+    assert pp.sp1_prefix_cost(2048, 1000, global_layers=1) == pytest.approx(0.92e-6 * 1000)
+    # the pre-G9 single constant, explicitly
+    old = pp.prefill_cost_model(sp1_s_per_row_key=pp.DEFAULT_SP1_ATTN_S_PER_ROW_KEY)
+    assert old(2048, 24576) == pytest.approx(1.55 + pp.DEFAULT_SP1_ATTN_S_PER_ROW_KEY * 2048 * 24576)
+    assert pp.prefill_cost_model(sp1_s_per_row_key=0.0)(2048, 24576) == pytest.approx(1.55)
+    custom = pp.prefill_cost_model({128: 1.0}, sp1_global_cost={128: (0.0, 1e-3)}, global_layers=2)
+    assert custom(128, 10) == pytest.approx(1.0 + 2 * 1e-3 * 10)
+    for bad in (dict(sp1_s_per_row_key=-1.0), dict(sp1_global_cost={}), dict(sp1_global_cost={128: (0.0, -1.0)})):
+        with pytest.raises(ValueError):
+            pp.prefill_cost_model(**bad)
+    with pytest.raises(ValueError):
+        pp.prefill_cost_model(global_layers=-1)
     t = {128: 1.0, 512: 3.0}
     assert pp.table_cost(t, 256) == pytest.approx(5.0 / 3.0)  # interpolated
     assert pp.table_cost(t, 64) == 1.0 and pp.table_cost(t, 1024) == pytest.approx(6.0)  # clamp / per-token extrap
@@ -562,11 +711,11 @@ def test_plans_do_not_depend_on_lanes():
 # scheduler config (features design §1.5)
 # ================================================================================================================
 def _sched(**kw):
-    base = dict(
+    base = dict(  # the production launch: A = 128 (G9 per-bucket chunks), budget = threshold = 8064
         chunked=True,
-        budget=8128,
-        threshold=8128,
-        align=64,
+        budget=PROD_BUDGET,
+        threshold=PROD_BUDGET,
+        align=PROD_A,
         span_cap=8192,
         prefix_caching=True,
         prefix_match_unit=None,
@@ -579,8 +728,9 @@ def _sched(**kw):
 
 def test_scheduler_config_production_is_clean():
     assert _sched() == []
-    assert _sched(align=128, budget=8064, threshold=8064) == []  # the R10 per-bucket q/k variant
-    assert _sched(budget=4032, threshold=2048) == []  # the interactive variant of §1.1
+    assert _sched(align=64, budget=8128, threshold=8128) == []  # the pre-G9 all-64/64 geometry (A = 64)
+    assert _sched(budget=3968, threshold=2048) == []  # the interactive variant of §1.1 at A = 128 (4096 - A)
+    assert _sched(align=64, budget=4032, threshold=2048) == []  # ... and at A = 64
     assert _sched(threshold=0) == []
     assert _sched(prefix_match_unit=64) == []
     assert _sched(chunked=False, budget=None, threshold=0) == []  # chunking off: nothing to check
@@ -588,14 +738,17 @@ def test_scheduler_config_production_is_clean():
 
 
 def test_scheduler_config_warnings():
-    w = _sched(align=128)  # 8128 is not a multiple of 128
+    w = _sched(budget=8128, threshold=8128)  # the pre-G9 budget at A = 128: unaligned, and 8128 + 127 > 8192
     assert any("max_num_batched_tokens 8128" in m and "128" in m for m in w)
     assert any("long_prefill_token_threshold 8128" in m for m in w)
-    w = _sched(budget=8192, threshold=0)  # 8192 + 63 > 8192: rows split internally
+    assert any("span cap" in m and "<= 8064" in m for m in w) and len(w) == 3
+    w = _sched(budget=8192, threshold=0)  # 8192 + 127 > 8192: rows split internally
+    assert len(w) == 1 and "span cap" in w[0] and "8064" in w[0]
+    w = _sched(align=64, budget=8192, threshold=0)  # ... 8192 + 63 at A = 64
     assert len(w) == 1 and "span cap" in w[0] and "8128" in w[0]
     w = _sched(budget=2048, threshold=0)  # vLLM's unpinned `vllm serve` default on TT
-    assert len(w) == 1 and "2048" in w[0] and "eager" in w[0]
-    w = _sched(budget=8128, threshold=4100)
+    assert len(w) == 1 and "2048" in w[0] and "eager" in w[0] and "pin 8064" in w[0]
+    w = _sched(threshold=4100)
     assert len(w) == 1 and "4100" in w[0]
 
 
@@ -617,6 +770,67 @@ def test_scheduler_config_errors():
     assert pp.recommended_budget(8192, 64) == 8128 and pp.recommended_budget(8192, 128) == 8064
     with pytest.raises(ValueError):
         pp.recommended_budget(64, 64)
+    with pytest.raises(ValueError):
+        pp.recommended_budget(128, 128)  # no budget fits a resumed chunk in one bucket; check_scheduler_config copes
+
+
+def test_scheduler_config_span_cap_not_above_alignment():
+    """MOTIF3_PREFILL_MAX_BUCKET=128 (allowed: a power of two in [128, 32768]) at A = 128 with vLLM's unpinned budget
+    2048: the bridge's init_device check (check_serving_config: DEFAULT_PREFILL_ALIGNMENT and the env's span cap)
+    must warn, not raise "span cap 128 must exceed the alignment 128" from recommended_budget (review of F5). No budget
+    fits a resumed chunk in a 128-row span then, so the warning names the span cap, and the small-budget warning (its
+    floor is min(4096, cap) - A) stays silent: the span cap, not the budget, keeps the chunks small."""
+    cap = api.prefill_span_cap_from_env({"MOTIF3_PREFILL_MAX_BUCKET": "128"})
+    assert cap == 128 and pp.resume_alignment(64, pp.span_buckets(32768, cap)) == 128 == api.DEFAULT_PREFILL_ALIGNMENT
+    w = _sched(span_cap=cap, align=api.DEFAULT_PREFILL_ALIGNMENT, budget=2048, threshold=0)
+    assert len(w) == 1 and "128-row span cap" in w[0] and "MOTIF3_PREFILL_MAX_BUCKET" in w[0], w
+    assert "<=" not in w[0] and "pin" not in w[0], w
+    w = _sched(span_cap=cap, budget=PROD_BUDGET, threshold=PROD_BUDGET)  # the TIS budget on that server
+    assert len(w) == 1 and "MOTIF3_PREFILL_MAX_BUCKET" in w[0], w
+    # The same span cap with a bf16 latent cache (A = 64): a budget fits, and the warning suggests it.
+    w = _sched(span_cap=cap, align=64, budget=2048, threshold=0)
+    assert len(w) == 1 and "span cap" in w[0] and "<= 64" in w[0], w
+    # A span cap below 4096: the budget that fits it (cap - A) is the floor, not 4096 - A, so the pin clears both.
+    w = _sched(span_cap=2048, budget=2048, threshold=0)
+    assert len(w) == 1 and "span cap" in w[0] and "<= 1920" in w[0], w
+    w = _sched(span_cap=2048, budget=1024, threshold=0)
+    assert len(w) == 1 and "1024 < 1920" in w[0] and "pin 1920" in w[0], w
+    assert _sched(span_cap=2048, budget=1920, threshold=1920) == []
+
+
+def test_scheduler_config_every_span_cap_and_advice_clears():
+    """Every span cap MOTIF3_PREFILL_MAX_BUCKET allows, at A = 64 (bf16 cache) and 128 (G9 per-bucket), block 32 and
+    64, budgets from 1 to 32768 and thresholds 0 / 2048 / 8064: check_scheduler_config never raises, never suggests a
+    budget below A, and following a suggestion clears the warning it came from ("pin X": all of them; "<= X": the
+    span-cap one; "use X" for an unaligned value: the alignment one)."""
+    caps = [b for b in BUCKETS if api.check_prefill_span_cap(b) == b]
+    assert caps[0] == 128 and caps[-1] == 32768
+    budgets = (1, 63, 64, 100, 128, 1920, 2048, 3968, 4032, 4096, 8064, 8128, 8192, 16384, 32640, 32768)
+    seen_pin = seen_le = seen_cap = 0
+    for cap, A, bs in itertools.product(caps, (64, 128), (32, 64)):
+        for budget, thr in itertools.product(budgets, (0, 2048, 8064)):
+            w = _sched(span_cap=cap, align=A, block_size=bs, budget=budget, threshold=thr)
+            for m in w:
+                if "pin " in m:
+                    seen_pin += 1
+                    p = int(m.rsplit("pin ", 1)[1].rstrip(")"))
+                    assert p >= A and p % A == 0 and cap > A, (cap, A, budget, thr, m)
+                    assert _sched(span_cap=cap, align=A, block_size=bs, budget=p, threshold=p) == [], (cap, A, m)
+                if "span cap" in m:
+                    if "<= " in m:
+                        seen_le += 1
+                        x = int(m.rsplit("<= ", 1)[1].rstrip(")"))
+                        assert x >= A and cap > A, (cap, A, m)
+                        again = _sched(span_cap=cap, align=A, block_size=bs, budget=x, threshold=x)
+                        assert not any("span cap" in n for n in again), (cap, A, m, again)
+                    else:
+                        seen_cap += 1
+                        assert cap <= A and "MOTIF3_PREFILL_MAX_BUCKET" in m, (cap, A, m)
+                if "not a multiple of the resume alignment" in m:
+                    u = int(m.rsplit("(use ", 1)[1].rstrip(")"))
+                    assert u >= A and u % A == 0, m
+            assert not any("small eager" in m for m in w) or budget < min(4096, cap) - A
+    assert seen_pin and seen_le and seen_cap  # every kind of advice was exercised
 
 
 # ================================================================================================================
@@ -805,7 +1019,8 @@ class FakeVllmScheduler:
 @pytest.mark.parametrize(
     "bs, A, budget, threshold, cap",
     [
-        (64, 64, 8128, 8128, 8192),  # production (lead decision 4: threshold = budget)
+        (64, 128, 8064, 8064, 8192),  # production (G9 per-bucket q / k: A = 128; threshold = budget = 8064)
+        (64, 64, 8128, 8128, 8192),  # the pre-G9 all-64/64 geometry (A = 64)
         (64, 64, 1000, 0, 8192),  # unaligned budget: every chunk end unaligned
         (64, 128, 777, 300, 512),  # A = 128, tiny cap: many internal chunks
         (32, 64, 2048, 1024, 1024),

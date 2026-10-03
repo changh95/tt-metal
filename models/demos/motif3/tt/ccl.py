@@ -57,6 +57,41 @@ per-device slice ``ttnn.mesh_partition``) with op-internal semaphores. That is t
 * Replica consistency (design §2.3.7 invariant): ``all_reduce`` is reduce-scatter + all-gather (or all-gather +
   local sum for small / unaligned payloads), so every chip of the reduced axis ends up with bitwise-identical
   data. Use :func:`replicas_identical` in tests to check it.
+* **Ring all-gather completion race (P1, docs/determinism/INVESTIGATION.md).** For small payloads on BH,
+  ``ttnn.all_gather`` picks its *multicast* factory (``all_gather_device_operation.cpp`` ``select_program_factory``),
+  which on an even-sized ring (the 8-chip TP axis) load-balances: every other packet takes the opposite direction's
+  longer route, so the farthest chip (N/2 hops away) receives half of each source's pages over that route. Each
+  worker's completion semaphore only travels its PRIMARY route (``multicast_reader.cpp`` / ``multicast_writer.cpp``:
+  ``sem_route_id`` is set up with ``ranges``, never ``ranges_alt``), so nothing orders those alternate-route pages
+  before the farthest chip's completion barrier: the op can retire there, and the next op read the output, before the
+  last of them land. In the model this made prefill irreproducible (the PolyNorm-moment gather of the shared expert
+  feeding ``ttnn.sum``: one chip summed a stale tile in ~5-10 % of the calls). The window is the backward writer's
+  lag behind its reader's completion increment. The circular buffer bounds it: with several CB pages per link
+  (:func:`native_ag_cb_pages_per_link`) the reader runs up to a page ahead and the race is frequent (isolated, under
+  the MoE combine's skew: 2.4 % of the calls at 2 pages, 62 % at 3, 11 % at 12); with one page both workers start
+  from the same push and it is rare (fp32 moments, 2-3 packets per worker: 0 of 6000; bf16 ``[32, 512]``, 4 packets:
+  27 of 3000) -- not zero. ``ring_gather`` (``cfg.ring_gather`` / ``MOTIF3_RING_GATHER``) picks which gathers that
+  :func:`native_ag_multicast_alt_routes` predicts on the racy path run as ``all_broadcast`` (ring, 2 links: each
+  source reaches a chip over ONE route, data and semaphore on it) + ``concat`` (:meth:`MotifCCL._all_gather_safe`;
+  bitwise the same output, no race):
+
+  - ``"lean"``: the multi-page ones, plus every predicted gather of a ``race_free=True`` call (the MoE
+    prefill combine, whose bucket-128 ``[32, 512]`` gather is single-page) or of a :meth:`MotifCCL.race_free_scope`.
+    Decode's gathers are all single-page and stay native: decode is unchanged, cost and exposure alike (greedy decode
+    bitwise equal to the safe mode's in 2 x 32 lanes x 160 steps; one event in ~10^4 decode steps of the spec suite).
+    Prefill cost: +21 us device time for the largest affected payload; ~430 vs 100 us host time per eager call
+    (+3.3-6.7 % TTFT for prompts <= 512 tokens, which are dispatch bound; none measurable from bucket 1024 up). Left
+    native in prefill unless the caller runs it in a :meth:`MotifCCL.race_free_scope`: the shared expert's PolyNorm
+    moments at buckets 128 / 256 (single-page fp32; no event in 6000 adversarial isolated calls nor in the model).
+  - ``"safe"``: every predicted gather, decode's too (bitwise-reproducible decode; +3-4 us per decode-sized gather:
+    +0.26-0.45 ms per traced decode step, which pushes the G13b KV-R gate of ``tests/test_spec_decode_device.py``
+    over its 2.0 ms).
+  - ``"native"``: the plain ttnn op (the pre-fix behaviour: prefill not run-to-run reproducible). ``race_free`` and
+    the scope are ignored.
+
+  The routing is a host-side decision per tensor spec (cached), so a traced program sequence is fixed at capture;
+  decode traces captured under ``"lean"`` contain exactly the pre-fix programs. docs/determinism/FIX.md has the
+  validation (bitwise prefill across repeats and processes, accuracy, cost).
 * Precision (measured, ``tests/unit/test_infra_device.py``, BH 4x8, 2026-10-01): bf16 reductions round like bf16
   (AR of 4-8 bf16 shards: PCC 0.999996-0.999997). fp32 inputs on the RS+AG path are reduced at **TF32 class**
   (``[1,1,32,4096]`` fp32 AR over DP: PCC 0.99999992, max-abs 8.9e-3 at |x| <= 10; an explicit HiFi4 / fp32-acc
@@ -89,16 +124,17 @@ AG(dp) back to ``[1,1,S,4096]``.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import warnings
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
 
 import ttnn
 
 from .model_config import COMPUTE_ROLES, MeshAxes, MotifTTConfig, active_fabric_name, make_compute_kernel_config
-from .model_config import mesh_l1_small_bytes
+from .model_config import RING_GATHER_MODES, mesh_l1_small_bytes
 
 Axis = Union[str, int]
 
@@ -245,6 +281,68 @@ def composite_ag(logical_shape, padded_shape, tiled: bool, dtype_name: str, dim:
     return False
 
 
+# ttnn all_gather_device_operation.cpp ``select_program_factory`` (BLACKHOLE): multicast while the per-link bytes stay
+# below min(4 MB, txn^2 * 1 MB / 2048^2), txn = the smaller of the input / output page; unicast above.
+_AG_MCAST_ANCHOR_PAGE = 2048
+_AG_MCAST_ANCHOR_CEILING = 1_000_000
+_AG_UNICAST_BW_FLOOR = 4_000_000
+# Fabric routing planes per axis on this Galaxy (ttnn ``get_num_links``; MotifCCL(num_links=...) overrides).
+DEFAULT_AXIS_LINKS = 2
+# Fabric max payload per packet on this Galaxy (``tt_fabric::get_tt_fabric_max_payload_size_bytes``: the "Fabric packet
+# size 4352 B" of the CCL warnings) and the BH circular-buffer page multiplier of the multicast factory for TILE inputs
+# (``all_gather_multicast_factory.cpp``: ideal_multiplier 4 on Blackhole when L1 allows).
+FABRIC_PACKET_BYTES = 4352
+_AG_MCAST_TILE_CB_MULTIPLIER = 4
+
+
+def native_ag_multicast_alt_routes(logical_shape, padded_shape, dtype_name: str, tiled: bool, dim: int,
+                                   num_devices: int, ring_axis: bool, num_links: int = DEFAULT_AXIS_LINKS) -> bool:
+    """Whether a native ``ttnn.all_gather`` of this tensor takes the multicast factory WITH its even-ring
+    alternate-route load balancing (the completion race of the module docstring): a ring / torus axis with an even
+    number of chips and a payload under BH's multicast ceiling. Interleaved tensors (the only kind the model gathers);
+    unknown dtypes count as multicast (the safe side)."""
+    if not ring_axis or num_devices < 2 or num_devices % 2:
+        return False
+    shape = [int(d) for d in logical_shape]
+    padded = [int(d) for d in padded_shape]
+    _norm_dim(dim, len(shape))
+    elem = _ELEM_BYTES.get(dtype_name, 1)  # Tensor::element_size: bfp8 / bfp4 count 1 B
+    if tiled:
+        page = _TILE_BYTES.get(dtype_name)
+        if page is None:
+            return True
+    else:
+        page = shape[-1] * elem  # one row; a last-dim gather widens the output row, so the input page is the min
+    ceiling = min(_AG_UNICAST_BW_FLOOR, page * page * _AG_MCAST_ANCHOR_CEILING // (_AG_MCAST_ANCHOR_PAGE ** 2))
+    per_link = math.prod(padded) * elem * num_devices // max(1, int(num_links))
+    return per_link < ceiling
+
+
+def native_ag_cb_pages_per_link(padded_shape, dtype_name: str, tiled: bool, num_links: int = DEFAULT_AXIS_LINKS,
+                                packet_bytes: int = FABRIC_PACKET_BYTES) -> int:
+    """Circular-buffer pages each link's worker of the multicast factory streams (``all_gather_multicast_factory.cpp``:
+    a CB page holds ``max(1, packet // page)`` input pages, x4 for TILE on BH; pages are split over the links). With
+    more than one, the reader runs up to a CB page ahead of the backward writer and the writer's last alternate-route
+    pages often land after the far chip retired (isolated, under the MoE combine's skew: 2 pages 2.4 %, 3 pages 62 %,
+    12 pages 11 % of the calls; INVESTIGATION.md §3.5). With one, both workers start from the same CB push and the
+    window is a few packets wide: rare but not zero (fp32 moments 0 of 6000, bf16 ``[32, 512]`` 27 of 3000). Every
+    decode gather is single-page. ``ring_gather="lean"`` reroutes the multi-page ones (and single-page ones
+    of ``race_free`` calls)."""
+    padded = [int(d) for d in padded_shape]
+    if tiled:
+        page = _TILE_BYTES.get(dtype_name)
+        if page is None:
+            return 1 << 30
+        n_pages = math.prod(padded) // (TILE * TILE)
+        per_cb = max(1, int(packet_bytes) // page) * _AG_MCAST_TILE_CB_MULTIPLIER
+    else:
+        n_pages = math.prod(padded[:-1])
+        page = padded[-1] * _ELEM_BYTES.get(dtype_name, 1)
+        per_cb = max(1, int(packet_bytes) // max(1, page))
+    per_link = -(-n_pages // max(1, int(num_links)))
+    return -(-per_link // per_cb)
+
+
 def _dtype_name(t) -> str:
     dt = t.dtype
     return getattr(dt, "name", str(dt).split(".")[-1])
@@ -276,6 +374,10 @@ class MotifCCL:
         l1_small_semaphores: route every CCL's global semaphores to L1_SMALL (module docstring). ``None`` (default)
             = on iff the mesh has an L1_SMALL region; ``True`` requires one (ValueError otherwise); ``False`` = the
             plain ttnn ops (legacy behaviour, semaphores partly in main L1).
+        ring_gather: ``"safe"`` | ``"lean"`` | ``"native"`` (module docstring, ring all-gather completion race).
+            ``None`` (default) = ``cfg.ring_gather`` (``MOTIF3_RING_GATHER``, default ``"safe"`` since 2026-10-03: decode gathers race ~1e-4 per step under ``"lean"``). A validated
+            attribute: tests may switch it between calls (every mode's programs must then be compiled before a
+            trace capture).
     """
 
     def __init__(
@@ -288,6 +390,7 @@ class MotifCCL:
         topology=None,
         memory_config=None,
         l1_small_semaphores: Optional[bool] = None,
+        ring_gather: Optional[str] = None,
     ):
         global _WARNED_NO_L1_SMALL
         self.mesh_device = mesh_device
@@ -322,8 +425,48 @@ class MotifCCL:
         self._reduce_ckc = make_compute_kernel_config(
             role.fidelity, role.fp32_acc, approx=role.approx, packer_l1_acc=role.packer_l1_acc
         )
+        if ring_gather is None:
+            ring_gather = getattr(cfg, "ring_gather", None) or "safe"
+        self.ring_gather = ring_gather  # validated (property)
+        self._race_free_depth = 0  # > 0 inside race_free_scope()
         self._ring_axis: Dict[int, bool] = {}  # cluster_axis -> usable topology is a ring / torus
         self._plans: Dict[tuple, Any] = {}  # (op, cluster_axis, tensor spec) -> dispatch decision (host-side cache)
+
+    # ---- ring all-gather completion race (module docstring) ------------------------------------------------
+    @property
+    def ring_gather(self) -> str:
+        """``"lean"`` | ``"safe"`` | ``"native"``: which race-prone ring gathers take the safe path."""
+        return self._ring_gather
+
+    @ring_gather.setter
+    def ring_gather(self, mode: str) -> None:
+        if mode not in RING_GATHER_MODES:
+            raise ValueError(f"ring_gather must be one of {RING_GATHER_MODES}, got {mode!r}")
+        self._ring_gather = mode
+
+    @contextlib.contextmanager
+    def race_free_scope(self, enabled: bool = True) -> Iterator["MotifCCL"]:
+        """Every all-gather / all-reduce issued inside behaves as if called with ``race_free=True``: under
+        ``"lean"`` each gather that :func:`native_ag_multicast_alt_routes` predicts on ttnn's racy path takes the safe
+        path, single-CB-page ones included (``"safe"``: no change; ``"native"``: ignored). Meant for latency-tolerant
+        phases whose modules do not thread ``race_free`` themselves, e.g. a model's eager prefill (``with
+        ccl.race_free_scope(): X = layer.forward_prefill(...)``): that closes the one prefill gather class ``"lean"``
+        leaves native, the shared expert's PolyNorm moments at buckets 128 / 256 (51 gathers per prefill: +20 ms TTFT
+        there, nothing above; docs/determinism/FIX.md §5). Never wrap decode in it (a decode trace captured inside
+        would carry the safe path: +0.24-0.45 ms per step). Nestable and exception safe; host-side only (a decision per
+        call, cached per spec)."""
+        if not enabled:
+            yield self
+            return
+        self._race_free_depth += 1
+        try:
+            yield self
+        finally:
+            self._race_free_depth -= 1
+
+    @property
+    def in_race_free_scope(self) -> bool:
+        return self._race_free_depth > 0
 
     # ---- axis helpers ------------------------------------------------------------------------------------
     def cluster_axis(self, axis: Axis) -> int:
@@ -359,12 +502,14 @@ class MotifCCL:
         return self._ring_axis[ca]
 
     # ---- collectives ---------------------------------------------------------------------------------------
-    def all_gather(self, x, dim: int, axis: Axis, *, memory_config=None, output_tensor=None):
+    def all_gather(self, x, dim: int, axis: Axis, *, memory_config=None, output_tensor=None, race_free: bool = False):
         """Concatenate the shards of ``axis`` along tensor ``dim`` (mesh order = DP/TP index order).
 
         A size-1 axis returns a copy of ``x``. Inputs whose gather dim is tile-padded (e.g. 8 lanes in TILE layout)
         take the composite path (all_broadcast + concat; with L1_SMALL semaphores when the mesh has the region);
-        results are identical either way.
+        results are identical either way. ``race_free``: a latency-tolerant caller (prefill) asks for the safe path
+        for every race-prone payload, single-page ones included, unless ``ring_gather="native"`` (module docstring;
+        :meth:`race_free_scope` does the same for every call inside it).
         """
         ca = self.cluster_axis(axis)
         mc = self._mc(memory_config)
@@ -377,14 +522,56 @@ class MotifCCL:
                 comp = self._plans[key] = composite_ag(x.shape, x.padded_shape, _is_tiled(x), _dtype_name(x), dim)
             if comp:
                 return self._all_gather_composite(x, dim, ca, mc)  # ttnn's composite ignores output_tensor as well
+        if self._ag_race_prone(x, dim, ca, race_free=race_free):
+            out = self._all_gather_safe(x, dim, ca, mc)
+            if output_tensor is None:
+                return out
+            ttnn.copy(out, output_tensor)
+            ttnn.deallocate(out)
+            return output_tensor
         kw = {}
         if output_tensor is not None:
             kw["output_tensor"] = output_tensor
         return ttnn.all_gather(x, dim=dim, cluster_axis=ca, memory_config=mc, **kw)
 
-    def _all_gather_composite(self, x, dim: int, ca: int, mc):
+    def _all_gather_safe(self, x, dim: int, ca: int, mc):
+        """The race-free gather of a race-prone payload (module docstring): ``all_broadcast`` on the ring (every source
+        reaches each chip over ONE route, data and completion semaphore on it; 2 links) + ``concat``. Bitwise equal to
+        ``ttnn.all_gather``; traced on this Galaxy (``docs/determinism/logs/gather_bench``) +3-4 us for decode-sized
+        payloads, +21 us for the bucket-4096 PolyNorm moments ([1, 3, 1024, 32] fp32: 74.6 vs 53.3 us)."""
+        return self._all_gather_composite(x, dim, ca, mc, topology=ttnn.Topology.Ring,
+                                          num_links=self.num_links or DEFAULT_AXIS_LINKS)
+
+    def _ag_race_prone(self, x, dim: int, ca: int, *, race_free: bool = False) -> bool:
+        """The native ``ttnn.all_gather`` of this tensor spec would take the multicast factory with even-ring
+        alternate routes (module docstring; :func:`native_ag_multicast_alt_routes`) and ``ring_gather`` routes it to
+        the safe path: ``"safe"`` all of them, ``"lean"`` those with more than one CB page per link
+        (:func:`native_ag_cb_pages_per_link`) and, with ``race_free`` or inside :meth:`race_free_scope`, all of them;
+        ``"native"`` none. Cached per spec and mode."""
+        if self._ring_gather == "native":
+            return False
+        n = self.axes.mesh_shape[ca]
+        if n < 2 or n % 2:
+            return False
+        lean = self._ring_gather == "lean" and not (race_free or self._race_free_depth > 0)
+        key = ("ag_race", lean, ca, dim, self._spec_key(x))
+        plan = self._plans.get(key)
+        if plan is None:
+            links = self.num_links or DEFAULT_AXIS_LINKS
+            plan = native_ag_multicast_alt_routes(
+                x.shape, x.padded_shape, _dtype_name(x), _is_tiled(x), dim, n, self.is_ring_axis(x, ca),
+                num_links=links,
+            )
+            if plan and lean:
+                plan = native_ag_cb_pages_per_link(x.padded_shape, _dtype_name(x), _is_tiled(x), links) > 1
+            self._plans[key] = plan
+        return plan
+
+    def _all_gather_composite(self, x, dim: int, ca: int, mc, *, topology=None, num_links: Optional[int] = None):
         """ttnn's composite all_gather (``composite_common::composite_all_gather``: sharded -> interleaved, bfp8 with
-        unaligned tiles -> bf16, ``all_broadcast``, ``concat``) with its semaphores in L1_SMALL."""
+        unaligned tiles -> bf16, ``all_broadcast``, ``concat``) with its semaphores in L1_SMALL (when
+        ``l1_small_semaphores``). ``topology`` / ``num_links`` of the ``all_broadcast`` (default: the op's, Linear and
+        1 link, as ttnn's composite)."""
         src = x
         if _is_sharded(src):
             src = ttnn.to_memory_config(src, mc if not mc.is_sharded() else ttnn.DRAM_MEMORY_CONFIG)
@@ -396,8 +583,14 @@ class MotifCCL:
             if src is not x:
                 ttnn.deallocate(src)
             src = t
-        parts = ttnn.all_broadcast(
-            src, cluster_axis=ca, memory_config=src.memory_config(), use_l1_small_for_semaphores=True
+        kw = {}
+        if topology is not None:
+            kw["topology"] = topology
+        if num_links is not None:
+            kw["num_links"] = int(num_links)
+        parts = ttnn.all_broadcast(  # (the safe path may run on a mesh without L1_SMALL: main-L1 semaphores there)
+            src, cluster_axis=ca, memory_config=src.memory_config(),
+            use_l1_small_for_semaphores=bool(self.l1_small_semaphores), **kw
         )
         cat_mc = mc if not mc.is_sharded() else src.memory_config()
         out = ttnn.concat(list(parts), _norm_dim(dim, len(shape)), memory_config=cat_mc)
@@ -475,11 +668,12 @@ class MotifCCL:
             kw["use_l1_small_for_semaphores"] = True
         return ttnn.reduce_scatter(x, dim=dim, cluster_axis=ca, memory_config=mc, **kw)
 
-    def all_reduce(self, x, axis: Axis, *, memory_config=None):
+    def all_reduce(self, x, axis: Axis, *, memory_config=None, race_free: bool = False):
         """Sum over ``axis``; every chip of the axis gets the identical result (RS+AG or AG+local-sum).
         bf16 / bfp8 inputs reduce in bf16; fp32 inputs take the fp32 path. With L1_SMALL semaphores this is a
         Python mirror of ``ttnn.all_reduce`` (same scatter dim, same RS+AG / AG+local-sum choice, bitwise-identical
-        results) whose collectives keep their semaphores in L1_SMALL (``ttnn.all_reduce`` has no such argument)."""
+        results) whose collectives keep their semaphores in L1_SMALL (``ttnn.all_reduce`` has no such argument).
+        ``race_free``: as in :meth:`all_gather`, for the AG half (the MoE prefill combine sets it)."""
         ca = self.cluster_axis(axis)
         mc = self._mc(memory_config)
         n = self.axes.mesh_shape[ca]
@@ -491,7 +685,7 @@ class MotifCCL:
         if rank < 2:
             shape = [int(d) for d in x.shape]
             x2 = ttnn.reshape(x, [1] + shape)
-            out = self.all_reduce(x2, ca, memory_config=mc)
+            out = self.all_reduce(x2, ca, memory_config=mc, race_free=race_free)
             res = ttnn.reshape(out, shape)
             return res
         sharded = _is_sharded(x)
@@ -505,7 +699,10 @@ class MotifCCL:
             out = self._ar_gather_sum(work, ca, n, mc)
         else:  # RS + AG, both into the output memory config (as all_reduce_async does)
             rs = self._reduce_scatter(work, dim, ca, n, mc)
-            out = ttnn.all_gather(rs, dim=dim, cluster_axis=ca, memory_config=mc)
+            if self._ag_race_prone(rs, dim, ca, race_free=race_free):  # module docstring: the completion race
+                out = self._all_gather_safe(rs, dim, ca, mc)
+            else:
+                out = ttnn.all_gather(rs, dim=dim, cluster_axis=ca, memory_config=mc)
             ttnn.deallocate(rs)
         if work is not x:
             ttnn.deallocate(work)
@@ -814,8 +1011,11 @@ def log_fabric(mesh_device, tag: str = "", printer=print) -> Dict[str, Any]:
 
 
 __all__ = [
+    "DEFAULT_AXIS_LINKS",
     "DIRECT_RS_MAX_INPUT_BYTES",
+    "FABRIC_PACKET_BYTES",
     "MotifCCL",
+    "RING_GATHER_MODES",
     "composite_ag",
     "composite_ag_for_ar",
     "composite_rs",
@@ -825,6 +1025,8 @@ __all__ = [
     "finding_scatter_dim",
     "l1_usage",
     "log_fabric",
+    "native_ag_cb_pages_per_link",
+    "native_ag_multicast_alt_routes",
     "replicas_identical",
     "resolve_axis",
     "topology_for_fabric",

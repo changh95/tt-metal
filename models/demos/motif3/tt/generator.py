@@ -83,10 +83,23 @@ with ONE blocking read per step (``a`` / ``m`` into persistent host staging, non
 ``m`` read, blocks): a blocking read ends in a full-mesh finish (an event round trip to all 32 chips), which cost
 ~0.7 ms each when ``a``, ``m`` and the logits were read one after another. An overflow pass is enqueued right behind
 pass 1 (its inputs do not depend on pass 1's outputs; command-queue order keeps pass 1's reads ahead of pass 2's
-replay).
-Verify step 89.4 ms vs 88.4 ms for the plain KV-R step; ordinary spec step (with the logits read) 90.1 ms. Without
-``OMP_WAIT_POLICY=PASSIVE`` torch's spinning OpenMP workers stall the input copies after the step's host planning
-(+4.7 ms per verify step measured): ``create`` logs a warning.
+replay). Verify step 89.4 ms vs 88.4 ms for the plain KV-R step; ordinary spec step (with the logits read) 90.1
+ms. Without ``OMP_WAIT_POLICY=PASSIVE`` torch's spinning OpenMP workers stall the input copies after the step's host
+planning (+4.7 ms per verify step measured): ``create`` logs a warning.
+
+Device sampling (``docs/sampling/DEVICE_SAMPLER.md`` §6; the bridge turns it on for ``sample_on_device_mode:
+"decode_only"`` through :meth:`MotifGenerator.enable_device_sampling`, before the decode warmup): the exact sampler
+``tt/sampling.MotifDeviceSampler`` runs at the end of EVERY decode step of the one decode trace (no second trace,
+FEATURES_REVIEW F3): the plain step samples the TILE logits (``model.decode(return_streams=True)`` -> ``head.
+forward_decode`` -> ``logits_rm`` for the host + ``sampler.sample``), the spec step samples its ROW_MAJOR logits ``rm``
+(one tilize; ``MotifModel.decode_spec`` frees its TILE logits). The sampler's outputs (``tokens`` / ``info``) are
+extra trace outputs (``DecodePath.so``), freed in :meth:`MotifGenerator.release_traces`. A device-sampled step
+(:meth:`MotifGenerator.decode_forward_sampled`, or :meth:`MotifGenerator.decode_forward_spec` with ``sampling``)
+writes the lane parameters (host compare, device write only on change) and the RNG counters of the lanes' positions,
+replays, reads the 1 KB ``info`` and re-samples the flagged active lanes on the host from the logits (read only
+then; ~1 % of 32-lane steps at T = 1.0 / top-p 0.95). Host-sampled steps (penalties, min_p, structured output,
+top-N logprobs: the plugin's per-step routing) keep the logits contract of ``decode_forward`` from the same trace (the
+sampler's 1.36 ms run is wasted there). Verify steps keep the argmax path (PS-1 keeps sampled rows out of them).
 
 Lanes and inactive lanes (README §2): the bridge maps vLLM rows / state slots onto lanes (``LaneMap``, ``slot_remap``);
 this class only sees lane-ordered tensors. Position ``-1`` marks an inactive lane: ``cur_pos = -1`` (no KV write,
@@ -133,6 +146,7 @@ from .model import LazySource, MotifKVPool, MotifModel
 from .model_config import MotifTTConfig, require_l1_small
 from .mtp import mtp_next_tokens
 from .rope import positions_to_rot_idxs, shard_lanes
+from .sampling import MotifDeviceSampler, SampleResult, SamplerOutput
 
 PrefillShape = Tuple[str, int]  # (path "sp0" | "sp1", bucket)
 
@@ -155,12 +169,28 @@ def prefill_page_table_host(page_table: torch.Tensor, entries: int, seq_len: int
 
 def _free(*ts) -> None:
     for t in ts:
-        if t is not None:
-            try:
-                if t.is_allocated():
-                    ttnn.deallocate(t)
-            except Exception:
-                pass
+        if t is None:
+            continue
+        if isinstance(t, SamplerOutput):  # not a tensor: is_allocated() would raise and the tensors would leak
+            _free(*t.tensors())
+            continue
+        try:
+            if t.is_allocated():
+                ttnn.deallocate(t)
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class SampledSpecDecodeResult(api.SpecDecodeResult):
+    """``decode_forward_spec(..., sampling=...)``: the ordinary spec step's ids (``argmax`` / ``mtp_argmax``, for the
+    bridge's speculation bookkeeping) plus the device-sampled tokens (``sample``, lane order, flagged active lanes
+    already resolved on the host)."""
+
+    sample: Optional[SampleResult] = None
+
+
+LaneSampling = Tuple[Sequence[float], Sequence[float], Sequence[int], Sequence[Optional[int]]]
 
 
 # ======================================================================================================================
@@ -401,7 +431,9 @@ class DecodePath:
     :meth:`MotifGenerator.decode_forward_spec`). ``mode``: the KV-write mode (``row`` on the plain path = the
     draft-1 ops, no ``DecodeKVWrite``). ``inputs``: ``tokens`` / ``rot`` (and ``cur`` / ``pt`` for the draft-1
     ``row`` path); ``kv_write``: the ``DecodeKVWrite`` (FlashMLA's ``cur_pos`` / ``page_table`` and the update-call
-    inputs) of every other path. ``out``: the captured outputs (plain: the ROW_MAJOR logits; spec: ``(rm, a, m)``)."""
+    inputs) of every other path. ``out``: the captured outputs (plain: the ROW_MAJOR logits; spec: ``(rm, a, m)``).
+    ``so``: the captured device sampler's outputs (:class:`~models.demos.motif3.tt.sampling.SamplerOutput`) when the
+    trace holds the sampler, else None."""
 
     kind: str
     mode: str
@@ -412,6 +444,7 @@ class DecodePath:
     out: Any = None
     pool: Any = None
     warmed: bool = False
+    so: Optional[SamplerOutput] = None
 
     @property
     def key(self) -> DecodeKey:
@@ -463,7 +496,12 @@ class MotifGenerator(api.MotifGenerator):
 
     Args beyond the model: ``decode_kv_mode`` / ``spec_kv_mode`` override the KV-write mode of the plain / spec path
     (default ``generator_api.kv_write_mode(cfg.kv_replicated_decode, False / True)``: ``row`` / ``row_split``, or
-    ``all`` / ``all_split`` with KV-R)."""
+    ``all`` / ``all_split`` with KV-R).
+
+    Device sampling (module docstring): :meth:`enable_device_sampling` builds ``self.sampler`` before the decode
+    warmup; ``sampling_observer(kind, positions, res, logits)`` (tests; default None) is called after every
+    device-sampled step with the lane-order :class:`SampleResult` (flagged lanes resolved) and a callable returning
+    the step's host logits (one 14 MB read, on demand)."""
 
     def __init__(
         self,
@@ -508,9 +546,14 @@ class MotifGenerator(api.MotifGenerator):
         self.extra_decode_paths: List[DecodeKey] = []
         self.chunk_observer: Optional[Callable[[PrefillRowJob, PP.ChunkPlan, Any], None]] = None
         self.spec_observer: Optional[Callable[[SpecStepPlan, int, Dict[str, Any]], None]] = None
+        self.sampling_observer: Optional[Callable[..., None]] = None
         self.observe_logits = False
         self.last_prefill: Optional[PrefillBatchPlan] = None
         self.last_spec: Optional[SpecStepPlan] = None
+        # device sampling (enable_device_sampling): the sampler and the outputs of the step that ran last (eager runs
+        # and captures hand them over through _take_so)
+        self.sampler: Optional[MotifDeviceSampler] = None
+        self._pending_so: Optional[SamplerOutput] = None
         self.stats: Dict[str, int] = {
             "prefill_calls": 0,
             "prefill_rows": 0,
@@ -526,6 +569,11 @@ class MotifGenerator(api.MotifGenerator):
             "cross_row_partners": 0,  # ... on another DP row than their owner (KV-R)
             "overflow_drafts": 0,  # drafts evaluated in pass 2 on their own lane
             "overflow_passes": 0,
+            "sampled_steps": 0,  # device-sampled decode steps (plain or spec)
+            "sampled_lanes": 0,  # ... active lanes they sampled
+            "gumbel_lanes": 0,  # ... of which full-vocab (top_p = 1) Gumbel lanes
+            "fallback_steps": 0,  # device-sampled steps that read the logits for the host fallback
+            "fallback_lanes": 0,  # ... active lanes re-sampled on the host
         }
         self.timings: Dict[str, float] = {}
         self.spec_profile: Dict[str, float] = {k: 0.0 for k in SPEC_PROFILE_KEYS}
@@ -633,6 +681,114 @@ class MotifGenerator(api.MotifGenerator):
     def spec_launch(self) -> bool:
         """Every decode step runs through the spec trace (``spec_tokens = 1`` with the MTP layer)."""
         return self.serving_path[0] == SPEC
+
+    # ==============================================================================================================
+    # device sampling (docs/sampling/DEVICE_SAMPLER.md §6)
+    # ==============================================================================================================
+    @property
+    def supports_device_sampling(self) -> bool:
+        """:meth:`enable_device_sampling` / :meth:`decode_forward_sampled` are implemented (the bridge checks it)."""
+        return True
+
+    @property
+    def device_sampling(self) -> bool:
+        """The decode trace holds the exact device sampler (:meth:`enable_device_sampling` ran)."""
+        return self.sampler is not None
+
+    def enable_device_sampling(self, **sampler_kwargs) -> MotifDeviceSampler:
+        """Build the device sampler (``MotifDeviceSampler(mesh, cfg, ccl=model.ccl, **sampler_kwargs)``; defaults:
+        K = 64, W = 512, logprobs, device RNG, the Gumbel full-vocab path; the vLLM bridge passes ``rng_seed`` = vLLM's
+        ``--seed`` for the unseeded lanes' host RNG) so that the decode warmup compiles it and the capture puts it into
+        the decode trace. Idempotent. Refused once a decode trace exists (the trace would not hold it:
+        ``release_traces()`` first); paths already warmed eagerly are marked unwarmed, so the capture runs the eager
+        step (which compiles the sampler's programs) again first."""
+        if self.sampler is not None:
+            return self.sampler
+        if self.trace_captured:
+            raise RuntimeError("enable_device_sampling after the decode trace capture: release_traces() first")
+        head = self.model.head
+        if getattr(head, "vocab_split", "mesh") != "mesh":
+            raise ValueError(f"the device sampler needs the LM head's 'mesh' vocab split, got {head.vocab_split!r}")
+        t0 = time.time()
+        self.sampler = MotifDeviceSampler(self.mesh_device, self.cfg, ccl=self.model.ccl, **sampler_kwargs)
+        for p in self._paths.values():
+            p.warmed = False
+        s = self.sampler
+        self.log(
+            f"device sampling on: K {s.K}, W {s.W}, logprobs {s.logprobs}, rng {s.rng}, gumbel {s.gumbel} "
+            f"({time.time() - t0:.1f} s); every decode step of the trace runs the sampler"
+        )
+        return s
+
+    def _require_sampler(self) -> MotifDeviceSampler:
+        if self.sampler is None:
+            raise RuntimeError("device sampling is off (enable_device_sampling has not run before the decode warmup)")
+        return self.sampler
+
+    def _take_so(self) -> Optional[SamplerOutput]:
+        so, self._pending_so = self._pending_so, None
+        return so
+
+    def _head_and_sample(self, X):
+        """The plain step's head with the sampler: TILE logits -> ROW_MAJOR host logits ``rm`` + ``sampler.sample``
+        (stashed for :meth:`_take_so`); the same head ops as ``MotifModel.decode`` (``forward_decode(row_major=True)``
+        = ``forward_decode`` + ``logits_rm``), so ``rm`` is bitwise what the step without the sampler returns."""
+        head = self.model.head
+        try:
+            lg = head.forward_decode(X)  # TILE [1, 1, 32, 6880]
+        finally:
+            _free(X)
+        rm = None
+        try:
+            rm = head.logits_rm(lg)
+            self._pending_so = self.sampler.sample(lg)
+        except BaseException:
+            _free(rm)
+            raise
+        finally:
+            _free(lg)
+        return rm
+
+    def _finish_sampled(self, kind: str, positions: torch.Tensor, res: SampleResult, rm) -> SampleResult:
+        """Counters, the host fallback of the flagged ACTIVE lanes (exact, the step's 53-bit uniform; the logits are
+        read only then) and the test observer."""
+        smp = self.sampler
+        active = positions >= 0
+        cache: List[torch.Tensor] = []
+
+        def logits() -> torch.Tensor:
+            if not cache:
+                cache.append(self.model.head.logits_to_host(rm))
+            return cache[0]
+
+        st = self.stats
+        st["sampled_steps"] += 1
+        act = active.tolist()
+        st["sampled_lanes"] += sum(act)
+        if smp.gumbel:
+            st["gumbel_lanes"] += sum(1 for on, lp in zip(act, smp.lane_params) if on and lp.full_support)
+        flagged = res.flags & active
+        if bool(flagged.any()):
+            res = smp.resolve(res, logits, active=active)
+            st["fallback_steps"] += 1
+            st["fallback_lanes"] += int(flagged.sum())
+        if self.sampling_observer is not None:
+            self.sampling_observer(kind, positions, res, logits)
+        return res
+
+    def sampling_stats(self) -> Dict[str, Any]:
+        """The device sampler's counters (``steps``, ``flagged_*``, ``resolved_*``, ``param_uploads``) next to the
+        generator's sampled / Gumbel / fallback counters, or ``{}`` without device sampling."""
+        if self.sampler is None:
+            return {}
+        st = self.stats
+        out: Dict[str, Any] = {k: st[k] for k in ("sampled_steps", "sampled_lanes", "gumbel_lanes", "fallback_steps",
+                                                  "fallback_lanes")}  # fmt: skip
+        out.update({f"sampler_{k}": v for k, v in self.sampler.stats.items()})
+        n = max(1, st["sampled_steps"])
+        out["fallback_step_rate"] = round(st["fallback_steps"] / n, 6)
+        out["fallback_lane_rate"] = round(st["fallback_lanes"] / max(1, st["sampled_lanes"]), 6)
+        return out
 
     @property
     def warmed_shapes(self) -> Set[PrefillShape]:
@@ -916,19 +1072,35 @@ class MotifGenerator(api.MotifGenerator):
         p.kv_write.write_step(ps.step, validate=False)
 
     def _plain_step(self, p: DecodePath, pool: MotifKVPool):
-        """One plain decode step on the device (eager or inside a capture): ROW_MAJOR logits ``[1, 1, 32, 6880]``."""
+        """One plain decode step on the device (eager or inside a capture): ROW_MAJOR logits ``[1, 1, 32, 6880]``.
+        With device sampling the step also runs the sampler on the TILE logits; its outputs wait in
+        :meth:`_take_so` (the caller owns them)."""
         d, w = p.inputs, p.kv_write
+        kw = {"kv_caches": pool}
+        if self.sampler is not None:
+            kw["return_streams"] = True
         if w is None:
-            return self.model.decode(
-                d["tokens"], rot_idxs=d["rot"], cur_pos=d["cur"], page_table=d["pt"], kv_caches=pool
+            out = self.model.decode(d["tokens"], rot_idxs=d["rot"], cur_pos=d["cur"], page_table=d["pt"], **kw)
+        else:
+            out = self.model.decode(
+                d["tokens"], rot_idxs=d["rot"], cur_pos=w.cur_pos, page_table=w.page_table, kv_write=w, **kw
             )
-        return self.model.decode(
-            d["tokens"], rot_idxs=d["rot"], cur_pos=w.cur_pos, page_table=w.page_table, kv_caches=pool, kv_write=w
-        )
+        if self.sampler is None:
+            return out
+        return self._head_and_sample(out)
 
     def _spec_step(self, p: DecodePath, pool: MotifKVPool):
-        """One T32-spec step on the device (eager or inside a capture): ``(rm, a, m)`` (``MotifModel.decode_spec``)."""
-        return self.model.decode_spec(p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool)
+        """One T32-spec step on the device (eager or inside a capture): ``(rm, a, m)`` (``MotifModel.decode_spec``).
+        With device sampling the step also samples ``rm`` (ROW_MAJOR: one tilize inside the sampler); its outputs
+        wait in :meth:`_take_so`."""
+        out = self.model.decode_spec(p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool)
+        if self.sampler is not None:
+            try:
+                self._pending_so = self.sampler.sample(out[0])
+            except BaseException:
+                _free(*out)
+                raise
+        return out
 
     def _device_step(self, p: DecodePath, pool: MotifKVPool):
         return self._spec_step(p, pool) if p.kind == SPEC else self._plain_step(p, pool)
@@ -959,14 +1131,9 @@ class MotifGenerator(api.MotifGenerator):
                 want_logits=True, path=key,
             )  # fmt: skip
             return res.logits
-        if int(batch.positions.max()) >= self.cfg.max_model_len:
-            raise ValueError(f"decode position {int(batch.positions.max())} >= max_model_len {self.cfg.max_model_len}")
         # every host check before the path is staged or written (the spec path's plan_spec_step does the same): an
         # active lane's token outside [0, vocab) would be embedded out of range (a negative one silently as padding)
-        check_token_ids(batch.tokens[batch.positions >= 0], self.cfg)
-        check_decode_page_tables(
-            batch.positions, batch.page_table, block_size=self.cfg.kv_block_size, num_blocks=pool.num_blocks
-        )
+        self._check_plain_batch(batch, pool)
         use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
         p = self._stage_path(key, batch.page_table_width)
         self._write_plain(p, batch)
@@ -976,10 +1143,71 @@ class MotifGenerator(api.MotifGenerator):
             ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
             return head.logits_to_host(p.out)  # blocking read of the trace output (fresh host tensor)
         out = self._plain_step(p, pool)
+        so = self._take_so()  # a host-sampled step on a device-sampling launch: the sampler's outputs are not used
         try:
             return head.logits_to_host(out)
         finally:
-            _free(out)
+            _free(out, so)
+
+    def _check_plain_batch(self, batch: api.DecodeBatch, pool: MotifKVPool) -> None:
+        """The plain path's host checks (before the path is staged or written)."""
+        if int(batch.positions.max()) >= self.cfg.max_model_len:
+            raise ValueError(f"decode position {int(batch.positions.max())} >= max_model_len {self.cfg.max_model_len}")
+        check_token_ids(batch.tokens[batch.positions >= 0], self.cfg)
+        check_decode_page_tables(
+            batch.positions, batch.page_table, block_size=self.cfg.kv_block_size, num_blocks=pool.num_blocks
+        )
+
+    def decode_forward_sampled(
+        self,
+        batch: api.DecodeBatch,
+        sampling: LaneSampling,
+        *,
+        kv_cache: Any,
+        enable_trace: bool,
+        path: Optional[DecodeKey] = None,
+    ) -> SampleResult:
+        """One device-sampled decode step (DEVICE_SAMPLER.md §6.2): the host checks and input writes of
+        :meth:`decode_forward`, then ``sampler.set_params(*sampling)`` (``sampling`` = lane-ordered ``(temperature,
+        top_p, top_k, seeds)`` in the plugin's conventions; a device write only when they changed) and
+        ``set_positions(batch.positions)`` (the RNG counters), the replay (or an eager step), one 1 KB read and the
+        exact host fallback of the flagged active lanes (logits read only then). Returns the lane-order
+        :class:`SampleResult` (``tokens`` int64 ``[32]``, raw ``logprobs``; inactive lanes are don't-care). On a
+        speculating launch this is the ordinary step of the spec trace (:meth:`decode_forward_spec` with
+        ``sampling``)."""
+        smp = self._require_sampler()
+        pool = self._check_pool(kv_cache)
+        key = self._resolve_key(None, path)
+        if key[0] == SPEC:
+            res = self.decode_forward_spec(
+                api.SpecDecodeBatch.from_decode_batch(batch), kv_cache=pool, enable_trace=enable_trace,
+                want_logits=False, path=key, sampling=sampling,
+            )  # fmt: skip
+            return res.sample
+        self._check_plain_batch(batch, pool)
+        use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
+        if use_trace and self._paths[key].so is None:
+            raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
+        p = self._stage_path(key, batch.page_table_width)
+        t0 = time.perf_counter()
+        self._write_plain(p, batch)
+        smp.set_params(*sampling)
+        smp.set_positions(batch.positions)
+        self.stats["decode_steps"] += 1
+        dev = so = None
+        try:
+            if use_trace:
+                ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
+                rm, so_read = p.out, p.so
+            else:
+                rm = dev = self._plain_step(p, pool)
+                so = so_read = self._take_so()
+            res = smp.read(so_read)  # blocking (chip 0, 1 KB): waits for the step
+            res = self._finish_sampled("plain", batch.positions, res, rm)
+        finally:
+            _free(dev, so)
+        self.timings["last_sampled_step_ms"] = (time.perf_counter() - t0) * 1e3
+        return res
 
     def plan_spec_step(self, batch: api.SpecDecodeBatch, *, path: Optional[DecodeKey] = None) -> SpecStepPlan:
         """:func:`plan_spec_step` with this generator's config, pool and (once traced) trace width: every host check
@@ -1003,6 +1231,7 @@ class MotifGenerator(api.MotifGenerator):
         enable_trace: bool,
         want_logits: bool,
         path: Optional[DecodeKey] = None,
+        sampling: Optional[LaneSampling] = None,
     ) -> api.SpecDecodeResult:
         """One decode step of a speculating launch (``generator_api.MotifGenerator.decode_forward_spec``; features
         design §3.8; module docstring "Speculative decode"): the plan (host checks, packing), then one replay of the
@@ -1010,75 +1239,119 @@ class MotifGenerator(api.MotifGenerator):
         only when some draft found no idle lane, a second replay (pass 2: those drafts on their own lanes at ``n +
         1``). Returns ``SpecDecodeResult`` in owner-lane order: ``argmax = (a0, a1)``, ``mtp_argmax = (m0, m1)``,
         logits of the anchor rows when ``want_logits`` (pass 1's owner lanes). ``path`` (tests): a non-default spec
-        path ``("spec", mode)``."""
+        path ``("spec", mode)``.
+
+        ``sampling`` (device sampling; an ORDINARY step only -- a verify step returns argmax ids and PS-1 keeps sampled
+        rows out of it): the lane-ordered ``(temperature, top_p, top_k, seeds)`` of :meth:`decode_forward_sampled`;
+        the step samples every lane on device (the anchors' positions key the RNG) and returns a
+        :class:`SampledSpecDecodeResult` whose ``sample`` holds the tokens (flagged active lanes resolved on the
+        host); ``a`` / ``m`` are still returned for the bridge's speculation bookkeeping."""
         pool = self._check_pool(kv_cache)
         if self.model.mtp is None:
             raise NotImplementedError("decode_forward_spec needs the MTP layer (the generator was built without it)")
         t0 = time.perf_counter()
         key = self._resolve_key(SPEC, path)
         plan = self.plan_spec_step(batch, path=key)
+        smp = None
+        if sampling is not None:
+            smp = self._require_sampler()
+            if plan.is_verify:
+                raise ValueError(
+                    "device sampling on a verify step: a verify returns the target argmax ids (PS-1 keeps sampled "
+                    "rows out of verify steps); sample on ordinary steps only"
+                )
         use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
+        if smp is not None and use_trace and self._paths[key].so is None:
+            raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
         p = self._stage_path(key, batch.page_table_width)
         head, outs, logits = self.model.head, [], None
         prof = self.spec_profile
         t_prev = time.perf_counter()
         prof["plan"] += (t_prev - t0) * 1e3
+        if smp is not None:
+            smp.set_params(*sampling)  # host compare; a device write only when the lanes' parameters changed
+            smp.set_positions(batch.positions)  # the step's RNG counters (anchor positions n)
         # Fast path (traced, "mesh" vocab split, no observer): every pass is enqueued back to back -- its inputs, the
         # replay, then non-blocking reads of a / m into pass-indexed host staging -- and only the step's LAST read
-        # blocks (the logits on an ordinary step, else the last m). A blocking read ends in a full-mesh finish (an
-        # event round trip to all 32 chips), so one per step instead of one per output; pass 2's inputs do not depend
-        # on pass 1's outputs, and in command-queue order pass 1's reads complete before pass 2 overwrites the
-        # trace outputs.
+        # blocks (the logits on an ordinary step, else the last m; on a device-sampled step the sampler's info read
+        # of every chip). A blocking read ends in a full-mesh finish (an event round trip to all 32 chips), so one per
+        # step instead of one per output; pass 2's inputs do not depend on pass 1's outputs, and in command-queue
+        # order pass 1's reads complete before pass 2 overwrites the trace outputs.
         fast = use_trace and head.vocab_split == "mesh" and self.spec_observer is None
         staged = []
         n_pass = len(plan.passes)
-        for i, ps in enumerate(plan.passes):
-            self._write_spec(p, ps)
-            read_logits = (bool(want_logits) and i == 0) or (self.spec_observer is not None and self.observe_logits)
-            dev = None
-            t1 = time.perf_counter()
-            if use_trace:
-                ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
-                rm, a_t, m_t = p.out
-            else:
-                rm, a_t, m_t = dev = self._spec_step(p, pool)
-            t2 = time.perf_counter()
-            lg = None
-            if fast:
-                ra, rmm = self._out_reader(f"a{i}", a_t), self._out_reader(f"m{i}", m_t)
-                ttnn.copy_device_to_host_tensor(a_t, ra.host, blocking=False)
-                last = i == n_pass - 1
-                ttnn.copy_device_to_host_tensor(m_t, rmm.host, blocking=last and not read_logits)
-                t3 = time.perf_counter()
-                if read_logits:
-                    lg = head.logits_to_host(rm)  # blocking: every read enqueued before it has landed too
-                staged.append((ra, rmm))
-            else:
-                try:
-                    a = head.tokens_to_host(a_t)  # blocking: waits for the step
+        res_s = None
+        keep_dev = None  # an eager device-sampled step keeps its outputs until the host fallback ran
+        rm_s = None
+        try:
+            for i, ps in enumerate(plan.passes):
+                self._write_spec(p, ps)
+                read_logits = (bool(want_logits) and i == 0) or (self.spec_observer is not None and self.observe_logits)
+                dev = so = None
+                t1 = time.perf_counter()
+                if use_trace:
+                    ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
+                    rm, a_t, m_t = p.out
+                    so_read = p.so
+                else:
+                    rm, a_t, m_t = dev = self._spec_step(p, pool)
+                    so = so_read = self._take_so()
+                t2 = time.perf_counter()
+                lg = None
+                sample_here = smp is not None and i == 0
+                if fast:
+                    ra, rmm = self._out_reader(f"a{i}", a_t), self._out_reader(f"m{i}", m_t)
+                    ttnn.copy_device_to_host_tensor(a_t, ra.host, blocking=False)
+                    block = i == n_pass - 1 and not read_logits and not sample_here
+                    ttnn.copy_device_to_host_tensor(m_t, rmm.host, blocking=block)
+                    if sample_here:  # the step's one blocking read: every chip's info (lands a / m too)
+                        res_s = smp.read(so_read, mesh_sync=True)
                     t3 = time.perf_counter()
-                    m = head.tokens_to_host(m_t)
-                    lg = head.logits_to_host(rm) if read_logits else None
-                finally:
-                    if dev is not None:
-                        _free(*dev)
-                outs.append((a, m))
-            t4 = time.perf_counter()
-            prof["write"] += (t1 - t_prev) * 1e3
-            prof["enqueue"] += (t2 - t1) * 1e3
-            prof["wait"] += (t3 - t2) * 1e3
-            prof["read"] += (t4 - t3) * 1e3
-            prof["passes"] += 1
-            t_prev = t4
-            self.stats["decode_steps"] += 1
-            if i == 0 and want_logits:
-                logits = lg
-            if self.spec_observer is not None:
-                self.spec_observer(plan, i, {"a": outs[-1][0], "m": outs[-1][1], "logits": lg})
-                t_prev = time.perf_counter()
-        for ra, rmm in staged:  # every staging buffer landed with the step's last (blocking) read
-            outs.append((_ids_from_staging(ra), _ids_from_staging(rmm)))
-        res = plan.result(outs, logits=logits)
+                    if read_logits:
+                        lg = head.logits_to_host(rm)  # blocking: every read enqueued before it has landed too
+                    staged.append((ra, rmm))
+                    if sample_here:
+                        rm_s = rm
+                else:
+                    try:
+                        a = head.tokens_to_host(a_t)  # blocking: waits for the step
+                        t3 = time.perf_counter()
+                        m = head.tokens_to_host(m_t)
+                        lg = head.logits_to_host(rm) if read_logits else None
+                        if sample_here:
+                            res_s = smp.read(so_read)
+                            rm_s = rm
+                    finally:
+                        if dev is not None:
+                            if sample_here:
+                                keep_dev = (dev, so)  # freed after the host fallback (it may read rm)
+                            else:
+                                _free(*dev, so)
+                    outs.append((a, m))
+                t4 = time.perf_counter()
+                prof["write"] += (t1 - t_prev) * 1e3
+                prof["enqueue"] += (t2 - t1) * 1e3
+                prof["wait"] += (t3 - t2) * 1e3
+                prof["read"] += (t4 - t3) * 1e3
+                prof["passes"] += 1
+                t_prev = t4
+                self.stats["decode_steps"] += 1
+                if i == 0 and want_logits:
+                    logits = lg
+                if self.spec_observer is not None:
+                    self.spec_observer(plan, i, {"a": outs[-1][0], "m": outs[-1][1], "logits": lg})
+                    t_prev = time.perf_counter()
+            for ra, rmm in staged:  # every staging buffer landed with the step's last (blocking) read
+                outs.append((_ids_from_staging(ra), _ids_from_staging(rmm)))
+            res = plan.result(outs, logits=logits)
+            if smp is not None:
+                res_s = self._finish_sampled("spec", batch.positions, res_s, rm_s)
+                res = SampledSpecDecodeResult(
+                    logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=res_s
+                )
+        finally:
+            if keep_dev is not None:
+                _free(*keep_dev[0], keep_dev[1])
         st = self.stats
         st["spec_steps"] += 1
         st["verify_steps"] += int(plan.is_verify)
@@ -1174,19 +1447,26 @@ class MotifGenerator(api.MotifGenerator):
         if p.kind == SPEC:
             self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
             rm, a, m = outs = self._spec_step(p, pool)
+            so = self._take_so()
             try:
                 head.tokens_to_host(a)
                 head.tokens_to_host(m)
                 head.logits_to_host(rm)
+                if so is not None:  # the sampler's reads (chip 0 and the staged every-chip read) before the capture
+                    self.sampler.read(so, count=False)
+                    self.sampler.read(so, mesh_sync=True, count=False)
             finally:
-                _free(*outs)
+                _free(*outs, so)
         else:
             self._write_plain(p, api.DecodeBatch(tokens=tokens, positions=pos, page_table=pt))
             out = self._plain_step(p, pool)
+            so = self._take_so()
             try:
                 head.logits_to_host(out)
+                if so is not None:
+                    self.sampler.read(so, count=False)
             finally:
-                _free(out)
+                _free(out, so)
         self.stats["decode_steps"] += 1
 
     def _write_inactive(self, p: DecodePath) -> None:
@@ -1263,6 +1543,7 @@ class MotifGenerator(api.MotifGenerator):
         try:
             out = self._device_step(p, pool)
         except BaseException:
+            _free(self._take_so())
             try:
                 ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
             except Exception:
@@ -1272,6 +1553,7 @@ class MotifGenerator(api.MotifGenerator):
             except Exception:
                 pass
             raise
+        so = self._take_so()  # the device sampler's outputs: extra trace outputs of the path
         try:
             ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
         except BaseException:
@@ -1279,8 +1561,9 @@ class MotifGenerator(api.MotifGenerator):
                 ttnn.release_trace(self.mesh_device, tid)
             except Exception:
                 pass
-            _free(*(out if isinstance(out, tuple) else (out,)))
+            _free(*(out if isinstance(out, tuple) else (out,)), so)
             raise
+        p.so = so
         return tid, out
 
     # ==============================================================================================================
@@ -1361,16 +1644,22 @@ class MotifGenerator(api.MotifGenerator):
             finally:
                 p.trace_id = None
                 _free(*(p.out if isinstance(p.out, tuple) else (p.out,)))
+                _free(p.so)  # the sampler's trace outputs (tokens, info)
                 p.out = None
+                p.so = None
                 p.pool = None
         if err is not None:
             raise err
 
     def close(self) -> None:
-        """Release the traces, the persistent inputs, the KV pool and the model weights (standalone runs)."""
+        """Release the traces, the persistent inputs, the device sampler, the KV pool and the model weights
+        (standalone runs)."""
         self.release_traces()
         for p in list(self._paths.values()):
             self._free_path(p)
+        if self.sampler is not None:
+            self.sampler.deallocate()
+            self.sampler = None
         if self._pool is not None:
             self._pool.deallocate()
             self._pool = None
@@ -1382,9 +1671,11 @@ __all__ = [
     "DecodePath",
     "MotifGenerator",
     "PLAIN",
+    "LaneSampling",
     "PrefillBatchPlan",
     "PrefillRowJob",
     "SPEC",
+    "SampledSpecDecodeResult",
     "SpecPass",
     "SpecStepPlan",
     "check_decode_page_tables",

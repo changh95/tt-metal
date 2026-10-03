@@ -840,7 +840,10 @@ class MotifMoE:
             rs = s
         if not reduce_tp:
             return rs
-        ar = self.ccl.ar_tp(rs)
+        # race_free: the AG half of this AR runs on ttnn's racy multicast gather for S/4 < 245 rows; prefill takes the
+        # safe path even for its single-CB-page size (bucket 128: [32, 512] bf16, which raced in isolation; tt/ccl.py
+        # module docstring, docs/determinism/INVESTIGATION.md). Decode's AR is not affected (forward_decode).
+        ar = self.ccl.ar_tp(rs, race_free=True)
         keep.drop(rs, ar)
         out = self.ccl.ag_dp(ar, 2)
         keep.drop(ar, out)

@@ -358,7 +358,7 @@ def test_cpu_capabilities_and_prefill_shapes(monkeypatch):
     gen, *_ = fake_generator(cfg, monkeypatch)
     assert gen.supports_resumed_prefill and gen.supports_spec_decode  # the fake model has its MTP layer
     assert not gen.spec_launch and gen.serving_path == ("plain", "row")  # host_cfg: spec_tokens 0, no KV-R
-    assert gen.prefill_alignment == cfg.prefill_resume_alignment == 64
+    assert gen.prefill_alignment == cfg.prefill_resume_alignment == api.DEFAULT_PREFILL_ALIGNMENT == 128  # G9 q/k
     assert gen.max_prefill_span == 8192 and gen.max_prefill_len == 32768 and gen.max_sp1_bucket == 8192
     buckets = (128, 256, 512, 1024, 2048, 4096, 8192)
     assert gen.prefill_shapes() == [(p, b) for b in buckets for p in (PP.SP0, PP.SP1)]
@@ -415,10 +415,10 @@ def test_cpu_plan_row_caps_sp1_buckets(monkeypatch, max_model_len, cap):
 @pytest.mark.parametrize(
     "bs, cap, budget, threshold, seed",
     [
-        (64, 8192, 8128, 8128, 0),  # production (lead decision 4: threshold = budget)
+        (64, 8192, 8064, 8064, 0),  # production (A = 128; lead decision 4: threshold = budget)
         (64, 512, 1000, 0, 1),  # small span cap: internal sp0 + sp1 chunks inside one call; unaligned vLLM chunk ends
         (64, 1024, 777, 300, 2),
-        (32, 512, 2048, 1024, 3),  # block 32 (A = 64 > bs)
+        (32, 512, 2048, 1024, 3),  # block 32 (A = 128 > bs)
     ],
 )
 def test_cpu_prefill_batch_emulated_schedule(monkeypatch, bs, cap, budget, threshold, seed):

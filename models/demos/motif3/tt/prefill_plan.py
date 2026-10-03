@@ -8,10 +8,13 @@ A prefill *row* is one :class:`~models.demos.motif3.tt.generator_api.PrefillRequ
 into the chunks the generator runs and builds every host-side table those chunks need. Every alignment and
 page-table rule of the features design lives here, so ``tests/unit/test_prefill_plan.py`` checks them exhaustively.
 
-Notation: ``bs`` = KV block size (64), ``A`` = resume alignment = ``lcm(bs, q_chunk, k_chunk)`` of the sp1 global
-op (64 by default; ``cfg.prefill_resume_alignment``), ``tail`` = the SWA tail (128 = window 129 minus the current
-key; ``cfg.prefill_swa_tail``), ``cap`` = the span cap (8192: the largest bucket the generator compiles;
-``cfg.max_prefill_span``), ``buckets`` = the prefill buckets ``<= cap`` (``cfg.prefill_span_buckets``).
+Notation: ``bs`` = KV block size (64), ``A`` = resume alignment = ``lcm(bs, every q_chunk / k_chunk)`` of the sp1
+global op over the buckets ``<= cap`` (:func:`resume_alignment`; ``cfg.prefill_resume_alignment``). Gate G9's
+per-bucket chunks (:data:`DEFAULT_SP1_GLOBAL_CHUNKS`: 128/128 at C = 128 and C >= 2048, 64/64 at 256-1024) give a
+uniform ``A = 128``, so the vLLM budget is ``cap - A = 8064`` (:func:`recommended_budget`). ``tail`` = the SWA tail
+(128 = window 129 minus the current key; ``cfg.prefill_swa_tail``), ``cap`` = the span cap (8192: the largest bucket
+the generator compiles; ``cfg.max_prefill_span``), ``buckets`` = the prefill buckets ``<= cap``
+(``cfg.prefill_span_buckets``).
 
 Rules (features design §3.1):
 
@@ -26,10 +29,11 @@ Rules (features design §3.1):
    or, when the cost model says it is cheaper, a head chunk of the largest bucket ``< r`` followed by the best plan
    of the rest (the same rule, recursively). This generalizes the design's single head split (2200 -> 2048 + 256;
    16,736 -> 8192 + 8192 + 512 are unchanged) to the cases where one split is not enough (6200 -> 4096 + 2048 + 128).
-   Only the last chunk is padded and only the last chunk runs the LM head (local row ``e - 1 - a``). A chunk at
-   start 0 is **sp0** (the draft-1 path: square causal SDPA over the chunk's own rows; no cache reads); every other
-   chunk is **sp1** (global layers attend over the paged cache from the chunk start; SWA layers read a ``tail``-row
-   tail from the cache).
+   An sp1 chunk's cost adds gate G9's per-bucket price of its global attention over the cached prefix
+   (:func:`prefill_cost_model`). Only the last chunk is padded and only the last chunk runs the LM head (local row
+   ``e - 1 - a``). A chunk at start 0 is **sp0** (the draft-1 path: square causal SDPA over the chunk's own rows; no
+   cache reads); every other chunk is **sp1** (global layers attend over the paged cache from the chunk start; SWA
+   layers read a ``tail``-row tail from the cache).
 4. **Tables per chunk** (start ``a``, bucket ``C``):
    * fill table ``[C / bs]``: ``-1`` (the fill kernel skips ``0xFFFFFFFF``) for blocks entirely below ``w0``
      (shared) and for blocks entirely at or past the chunk's end (pure padding), else the block id. Bucket padding
@@ -55,6 +59,7 @@ Import rule: stdlib, torch and ``generator_api`` only (never ttnn): the bridge, 
 from __future__ import annotations
 
 import heapq
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -82,12 +87,96 @@ DEFAULT_PREFILL_COST_TABLE: Mapping[int, float] = {
     16384: 11.547,
     32768: 23.396,
 }
-# sp1 chunks additionally run the absorbed global attention over the cached prefix [I]: 14 global layers x 10 heads x
-# 2 x (576 + 576) FLOP per (row, key) at ~50 TFLOP/s per chip (features design §3.2.2, review R10) = 6.5e-9 s per
-# (chunk row, prefix key). The chunk's own causal triangle is already in the bucket's table cost.
+# sp1 global op (ttnn.transformer.chunked_scaled_dot_product_attention over the paged latent cache): (q_chunk, k_chunk)
+# per chunk bucket, as (max bucket, (q, k)) entries, ascending; a bucket C uses the first entry with C <= max bucket.
+# Gate G9 (tests/unit/gates/GATES_RESULTS.md §12.2, fp32 dest acc, the fastest config per bucket; lead decision F5):
+# 128/128 at C = 128 and C >= 2048, 64/64 at C = 256-1024. A chunk start must be a multiple of its q and k (the kernels
+# floor it silently, G9 negative control), so the planner aligns every start to the uniform A = lcm(bs, every q / k up
+# to the span cap) = 128 (64/64 serves 128-aligned starts). model_config.SP1_GLOBAL_CHUNKS is this table; the bridge's
+# pre-generator default generator_api.DEFAULT_PREFILL_ALIGNMENT must equal resume_alignment(64, the 8192-cap buckets).
+DEFAULT_SP1_GLOBAL_CHUNKS: Tuple[Tuple[int, Tuple[int, int]], ...] = (
+    (128, (128, 128)),
+    (1024, (64, 64)),
+    (32768, (128, 128)),
+)
+# A bf16 latent cache (MOTIF3_KV_CACHE_DTYPE=bf16; bfp8 is the serving default) keeps 64/64 at every bucket (A = 64).
+# Its K / V tiles are 2048 B instead of 1088 B, and at 128/128 (fp32 dest acc) the op's static CB region ends at
+# 1,572,480 B (measured at C = 2048): through the whole 32 KB L1_SMALL region at the top of the 1.5 MB L1, where the
+# CCL global semaphores live. tt-metal checks a CB region only against the full L1 size and the lowest MAIN-L1 buffer,
+# so the overlap is silent: test_attention_resumed's bf16-KV schedules returned garbage, lost replica consistency and
+# hung in a later CCL (2026-10-03), while the op alone was exact. bfp8 at 128/128 (C = 128 and 2048) and bf16 at 64/64
+# measured below an L1 page held at 1,533,824 B, i.e. below L1_SMALL (bf16 at 128/128 also fit at C = 128 only).
+SP1_GLOBAL_CHUNKS_BF16_KV: Tuple[Tuple[int, Tuple[int, int]], ...] = ((32768, (64, 64)),)
+SP1_GLOBAL_CHUNKS_BY_KV_DTYPE: Mapping[str, Tuple[Tuple[int, Tuple[int, int]], ...]] = {
+    "bfp8": DEFAULT_SP1_GLOBAL_CHUNKS,
+    "bf16": SP1_GLOBAL_CHUNKS_BF16_KV,
+}
+
+# Gate G9's sp1 cost model (GATES_RESULTS §12.2; fp32 acc, eager, the q / k above): one global layer's sp1 attention at
+# bucket C behind a cached prefix of s keys takes t0(C) + slope(C) * s. {bucket: (t0 s, slope s per prefix key)}. The
+# op streams the whole prefix per (head, q chunk), so short chunks behind long prefixes cost far more per (row, key)
+# than the FLOP estimate (C = 128: 4.7e-8 s per row-key over 14 layers, C = 512: 1.4e-8, C >= 1024: 5.2e-9 - 7.4e-9).
+DEFAULT_SP1_GLOBAL_COST: Mapping[int, Tuple[float, float]] = {
+    128: (0.30e-3, 0.43e-6),
+    256: (0.60e-3, 0.50e-6),
+    512: (0.38e-3, 0.52e-6),
+    1024: (0.50e-3, 0.54e-6),
+    2048: (1.22e-3, 0.92e-6),
+    4096: (4.21e-3, 1.88e-6),
+    8192: (12.28e-3, 3.07e-6),
+}
+SP1_GLOBAL_LAYERS = 14  # Motif-3: layers l % 4 == 0 of 53
+
+# The pre-G9 single constant [I] (prefill_cost_model(sp1_s_per_row_key=...)): 14 global layers x 10 heads x 2 x (576 +
+# 576) FLOP per (row, key) at ~50 TFLOP/s per chip (features design §3.2.2, review R10) = 6.5e-9 s per (chunk row,
+# prefix key). G9 measured 6.1-7.7e-9 at C >= 1024 but 1.5e-8 - 4.8e-8 below (DEFAULT_SP1_GLOBAL_COST).
 DEFAULT_SP1_ATTN_S_PER_ROW_KEY = 6.5e-9
 
 CostFn = Callable[[int, int], float]  # (bucket, chunk start) -> estimated seconds
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# sp1 global op geometry (gate G9)
+# ----------------------------------------------------------------------------------------------------------------
+def sp1_global_qk(
+    bucket: int, table: Sequence[Tuple[int, Tuple[int, int]]] = DEFAULT_SP1_GLOBAL_CHUNKS
+) -> Tuple[int, int]:
+    """``(q_chunk, k_chunk)`` of the sp1 global op at chunk bucket ``bucket``: the first ``(max bucket, (q, k))``
+    entry of ``table`` with ``bucket <= max bucket``. Both must be positive and ``q`` must divide the bucket.
+    ``model_config.sp1_global_chunks`` is the same lookup on the same table, with the device's tile checks."""
+    C = int(bucket)
+    for upto, (q, k) in table:
+        if C <= int(upto):
+            q, k = int(q), int(k)
+            if C < 1 or q < 1 or k < 1 or C % q:
+                raise ValueError(f"sp1 bucket {C} with q/k chunks {(q, k)}: chunks must be positive and q | C")
+            return q, k
+    raise ValueError(f"no sp1 global chunk entry for bucket {C} in {tuple(table)}")
+
+
+def sp1_global_chunk_table(kv_cache_dtype: str = "bfp8") -> Tuple[Tuple[int, Tuple[int, int]], ...]:
+    """The sp1 global ``(max bucket, (q, k))`` table for a latent-cache dtype name: gate G9's per-bucket table for
+    ``"bfp8"`` (the serving default), 64/64 everywhere for ``"bf16"`` (:data:`SP1_GLOBAL_CHUNKS_BF16_KV`)."""
+    name = str(kv_cache_dtype)
+    if name not in SP1_GLOBAL_CHUNKS_BY_KV_DTYPE:
+        known = sorted(SP1_GLOBAL_CHUNKS_BY_KV_DTYPE)
+        raise ValueError(f"no sp1 global chunk table for KV cache dtype {name!r}; known {known}")
+    return SP1_GLOBAL_CHUNKS_BY_KV_DTYPE[name]
+
+
+def resume_alignment(
+    block_size: int, buckets: Sequence[int], table: Sequence[Tuple[int, Tuple[int, int]]] = DEFAULT_SP1_GLOBAL_CHUNKS
+) -> int:
+    """``A = lcm(block_size, q, k of every bucket in buckets)`` (``cfg.prefill_resume_alignment`` with ``buckets`` =
+    the span buckets): every chunk start a multiple of ``A`` is a valid start for every bucket's sp1 global op. 128 for
+    the default table at block 32 or 64 (64 for an all-64/64 table at block 64)."""
+    a = int(block_size)
+    if a < 1:
+        raise ValueError(f"block_size must be positive, got {a}")
+    for b in buckets:
+        q, k = sp1_global_qk(int(b), table)
+        a = math.lcm(a, q, k)
+    return a
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -199,16 +288,60 @@ def table_cost(table: Mapping[int, float], bucket: int) -> float:
     return float(table[lo]) * (1.0 - t) + float(table[hi]) * t
 
 
+def sp1_prefix_cost(
+    bucket: int,
+    start: int,
+    *,
+    sp1_global_cost: Optional[Mapping[int, Tuple[float, float]]] = None,
+    global_layers: int = SP1_GLOBAL_LAYERS,
+) -> float:
+    """Seconds an sp1 chunk of ``bucket`` rows at ``start`` spends attending over its cached prefix in the global
+    layers: ``global_layers * slope(C) * start`` with gate G9's per-bucket slope (:data:`DEFAULT_SP1_GLOBAL_COST`;
+    piecewise-linear between measured buckets, per token above the largest). 0 at ``start = 0`` (sp0). The fixed part
+    ``t0(C)`` is not added: the bucket's table cost already holds the chunk's own causal attention (the absorbed op
+    costs ``t0 - sp0`` more, about 0.12 s per 8192-row chunk over 14 layers and <= 0.04 s below 8192)."""
+    if int(start) <= 0:
+        return 0.0
+    slopes = _sp1_slopes(DEFAULT_SP1_GLOBAL_COST if sp1_global_cost is None else sp1_global_cost)
+    return float(global_layers) * table_cost(slopes, int(bucket)) * int(start)
+
+
+def _sp1_slopes(model: Mapping[int, Tuple[float, float]]) -> Dict[int, float]:
+    """``{bucket: slope}`` of an sp1 cost model ``{bucket: (t0, slope)}`` (validated)."""
+    if not model or any(int(c) < 1 or float(t0) < 0 or float(sl) < 0 for c, (t0, sl) in model.items()):
+        raise ValueError(f"sp1_global_cost must map buckets to non-negative (t0, slope) pairs, got {dict(model)}")
+    return {int(c): float(sl) for c, (_, sl) in model.items()}
+
+
 def prefill_cost_model(
-    table: Optional[Mapping[int, float]] = None, *, sp1_s_per_row_key: float = DEFAULT_SP1_ATTN_S_PER_ROW_KEY
+    table: Optional[Mapping[int, float]] = None,
+    *,
+    sp1_s_per_row_key: Optional[float] = None,
+    sp1_global_cost: Optional[Mapping[int, Tuple[float, float]]] = None,
+    global_layers: int = SP1_GLOBAL_LAYERS,
 ) -> CostFn:
-    """The default chunk cost [I]: ``table_cost(table, C)`` plus, for an sp1 chunk at ``a > 0``, the absorbed global
-    attention over the cached prefix ``sp1_s_per_row_key * C * a``."""
+    """The default chunk cost: ``table_cost(table, C)`` (eager single-row TTFT per bucket) plus, for an sp1 chunk at
+    ``a > 0``, its global attention over the cached prefix: gate G9's per-bucket model :func:`sp1_prefix_cost`
+    (default), or, when ``sp1_s_per_row_key`` is given, the pre-G9 single constant ``sp1_s_per_row_key * C * a``
+    (``0.0`` drops the prefix term)."""
     t = dict(DEFAULT_PREFILL_COST_TABLE if table is None else table)
-    k = float(sp1_s_per_row_key)
+    if sp1_s_per_row_key is not None:
+        k = float(sp1_s_per_row_key)
+        if k < 0:
+            raise ValueError(f"sp1_s_per_row_key must be >= 0, got {k}")
+
+        def cost(bucket: int, start: int) -> float:
+            return table_cost(t, bucket) + (k * bucket * start if start > 0 else 0.0)
+
+        return cost
+    slopes = _sp1_slopes(DEFAULT_SP1_GLOBAL_COST if sp1_global_cost is None else sp1_global_cost)
+    layers = int(global_layers)
+    if layers < 0:
+        raise ValueError(f"global_layers must be >= 0, got {layers}")
 
     def cost(bucket: int, start: int) -> float:
-        return table_cost(t, bucket) + (k * bucket * start if start > 0 else 0.0)
+        prefix = layers * table_cost(slopes, bucket) * start if start > 0 else 0.0
+        return table_cost(t, bucket) + prefix
 
     return cost
 
@@ -572,7 +705,11 @@ def check_scheduler_config(
         block_size: vLLM ``--block-size``.
         kv_replicated: KV-R resolved (``GeneratorSettings.kv_replicated``).
 
-    Raises ``ValueError`` on configurations that would serve wrong outputs; returns warnings (performance only)."""
+    Raises ``ValueError`` on configurations that would serve wrong outputs; returns warnings (performance only), each
+    naming the change that clears it (for the bucket geometry: ``A`` a power of two that divides the span cap). Every
+    span cap ``MOTIF3_PREFILL_MAX_BUCKET`` allows is accepted, including one that does not exceed ``A`` (128 at
+    A = 128): no budget then fits a resumed chunk in one bucket, so the warning names the span cap instead of a
+    budget, and the small-budget warning (whose floor is ``min(4096, span cap) - A``) stays silent."""
     bs = check_block_size(block_size)
     A, cap, thr = int(align), int(span_cap), int(threshold)
     if A < 1 or A % bs:
@@ -611,14 +748,25 @@ def check_scheduler_config(
         )
     per_row = min(budget, thr) if thr > 0 else budget
     if per_row + A - 1 > cap:
+        # A span cap <= A (MOTIF3_PREFILL_MAX_BUCKET=128 at A = 128) leaves no budget that fits a resumed chunk plus its
+        # recompute in one bucket: point at the cap instead of suggesting a budget <= 0.
+        fix = (
+            f"use max_num_batched_tokens <= {cap - A}"
+            if cap > A
+            else f"no budget avoids that while the span cap does not exceed the resume alignment {A}: raise "
+            f"MOTIF3_PREFILL_MAX_BUCKET"
+        )
         warnings.append(
             f"a {per_row}-token chunk plus up to {A - 1} recomputed tokens exceeds the {cap}-row span cap: such rows "
-            f"are split internally, so a prefill step can take longer than the budget suggests (use "
-            f"max_num_batched_tokens <= {cap - A})"
+            f"are split internally, so a prefill step can take longer than the budget suggests ({fix})"
         )
-    if budget < SMALL_BUDGET_TOKENS - A:  # below the aligned 4K budget (the §1.1 interactive variant is 4096 - A)
+    # Below the aligned 4K budget (the §1.1 interactive variant is 4096 - A), or below the span cap's own budget when
+    # that is smaller: under a small span cap the chunks are small whatever the budget (the warning above says so), and
+    # the suggested pin (cap - A) must not trip this warning again. Never fires when cap <= A (small_floor <= 0).
+    small_floor = min(SMALL_BUDGET_TOKENS, cap) - A
+    if budget < small_floor:
         warnings.append(
-            f"max_num_batched_tokens {budget} < {SMALL_BUDGET_TOKENS - A}: long prompts run as many small eager "
+            f"max_num_batched_tokens {budget} < {small_floor}: long prompts run as many small eager "
             f"chunks, each paying up to the ~0.64 s dispatch floor (vLLM's unpinned default for `vllm serve` on TT is "
             f"2048; pin {recommended_budget(cap, A)})"
         )
@@ -627,7 +775,8 @@ def check_scheduler_config(
 
 def recommended_budget(span_cap: int, align: int) -> int:
     """The chunk budget that keeps every lone-request span inside one ``span_cap`` bucket: ``span_cap - A``
-    (8128 for 8192 / 64, 8064 for 8192 / 128). Also the recommended ``--long-prefill-token-threshold``."""
+    (8064 for the production 8192 / 128 of gate G9's per-bucket chunks; 8128 for an all-64/64 table, A = 64). Also the
+    recommended ``--long-prefill-token-threshold`` (lead decision: threshold = budget)."""
     cap, A = int(span_cap), int(align)
     if A < 1 or cap <= A:
         raise ValueError(f"span cap {cap} must exceed the alignment {A}")
@@ -640,6 +789,8 @@ __all__ = [
     "CostFn",
     "DEFAULT_PREFILL_COST_TABLE",
     "DEFAULT_SP1_ATTN_S_PER_ROW_KEY",
+    "DEFAULT_SP1_GLOBAL_CHUNKS",
+    "DEFAULT_SP1_GLOBAL_COST",
     "DEFAULT_SWA_TAIL",
     "PATHS",
     "RowPlan",
@@ -647,6 +798,9 @@ __all__ = [
     "SMALL_BUDGET_TOKENS",
     "SP0",
     "SP1",
+    "SP1_GLOBAL_CHUNKS_BF16_KV",
+    "SP1_GLOBAL_CHUNKS_BY_KV_DTYPE",
+    "SP1_GLOBAL_LAYERS",
     "check_scheduler_config",
     "chunk_tables",
     "fill_table",
@@ -656,9 +810,13 @@ __all__ = [
     "plan_prefill_row",
     "prefill_cost_model",
     "recommended_budget",
+    "resume_alignment",
     "rope_positions",
     "sdpa_table",
     "sdpa_table_width",
+    "sp1_global_chunk_table",
+    "sp1_global_qk",
+    "sp1_prefix_cost",
     "span_buckets",
     "table_cost",
     "tail_blocks",

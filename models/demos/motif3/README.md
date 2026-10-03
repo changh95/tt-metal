@@ -275,6 +275,7 @@ Verbatim copies of the gate configs (`tests/unit/test_infra_config.py` compares 
 |---|---|---|
 | `cfg.flash_mla_decode_pc()` / `flash_mla_decode_pc(grid)` | `SDPAProgramConfig(12x10, q_chunk 0, k_chunk 128, exp_approx False, max_cores_per_head_batch 16)` with `sdpa_decode` | PCC 0.99994 SWA / global, SWA window + causal-edge probe exact, 29.8 us SWA / 102 us global 4K traced. **Never** `k_chunk` 0/None (dynamic chunking drops the causal mask under a window: upstream bug), 256 clashes with a sharded Q, 512 overflows L1 |
 | `cfg.sdpa_prefill_pc(layer or "swa"/"global", seq_len=S)` | `SDPAProgramConfig(12x10, q/k 128/128 SWA, 256/256 global, exp_approx False)`, clamped to 128 for S = 128; with `sdpa_prefill` | PCC 0.99975 SWA / 0.99961 global at S = 1024; V zero-padded to 192 (dv = 128 is rejected); q512/k512 overflows L1 |
+| `cfg.resumed_prefill_pc(layer or "global"/"swa", C)` | sp1 (resumed) chunk of bucket C. **global**: `chunked_scaled_dot_product_attention` config with gate G9's per-bucket q/k (`SP1_GLOBAL_CHUNKS` = `prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS`: 128/128 at C = 128 and C >= 2048, 64/64 at 256-1024; 64/64 everywhere for a bf16 cache, `kv_dtype=`), with **`sdpa_prefill_fp32`**; **swa**: the G2 square config over 128 + C rows, with `sdpa_prefill` | G9: fp32 dest acc PCC 0.99983-0.99999 in all 68 cases; the bf16-dest `sdpa_prefill` role fails all 68 (worst row 0.988). A start that is not a multiple of q and k is silently floored (no device check): `attention.py` asserts it before every call |
 | `cfg.experts_gate_up_pc()` | `MatmulMultiCoreReuseMultiCast1DProgramConfig` grid 10x8, `in0_block_w` 8, `per_core_M` 1, `per_core_N` 1, `out_subblock_w` 1, `fuse_batch` False, `mcast_in0` True; with `experts` | `[1,12,32,4096] @ [1,12,4096,2560]` bfp8: PCC 0.9999986, 438 us traced (auto config: 983 us) |
 | `cfg.experts_down_pc()` | same, grid 8x4, `in0_block_w` 4, `per_core_N` 4, `out_subblock_w` 4 | `[1,12,32,1280] @ [1,12,1280,4096]` bfp8: PCC 0.9999986, 230 us traced (auto: 289 us) |
 
@@ -585,9 +586,10 @@ checks that the default generator class imports device-free (`test_real_generato
 | `MOTIF3_FABRIC` | `FABRIC_2D_TORUS_XY` (fallback `FABRIC_1D_RING`); with a mesh the device's fabric wins |
 | `MOTIF3_GENERATOR_CLASS` | runtime class for the bridge (`models.demos.motif3.tt.generator:MotifGenerator`) |
 | `MESH_DEVICE` | `"(4, 8)"` for serving (`(8, 4)` also works; `open_motif_mesh()` reads it) |
-| `MOTIF3_PREFIX_CACHING` / `MOTIF3_CHUNKED_PREFILL` / `MOTIF3_SPEC_DECODE` | bridge class capabilities (§15-§17; `generator_api.feature_switch_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises); they only allow a feature, vLLM's flags enable it |
+| `MOTIF3_PREFIX_CACHING` / `MOTIF3_CHUNKED_PREFILL` / `MOTIF3_SPEC_DECODE` | bridge class capabilities (§15-§17; `generator_api.feature_switch_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises; default on); they only allow a feature, vLLM's flags enable it. `MOTIF3_*=0` alone is **not** draft 1 for prompts over 8192 tokens: the span cap still splits them (sp0 + sp1). Draft-1 behaviour is the pair `MOTIF3_*=0` + `MOTIF3_PREFILL_MAX_BUCKET=32768` (below) |
+| `MOTIF3_DEVICE_SAMPLING` | bridge class capability `supports_sample_on_device` (`generator_vllm.device_sampling_switch`: `1/true/yes/on` or `0/false/no/off`, a typo raises; default on, never with `max_device_top_k`). It only allows device sampling; the `"tt"` config's `"sample_on_device_mode": "decode_only"` enables it (the production launch below), and with the switch at `0` the plugin refuses that mode at boot. `0` and no `sample_on_device_mode` is draft 1's host sampling (rollback) |
 | `MOTIF3_KV_REPLICATED_DECODE` | KV-R (§16): `auto` (default: on iff prefix caching), `1` (forced on), `0` (refused with prefix caching) |
-| `MOTIF3_PREFILL_MAX_BUCKET` | span cap (§15): largest prefill bucket of a resumed-prefill generator, a power of two in [128, 32768] (8192); longer spans are split into chunks |
+| `MOTIF3_PREFILL_MAX_BUCKET` | span cap (§15): largest prefill bucket of a resumed-prefill generator, a power of two in [128, 32768] (8192); longer spans are split into chunks. `32768` restores the draft-1 single-shot buckets (rollback, with `MOTIF3_*=0`) |
 | `MOTIF3_PACKED_PREFILL` | optional packed multi-row prefill (0; only after gate G15) |
 | `MOTIF3_SPEC_VERIFY` | `packed` (default: drafts in idle lanes of the 32-lane trace) or `wide` (64-row verify trace, only after gate G16) |
 
@@ -596,6 +598,18 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
 "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col", "l1_small_size": 32768}}'` (`generator_api.SERVING_TT_CONFIG`; TIS:
 `override_tt_config`). Without `l1_small_size` the bridge refuses to start (`get_max_tokens_all_users`, in
 `init_device`, before the weights load) and refuses a mesh with less L1_SMALL (`initialize_vllm_model`).
+
+Launches (lead decisions; TIS dev spec `id_motif3-galaxy_Motif-3_blackhole_galaxy`, `docs/TIS_RUNBOOK.md` §1):
+
+| Launch | vLLM flags on top of the above | Use |
+|---|---|---|
+| **production default** | `--enable-chunked-prefill --max-num-batched-tokens 8064 --long-prefill-token-threshold 8064 --enable-prefix-caching --no-async-scheduling`; `"tt"` adds `"sample_on_device_mode": "decode_only"` (device sampling; the bridge must declare `supports_sample_on_device`, no `max_device_top_k`) and `"decode_interleave_prefill_steps": 1, "decode_interleave_decode_steps": 1`; env `OMP_WAIT_POLICY=PASSIVE` | all traffic |
+| MTP opt-in | the production default + `--speculative-config '{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}'` (TIS impl `motif3-galaxy-mtp`) | greedy / agentic / low-concurrency serving and the TIS greedy benchmarks (~1.9x decode for greedy rows at c <= 8). Sampled traffic gets no speedup, and while a sampled request is live nothing speculates (PS-1). With device sampling no step-time cost was measurable against the production default (`docs/sampling/DEVICE_SAMPLER.md` §11: sampled TPOT 92-96 vs 94-98 ms at c = 1-32, greedy at c = 32 95.2 vs 96.5 ms; separate runs); the +4-7 ms per sampled step and -2.5 % at c = 32 of `FEATURES_RESULTS.md` §3.8 were host-sampling numbers. vLLM refuses sampled `min_p` and `logit_bias`, the plugin `logprobs`, structured output, `bad_words`, `allowed_token_ids` and `min_tokens` on it |
+| honest benchmark | either of the above + `--no-enable-prefix-caching` (KV-R then off: decode skips its ~1.9 ms) | `vllm bench` repeats identical prompts: prefix hits would flatter TTFT |
+| rollback (draft-1 behaviour) | `MOTIF3_PREFIX_CACHING=0 MOTIF3_CHUNKED_PREFILL=0 MOTIF3_SPEC_DECODE=0 MOTIF3_DEVICE_SAMPLING=0 MOTIF3_PREFILL_MAX_BUCKET=32768`, the draft-1 flags (`--max-num-batched-tokens 32768 --no-enable-prefix-caching`, no speculative or interleave keys) and no `sample_on_device_mode` (host sampling); keep `OMP_WAIT_POLICY=PASSIVE` | A/B against draft 1: the `docs/SERVING_RESULTS.md` server also ran with PASSIVE (its §4), and the TIS rollback cannot drop it (a spec env value overrides a shell export). Against a draft-1 launch without it, the rollback is 2.5-4 ms per step faster (`docs/SERVING_SMOKE.md` §7.2) |
+
+The budget is `prefill_plan.recommended_budget(8192, A)` = 8064 for A = 128 (§15); the bridge's `FEATURE_VLLM_ARGS`
+derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks against the generator's real A at init.
 
 ## 15. Resumed and chunked prefill (`tt/prefill_plan.py`; `docs/features/FEATURES_DESIGN.md` §2, §3.1-§3.3, §3.7)
 
@@ -613,10 +627,10 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
   | Quantity | Rule | Default |
   |---|---|---|
   | write floor `w0` | `floor(s / bs) * bs`: full blocks below it are never written | |
-  | resume alignment `A` | `cfg.prefill_resume_alignment = lcm(bs, q, k)` of the sp1 global op (`model_config.SP1_GLOBAL_CHUNKS`, gate G9 decides) | 64 |
+  | resume alignment `A` | `cfg.prefill_resume_alignment = lcm(bs, q, k)` over the span buckets of the sp1 global op (`prefill_plan.resume_alignment`; per-bucket q/k from gate G9: `model_config.SP1_GLOBAL_CHUNKS` = `prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS`, 128/128 at C = 128 and C >= 2048, 64/64 at 256-1024). A **bf16** latent cache uses 64/64 everywhere (`SP1_GLOBAL_CHUNKS_BF16_KV`, A = 64; `cfg.sp1_global_chunk_table`, and attention picks by the cache tensor's dtype): at 128/128 the op's static CBs end at 1,572,480 B, through the L1_SMALL region of the CCL semaphores, which tt-metal does not check | 128 (bfp8) |
   | compute floor `c0` | `floor(s / A) * A`, or 0 when that is below the SWA tail `cfg.prefill_swa_tail` (128) | |
   | span cap | `cfg.max_prefill_span` (`MOTIF3_PREFILL_MAX_BUCKET`), buckets `cfg.prefill_span_buckets` (128 ... 8192) | 8192 |
-  | chunks | consecutive, `A`-aligned starts; full-cap chunks while more than the cap remains; then one padded chunk, or a head chunk + the rest when the cost table (`cfg.prefill_cost_table`) says it is cheaper | 16,736 -> 8192 + 8192 + 512 |
+  | chunks | consecutive, `A`-aligned starts; full-cap chunks while more than the cap remains; then one padded chunk, or a head chunk + the rest when the cost model says it is cheaper (`cfg.prefill_cost_table` per bucket + gate G9's per-bucket price of an sp1 chunk's global attention over its prefix, `prefill_plan.DEFAULT_SP1_GLOBAL_COST`) | 16,736 -> 8192 + 8192 + 512 |
   | path | **sp0** (start 0: the draft-1 square causal SDPA over the chunk's own rows, no cache reads) / **sp1** (start > 0: global layers attend over the paged latent from the chunk start; SWA layers read the 128-row tail from the cache) | |
 
 * **Tables per chunk** (`prefill_plan.chunk_tables`): fill table `[C / bs]` with **-1** (skipped by
@@ -637,11 +651,14 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
   fill with speculation) compiles before the decode capture; the generator refuses any other shape afterwards. The
   16K / 32K buckets are no longer compiled (the planner splits those spans).
 * **vLLM flags**: `--max-num-batched-tokens` = `--long-prefill-token-threshold` = `span cap - A`
-  (`prefill_plan.recommended_budget`: 8128 for A = 64, 8064 if G9 moves the large buckets to 128/128): a lone prompt's
-  chunk ends are then multiples of `A` (no recompute) and every span fits one bucket. The bridge runs
+  (`prefill_plan.recommended_budget`: **8064** for A = 128; 8128 only for an all-64/64 table): a lone prompt's chunk
+  ends are then multiples of `A` (no recompute) and every span fits one bucket. A prefix hit at an odd multiple of 64
+  recomputes 64 rows per continuation (the price of the uniform A = 128). The bridge runs
   `prefill_plan.check_scheduler_config` at `init_device`: it raises on prefix caching without KV-R or with a
   `--prefix-match-unit` other than the block size, and warns on unaligned budgets / thresholds, spans over the cap and
-  budgets below `4096 - A` (vLLM's unpinned `vllm serve` default on TT is 2048).
+  budgets below `min(4096, span cap) - A` (vLLM's unpinned `vllm serve` default on TT is 2048); each warning names
+  the change that clears it. Every span cap `MOTIF3_PREFILL_MAX_BUCKET` allows is accepted: at 128 with A = 128 no
+  budget fits a resumed chunk plus its recompute in one bucket, so the span-cap warning says to raise the cap.
 
 ## 16. Decode KV writes: KV-R and the speculative split (`tt/kv_write.py`; features design §3.4-§3.5)
 
@@ -702,10 +719,74 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
 * Modules (wave B1): embedding, mHC, attention, PolyNorm / MLP, MoE, LM head, the Sinkhorn and router kernels
   (`docs/WAVE_B1_SUMMARY.json`). Decoder, model, generator, TIS integration: the integration wave (WAVE_A_REVIEW
   §5.8-5.11).
-* Features (chunked prefill, prefix caching, MTP speculation; `docs/features/FEATURES_DESIGN.md`), WP1 contract +
-  config (2026-10-02): `generator_api` (`PrefillRequest.start`, `prefill_forward_batch`, `SpecDecodeBatch` /
-  `SpecDecodeResult` / `decode_forward_spec`, the capability properties, the feature `GeneratorSettings` and their
-  environment, `kv_write_mode`, `check_generator_features`), `tt/prefill_plan.py`, the `model_config` feature fields
-  (§15-§17). Host only: `test_prefill_plan.py` (exhaustive planning to 1100 tokens for blocks 32 / 64 and A 64 / 128,
-  samples to 32768, an emulated paged cache under a vLLM-like scheduler) and the `test_infra_config.py` feature tests
-  pass; nothing in the runtime uses them yet (WP2-WP6 build on this contract).
+* Features (chunked prefill, prefix caching, MTP speculation; `docs/features/FEATURES_DESIGN.md`): **in the runtime and
+  validated end to end** (2026-10-03; `docs/FEATURES_RESULTS.md`, review `docs/FEATURES_REVIEW.md`). The contract
+  (`generator_api`: `PrefillRequest.start`, `prefill_forward_batch`, `SpecDecodeBatch` / `SpecDecodeResult` /
+  `decode_forward_spec`, the capability properties, the feature `GeneratorSettings`, `kv_write_mode`), the planner
+  (`tt/prefill_plan.py`), the sp1 attention paths (`tt/attention.py`), KV-R and the split KV writes (`tt/kv_write.py`),
+  the MTP layer (`tt/mtp.py`), the generator (`prefill_forward_batch`, the T32-spec decode trace) and the bridge
+  (`FEATURE_SWITCH_DEFAULT = True`) all serve through a real `vllm serve`; the plugin has PS-1 (a verify step never
+  holds a sampled or penalized row). Host suites: `test_prefill_plan.py` (exhaustive planning to 1100 tokens for
+  blocks 32 / 64 and A 64 / 128, every lone-request vLLM step to 32768 at the production geometry, samples to 32768,
+  an emulated paged cache under a vLLM-like scheduler), the `test_infra_config.py` feature tests, the bridge suite,
+  the WP4 / WP5 host emulation; device: gates G9-G13, `test_attention_resumed.py`, `test_resumed_prefill.py` (CP-H /
+  CP-C / CP-L / CP-X / CP9), `test_spec_decode_device.py`, `test_vllm_features_e2e.py` against live servers.
+  Lead decisions: the production default launch is chunked prefill + prefix caching + device sampling (MTP is an
+  opt-in launch, §14); the floor-relative accuracy bars of `test_resumed_prefill.py` are signed off; gate G9's
+  per-bucket sp1 q/k (F5: A = 128, budget = threshold = 8064). Open: prefill run-to-run nondeterminism at >= 4K buckets
+  (FEATURES_REVIEW P1), a latent two-trace hazard (F3, so one decode trace), burst TTFT (serial prefill rows, P2).
+  **Needs a lead decision:** two of the signed-off bars fail under F5 (CP-H (ii), CP-L (ii); below), so the
+  full-depth `test_resumed_prefill.py` run is red until the bars are re-signed or the sp1 table changes.
+* F5 (2026-10-03): gate G9's per-bucket sp1 global q/k (`prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS`), A = 128, vLLM budget
+  = threshold = 8064 (`recommended_budget`, `generator_api.DEFAULT_PREFILL_ALIGNMENT`, `FEATURE_VLLM_ARGS`, the TIS
+  spec) and G9's per-bucket sp1 cost model in the planner (`DEFAULT_SP1_GLOBAL_COST`). Measured on HEAD + F5 alone:
+  * Module level (`test_attention_resumed.py::test_wp2b_sp1_cost`, eager, bfp8 cache, prefix 128 / 8192): global sp1
+    per call C = 128 2.85 / 5.36 ms (64/64: 2.81 / 6.03), 2048 4.82 / 12.08 (5.26 / 15.54), 8192 24.44 / 47.05
+    (30.85 / 65.69). `test_attention_resumed.py` 7/7.
+  * A bf16 latent cache keeps 64/64 (A = 64): at 128/128 the op's static CBs end at 1,572,480 B, through L1_SMALL,
+    and the bf16-KV schedules returned garbage and hung a later CCL (tt-metal does not check CBs against L1_SMALL);
+    with 64/64 they pass again.
+  * Prefill TTFT (`test_prefill_ttft_report` alone, HEAD vs HEAD + F5 back to back): cold 32,000 tokens 27.04 ->
+    25.78 s, 16,736 13.11 -> 12.85 s; single-chunk rows (128: 0.66-0.67 s, 8192: 5.85 s) and prefix hits (0.67-0.70 s)
+    unchanged. (At the end of the full-suite run, after CP9, the hits measured 0.77-0.81 s.)
+  * Serving (direct `vllm serve`, host sampling). Production flags: the 30,832-token needle prompt in 4 vLLM steps of
+    8064 has TTFT 25.5 s (26.4 s at 8128 with 64/64), a running decode stalls at most 6.7 s (7.1 s), the same prompt
+    again 0.93 s (30,784 tokens hit; that odd-64 hit recomputes 64 rows), answers equal to the pre-F5 servers'. The
+    opt-in MTP launch (`FEATURE_VLLM_ARGS`, 8064) passes the live e2e tests that touch the budget, prefix hits or
+    speculation: greedy speculation 8/8 identical to draft 1 (acceptance 0.93 / 0.88), a 6,196-token prompt 5.15 s
+    cold -> 0.79 s hit, a decode-written hit 0.83 s (cold 2.23 s), the 30K prompt 25.5 s (26.5 s) with a 6.7 s stall
+    and 0.84 s again, the PS-1 mix 16/16, the logprob refusal; its prefix, 30K and PS-1 greedy outputs equal the
+    pre-F5 server's.
+  * `test_resumed_prefill.py` (full depth): CP-L (i) passes on the 31,972-token needle prompt (budget path 4 calls of
+    8064, 27.4 s vs 28.1-28.8 s at 8128; top-1 vs the single shot 0.912 on the 420 confident rows, 0.876-0.905 at
+    8128, asserted bar 0.857, the chunked path's own repeat 0.911; NLL 1.893 vs 1.971; the needle found on every
+    path); CP-C 4/4 (top-1 vs the cold rows -0.13 .. +0.13 pt), CP-H (iii) pooled -0.06 pt / -0.03 % NLL, CP-X, CP9
+    (program cache constant) and the MTP fill pass.
+  * Two single-row bars of the signed-off set fail (open: the lead's call; reproduced bit-identically by the review,
+    `logs/dev/20261003_084206_rev_defaults_f5_snap.log`). **CP-H (ii)**: multi_turn_chat's hit at
+    192 now resumes at 128, and its last row picks the fp32 golden's token (6, golden margin 0.24) where the cold row
+    picks 171 at margin 0.531, just over the 0.5 near-tie bar (KL vs fp32: hit 0.024, cold 0.142); the rule reads
+    the cold row's margin only, while the greedy-stream rule excuses the same token as a near tie (hit margin 0.25).
+    **CP-L (ii)** (layers 0-3 vs the CPU reference): at 31,972 tokens both chunked paths' worst sampled
+    position is 31961 at stream PCC 0.99678, 0.0015 under the single shot's worst (0.99829; bar: within 0.001),
+    while their median rises to 0.99988 (64/64: 0.99972; single shot 0.99995) and the mean error (1 - PCC over the
+    172 positions) falls from 0.000426 to 0.000306. Same-session diagnostics: the k chunk decides (q 64 / k 128 at
+    C >= 2048 gives F5's numbers; q 128 / k 64 gives 64/64's: worst 0.99803 at 16386, median 0.99971), a repeat is
+    bitwise equal, and against the single shot k = 128 is the closer table at 132 / 127 / 131 / 123 of the 172
+    positions after layers 0 / 1 / 2 / 3 (mean error 0.000176 vs 0.000379 after layer 0) while single positions swing
+    both ways from layer to layer (28672: closer through layer 2, 0.9971 vs 0.9996 after layer 3, an MoE layer): the
+    chaotic single-row behaviour of CP-H, not a systematic loss.
+  * The decision these two need (lead decision 2 signed off exactly these bars). Both fail on a noisy reference
+    (the cold row's margin; one worst position), not on an F5 defect:
+    (a) re-sign them with references that are not noisy: CP-H (ii) against the fp32 golden's argmax and margin (the
+    hit picks the golden's token), CP-L (ii) on the median or mean error over the 172 positions (both better under
+    F5). Only the bar code in `test_resumed_prefill.py` changes; F5's TTFT stays.
+    (b) keep the bars and go back to the all-64/64 table (A = 64, budget = threshold = 8128), under which both
+    pass (CP-H (ii) on the pre-F5 tree, `logs/dev/20261003_015009_wp45_rev_cp53_b.log`; CP-L (ii) worst 0.99812 in
+    the same-session 64/64 run): about +1.3 s cold TTFT at 32K (27.04 vs 25.78 s) and +0.9 s on the 30K serving
+    prompt (26.4 vs 25.5 s).
+    k = 64 at C >= 2048 alone (q 128 / k 64, A stays 128) clears CP-L (ii) only (worst 0.99803 vs the single shot's
+    0.99829) at an unmeasured cost (G9 timed 64/64 and 128/128 there). CP-H (ii) follows A, not the large buckets:
+    the hit at 192 resumes at 128 whatever the C >= 2048 entry. Restoring its pre-F5 resume point needs A = 64 for
+    the C = 128 chunk: (b), or 32/64 or 64/64 at C = 128 with G9's per-bucket A (a planner change, GATES_RESULTS
+    §12.2; not run against the bar).

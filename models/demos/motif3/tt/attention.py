@@ -144,7 +144,12 @@ reads the cached prefix:
   Row ``i`` attends keys ``[0, a + i]``; every key, the chunk's own included, is a bfp8 cache row (decode numerics).
   Gate G9: the op needs fp32 dest accumulation over the 576-wide heads (the bf16-dest ``sdpa_prefill`` role misses
   PCC 0.999 everywhere), and ``a`` must be a multiple of the op's q and k chunks (no device check: a misaligned start
-  silently answers from the floored start) -- checked here before every call.
+  silently answers from the floored start) -- checked here before every call. The q / k chunks are per bucket
+  (``model_config.SP1_GLOBAL_CHUNKS`` = ``prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS``, G9's fastest: 128/128 at C = 128
+  and C >= 2048, 64/64 at C = 256-1024), so every start is a multiple of ``cfg.prefill_resume_alignment`` = 128. A
+  bf16 cache (picked by the cache tensor's dtype) uses 64/64 everywhere (``SP1_GLOBAL_CHUNKS_BF16_KV``): at 128/128
+  its static CBs end at 1,572,480 B, through the L1_SMALL region of the CCL semaphores, which tt-metal does not check
+  (garbage, lost replica consistency, then a hang in a later CCL).
 * **SWA layers** (square ``[tail ‖ chunk]`` window; D3, gate G10)::
 
       tail = typecast(concat(slice(cache, [blk_j, 0, 0, 0], [blk_j + 1, 1, bs, 576], slice_dim=0, num_devices=N)))
@@ -194,8 +199,9 @@ caught (global sp1 rows PCC 0.9886, worst row 0.952; own blocks differ on both k
 bucket)`` compiles every program: a real chunk after it (``forward_prefill`` + ``fill_kv``) compiles 0. Eager per call
 (random weights, start 128 / 8192; sp0 at the same bucket; two runs, small buckets are dispatch-bound and noisy):
 global C = 512 2.9-4.5 / 6.5-7.3 ms (sp0 3.7-3.8), 2048 5.3-5.5 / 15.5-15.6 (4.2), 8192 30.9 / 65.6-65.7 (14.9-15.0)
-with the default 64/64 chunks (G9: 128/128 is 1.5x faster on the op at C = 8192); SWA C = 512 4.4 (3.7-3.8), 2048
-4.9 (4.2), 8192 11.9 (11.6-11.7) at either start.
+with 64/64 chunks at every bucket; with G9's per-bucket table (``test_wp2b_sp1_cost``, 2026-10-03, bfp8 cache) C =
+128 2.85 / 5.36 ms (64/64: 2.81 / 6.03), 2048 4.82 / 12.08 (5.26 / 15.54), 8192 24.44 / 47.05 (30.85 / 65.69), C = 512
+unchanged (64/64 in both); SWA C = 512 4.4 (3.7-3.8), 2048 4.9 (4.2), 8192 11.9 (11.6-11.7) at either start.
 Deviations from the wave-B action list, with reasons: ATTN-4 uses ``rotary_embedding_hf`` in *prefill* mode on the
 heads-on-dim-1 / lanes-on-rows q_pe ``[1, 10, L, 64]`` with ``decode_cos_sin(layout="rows")`` (same kernel, row t
 rotated by lane t's position; the decode-mode variant would need a transpose + reshard of q_pe and k_pe, 4 extra ops);
@@ -1573,9 +1579,11 @@ class MotifAttention:
             )
         return C
 
-    def sp1_global_program_config(self, bucket: int):
-        """Program config of the sp1 global chunked SDPA at ``bucket`` rows (``cfg.resumed_prefill_pc``, gate G9)."""
-        return self.cfg.resumed_prefill_pc(self.spec, int(bucket))
+    def sp1_global_program_config(self, bucket: int, kv_dtype=None):
+        """Program config of the sp1 global chunked SDPA at ``bucket`` rows (``cfg.resumed_prefill_pc``, gate G9).
+        ``kv_dtype`` = the dtype of the cache it reads (default ``cfg.dtypes.kv_cache``): a bf16 cache takes the 64/64
+        table (``model_config.SP1_GLOBAL_CHUNKS_BF16_KV``: at 128/128 its static CBs overrun the CCL semaphores)."""
+        return self.cfg.resumed_prefill_pc(self.spec, int(bucket), kv_dtype=kv_dtype)
 
     def _check_sp1_global(self, chunk: PrefillChunkInputs, pc, C: int) -> None:
         """Design R6 / G9: the chunked kernels divide the start by ``q_chunk`` with no device check, so a start that is
@@ -1595,7 +1603,7 @@ class MotifAttention:
         """sp1 global layer: absorbed MLA over the paged latent cache (D2, G9). Row ``i`` (position ``a + i``) attends
         keys ``[0, a + i]``, all of them read from the cache, so the chunk's latent is filled first."""
         C = int(x.shape[-2])
-        pc = self.sp1_global_program_config(C)
+        pc = self.sp1_global_program_config(C, kv_dtype=kv_cache.dtype)  # the (q, k) table of the cache it reads
         self._check_sp1_global(chunk, pc, C)
         cos, sin = self._rot_tables(chunk.rot)
         q, g, n, kpe, lam = self._project(x, decode=False)

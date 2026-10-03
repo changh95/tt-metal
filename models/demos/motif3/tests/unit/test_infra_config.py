@@ -819,25 +819,27 @@ def test_tt_cache_root_precedence(tmp_path, monkeypatch):
 # Features (docs/features/FEATURES_DESIGN.md §2, §3.1-§3.6; WP1): config fields and the generator contract
 # ======================================================================================================
 def test_features_config_defaults():
-    """Span cap 8192 (D8), A = 64 (D1), W' = 640, SWA tail 128, draft-1 KV writes, no MTP cache until spec is on."""
+    """Span cap 8192 (D8), A = 128 (gate G9's per-bucket sp1 q / k), W' = 640, SWA tail 128, draft-1 KV writes, no
+    MTP cache until spec is on."""
     cfg = _cfg()
     assert cfg.prefill_span_cap == api.DEFAULT_PREFILL_SPAN_CAP == 8192 and cfg.max_prefill_span == 8192
     assert cfg.prefill_span_buckets == (128, 256, 512, 1024, 2048, 4096, 8192) == pp.span_buckets(32768, 8192)
     assert cfg.prefill_buckets[-1] == 32768  # the draft-1 bucket list is unchanged
     assert cfg.prefill_swa_tail == 128 == pp.DEFAULT_SWA_TAIL
-    assert cfg.prefill_resume_alignment == api.DEFAULT_PREFILL_ALIGNMENT == 64
+    assert cfg.prefill_resume_alignment == api.DEFAULT_PREFILL_ALIGNMENT == 128
+    assert cfg.prefill_resume_alignment == pp.resume_alignment(64, cfg.prefill_span_buckets)
     assert cfg.sp1_page_table_width == 640 == pp.sdpa_table_width(32768, 8192, 64)
     assert (
-        pp.recommended_budget(cfg.max_prefill_span, cfg.prefill_resume_alignment) == 8128
-    )  # §1.1 --max-num-batched-tokens
+        pp.recommended_budget(cfg.max_prefill_span, cfg.prefill_resume_alignment) == 8064
+    )  # --max-num-batched-tokens = --long-prefill-token-threshold
     assert cfg.kv_write_mode == "row" and cfg.kv_replicated_decode is False and cfg.spec_tokens == 0
     assert cfg.mtp_kv_layers == 0 and cfg.kv_pool_layers == 53
     assert cfg.kv_pool_bytes_per_chip() == cfg.kv_cache_bytes_per_chip()
     assert cfg.num_nextn_predict_layers == 1 and cfg.mtp_layer_idx == 53 == api.MTP_LAYER_IDX
     assert cfg.prefill_cost_table == dict(pp.DEFAULT_PREFILL_COST_TABLE)
-    assert "span cap=8192 A=64 kv_write=row spec=0" in cfg.describe()
-    cfg.set_kv_geometry(8225, 32)  # block 32: A stays 64 (q/k 64), W' doubles
-    assert cfg.prefill_resume_alignment == 64 and cfg.sp1_page_table_width == 1280
+    assert "span cap=8192 A=128 kv_write=row spec=0" in cfg.describe()
+    cfg.set_kv_geometry(8225, 32)  # block 32: A stays 128 (q/k 128 at C = 128 and C >= 2048), W' doubles
+    assert cfg.prefill_resume_alignment == 128 and cfg.sp1_page_table_width == 1280
     small = _cfg(max_model_len=4096)  # max_model_len below the cap: the cap clamps to the last bucket
     assert small.max_prefill_span == 4096 and small.prefill_span_buckets[-1] == 4096
     assert small.sp1_page_table_width == 128
@@ -918,14 +920,18 @@ def test_mtp_layer_spec_matches_reference():
 
 
 def test_resumed_prefill_program_configs():
-    """sp1 global: flexible chunked SDPA with q/k 64/64 (D1, until G9); sp1 SWA: the G2 square config over 128 + C."""
+    """sp1 global: flexible chunked SDPA with gate G9's per-bucket q/k (128/128 at C = 128 and C >= 2048, 64/64 at
+    256-1024; the table is prefill_plan's); sp1 SWA: the G2 square config over 128 + C."""
     mesh = _FakeMesh()
     cfg = _cfg()
-    want = ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=ttnn.CoreCoord(12, 10), q_chunk_size=64, k_chunk_size=64, exp_approx_mode=False
-    )
+    assert SP1_GLOBAL_CHUNKS == pp.DEFAULT_SP1_GLOBAL_CHUNKS
     for C in cfg.prefill_span_buckets:
-        assert cfg.sp1_global_chunks(C) == (64, 64)
+        qk = (64, 64) if 256 <= C <= 1024 else (128, 128)
+        assert cfg.sp1_global_chunks(C) == qk == pp.sp1_global_qk(C)
+        want = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(12, 10), q_chunk_size=qk[0], k_chunk_size=qk[1],
+            exp_approx_mode=False,
+        )  # fmt: skip
         assert repr(cfg.resumed_prefill_pc("global", C)) == repr(want) == repr(resumed_prefill_pc("global", C, mesh))
         assert repr(cfg.resumed_prefill_pc(0, C)) == repr(want)  # layer 0 is global
         swa = repr(sdpa_prefill_pc("swa", mesh, seq_len=128 + C))
@@ -939,13 +945,25 @@ def test_resumed_prefill_program_configs():
         sp1_global_chunks(65536)
     r10 = ((512, (64, 64)), (32768, (128, 128)))  # review R10's per-bucket candidate -> A = 128, budget 8064
     assert sp1_global_chunks(512, r10) == (64, 64) and sp1_global_chunks(1024, r10) == (128, 128)
+    # a bf16 latent cache: 64/64 everywhere (A = 64); the table follows the cache dtype (name, ttnn dtype or config)
+    b16 = _cfg(kv_cache_dtype="bf16")
+    assert b16.sp1_global_chunk_table() == pp.SP1_GLOBAL_CHUNKS_BF16_KV and b16.prefill_resume_alignment == 64
+    pc64 = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(12, 10), q_chunk_size=64, k_chunk_size=64, exp_approx_mode=False
+    )
+    for C in cfg.prefill_span_buckets:
+        assert b16.sp1_global_chunks(C) == (64, 64) == cfg.sp1_global_chunks(C, kv_dtype=ttnn.bfloat16)
+        assert repr(cfg.resumed_prefill_pc("global", C, kv_dtype="bf16")) == repr(pc64)
+        assert cfg.sp1_global_chunks(C, kv_dtype=ttnn.bfloat8_b) == cfg.sp1_global_chunks(C)
+    with pytest.raises(ValueError, match="KV cache dtype"):
+        cfg.sp1_global_chunks(128, kv_dtype=ttnn.float32)
 
 
 def test_cfg_plan_prefill_row_matches_free_function():
     cfg = _cfg()
     for s, e in ((0, 1000), (1348, 3000), (6976, 9000), (0, 16736), (32704, 32768), (64, 900)):
         p = cfg.plan_prefill_row(s, e)
-        q = pp.plan_prefill_row(s, e, block_size=64, align=64, buckets=api.prefill_buckets(32768), span_cap=8192)
+        q = pp.plan_prefill_row(s, e, block_size=64, align=128, buckets=api.prefill_buckets(32768), span_cap=8192)
         assert p == q
         assert pp.plan_cost(p, cfg.prefill_cost) == pytest.approx(pp.plan_cost(q))
     with pytest.raises(ValueError):
@@ -955,7 +973,7 @@ def test_cfg_plan_prefill_row_matches_free_function():
     assert [(c.start, c.bucket) for c in flat.plan_prefill_row(0, 2200).chunks] == [(0, 4096)]  # re-measured table
     cfg.set_kv_geometry(8225, 32)  # the geometry allocate_kv_cache recorded wins
     p = cfg.plan_prefill_row(100, 1000)
-    assert (p.block_size, p.align, p.w0, p.c0) == (32, 64, 96, 0)
+    assert (p.block_size, p.align, p.w0, p.c0) == (32, 128, 96, 0)
 
 
 def test_from_settings_features(monkeypatch):

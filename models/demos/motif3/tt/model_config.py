@@ -96,6 +96,16 @@ TILE = 32
 KV_CACHE_DTYPE_BY_NAME = {"bfp8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16}
 MHC_SINKHORN_IMPLS = ("motif", "stock")  # MHCSite(sinkhorn=...)
 ROUTER_LOGITS_IMPLS = ("composite", "exact_fp32")  # MotifMoE(router_logits=...)
+# MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
+# ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
+# cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
+# with even-ring alternate routes (a completion race: docs/determinism/INVESTIGATION.md, tt/ccl.py) AND that streams
+# more than one circular-buffer page per link (where the race is frequent) through all_broadcast + concat, plus every
+# such gather of a race_free=True call (the MoE prefill combine) or of a MotifCCL.race_free_scope(); the other
+# single-page ones (every decode gather, the bucket-128 / 256 PolyNorm moments) stay native under "lean". "safe"
+# reroutes every such gather (+0.26-0.45 ms per decode step); "native" = the plain ttnn.all_gather (the pre-fix
+# behaviour, prefill not run-to-run reproducible). Validation and cost: docs/determinism/FIX.md.
+RING_GATHER_MODES = ("safe", "lean", "native")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -278,6 +288,18 @@ def kv_cache_dtype_from_name(name: str):
     if key not in KV_CACHE_DTYPE_BY_NAME:
         raise ValueError(f"kv cache dtype must be one of {sorted(KV_CACHE_DTYPE_BY_NAME)}, got {name!r}")
     return KV_CACHE_DTYPE_BY_NAME[key]
+
+
+def kv_cache_dtype_name(dtype) -> str:
+    """``"bfp8"`` | ``"bf16"`` of a latent-cache dtype given as a name or a ttnn dtype (the inverse of
+    :func:`kv_cache_dtype_from_name`; a cache tensor's ``.dtype``). Raises on any other dtype."""
+    if isinstance(dtype, str) and dtype.strip().lower() in KV_CACHE_DTYPE_BY_NAME:
+        return dtype.strip().lower()
+    for name, dt in KV_CACHE_DTYPE_BY_NAME.items():
+        if dtype == dt:
+            return name
+    known = sorted(KV_CACHE_DTYPE_BY_NAME)
+    raise ValueError(f"KV cache dtype must be one of {known} (or their ttnn dtypes), got {dtype!r}")
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -647,13 +669,20 @@ def sdpa_prefill_pc(kind, grid=(12, 10), seq_len: Optional[int] = None):
 
 # Resumed (sp1) prefill, global layers: ttnn.transformer.chunked_scaled_dot_product_attention(Q_abs [1,10,C,576],
 # K = V = the paged latent cache, page_table [1, W'], chunk_start_idx_tensor [1]) (features design D2, §3.2.2).
-# (max bucket, (q_chunk, k_chunk)) entries, ascending: a bucket C uses the first entry with C <= max bucket. Default
-# 64/64 everywhere (D1: A = lcm(64, 64, 64) = 64, vLLM budget 8192 - 64 = 8128). q/k <= 128 (256/128 overflows L1,
-# tt_ops_chunked.md §3.3). Gate G9 decides; review R10's candidate is ((512, (64, 64)), (32768, (128, 128))), which
-# makes A = 128 and the budget 8064 (update generator_api.DEFAULT_PREFILL_ALIGNMENT with it). The chunk start must
-# be a multiple of q and k (the kernels divide it by q_chunk without a device check): prefill_plan aligns every chunk
-# start to cfg.prefill_resume_alignment = lcm(block, every q/k used up to the span cap).
-SP1_GLOBAL_CHUNKS: Tuple[Tuple[int, Tuple[int, int]], ...] = ((32768, (64, 64)),)
+# (max bucket, (q_chunk, k_chunk)) entries, ascending: a bucket C uses the first entry with C <= max bucket. Gate G9
+# decided it per bucket (GATES_RESULTS §12.2; lead decision F5): 128/128 at C = 128 and C >= 2048, 64/64 at C =
+# 256-1024, the fastest fp32-acc config of each bucket (vs 64/64 everywhere: 1.2x at C = 128, 1.2-1.46x at C >= 2048).
+# A = cfg.prefill_resume_alignment = lcm(block, every q/k up to the span cap) = 128 (64/64 serves 128-aligned starts),
+# so the vLLM budget = threshold = 8192 - 128 = 8064 (prefill_plan.recommended_budget) and the bridge's
+# pre-generator default generator_api.DEFAULT_PREFILL_ALIGNMENT = 128. q/k <= 128 (256/128 overflows L1,
+# tt_ops_chunked.md §3.3). The chunk start must be a multiple of q and k (the kernels divide it by q_chunk without a
+# device check): prefill_plan aligns every chunk start to A, and attention asserts it before every call. The table
+# itself lives in prefill_plan (pure host: the planner's tests check every sp1 start against it).
+SP1_GLOBAL_CHUNKS: Tuple[Tuple[int, Tuple[int, int]], ...] = _plan.DEFAULT_SP1_GLOBAL_CHUNKS
+# A bf16 latent cache keeps 64/64 at every bucket (A = 64): at 128/128 the op's static CBs run through the L1_SMALL
+# region (CCL semaphores) without tt-metal noticing (measured; prefill_plan.SP1_GLOBAL_CHUNKS_BF16_KV).
+# cfg.sp1_global_chunk_table picks the table by cache dtype.
+SP1_GLOBAL_CHUNKS_BF16_KV: Tuple[Tuple[int, Tuple[int, int]], ...] = _plan.SP1_GLOBAL_CHUNKS_BF16_KV
 
 
 def sp1_global_chunks(bucket: int, table: Sequence[Tuple[int, Tuple[int, int]]] = SP1_GLOBAL_CHUNKS) -> Tuple[int, int]:
@@ -667,17 +696,29 @@ def sp1_global_chunks(bucket: int, table: Sequence[Tuple[int, Tuple[int, int]]] 
     raise ValueError(f"no sp1 global chunk entry for bucket {C} in {tuple(table)}")
 
 
-def resumed_prefill_pc(kind, bucket: int, grid=(12, 10), swa_tail: int = _plan.DEFAULT_SWA_TAIL):
-    """Program config of an sp1 (resumed) prefill chunk of ``bucket`` rows; pair it with the ``sdpa_prefill`` role.
+def resumed_prefill_pc(
+    kind,
+    bucket: int,
+    grid=(12, 10),
+    swa_tail: int = _plan.DEFAULT_SWA_TAIL,
+    table: Sequence[Tuple[int, Tuple[int, int]]] = SP1_GLOBAL_CHUNKS,
+):
+    """Program config of an sp1 (resumed) prefill chunk of ``bucket`` rows. The compute role differs per kind:
 
-    * ``"global"``: the flexible chunked SDPA (:func:`sp1_global_chunks`), ``exp_approx_mode=False``.
+    * ``"global"``: the flexible chunked SDPA (:func:`sp1_global_chunks` of ``table``: :data:`SP1_GLOBAL_CHUNKS` for
+      a bfp8 cache, :data:`SP1_GLOBAL_CHUNKS_BF16_KV` for a bf16 one), ``exp_approx_mode=False``. Pair
+      it with the **``sdpa_prefill_fp32``** role (HiFi4, fp32 dest acc): gate G9 measured the bf16-dest
+      ``sdpa_prefill`` role failing on the 576-wide latent heads in all 68 cases (PCC 0.9978-0.9991, worst row 0.988)
+      against 0.99983-0.99999 with fp32 acc. The op is window-free, so fp32 acc is allowed (``attention.py`` uses
+      ``cfg.compute_config("sdpa_prefill_fp32")``).
     * ``"swa"``: the square ``[tail ‖ chunk]`` causal + window-129 SDPA over ``swa_tail + bucket`` rows, i.e. the G2
-      config :func:`sdpa_prefill_pc` ``("swa", seq_len=swa_tail + bucket)`` (features design §3.2.3).
+      config :func:`sdpa_prefill_pc` ``("swa", seq_len=swa_tail + bucket)`` (features design §3.2.3). Pair it with
+      the ``sdpa_prefill`` role (never fp32 acc with a sliding window: upstream window-mask bug).
     """
     k = _attn_kind(kind)
     if k == "swa":
         return sdpa_prefill_pc("swa", grid, seq_len=int(swa_tail) + int(bucket))
-    qc, kc = sp1_global_chunks(bucket)
+    qc, kc = sp1_global_chunks(bucket, table)
     x, y = _grid_xy(grid)
     return ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(x, y),
@@ -1131,9 +1172,11 @@ class MotifTTConfig:
     # Span cap (MOTIF3_PREFILL_MAX_BUCKET): the largest bucket a resumed-prefill generator compiles; longer spans are
     # split into sp0 + sp1 chunks (D8). Effective value: max_prefill_span = min(cap, max_model_len).
     prefill_span_cap: int = DEFAULT_PREFILL_SPAN_CAP
-    # Eager prefill cost per bucket (s) + sp1 prefix-attention coefficient for the chunk planner [I; G9 / CP-L refine].
+    # Eager prefill cost per bucket (s) for the chunk planner. sp1 chunks add their global attention over the cached
+    # prefix: gate G9's per-bucket model (prefill_plan.DEFAULT_SP1_GLOBAL_COST) when prefill_sp1_s_per_row_key is None
+    # (default), else that single pre-G9 constant per (chunk row, prefix key) (0.0 drops the prefix term).
     prefill_cost_table: Dict[int, float] = field(default_factory=lambda: dict(_plan.DEFAULT_PREFILL_COST_TABLE))
-    prefill_sp1_s_per_row_key: float = _plan.DEFAULT_SP1_ATTN_S_PER_ROW_KEY
+    prefill_sp1_s_per_row_key: Optional[float] = None
     kv_replicated_decode: bool = False  # KV-R: every decode KV write on all 32 chips (on with prefix caching)
     spec_tokens: int = 0  # MTP self-speculation drafts per step: 0 | 1
     num_nextn_predict_layers: int = 1  # config.json: MTP layers in the checkpoint (model.mtp_layers.0)
@@ -1145,6 +1188,8 @@ class MotifTTConfig:
     # Router decode logits (decision D1, decided on model-level metrics): "composite" (FPU fp32 composite, 99.81 % top-8
     # agreement on real tokens) | "exact_fp32" (tt/kernels/router_fp32, 99.997 %, +24 us per MoE layer).
     router_logits: str = "composite"  # MOTIF3_ROUTER_LOGITS
+    # Ring all-gathers of the TP axis (tt/ccl.py MotifCCL, P1 determinism fix): "lean" (default) | "safe" | "native".
+    ring_gather: str = "safe"  # MOTIF3_RING_GATHER
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1290,6 +1335,7 @@ class MotifTTConfig:
             fabric=os.environ.get("MOTIF3_FABRIC") or DEFAULT_FABRIC,
             l1_small_size=_env_int("MOTIF3_L1_SMALL_SIZE", DEFAULT_L1_SMALL_SIZE),
             router_logits=(os.environ.get("MOTIF3_ROUTER_LOGITS") or "composite").strip(),
+            ring_gather=(os.environ.get("MOTIF3_RING_GATHER") or "safe").strip(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
@@ -1415,14 +1461,16 @@ class MotifTTConfig:
             raise ValueError(f"mhc_sinkhorn must be one of {MHC_SINKHORN_IMPLS}, got {self.mhc_sinkhorn!r}")
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
+        if self.ring_gather not in RING_GATHER_MODES:
+            raise ValueError(f"ring_gather must be one of {RING_GATHER_MODES}, got {self.ring_gather!r}")
         # ---- features ----
         check_prefill_span_cap(self.prefill_span_cap, self.max_model_len)
         if self.max_prefill_span not in self.prefill_buckets:
             raise ValueError(f"span cap {self.max_prefill_span} is not a prefill bucket {self.prefill_buckets}")
         if not self.prefill_cost_table or any(int(k) < 1 or float(v) <= 0 for k, v in self.prefill_cost_table.items()):
             raise ValueError(f"prefill_cost_table must map buckets to positive seconds, got {self.prefill_cost_table}")
-        if self.prefill_sp1_s_per_row_key < 0:
-            raise ValueError(f"prefill_sp1_s_per_row_key must be >= 0, got {self.prefill_sp1_s_per_row_key}")
+        if self.prefill_sp1_s_per_row_key is not None and self.prefill_sp1_s_per_row_key < 0:
+            raise ValueError(f"prefill_sp1_s_per_row_key must be None or >= 0, got {self.prefill_sp1_s_per_row_key}")
         if self.kv_replicated_decode not in (True, False):
             raise TypeError(f"kv_replicated_decode must be a bool, got {self.kv_replicated_decode!r}")
         if self.spec_tokens not in SUPPORTED_SPEC_TOKENS:
@@ -1724,15 +1772,25 @@ class MotifTTConfig:
         w = self.effective_sliding_window
         return 0 if w is None else int(w) - 1
 
-    def sp1_global_chunks(self, bucket: int) -> Tuple[int, int]:
-        """``(q_chunk, k_chunk)`` of the sp1 global op at ``bucket`` (:data:`SP1_GLOBAL_CHUNKS`)."""
-        return sp1_global_chunks(bucket)
+    def sp1_global_chunk_table(self, kv_dtype=None) -> Tuple[Tuple[int, Tuple[int, int]], ...]:
+        """The sp1 global ``(max bucket, (q, k))`` table for a latent-cache dtype (a name or a ttnn dtype; default
+        this config's ``dtypes.kv_cache``): :data:`SP1_GLOBAL_CHUNKS` for bfp8, :data:`SP1_GLOBAL_CHUNKS_BF16_KV` for
+        bf16 (``prefill_plan.sp1_global_chunk_table``)."""
+        name = self.dtypes.kv_cache_name if kv_dtype is None else kv_cache_dtype_name(kv_dtype)
+        return _plan.sp1_global_chunk_table(name)
+
+    def sp1_global_chunks(self, bucket: int, kv_dtype=None) -> Tuple[int, int]:
+        """``(q_chunk, k_chunk)`` of the sp1 global op at ``bucket`` for a cache of ``kv_dtype`` (default this
+        config's): :meth:`sp1_global_chunk_table`."""
+        return sp1_global_chunks(bucket, self.sp1_global_chunk_table(kv_dtype))
 
     @property
     def prefill_resume_alignment(self) -> int:
-        """``A = lcm(kv_block_size, q_chunk, k_chunk)`` over every sp1 global config up to the span cap (64 for the
-        defaults: block 64, q/k 64/64). Every chunk start is a multiple of ``A`` (the chunked kernels divide the start
-        by ``q_chunk`` with no device check); vLLM's chunk budget should be ``max_prefill_span - A``."""
+        """``A = lcm(kv_block_size, q_chunk, k_chunk)`` over every sp1 global config up to the span cap
+        (``prefill_plan.resume_alignment``) for this config's cache dtype: 128 for the defaults (bfp8, block 32 or 64;
+        gate G9's per-bucket q/k 128/128 at C = 128 and C >= 2048, 64/64 at 256-1024), 64 with a bf16 cache (64/64).
+        Every chunk start is a multiple of ``A`` (the chunked kernels divide the start by ``q_chunk`` with no device
+        check); vLLM's chunk budget = threshold = ``max_prefill_span - A`` (8064; 8064 is also aligned for A = 64)."""
         a = int(self.kv_block_size)
         for b in self.prefill_span_buckets:
             q, k = self.sp1_global_chunks(b)
@@ -1745,12 +1803,15 @@ class MotifTTConfig:
         (32768 + 8192 at block 64). Fixed, so one program per bucket; padded with 0 (never -1)."""
         return _plan.sdpa_table_width(self.max_model_len, self.max_prefill_span, self.kv_block_size)
 
-    def resumed_prefill_pc(self, kind, bucket: int):
+    def resumed_prefill_pc(self, kind, bucket: int, kv_dtype=None):
         """sp1 prefill program config (:func:`resumed_prefill_pc`) on this chip's grid; ``kind`` = "global" | "swa" |
-        a ``LayerSpec`` | a layer index."""
+        a ``LayerSpec`` | a layer index. ``kv_dtype``: the cache the global op reads (default this config's
+        ``dtypes.kv_cache``); it selects the (q, k) table (:meth:`sp1_global_chunk_table`)."""
         if isinstance(kind, int) and not isinstance(kind, bool):
             kind = self.layer(kind)
-        return resumed_prefill_pc(kind, bucket, self.compute_grid, self.prefill_swa_tail)
+        return resumed_prefill_pc(
+            kind, bucket, self.compute_grid, self.prefill_swa_tail, table=self.sp1_global_chunk_table(kv_dtype)
+        )
 
     def prefill_cost(self, bucket: int, start: int = 0) -> float:
         """Estimated seconds of one prefill chunk (:func:`prefill_plan.prefill_cost_model` with this config's table)."""
@@ -2047,9 +2108,11 @@ __all__ = [
     "MotifTTConfig",
     "NUM_CB_SLOTS",
     "ROUTER_DECODE_GRID",
+    "RING_GATHER_MODES",
     "ROUTER_LOGITS_IMPLS",
     "SDPA_PREFILL_CHUNKS",
     "SP1_GLOBAL_CHUNKS",
+    "SP1_GLOBAL_CHUNKS_BF16_KV",
     "SUPPORTED_BLOCK_SIZES",
     "active_fabric_name",
     "attn_decode_matmul_pcs",
@@ -2064,6 +2127,7 @@ __all__ = [
     "fabric_config_from_name",
     "flash_mla_decode_pc",
     "kv_cache_dtype_from_name",
+    "kv_cache_dtype_name",
     "lm_head_pc",
     "make_compute_kernel_config",
     "mcast1d_matmul_pc",

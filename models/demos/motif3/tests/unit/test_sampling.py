@@ -17,9 +17,19 @@ device tests needs at collection -- the devices stay hidden)::
 * ``test_cpu_emulation_*``: the fp32 emulation of the device pipeline: kept-set size = fp64 on every certified lane,
   the token = the fp64 inverse CDF fed the same ``u``, the certificate is sound (never certifies a nucleus that is not
   inside the candidates) and flags exactly the expected real rows; the host fallback equals the reference sampler.
+* ``test_cpu_topk_coverage``: top-k lanes on the real rows: certified iff ``k < W`` and no chip holds 64 or more of
+  the top-k set (contiguous vocab blocks: moderate k already flags), the documented flag counts per ``top_k``, and the
+  certified lanes keep the exact top-k set.
 * ``test_cpu_adversarial_rows``: the review rows (``_adversarial_rows``: a flat high-entropy row with a near-tie top-2
   whose T = 0.6 nucleus is ~2e5 tokens, the near-tie top-2 on a window-sized nucleus and alone, an exact top-2 tie)
   against vLLM's top-k/top-p, the host twin's certificate and the host fallback.
+* ``test_cpu_rng_counter_pairs`` / ``test_cpu_uniform64``: the two per-lane counters keyed by the 64-bit seed, and
+  the host fallback's 53-bit uniform (lead decision 5): its top 24 bits are the device uniform bit for bit, the rest
+  refine the device cell uniformly.
+* ``test_cpu_gumbel_hash`` / ``test_cpu_gumbel_race_exact`` / ``test_cpu_gumbel_real_rows``: the full-vocab Gumbel
+  path's host twin (lead decision 4): the per-(seed, position, token) hash bit-exact against a pure-Python reference,
+  ``W`` uniform with a 2^-47 resolution below the 24-bit grid, the race an exact sampler of ``softmax(x / T)``
+  (binomial / chi-square over 1e6 draws, probabilities down to 3e-7), the pruned twin == the full twin on real rows.
 * ``test_cpu_import_rule``: ``tt/sampling.py`` imports no other ``models/demos`` package, vLLM, transformers or
   safetensors, and opens no device.
 
@@ -41,15 +51,21 @@ Device tests (lock wrapper; ~2 min; run with the trace-allocation tracker on)::
     lanes' parameters, cross-lane independence statistics, unseeded lanes, the host uniform bit-exact.
 (d) ``test_sampler_traced_equals_eager`` -- a captured trace replayed with new logits, parameters and positions equals
     eager bitwise; no program compiled after the capture.
-(e) ``test_sampler_latency`` -- traced sampler latency at 32 lanes (budget ``MOTIF3_SAMPLER_BUDGET_MS``, 1.0 ms) and the
-    per-step host costs (counter write, result read, a fallback step).
+(e) ``test_sampler_latency`` -- traced sampler latency at 32 lanes (budget ``MOTIF3_SAMPLER_BUDGET_MS``, 1.5 ms with the
+    Gumbel path; also reported without it) and the per-step host costs (counter write, result read, the host fallback
+    of the two flagged real rows, the Gumbel lane's fp64 host twin).
 (f) ``test_sampler_rows_and_coverage`` -- the 32 real rows with their lane parameters (mixed greedy / T / top-k /
-    top-p 1.0 lanes): kept-set sizes = fp64, tokens = fp64 inverse CDF with the same u over many positions, tokens and
-    info identical on all 32 chips, flags exactly on the rows whose nucleus leaves the candidate set (and top-p 1.0 /
-    top-k > W), the cumulative coverage counter, the host fallback; also on the (8, 4) mesh orientation.
+    top-p 1.0 lanes): kept-set sizes = fp64, tokens = fp64 inverse CDF with the same u over many positions (the top-p
+    1.0 lane: the fp64 Gumbel twin), tokens and info identical on all 32 chips, flags exactly on the rows whose nucleus
+    leaves the candidate set (and top-k >= W), the cumulative coverage counter, the host fallback (53-bit uniform);
+    also on the (8, 4) mesh orientation.
 (g) ``test_sampler_adversarial_rows`` -- the review rows at T = 0.6 (3,000 traced steps, ``MOTIF3_SAMPLER_ADV_STEPS``):
     the flat ~2e5-token nucleus flagged every step (fallback == ``exact_sample``), every certified draw of the near-tie
     / exact-tie rows == the fp64 inverse CDF over the lane's device order, chi-square / binomial tests on all draws.
+(h) ``test_sampler_gumbel_full_vocab`` -- the full-vocab Gumbel path (``top_p = 1``) in a mixed batch, 8,000 traced
+    steps (``MOTIF3_SAMPLER_GUMBEL_STEPS``): never flagged, == the fp64 twin, (seed, position) determinism across lanes
+    and replays, the distribution of 48,000 draws per row = ``softmax(x / T)`` over the whole vocabulary (chi-square,
+    TV vs the noise floor, the mass drawn outside the top-512 window), greedy / top-p / top-k lanes unchanged.
 
 Opt-in ``test_probe_sampler_variants`` (``MOTIF3_SAMPLER_PROBE=1``): per-stage traced latency and every option /
 implementation variant (K, W, logprobs, rng, L1 intermediates, fused activations, the cut repair, the cost of the
@@ -191,9 +207,10 @@ def vllm_kept(x_bf16: torch.Tensor, temps, top_k, top_p) -> torch.Tensor:
     return out > -float("inf")
 
 
-def _expected_flag(row: torch.Tensor, lane, K: int, W: int):
+def _expected_flag(row: torch.Tensor, lane, K: int, W: int, gumbel: bool = True):
     """Independent fp64 re-derivation of the device certificate: ``(flag, borderline)``; ``borderline`` = the window
-    mass is within 1e-6 of ``p_eff + margin`` (the fp32 device sum may decide either way)."""
+    mass is within 1e-6 of ``p_eff + margin`` (the fp32 device sum may decide either way). Full-support lanes are
+    never flagged with the Gumbel path (always without it)."""
     S = _S()
     x = row.float()
     xc = x.view(NUM_CHIPS, SLICE)
@@ -203,17 +220,18 @@ def _expected_flag(row: torch.Tensor, lane, K: int, W: int):
     if lane.greedy:
         return not (lim < float(x.max())), False
     if lane.full_support:
-        return True, False
+        return not gumbel, False
     if lane.top_k_active:
-        if lane.top_k > W:
+        if lane.top_k >= W:  # k = W: the k-th value is the window's last value (never strictly below it)
             return True, False
         return not (lim < float(sv[lane.top_k - 1])), False
     ids, _ = S.exact_nucleus(row, lane)
     v_last = float(x[ids[-1]])
     xd = row.double()
     logp = (xd - xd.max()) / lane.temperature
-    mass_w = float(torch.exp(sv.double() / lane.temperature - xd.max() / lane.temperature
-                             - torch.logsumexp(logp, 0)).sum())
+    mass_w = float(
+        torch.exp(sv.double() / lane.temperature - xd.max() / lane.temperature - torch.logsumexp(logp, 0)).sum()
+    )
     need = float(np.float32(lane.top_p)) + S.CERT_MARGIN
     return not (lim < v_last and mass_w >= need), abs(mass_w - need) < 1e-6
 
@@ -282,10 +300,12 @@ def test_cpu_rng_uniformity():
         h, _ = np.histogram(u, bins=32, range=(0, 1))
         assert stats.chisquare(h).pvalue > 1e-4
     # two lanes with neighbouring seeds over positions: uncorrelated
-    a = S.uniform_from_counter((np.uint64(S.seed_key(7)) + np.arange(n, dtype=np.uint64) * np.uint64(S.GOLDEN32))
-                               & np.uint64(S.MASK32)).astype(np.float64)
-    b = S.uniform_from_counter((np.uint64(S.seed_key(8)) + np.arange(n, dtype=np.uint64) * np.uint64(S.GOLDEN32))
-                               & np.uint64(S.MASK32)).astype(np.float64)
+    a = S.uniform_from_counter(
+        (np.uint64(S.seed_key(7)) + np.arange(n, dtype=np.uint64) * np.uint64(S.GOLDEN32)) & np.uint64(S.MASK32)
+    ).astype(np.float64)
+    b = S.uniform_from_counter(
+        (np.uint64(S.seed_key(8)) + np.arange(n, dtype=np.uint64) * np.uint64(S.GOLDEN32)) & np.uint64(S.MASK32)
+    ).astype(np.float64)
     assert abs(np.corrcoef(a, b)[0, 1]) < 5 / math.sqrt(n)
 
 
@@ -315,14 +335,28 @@ def test_cpu_lane_params():
             n(bad[0], bad[1], 0, None, vocab_size=VOCAB)
     assert n(1.0, 1.0, 0, None, vocab_size=VOCAB).full_support
     assert not n(1.0, 1.0, 40, None, vocab_size=VOCAB).full_support
-    lanes = [S.LaneParams(0.0, 1.0, 1), S.LaneParams(0.5, 0.95, 0), S.LaneParams(1.0, 0.0, 1),
-             S.LaneParams(1.0, 0.9, 600), S.LaneParams(2.0, 1.0, 512)]
+    lanes = [
+        S.LaneParams(0.0, 1.0, 1),
+        S.LaneParams(0.5, 0.95, 0),
+        S.LaneParams(1.0, 0.0, 1),
+        S.LaneParams(1.0, 0.9, 600),
+        S.LaneParams(2.0, 1.0, 512),
+    ]
     c = S.device_param_columns(lanes, 512)
     assert c["greedy"].tolist() == [1, 0, 0, 0, 0]
     assert c["inv_t"].tolist() == [1.0, 2.0, 1.0, 1.0, 0.5]
     assert c["k_active"].tolist() == [0, 0, 1, 1, 1]
     assert c["k_idx"].tolist() == [0, 0, 0, 511, 511]
-    assert c["k_in_win"].tolist() == [0, 0, 1, 0, 1]
+    assert c["k_in_win"].tolist() == [0, 0, 1, 0, 0]  # k < W only: at k = W the k-th value is the window's last
+    assert c["gumbel"].tolist() == [0, 0, 0, 0, 0]  # top_p = 1 with top-k (lane 4) is the top-k path
+    full = [
+        S.LaneParams(1.0, 1.0, 0),
+        n(0.7, 1.0, VOCAB, None, vocab_size=VOCAB),
+        S.LaneParams(0.0, 1.0, 0),
+        S.LaneParams(1.0, 0.99, 0),
+    ]
+    assert S.device_param_columns(full, 512)["gumbel"].tolist() == [1, 1, 0, 0]
+    assert S.device_param_columns(full, 512, gumbel=False)["gumbel"].tolist() == [0, 0, 0, 0]
     assert float(c["top_p"][2]) == pytest.approx(S.MIN_TOP_P) and float(c["top_p"][1]) == pytest.approx(0.95)
     with pytest.raises(ValueError):
         S.normalize_lanes([1.0] * 3, None, None, None, vocab_size=VOCAB, num_lanes=4)
@@ -433,8 +467,11 @@ def test_cpu_emulation_real_rows():
     lanes = _lanes_of(rows)
     rng = np.random.default_rng(3)
     for K in (64, 32):
-        for set_name, ls in (("own", lanes), ("T1", [S.LaneParams(1.0, 0.95, 0, 1)] * LANES),
-                             ("T0.6", [S.LaneParams(0.6, 0.95, 0, 1)] * LANES)):
+        for set_name, ls in (
+            ("own", lanes),
+            ("T1", [S.LaneParams(1.0, 0.95, 0, 1)] * LANES),
+            ("T0.6", [S.LaneParams(0.6, 0.95, 0, 1)] * LANES),
+        ):
             for rep in range(3):
                 ctr = rng.integers(0, 1 << 32, LANES, dtype=np.uint64)
                 em = S.emulate_device(x, ls, ctr, local_k=K, window=512)
@@ -447,7 +484,11 @@ def test_cpu_emulation_real_rows():
                     want, borderline = _expected_flag(x[l], lane, K, 512)
                     if not borderline:
                         assert flag == want, (K, set_name, l, flag, want)
-                    if not contained or lane.full_support:
+                    if lane.full_support:  # the full-vocab Gumbel path: never flagged, the fp64 race's token
+                        assert not flag and int(em["n_kept"][l]) == VOCAB
+                        assert int(em["token"][l]) == S.gumbel_sample(x[l], lane, S.as_counter_pairs(ctr)[l])
+                        continue
+                    if not contained:
                         assert flag, (K, set_name, l, "not contained but certified")
                     if flag:
                         continue
@@ -461,8 +502,11 @@ def test_cpu_emulation_real_rows():
                     assert int(em["token"][l]) == want, (K, set_name, l)
                     lp = S.raw_logprob(x[l], int(em["token"][l]))
                     assert abs(float(em["logprob"][l]) - lp) < 2e-5 * max(1.0, abs(lp))
-    # the documented flags of the own-parameter batch at K = 64 (MEASURE_AND_CONTRACT §1.8: lanes 0, 1, 30)
+    # the documented flags of the own-parameter batch at K = 64 (MEASURE_AND_CONTRACT §1.8: lanes 0, 1, 30): lane 30
+    # (top-p 1.0) takes the full-vocab Gumbel path (lead decision 4) and is flagged only without it
     em = S.emulate_device(x, lanes, np.zeros(LANES, dtype=np.uint64), local_k=64, window=512)
+    assert torch.nonzero(em["flag"] > 0.5).reshape(-1).tolist() == [0, 1]
+    em = S.emulate_device(x, lanes, np.zeros(LANES, dtype=np.uint64), local_k=64, window=512, gumbel=False)
     assert torch.nonzero(em["flag"] > 0.5).reshape(-1).tolist() == [0, 1, 30]
 
 
@@ -473,8 +517,17 @@ def test_cpu_emulation_synthetic():
     x = _synthetic_rows(1)
     B = x.shape[0]
     rng = np.random.default_rng(4)
-    params = [(1.0, 0.95, 0), (0.6, 0.95, 0), (1.0, 0.9, 20), (0.7, 1.0, 5), (1.0, 1.0, 0), (1.0, 0.95, 600),
-              (0.0, 1.0, 1), (1.0, 0.0, 1), (2.0, 0.5, 0)]
+    params = [
+        (1.0, 0.95, 0),
+        (0.6, 0.95, 0),
+        (1.0, 0.9, 20),
+        (0.7, 1.0, 5),
+        (1.0, 1.0, 0),
+        (1.0, 0.95, 600),
+        (0.0, 1.0, 1),
+        (1.0, 0.0, 1),
+        (2.0, 0.5, 0),
+    ]
     for T, p, k in params:
         lanes = [S.LaneParams(T, p, k, 9)] * B
         ctr = rng.integers(0, 1 << 32, B, dtype=np.uint64)
@@ -493,7 +546,10 @@ def test_cpu_emulation_synthetic():
             want, borderline = _expected_flag(x[l], lane, 64, 512)
             if not borderline:
                 assert flag == want, (T, p, k, l, flag, want)
-            if lane.full_support or (lane.top_k_active and lane.top_k > 512):
+            if lane.full_support:  # Gumbel path
+                assert not flag and int(em["token"][l]) == S.gumbel_sample(x[l], lane, S.as_counter_pairs(ctr)[l])
+                continue
+            if lane.top_k_active and lane.top_k >= 512:
                 assert flag
                 continue
             if not _contained(x[l], ids, 64) or ids.numel() > 512:
@@ -507,14 +563,65 @@ def test_cpu_emulation_synthetic():
     assert bool(em["flag"][3] > 0.5) and bool(em["flag"][10] > 0.5) and not bool(em["flag"][9] > 0.5)
 
 
+# top_k -> flagged rows of the 32 real rows (host twin, K = 64, W = 512; DEVICE_SAMPLER.md §2 "Expected fallback rates")
+TOPK_FLAGGED_REAL_ROWS = {20: 0, 50: 0, 64: 0, 100: 2, 128: 6, 150: 9, 200: 11, 256: 17, 300: 20, 400: 28, 500: 31,
+                          511: 32, 512: 32, 600: 32, 1000: 32}  # fmt: skip
+
+
+def test_cpu_topk_coverage():
+    """Top-k lanes on the 32 real rows (DEVICE_SAMPLER.md §2, §7): the host twin certifies a top-k lane (with or
+    without top-p) iff ``k < W`` and no chip holds K = 64 or more of the top-k set (all ties of the k-th value).
+    Motif's vocabulary is split into contiguous 6,880-token blocks, so a row's top tokens cluster on a few chips and
+    moderate k already flags: the documented counts per ``top_k`` (:data:`TOPK_FLAGGED_REAL_ROWS`) are reproduced. A
+    ``top_p = 1`` lane WITH top-k is a top-k lane (never the Gumbel path): flagged on every row from k = 511 on.
+    Certified lanes keep the exact fp64 kept set (soundness)."""
+    S = _S()
+    rows = _real_rows()
+    x = rows["logits"]
+    xf = x.float()
+    srt = torch.sort(xf, dim=1, descending=True, stable=True).values
+    rng = np.random.default_rng(11)
+    for top_p, T in ((1.0, 1.0), (0.95, 0.6)):
+        counts = {}
+        for k in TOPK_FLAGGED_REAL_ROWS:
+            lanes = [S.LaneParams(T, top_p, k, 1)] * LANES
+            assert not bool(S.device_param_columns(lanes, 512)["gumbel"].any())  # top-k lanes: never Gumbel
+            em = S.emulate_device(x, lanes, rng.integers(0, 1 << 32, (LANES, 2), dtype=np.uint64))
+            flag = em["flag"] > 0.5
+            kth = srt[:, k - 1 : k]
+            busiest = torch.stack(
+                [torch.bincount(torch.nonzero(xf[r] >= kth[r]).reshape(-1) // SLICE, minlength=NUM_CHIPS).max()
+                 for r in range(LANES)]
+            )  # fmt: skip
+            if k < 511:  # (at k = 511 a tie of the window's last two values flags one more row)
+                assert torch.equal(flag, busiest >= 64), (top_p, k, flag.nonzero().tolist())
+            else:
+                assert bool(flag.all()), (top_p, k)
+            counts[k] = int(flag.sum())
+            for l in torch.nonzero(~flag).reshape(-1).tolist():  # soundness of the certified lanes
+                if top_p >= 1.0:  # the whole top-k set, ties included
+                    assert int(em["n_kept"][l]) == int((xf[l] >= kth[l]).sum()), (k, l)
+                elif k in (100, 256):
+                    assert int(em["n_kept"][l]) == S.exact_nucleus(x[l], lanes[l])[0].numel(), (k, l)
+        assert counts == TOPK_FLAGGED_REAL_ROWS, (top_p, counts)
+    print(f"[sampling] top-k coverage on the real rows (flagged rows by top_k): {TOPK_FLAGGED_REAL_ROWS}")
+
+
 def test_cpu_fallback_sampler():
     """``fallback_sample`` (the host path of flagged lanes) == ``exact_sample`` (reference order) for every lane type,
     and its full-support path draws the full-vocab distribution."""
     S = _S()
     x = _synthetic_rows(2)
     rng = np.random.default_rng(5)
-    for T, p, k in ((1.0, 0.95, 0), (0.6, 0.9, 0), (1.0, 0.95, 30), (1.0, 0.95, 3000), (1.5, 0.99, 0), (0.0, 1, 1),
-                    (0.7, 1.0, 5)):
+    for T, p, k in (
+        (1.0, 0.95, 0),
+        (0.6, 0.9, 0),
+        (1.0, 0.95, 30),
+        (1.0, 0.95, 3000),
+        (1.5, 0.99, 0),
+        (0.0, 1, 1),
+        (0.7, 1.0, 5),
+    ):
         lane = S.LaneParams(T, p, k, None)
         for l in (0, 2, 3, 4, 5, 9, 10, 11):
             ids, q = S.exact_nucleus(x[l], lane)
@@ -556,7 +663,7 @@ def test_cpu_adversarial_rows():
     if apply_top_k_top_p_pytorch is not None:  # the replica == vLLM's own function on these rows too
         out = apply_top_k_top_p_pytorch(x.float() / T, torch.full((len(names),), VOCAB), torch.full((len(names),), P))
         assert torch.equal((out > -float("inf")).sum(1), kept_v.sum(1))
-    sizes ={n: int(S.exact_nucleus(x[i], lane)[0].numel()) for i, n in enumerate(names)}
+    sizes = {n: int(S.exact_nucleus(x[i], lane)[0].numel()) for i, n in enumerate(names)}
     assert sizes["flat"] > 200_000 and 300 < sizes["window"] < 512 and sizes["pure"] == 2 and 50 < sizes["tie"] < 64
     ids, q = S.exact_nucleus(rows["pure"], lane)
     d = float(rows["pure"].float()[ids[0]] - rows["pure"].float()[ids[1]])
@@ -577,6 +684,212 @@ def test_cpu_adversarial_rows():
         assert S.fallback_sample(rows["flat"], lane, u) == S.exact_sample(rows["flat"], lane, u)
 
 
+def test_cpu_rng_counter_pairs():
+    """Two counters per lane and step keyed by the 64-bit seed: ``(k1, k2) = splitmix64(seed)`` (high, low), ``c1 =
+    k1 + pos * 0x9E3779B1``, ``c2 = k2 + pos * 0x85EBCA6B``; ``k1 = seed_key`` (the device uniform of a seed is
+    unchanged); the key pair is a bijection of the seed (no two of 50,000 seeds share it, while first keys alone may
+    collide); ``[n]`` first counters get a derived ``c2``."""
+    S = _S()
+    m32 = 0xFFFFFFFF
+    for seed in (0, 1, 42, 2**63 + 5, -1):
+        k1, k2 = S.seed_keys(seed)
+        assert k1 == S.seed_key(seed) and 0 <= k2 <= m32
+        for pos in (0, 1, 1000, 2**31, -1):
+            c1, c2 = S.lane_counters(seed, pos)
+            p = max(pos, 0)
+            assert c1 == S.lane_counter(k1, p) and c2 == (k2 + p * S.GOLDEN32_2) & m32
+    assert len({S.seed_keys(s) for s in range(50_000)}) == 50_000
+    c = S.as_counter_pairs(np.array([1, 2, 3], dtype=np.uint64))
+    assert c.shape == (3, 2) and c.dtype == np.uint32
+    assert np.array_equal(c[:, 1], S.derived_ctr2(np.array([1, 2, 3])))
+    assert np.array_equal(S.as_counter_pairs(c), c) and np.array_equal(S.as_counter_pairs(torch.from_numpy(c.astype(
+        np.int64))), c)  # fmt: skip
+    with pytest.raises(ValueError):
+        S.as_counter_pairs(np.zeros((3, 3)))
+
+
+def test_cpu_uniform64():
+    """The host fallback's 53-bit uniform (lead decision 5): its top 24 bits ARE the device uniform (the fallback only
+    refines the device draw's 2^-24 cell), the refinement is uniform inside the cell with ~29 more bits, the second
+    counter changes only the refinement, and the value is the exact integer construction."""
+    from scipy import stats
+
+    S = _S()
+    rng = np.random.default_rng(11)
+    c = rng.integers(0, 1 << 32, size=(400_000, 2), dtype=np.uint64).astype(np.uint32)
+    U = S.uniform64(c)
+    u = S.uniform_from_counter(c[:, 0]).astype(np.float64)
+    assert U.dtype == np.float64 and U.min() >= 0.0 and U.max() < 1.0
+    assert np.array_equal(np.floor(U * 2**24), u * 2**24)  # the same 2^-24 cell as the device draw, bit for bit
+    frac = U * 2**24 - np.floor(U * 2**24)  # position inside the cell
+    assert stats.kstest(frac, "uniform").pvalue > 1e-4
+    assert np.unique(frac).size > 0.99 * frac.size  # a resolution far below the device grid
+    h, _ = np.histogram(U, bins=256, range=(0, 1))
+    assert stats.chisquare(h).pvalue > 1e-4
+    hi = S.lowbias32(c[:7, 0]).astype(np.uint64)
+    lo = S.lowbias32(c[:7, 1]).astype(np.uint64)
+    assert np.array_equal(U[:7], (((hi << np.uint64(32)) | lo) >> np.uint64(11)).astype(np.float64) * 2.0**-53)
+    c2 = c[:1000].copy()
+    c2[:, 1] ^= np.uint32(0x5A5A5A5A)
+    U2 = S.uniform64(c2)
+    assert np.array_equal(np.floor(U2 * 2**24), np.floor(U[:1000] * 2**24)) and not np.array_equal(U2, U[:1000])
+
+
+def _gumbel_words_vec(c: np.ndarray, ids) -> tuple:
+    """Vectorized Gumbel hash words ``[N, M]`` for ``N`` counter pairs x ``M`` token ids (test helper; checked
+    against ``S.gumbel_words``)."""
+    S = _S()
+    k = S.gumbel_token_keys(ids).astype(np.uint64)[None, :]
+    c1 = c[:, 0:1].astype(np.uint64)
+    c2 = c[:, 1:2].astype(np.uint64)
+    h1 = S.lowbias32(k ^ c1).astype(np.uint64)
+    y = ((h1 ^ c2) * np.uint64(S.GUMBEL_MIX)) & np.uint64(0xFFFFFFFF)
+    h2 = y ^ (y >> np.uint64(16))
+    return h1.astype(np.uint32), h2.astype(np.uint32)
+
+
+def _gumbel_draws(x: np.ndarray, T: float, c: np.ndarray, ids: np.ndarray, chunk: int = 50_000) -> np.ndarray:
+    """fp64 Gumbel-max draws (indices into ``ids``) of ``N`` counter pairs (the device race, vectorized)."""
+    S = _S()
+    a = (x[ids] - x.max()) / T
+    out = []
+    for i in range(0, c.shape[0], chunk):
+        h1, h2 = _gumbel_words_vec(c[i : i + chunk], ids)
+        w = S.gumbel_uniform(h1, h2)
+        with np.errstate(divide="ignore"):
+            out.append((a[None, :] - np.log(-np.log1p(-w))).argmax(1))
+    return np.concatenate(out)
+
+
+def _chi2_vs(cnt: np.ndarray, p: np.ndarray, min_expected: float = 5.0) -> float:
+    """Chi-square p-value of counts vs probabilities, the bins with an expected count below ``min_expected`` merged."""
+    from scipy import stats
+
+    n = cnt.sum()
+    e = p * n
+    big = e >= min_expected
+    c_b, e_b = np.append(cnt[big], cnt[~big].sum()), np.append(e[big], e[~big].sum())
+    keep = e_b > 0
+    return float(stats.chisquare(c_b[keep], e_b[keep] * c_b[keep].sum() / e_b[keep].sum()).pvalue)
+
+
+def test_cpu_gumbel_hash():
+    """The per-(seed, position, token id) hash of the Gumbel path: numpy == a pure-Python reference (and the
+    vectorized test helper); ``W`` in (0, 1), uniform, with the refinement word resolving the cell below 2^-24 (where
+    ``E = -log1p(-W) ~ W`` decides the race for low-probability tokens); ``P(W < t)`` = t down to 2^-16 over 4M
+    words of real hash outputs."""
+    from scipy import stats
+
+    S = _S()
+    m32 = 0xFFFFFFFF
+    for c1, c2 in ((0, 0), (0xFFFFFFFF, 0x80000000), (0xDEADBEEF, 0x12345678)):
+        ids = np.array([0, 1, 6879, 6880, 110079, 220159])
+        h1, h2 = S.gumbel_words(c1, c2, ids)
+        for a, b, v in zip(h1.tolist(), h2.tolist(), ids.tolist()):
+            r1 = _lowbias32_py(_lowbias32_py((v + S.GUMBEL_KEY_SALT) & m32) ^ c1)
+            y = ((r1 ^ c2) * S.GUMBEL_MIX) & m32
+            assert (a, b) == (r1, y ^ (y >> 16))
+    rng = np.random.default_rng(12)
+    c = rng.integers(0, 1 << 32, size=(64, 2), dtype=np.uint64).astype(np.uint32)
+    ids = rng.integers(0, VOCAB, 4096)
+    v1, v2 = _gumbel_words_vec(c, ids)
+    w1, w2 = S.gumbel_words(int(c[3, 0]), int(c[3, 1]), ids)
+    assert np.array_equal(v1[3], w1) and np.array_equal(v2[3], w2)
+    W = S.gumbel_uniform(v1, v2).reshape(-1)
+    assert W.min() > 0.0 and W.max() < 1.0
+    h, _ = np.histogram(W, bins=64, range=(0, 1))
+    assert stats.chisquare(h).pvalue > 1e-4
+    # below the 24-bit grid (h1 >> 8 == 0): W = ((h2 >> 9) + 1/2) 2^-47, distinct, and E = -log1p(-W) = W to 1e-7
+    h1 = rng.integers(0, 256, 1000).astype(np.uint32)
+    h2 = rng.integers(0, 1 << 32, 1000, dtype=np.uint64).astype(np.uint32)
+    Ws = S.gumbel_uniform(h1, h2)
+    assert Ws.max() < 2.0**-24 and Ws.min() >= 2.0**-48 and np.unique(Ws).size > 990
+    assert np.allclose(-np.log1p(-Ws), Ws, rtol=1e-7, atol=0)
+    big = rng.integers(0, 1 << 32, size=(4096, 2), dtype=np.uint64).astype(np.uint32)
+    b1, b2 = _gumbel_words_vec(big, np.arange(1024))
+    Wb = S.gumbel_uniform(b1, b2).reshape(-1)
+    for t in (2.0**-4, 2.0**-8, 2.0**-12, 2.0**-16):
+        k = int((Wb < t).sum())
+        assert stats.binomtest(k, Wb.size, t).pvalue > 1e-4, (t, k, Wb.size * t)
+
+
+def test_cpu_gumbel_race_exact():
+    """The Gumbel-max race over the hash is an exact sampler of ``softmax(x / T)`` (this fp64 race is the device's
+    draw up to fp32 rounding): two-token rows at probability ratios 1, 1/9 and 1/999 (1e6 draws each: binomial), and a
+    60-token row whose probabilities span 3e-7 .. 0.3 at T = 1 and T = 0.7 (1e6 draws each: chi-square with the bins
+    of expected count < 5 merged, the rare tokens' counts within their binomial bounds). ``gumbel_sample`` (scalar
+    API) == the vectorized race."""
+    from scipy import stats
+
+    S = _S()
+    rng = np.random.default_rng(13)
+    n = 1_000_000
+    c = rng.integers(0, 1 << 32, size=(n, 2), dtype=np.uint64).astype(np.uint32)
+    for d in (0.0, math.log(9.0), math.log(999.0)):
+        x = np.full(VOCAB, -1e4)
+        x[[77, 150000]] = [0.0, -d]
+        got = _gumbel_draws(x, 1.0, c, np.array([77, 150000]))
+        k = int((got == 1).sum())
+        p = 1.0 / (1.0 + math.exp(d))
+        assert stats.binomtest(k, n, p).pvalue > 1e-4, (d, k / n, p)
+    ids = rng.choice(VOCAB, 60, replace=False)
+    x = np.full(VOCAB, -1e4)
+    x[ids] = np.concatenate([np.linspace(0.0, -4.0, 30), np.linspace(-6.0, -15.0, 30)])
+    for T in (1.0, 0.7):
+        got = _gumbel_draws(x, T, c, ids)
+        p = np.exp((x[ids] - x.max()) / T)
+        p /= p.sum()
+        cnt = np.bincount(got, minlength=ids.size).astype(np.float64)
+        assert _chi2_vs(cnt, p) > 1e-4, T
+        for j in range(ids.size):  # every token, the rarest included, within its binomial bounds
+            if p[j] * n < 1:
+                assert cnt[j] <= 6, (T, j, cnt[j], p[j] * n)
+            else:
+                assert stats.binomtest(int(cnt[j]), n, p[j]).pvalue > 1e-6, (T, j, cnt[j], p[j] * n)
+    row = torch.from_numpy(x).to(torch.float32)
+    lane = S.LaneParams(1.0, 1.0, 0, None)
+    for i in range(50):
+        assert S.gumbel_sample(row, lane, c[i], ids=ids) == int(ids[_gumbel_draws(x, 1.0, c[i : i + 1], ids)[0]])
+
+
+def test_cpu_gumbel_real_rows():
+    """Real rows at top_p = 1 (the full-vocab support; the top-512 window holds only 94-97 % of the mass at T = 1):
+    the fp64 twin over the whole vocabulary equals the twin over the ids that can win at all (``(x - M) / T >=
+    -36.2``: the largest Gumbel boost is ``-log(2^-48) = 33.3`` and the winner's score is at least ``-log(17.3)``),
+    and 20,000 pruned draws of two rows at T = 0.7 follow ``softmax(x / T)`` (chi-square)."""
+    S = _S()
+    rows = _real_rows()
+    x = rows["logits"]
+    rng = np.random.default_rng(14)
+    for r, T in ((2, 1.0), (15, 1.5), (8, 0.7)):
+        row = x[r]
+        xr = row.double().numpy()
+        keep = np.flatnonzero((xr - xr.max()) / T >= -36.2)
+        lane = S.LaneParams(T, 1.0, 0, None)
+        for _ in range(6):
+            cp = rng.integers(0, 1 << 32, 2, dtype=np.uint64).astype(np.uint32)
+            assert S.gumbel_sample(row, lane, cp) == S.gumbel_sample(row, lane, cp, ids=keep)
+    c = rng.integers(0, 1 << 32, size=(20_000, 2), dtype=np.uint64).astype(np.uint32)
+    tested = 0
+    for r in range(LANES):
+        xr = x[r].double().numpy()
+        keep = np.flatnonzero((xr - xr.max()) / 0.7 >= -36.2)
+        if keep.size > 20_000 or tested == 2:
+            continue
+        got = keep[_gumbel_draws(xr, 0.7, c, keep, chunk=2000)]
+        p = np.exp((xr - xr.max()) / 0.7)
+        p /= p.sum()
+        uniq, cnt = np.unique(got, return_counts=True)
+        top = np.argsort(-p)[:400]
+        cnt_full = np.zeros(VOCAB)
+        cnt_full[uniq] = cnt
+        pv = _chi2_vs(np.append(cnt_full[top], cnt_full.sum() - cnt_full[top].sum()),
+                      np.append(p[top], 1.0 - p[top].sum()))  # fmt: skip
+        assert pv > 1e-4, (r, pv)
+        tested += 1
+    assert tested == 2
+
+
 def test_cpu_import_rule():
     probe = (
         "import sys, json; import models.demos.motif3.tt.sampling as m; "
@@ -586,8 +899,9 @@ def test_cpu_import_rule():
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(TT_METAL) + os.pathsep + env.get("PYTHONPATH", "")
-    r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, cwd=str(TT_METAL), env=env,
-                       timeout=300)
+    r = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, cwd=str(TT_METAL), env=env, timeout=300
+    )
     assert r.returncode == 0, r.stderr[-2000:]
     assert json.loads(r.stdout.strip().splitlines()[-1]) == []
 
@@ -657,16 +971,25 @@ def _logits_mapper(mesh_device, cfg):
 def _upload_logits(mesh_device, cfg, rows: torch.Tensor):
     import ttnn
 
-    return ttnn.from_torch(_host_blocks(cfg, rows.to(torch.bfloat16)), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                           mesh_mapper=_logits_mapper(mesh_device, cfg))
+    return ttnn.from_torch(
+        _host_blocks(cfg, rows.to(torch.bfloat16)),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=_logits_mapper(mesh_device, cfg),
+    )
 
 
 def _write_logits(mesh_device, cfg, dev, rows: torch.Tensor):
     import ttnn
 
-    host = ttnn.from_torch(_host_blocks(cfg, rows.to(torch.bfloat16)), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           mesh_mapper=_logits_mapper(mesh_device, cfg))
+    host = ttnn.from_torch(
+        _host_blocks(cfg, rows.to(torch.bfloat16)),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=_logits_mapper(mesh_device, cfg),
+    )
     ttnn.copy_host_to_device_tensor(host, dev)
 
 
@@ -698,7 +1021,7 @@ def _expect_tokens(S, rows, lanes, orders, u, res, *, tol=2e-6):
     boundary."""
     compared = mism = boundary = 0
     for l, lane in enumerate(lanes):
-        if bool(res.flags[l]):
+        if bool(res.flags[l]) or lane.full_support:  # Gumbel lanes: _gumbel_check
             continue
         compared += 1
         if lane.greedy:
@@ -714,6 +1037,17 @@ def _expect_tokens(S, rows, lanes, orders, u, res, *, tol=2e-6):
             else:
                 mism += 1
     return compared, mism, boundary
+
+
+def _gumbel_check(S, row, lane, ctr_pair, got: int, *, rel_tie: float = 1e-5):
+    """A Gumbel lane's device token vs the fp64 twin with the same counters: ``(match, near_tie)``; a mismatch is a
+    near tie when the twin's scores of the two tokens agree to ``rel_tie`` (fp32 rounding of the device scores)."""
+    ids, sc = S.gumbel_scores(row, lane, ctr_pair)
+    want = int(ids[np.flatnonzero(sc == sc.max())].min())
+    if want == int(got):
+        return True, False
+    s_w, s_g = float(sc[want]), float(sc[int(got)])
+    return False, abs(s_w - s_g) <= rel_tie * max(1.0, abs(s_w))
 
 
 # ============================================================================================================
@@ -739,7 +1073,9 @@ def test_sampler_rows_and_coverage(mesh_device):
     em = S.emulate_device(x, lanes, smp._last_ctr, local_k=smp.K, window=smp.W)
     assert torch.equal(res.flags, em["flag"] > 0.5), (res.flags, em["flag"])
     flagged = torch.nonzero(res.flags).reshape(-1).tolist()
-    assert flagged == [0, 1, 30], flagged  # not contained at K = 64 (0, 1), top-p 1.0 (30)
+    assert flagged == [0, 1], flagged  # not contained at K = 64 (0, 1); top-p 1.0 (30) takes the Gumbel path
+    gumbel = [l for l, lane in enumerate(lanes) if lane.full_support]
+    assert gumbel == [30] and int(res.n_kept[30]) == VOCAB
     assert bool((res.per_chip == res.per_chip[0]).all()), "outputs differ between chips"
     assert torch.equal(_tokens_u32(out), res.tokens)
     M = ttnn.to_torch(ttnn.get_device_tensors(out.debug["M"])[0]).float().reshape(-1)[:LANES]
@@ -752,7 +1088,7 @@ def test_sampler_rows_and_coverage(mesh_device):
         worst_lz = max(worst_lz, abs(math.log(float(Z[l])) + float(M[l]) / Tl - lz_ref))
         o = orders[l]
         assert bool((x[l].float()[o][1:] <= x[l].float()[o][:-1]).all()), "device window is not sorted"
-        if l in flagged or lane.greedy:
+        if l in flagged or lane.greedy or lane.full_support:
             continue
         ids, q = S.exact_nucleus(x[l], lane)
         assert int(res.n_kept[l]) == ids.numel(), (l, int(res.n_kept[l]), ids.numel())
@@ -781,6 +1117,7 @@ def test_sampler_rows_and_coverage(mesh_device):
     _free_out(out)
     smp.reset_coverage()
     steps, tot = 150, [0, 0, 0]
+    g_tot = [0, 0, 0]  # Gumbel draws compared, mismatches, near ties
     counts0 = smp.coverage_counts()
     assert float(counts0.sum()) == 0
     worst_lp = 0.0
@@ -795,27 +1132,34 @@ def test_sampler_rows_and_coverage(mesh_device):
         assert np.array_equal(res.u.numpy().astype(np.float32), u), "device uniform != host twin"
         c, m, b = _expect_tokens(S, x, lanes, orders, u, res)
         tot = [tot[0] + c, tot[1] + m, tot[2] + b]
+        for l in gumbel:
+            ok, tie = _gumbel_check(S, x[l], lanes[l], res.counters[l], int(res.tokens[l]))
+            g_tot = [g_tot[0] + 1, g_tot[1] + int(not ok and not tie), g_tot[2] + int(tie)]
         for l in range(LANES):
             if not bool(res.flags[l]):
                 worst_lp = max(worst_lp, abs(float(res.logprobs[l]) - S.raw_logprob(x[l], int(res.tokens[l]))))
-        # the host fallback of the flagged lanes: exact (== the reference sampler with the same u)
+        # the host fallback of the flagged lanes: exact (== the reference sampler with the step's 53-bit uniform)
         if step % 25 == 0:
+            U = S.uniform64(res.counters)
             res = smp.resolve(res, x)
             for l in flagged:
-                assert int(res.tokens[l]) == S.fallback_sample(x[l], lanes[l], float(u[l]))
+                assert int(res.tokens[l]) == S.fallback_sample(x[l], lanes[l], float(U[l]))
                 ids, _ = S.exact_nucleus(x[l], lanes[l])
                 if not lanes[l].full_support:
                     assert int(res.tokens[l]) in set(ids.tolist())
         _free_out(out)
     assert tot[1] == 0, f"{tot[1]} non-boundary token mismatches of {tot[0]}"
+    assert g_tot[1] == 0, f"Gumbel lanes: {g_tot[1]} mismatches with the fp64 twin of {g_tot[0]}"
     assert worst_lp < 1e-4, worst_lp
     counts = smp.coverage_counts()
     assert torch.equal(counts, seen_flags), (counts, seen_flags)
     extra = int(seen_flags.sum()) - steps * len(flagged)  # exactness-verification flags of certifiable lanes (rare)
     assert extra <= 3, f"{extra} verification flags in {steps} steps"
-    print(f"[sampling] rows {tuple(mesh_device.shape)}: {tot[0]} draws compared, {tot[2]} rounding-boundary, "
-          f"log Z err {worst_lz:.2e}, logprob err {worst_lp:.2e}, flagged {flagged} (+{extra} verification flags), "
-          f"stats {smp.stats}")
+    print(
+        f"[sampling] rows {tuple(mesh_device.shape)}: {tot[0]} draws compared, {tot[2]} rounding-boundary, "
+        f"Gumbel {g_tot[0]} compared ({g_tot[2]} near ties), log Z err {worst_lz:.2e}, logprob err {worst_lp:.2e}, "
+        f"flagged {flagged} (+{extra} verification flags), stats {smp.stats}"
+    )
     ttnn.deallocate(dev)
     smp.deallocate()
 
@@ -915,8 +1259,10 @@ def test_sampler_seeds_and_lanes(mesh_device):
     r1 = run([None] * LANES, torch.full((LANES,), 9))
     r2 = run([None] * LANES, torch.full((LANES,), 9))
     assert not torch.equal(r1.u, r2.u)
-    print(f"[sampling] seeds: {n_pos} positions x 32 lanes deterministic, relocation / independence OK, "
-          f"max |corr(u)| {np.abs(off).max():.3f}")
+    print(
+        f"[sampling] seeds: {n_pos} positions x 32 lanes deterministic, relocation / independence OK, "
+        f"max |corr(u)| {np.abs(off).max():.3f}"
+    )
     ttnn.deallocate(dev)
     smp.deallocate()
 
@@ -935,8 +1281,8 @@ def test_sampler_traced_equals_eager(mesh_device):
     def params(i):
         T = [float(v) for v in (torch.rand(LANES, generator=g) * 1.4).tolist()]
         T = [0.0 if (i + l) % 5 == 0 else t for l, t in enumerate(T)]
-        P = [0.95 if l % 3 else 0.8 for l in range(LANES)]
-        K = [VOCAB if l % 4 else 40 for l in range(LANES)]
+        P = [1.0 if (i + l) % 7 == 3 else (0.95 if l % 3 else 0.8) for l in range(LANES)]  # + full-vocab Gumbel lanes
+        K = [VOCAB if (l % 4 or P[l] >= 1.0) else 40 for l in range(LANES)]
         return T, P, K, [i * 100 + l for l in range(LANES)]
 
     out = smp.sample(dev)  # warm every program
@@ -980,13 +1326,22 @@ def test_sampler_distribution(mesh_device):
     S = _S()
     rows = _real_rows()
     lanes_src = _lanes_of(rows)
+
     def LP(t, p, k):  # fp32 values, as the plugin sends them
         return S.LaneParams(float(np.float32(t)), float(np.float32(p)), k, None)
 
     # (row, lane parameters): the rows' own top-p 0.95 lanes (kept 477, 258, 6, 3), T = 1.5 (kept 14), top-k 20 with
     # top-p off (kept 20), top-k 20 with ties at the k-th value (kept 23), top-k 100 + top-p 0.9 at T = 0.8 (kept 23)
-    groups = [(2, lanes_src[2]), (7, lanes_src[7]), (15, lanes_src[15]), (8, lanes_src[8]),
-              (15, LP(1.5, 0.95, 0)), (2, LP(1.0, 1.0, 20)), (28, LP(1.0, 1.0, 20)), (7, LP(0.8, 0.9, 100))]
+    groups = [
+        (2, lanes_src[2]),
+        (7, lanes_src[7]),
+        (15, lanes_src[15]),
+        (8, lanes_src[8]),
+        (15, LP(1.5, 0.95, 0)),
+        (2, LP(1.0, 1.0, 20)),
+        (28, LP(1.0, 1.0, 20)),
+        (7, LP(0.8, 0.9, 100)),
+    ]
     pick = [g[0] for g in groups]
     x = torch.stack([rows["logits"][pick[l // 4]] for l in range(LANES)])
     lanes = [groups[l // 4][1] for l in range(LANES)]
@@ -994,8 +1349,12 @@ def test_sampler_distribution(mesh_device):
     steps = draws // 4
     cfg, ccl, smp = _setup(mesh_device, "sampling_distribution")
     dev = _upload_logits(mesh_device, cfg, x)
-    smp.set_params([l.temperature for l in lanes], [l.top_p for l in lanes], [l.top_k or VOCAB for l in lanes],
-                   [500 + 13 * l for l in range(LANES)])
+    smp.set_params(
+        [l.temperature for l in lanes],
+        [l.top_p for l in lanes],
+        [l.top_k or VOCAB for l in lanes],
+        [500 + 13 * l for l in range(LANES)],
+    )
     smp.set_positions(torch.zeros(LANES))
     out = smp.sample(dev, debug=True)
     res = smp.read(out)
@@ -1023,9 +1382,10 @@ def test_sampler_distribution(mesh_device):
         u = smp.last_uniforms().astype(np.float64)
         if bool(flg.any()):  # rare exactness-verification flags: the production host fallback (exact, id tie order)
             n_flag += int(flg.sum())
+            U = S.uniform64(res.counters)
             res = smp.resolve(res, x)
             for l in torch.nonzero(flg).reshape(-1).tolist():
-                assert int(res.tokens[l]) == S.fallback_sample(x[l], lanes[l], float(u[l]))
+                assert int(res.tokens[l]) == S.fallback_sample(x[l], lanes[l], float(U[l]))
         toks[s] = res.tokens.numpy()
         for r, (ids, q, C) in enumerate(ref):
             ls = slice(4 * r, 4 * r + 4)
@@ -1043,9 +1403,19 @@ def test_sampler_distribution(mesh_device):
                 mism += int(near >= 2e-6)
                 if near >= 2e-6 and len(bad_cases) < 12:
                     ids_l = ids.tolist()
-                    bad_cases.append({"step": s, "lane": l, "group": r, "u": float(u[l]), "flagged": bool(flg[l]),
-                                      "want_j": int(jj[b]), "got_j": ids_l.index(got) if got in ids_l else None,
-                                      "ctr": ctr.copy(), "near": float(near)})
+                    bad_cases.append(
+                        {
+                            "step": s,
+                            "lane": l,
+                            "group": r,
+                            "u": float(u[l]),
+                            "flagged": bool(flg[l]),
+                            "want_j": int(jj[b]),
+                            "got_j": ids_l.index(got) if got in ids_l else None,
+                            "ctr": ctr.copy(),
+                            "near": float(near),
+                        }
+                    )
     wall = time.perf_counter() - t0
     ttnn.release_trace(mesh_device, cap.tid)
     _free_out(tout)
@@ -1060,10 +1430,18 @@ def test_sampler_distribution(mesh_device):
         ids, q, C = ref[case["group"]]
         j = case["want_j"]
         lo_, hi_ = max(0, j - 2), min(len(C), j + 3)
-        case.update({"device_token": int(r_.tokens[l]), "mass_kept": mk, "n_kept": float(r_.n_kept[l]),
-                     "u_dev": float(r_.u[l]), "C_exact": C[lo_:hi_].tolist(),
-                     "EX_dev_norm": (EX[lo_ + 1: hi_ + 1] / mk).tolist(), "PR_dev": PR[lo_:hi_].tolist(),
-                     "q_exact": q[lo_:hi_].tolist()})
+        case.update(
+            {
+                "device_token": int(r_.tokens[l]),
+                "mass_kept": mk,
+                "n_kept": float(r_.n_kept[l]),
+                "u_dev": float(r_.u[l]),
+                "C_exact": C[lo_:hi_].tolist(),
+                "EX_dev_norm": (EX[lo_ + 1 : hi_ + 1] / mk).tolist(),
+                "PR_dev": PR[lo_:hi_].tolist(),
+                "q_exact": q[lo_:hi_].tolist(),
+            }
+        )
         _free_out(o)
         print("[sampling] mismatch", json.dumps(case), flush=True)
     report = []
@@ -1088,20 +1466,41 @@ def test_sampler_distribution(mesh_device):
         floor = [0.5 * np.abs(rng.multinomial(int(n), q.numpy()) / n - q.numpy()).sum() for _ in range(40)]
         fm, fs = float(np.mean(floor)), float(np.std(floor))
         lp_ = groups[r][1]
-        report.append({"row": pick[r], "T": round(float(lp_.temperature), 4), "top_p": round(float(lp_.top_p), 4),
-                       "top_k": int(lp_.top_k), "kept": len(pos), "draws": int(n), "chi2_p": float(pval),
-                       "tv": float(tv), "tv_floor_mean": fm, "tv_floor_std": fs})
-    print(f"[sampling] distribution: {steps} traced steps in {wall:.1f} s ({wall / steps * 1e3:.2f} ms per step incl. "
-          f"host checks), {mism} mismatches, {boundary} rounding-boundary draws, {tie_perm} tie-order draws "
-          f"(identical logits), {n_flag} verification-flagged draws (exact host fallback)")
+        report.append(
+            {
+                "row": pick[r],
+                "T": round(float(lp_.temperature), 4),
+                "top_p": round(float(lp_.top_p), 4),
+                "top_k": int(lp_.top_k),
+                "kept": len(pos),
+                "draws": int(n),
+                "chi2_p": float(pval),
+                "tv": float(tv),
+                "tv_floor_mean": fm,
+                "tv_floor_std": fs,
+            }
+        )
+    print(
+        f"[sampling] distribution: {steps} traced steps in {wall:.1f} s ({wall / steps * 1e3:.2f} ms per step incl. "
+        f"host checks), {mism} mismatches, {boundary} rounding-boundary draws, {tie_perm} tie-order draws "
+        f"(identical logits), {n_flag} verification-flagged draws (exact host fallback)"
+    )
     for line in report:
         print("  ", line)
     try:
-        (REPORT_DIR / "device_distribution.json").write_text(json.dumps({"rows": report, "mismatches": mism,
-                                                                         "boundary": boundary,
-                                                                         "tie_order_draws": tie_perm,
-                                                                         "flagged_draws": n_flag, "steps": steps},
-                                                                        indent=1))
+        (REPORT_DIR / "device_distribution.json").write_text(
+            json.dumps(
+                {
+                    "rows": report,
+                    "mismatches": mism,
+                    "boundary": boundary,
+                    "tie_order_draws": tie_perm,
+                    "flagged_draws": n_flag,
+                    "steps": steps,
+                },
+                indent=1,
+            )
+        )
     except OSError:
         pass
     ttnn.deallocate(dev)
@@ -1171,10 +1570,11 @@ def test_sampler_adversarial_rows(mesh_device):
         assert all(bool(r.flags[l]) for l in flat_lanes)
         flg = r.flags.clone()
         flg[flat_lanes] = False
+        U = S.uniform64(r.counters)
         if s % 300 == 0:  # the flat lanes' fallback (a full sort each: sparse)
             r = smp.resolve(r, x, lanes=flat_lanes)
             for l in flat_lanes:
-                assert int(r.tokens[l]) == S.exact_sample(x[l], lanes[l], float(u[l]))
+                assert int(r.tokens[l]) == S.exact_sample(x[l], lanes[l], float(U[l]))
                 fb_checked += 1
         if bool(flg.any()):  # draw-check flags of certifiable lanes: resolved and kept in the statistics
             r = smp.resolve(r, x, lanes=torch.nonzero(flg).reshape(-1).tolist())
@@ -1185,7 +1585,7 @@ def test_sampler_adversarial_rows(mesh_device):
             elif l in ref:
                 if bool(flg[l]):
                     n_res += 1
-                    mism += int(got != S.fallback_sample(x[l], lanes[l], float(u[l])))
+                    mism += int(got != S.fallback_sample(x[l], lanes[l], float(U[l])))
                 else:
                     ids, C = ref[l]
                     mism += int(got != int(ids[min(int(np.searchsorted(C, float(u[l]), side="right")), len(C) - 1)]))
@@ -1220,9 +1620,15 @@ def test_sampler_adversarial_rows(mesh_device):
         k1, k2 = int((got == int(ids[0])).sum()), int((got == int(ids[1])).sum())
         p12 = float(q[0] / (q[0] + q[1]))
         bin_p = float(stats.binomtest(k1, k1 + k2, p12).pvalue)
-        report["groups"][name] = {"kept": int(ids.numel()), "boundary_tie_kept": int(ids.numel()) - len(above),
-                                  "draws": int(n), "chi2_p": chi_p, "top2": [k1, k2], "p_first": p12,
-                                  "binom_p": bin_p}
+        report["groups"][name] = {
+            "kept": int(ids.numel()),
+            "boundary_tie_kept": int(ids.numel()) - len(above),
+            "draws": int(n),
+            "chi2_p": chi_p,
+            "top2": [k1, k2],
+            "p_first": p12,
+            "binom_p": bin_p,
+        }
         assert chi_p > 1e-4 and bin_p > 1e-4, (name, report["groups"][name])
     report["topk1_tokens"] = sorted(set(toks[:, 30].tolist()))
     assert len(report["topk1_tokens"]) == 1 and report["topk1_tokens"][0] in (SLICE * 30 + 100, SLICE * 3 + 7)
@@ -1231,6 +1637,143 @@ def test_sampler_adversarial_rows(mesh_device):
     smp.deallocate()
     assert mism == 0, report
     assert n_res <= 1e-3 * steps * len(ref), report
+
+
+@pytest.mark.parametrize("mesh_device, device_params", _mesh_params(), indirect=True)
+def test_sampler_gumbel_full_vocab(mesh_device):
+    """(h) The full-vocab Gumbel path (lead decision 4: ``top_p = 1`` without top-k, never a host fallback), traced, in
+    one mixed batch: 24 Gumbel lanes (real rows 2 / 7 at T = 1.0, 15 at T = 1.5, 8 at T = 0.7; 6 lanes each, seeded)
+    next to greedy, top-p 0.95, top-k 20 (+ top_p = 1: the top-k path) lanes, an unseeded Gumbel lane and a Gumbel lane
+    that repeats lane 0's seed. ``MOTIF3_SAMPLER_GUMBEL_STEPS`` (default 8000) steps:
+
+    * Gumbel lanes are never flagged, report ``n_kept = vocab``, and equal the fp64 twin (:func:`gumbel_sample`, the
+      same hash words) on the first 120 steps (a difference only where the twin's two scores agree to fp32 rounding);
+    * lane 31 (lane 0's seed, same row) draws lane 0's token at every step: (seed, position) determinism across lanes;
+      the replay of the first 50 steps' counters gives the same tokens; the unseeded lane draws fresh noise;
+    * the draws of every group follow ``softmax(x / T)`` over the WHOLE vocabulary: chi-square over the top tokens
+      plus the merged tail, TV within the multinomial noise floor, and the fraction drawn outside the top-512 window
+      (its exact mass: 4.8 % / 2.9 % for rows 2 / 7 at T = 1, 0.18 % for the peaked row 15 at T = 1.5; what a
+      window-bound sampler can never draw) matches its mass;
+    * raw logprobs equal the fp64 value; greedy lanes = ``torch.argmax``; top-p / top-k lanes = the fp64 inverse CDF
+      over the device's walk order fed the same uniform."""
+    import ttnn
+    from scipy import stats
+
+    S = _S()
+    rows = _real_rows()
+    f32 = lambda v: float(np.float32(v))  # noqa: E731
+    groups = [(2, 1.0), (7, 1.0), (15, 1.5), (8, 0.7)]
+    plan = []
+    for r, T in groups:
+        plan += [(r, S.LaneParams(f32(T), 1.0, 0, None))] * 6
+    plan += [(2, S.LaneParams(0.0, 1.0, 1, None)), (7, S.LaneParams(0.0, 1.0, 1, None))]
+    plan += [(15, S.LaneParams(1.0, f32(0.95), 0, None)), (8, S.LaneParams(1.0, f32(0.95), 0, None))]
+    plan += [(2, S.LaneParams(1.0, 1.0, 20, None)), (28, S.LaneParams(1.0, 1.0, 20, None))]
+    plan += [(2, S.LaneParams(1.0, 1.0, 0, None)), (2, S.LaneParams(1.0, 1.0, 0, None))]  # unseeded; lane 0's seed
+    x = torch.stack([rows["logits"][r] for r, _ in plan])
+    lanes_in = [lp for _, lp in plan]
+    seeds = [9100 + 7 * l for l in range(LANES)]
+    seeds[30], seeds[31] = None, seeds[0]
+    gl = list(range(24)) + [30, 31]
+    steps = int(os.environ.get("MOTIF3_SAMPLER_GUMBEL_STEPS", "8000"))
+    cfg, ccl, smp = _setup(mesh_device, "sampling_gumbel")
+    dev = _upload_logits(mesh_device, cfg, x)
+    smp.set_params([l.temperature for l in lanes_in], [l.top_p for l in lanes_in], [l.top_k or VOCAB for l in lanes_in],
+                   seeds)  # fmt: skip
+    lanes = smp.lane_params
+    assert [l for l in range(LANES) if lanes[l].full_support] == gl
+    smp.set_positions(torch.full((LANES,), 40))
+    out = smp.sample(dev, debug=True)
+    res = smp.read(out)
+    orders = _device_order(smp, out)
+    _free_out(out)
+    assert not bool(res.flags[gl].any()) and all(int(res.n_kept[l]) == VOCAB for l in gl)
+    out = smp.sample(dev)
+    _free_out(out)
+    with _Capture(mesh_device) as cap:
+        tout = smp.sample(dev)
+    toks = np.zeros((steps, LANES), dtype=np.int64)
+    ctrs = np.zeros((steps, LANES, 2), dtype=np.uint32)
+    g_cmp = g_mism = g_tie = other_mism = other_flags = 0
+    worst_lp = 0.0
+    xf = x.float()
+    t0 = time.perf_counter()
+    for s in range(steps):
+        smp.set_positions(torch.full((LANES,), 41 + s))
+        ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=False)
+        r = smp.read(tout)
+        assert not bool(r.flags[gl].any()), f"a Gumbel lane was flagged at step {s}"
+        flg = r.flags.clone()
+        other_flags += int(flg.sum())
+        if bool(flg.any()):
+            U = S.uniform64(r.counters)
+            r = smp.resolve(r, x)
+            for l in torch.nonzero(flg).reshape(-1).tolist():
+                assert int(r.tokens[l]) == S.fallback_sample(x[l], lanes[l], float(U[l]))
+        toks[s] = r.tokens.numpy()
+        ctrs[s] = r.counters
+        if s < 120:
+            for l in gl:
+                ok, tie = _gumbel_check(S, x[l], lanes[l], r.counters[l], int(r.tokens[l]))
+                g_cmp, g_mism, g_tie = g_cmp + 1, g_mism + int(not ok and not tie), g_tie + int(tie)
+            u = smp.last_uniforms()
+            c_, m_, b_ = _expect_tokens(S, x, lanes, orders, u, r)
+            other_mism += m_
+        if s % 97 == 0:
+            for l in range(LANES):
+                worst_lp = max(worst_lp, abs(float(r.logprobs[l]) - S.raw_logprob(x[l], int(r.tokens[l]))))
+    wall = time.perf_counter() - t0
+    # determinism: replaying the first 50 steps' counters reproduces their tokens; lane 31 = lane 0 every step
+    for s in range(50):
+        smp.set_counters(ctrs[s])
+        ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=False)
+        r = smp.read(tout)
+        if bool(r.flags.any()):
+            r = smp.resolve(r, x)
+        assert np.array_equal(r.tokens.numpy(), toks[s]), s
+    ttnn.release_trace(mesh_device, cap.tid)
+    _free_out(tout)
+    assert np.array_equal(toks[:, 31], toks[:, 0]), "the same (seed, position) on another lane drew another token"
+    assert len(set(map(tuple, ctrs[:, 30].tolist()))) == steps  # the unseeded lane: fresh counters every step
+    assert np.all(toks[:, 24] == int(torch.argmax(xf[24]))) and np.all(toks[:, 25] == int(torch.argmax(xf[25])))
+    report = {"steps": steps, "wall_s": round(wall, 1), "gumbel_compared": g_cmp, "gumbel_mismatch": g_mism,
+              "gumbel_near_ties": g_tie, "other_lane_mismatch": other_mism, "other_lane_flags": other_flags,
+              "logprob_err_max": worst_lp, "groups": []}  # fmt: skip
+    for gi, (r_, T) in enumerate(groups):
+        ls = list(range(6 * gi, 6 * gi + 6))
+        got = toks[:, ls].reshape(-1)
+        xr = xf[ls[0]].double()
+        p = torch.softmax(xr / float(np.float32(T)), 0).numpy()
+        n = got.size
+        top = np.argsort(-p)[:400]
+        cnt = np.bincount(got, minlength=VOCAB).astype(np.float64)
+        c_top = np.append(cnt[top], n - cnt[top].sum())
+        p_top = np.append(p[top], 1.0 - p[top].sum())
+        chi_p = _chi2_vs(c_top, p_top)
+        tv = 0.5 * np.abs(c_top / n - p_top).sum()
+        rng = np.random.default_rng(gi)
+        floor = [0.5 * np.abs(rng.multinomial(n, p_top) / n - p_top).sum() for _ in range(40)]
+        win = np.argsort(-p)[:512]  # the top-512 window: what a window-bound sampler can draw at most
+        out_k = int(n - np.isin(got, win).sum())
+        p_out = float(1.0 - p[win].sum())
+        bin_p = float(stats.binomtest(out_k, n, p_out).pvalue)
+        report["groups"].append(
+            {"row": r_, "T": T, "draws": n, "chi2_p": chi_p, "tv": float(tv), "tv_floor_mean": float(np.mean(floor)),
+             "tv_floor_std": float(np.std(floor)), "outside_window": out_k / n, "outside_window_exact": p_out,
+             "binom_p": bin_p}
+        )  # fmt: skip
+    print(f"[sampling] gumbel: {json.dumps(report)}")
+    try:
+        (REPORT_DIR / "device_gumbel.json").write_text(json.dumps(report, indent=1))
+    except OSError:
+        pass
+    ttnn.deallocate(dev)
+    smp.deallocate()
+    assert g_mism == 0 and other_mism == 0, report
+    assert worst_lp < 1e-4, report
+    for g in report["groups"]:
+        assert g["chi2_p"] > 1e-4 and g["binom_p"] > 1e-4, g
+        assert g["tv"] <= g["tv_floor_mean"] + 6 * g["tv_floor_std"] + 1e-3, g
 
 
 def _traced_ms(mesh_device, fn, reps=200, n=1):
@@ -1260,11 +1803,17 @@ def test_sampler_latency(mesh_device):
     import ttnn
 
     rows = _real_rows()
-    budget = float(os.environ.get("MOTIF3_SAMPLER_BUDGET_MS", "1.0"))
+    budget = float(os.environ.get("MOTIF3_SAMPLER_BUDGET_MS", "1.5"))
     cfg, ccl, smp = _setup(mesh_device, "sampling_latency")
     dev = _upload_logits(mesh_device, cfg, rows["logits"])
     smp.set_params(rows["temperature"], rows["top_p"], rows["top_k"], rows["seed"])
     rep = {"traced_ms": _traced_ms(mesh_device, lambda: smp.sample(dev))}
+    from models.demos.motif3.tt.sampling import MotifDeviceSampler
+
+    nog = MotifDeviceSampler(mesh_device, cfg, ccl=ccl, gumbel=False)  # the cost of the full-vocab Gumbel path
+    nog.set_params(rows["temperature"], rows["top_p"], rows["top_k"], rows["seed"])
+    rep["traced_ms_without_gumbel"] = _traced_ms(mesh_device, lambda: nog.sample(dev))
+    nog.deallocate()
     # host side of one step: counter write, replay, result read; a fallback step adds the host logits row work
     out = smp.sample(dev)
     _free_out(out)
@@ -1281,13 +1830,24 @@ def test_sampler_latency(mesh_device):
         tw.append((t1 - t0) * 1e3)
         tr.append((t2 - t1) * 1e3)
         tt.append((t2 - t0) * 1e3)
+    # the host fallback of the two flagged real rows (lanes 0, 1: top-p nuclei of 641 / 771 tokens, beyond the
+    # candidates); lane 30 (top_p = 1) is a Gumbel lane, never flagged: its fp64 host twin is timed apart (only tests
+    # and resolve(lanes=[30]) run it, serving never does)
     t0 = time.perf_counter()
-    smp.resolve(res, rows["logits"], lanes=[0, 1, 30])
-    rep["fallback_3_lanes_host_ms"] = (time.perf_counter() - t0) * 1e3
+    smp.resolve(res, rows["logits"], lanes=[0, 1])
+    rep["fallback_2_flagged_lanes_host_ms"] = (time.perf_counter() - t0) * 1e3
+    t0 = time.perf_counter()
+    smp.resolve(res, rows["logits"], lanes=[30])
+    rep["gumbel_host_twin_1_lane_ms"] = (time.perf_counter() - t0) * 1e3
     ttnn.release_trace(mesh_device, cap.tid)
     _free_out(tout)
-    rep.update({"set_positions_ms_median": float(np.median(tw)), "replay_plus_read_ms_median": float(np.median(tr)),
-                "step_host_total_ms_median": float(np.median(tt))})
+    rep.update(
+        {
+            "set_positions_ms_median": float(np.median(tw)),
+            "replay_plus_read_ms_median": float(np.median(tr)),
+            "step_host_total_ms_median": float(np.median(tt)),
+        }
+    )
     t0 = time.perf_counter()
     smp.set_params(rows["temperature"], rows["top_p"], rows["top_k"], rows["seed"], force=True)
     rep["set_params_upload_ms"] = (time.perf_counter() - t0) * 1e3
@@ -1321,6 +1881,7 @@ def test_probe_sampler_variants(mesh_device):
     _free_out(o)
     variants = [
         ("default", {}),
+        ("gumbel_off (top_p = 1 lanes flagged for the host)", {"gumbel": False}),
         ("no_fuse", {"impl": {"fuse": False}}),
         ("no_repair", {"impl": {"repair": False}}),
         ("no_verify_no_repair (cost of exactness; NOT exact)", {"impl": {"verify": False, "repair": False}}),
@@ -1346,6 +1907,7 @@ def test_probe_sampler_variants(mesh_device):
     stage_fns = (
         ("local_topk_gather", lambda: base._stage_local(d["x"], [])),
         ("normalizer", lambda: base._stage_norm(d["x"], d["M"], [])),
+        ("gumbel_full_vocab", lambda: base._stage_gumbel(d, [])),
         ("window_topk_probs", lambda: base._stage_window(d["Vb"], d["M"], d["Z"], [])),
         ("prefix_matmuls", lambda: base._stage_prefix(d["PR"], [])),
         ("select_repair_rng_cert_verify", lambda: base._stage_select(d, [])),
@@ -1353,12 +1915,14 @@ def test_probe_sampler_variants(mesh_device):
     )
     stages_ms = {}
     for name, fn in stage_fns:
+
         def run(fn=fn):
             o = fn()
             vals = o.values() if isinstance(o, dict) else o
             for t in vals:
                 if t is not None:
                     ttnn.deallocate(t)
+
         run()
         ttnn.synchronize_device(mesh_device)
         with _Capture(mesh_device) as cap:
