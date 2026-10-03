@@ -55,6 +55,10 @@ Serving pattern (trace-safe): capture ``forward_decode(x, row_major=True)`` (and
 on ``forward_decode(x)``) in the decode trace; outside it read with ``logits_to_host`` / ``tokens_to_host`` (no device
 op on a ROW_MAJOR input). A TILE input to ``logits_to_host`` / ``prefill_logits_to_host`` runs an eager untilize, so
 warm that path before capture too. Prefill: ``forward_prefill(X, last_index)`` once per bucket during warmup.
+Speculative decode (features design §3.8.1; README §17): ``forward_decode`` = :meth:`MotifLMHead.stream_mean_norm` +
+:meth:`MotifLMHead.decode_logits`; the spec step keeps ``hn = stream_mean_norm(X)`` (``decode_logits(hn)`` does not
+consume it by default) and hands it to the MTP layer (``tt/mtp.py``), whose ``final_layernorm`` output goes through
+``decode_logits`` + :meth:`MotifLMHead.argmax_decode` as well (the shared LM head).
 
 Decision EMB-D1 (2026-10-01; module owner; awaiting the README §3 / §6 and design §2.3.8-2.3.9 update by the shared-
 infra owner): the default vocab split is "mesh" (6880 vocab per chip over all 32 chips) instead of the "tp" split the
@@ -576,14 +580,28 @@ class MotifLMHead:
         Returns device logits, ``logits_dtype``: "mesh" ``[1, 1, 32, 6880]`` per chip (rows = all 32 lanes in lane
         order 8 dp + l; chip (r, c) = vocab block r * C + c); "tp" ``[1, 1, 8, 27520]`` (the row's lanes x vocab
         block tp). TILE by default (the input of :meth:`argmax_decode`); ``row_major=True`` untilizes on device (the
-        layout :meth:`logits_to_host` reads without a host-side untilize). Trace-safe."""
-        hn = self.stream_mean_norm(x)
+        layout :meth:`logits_to_host` reads without a host-side untilize). Trace-safe.
+
+        = :meth:`stream_mean_norm` + :meth:`decode_logits` (``consume=True``), the same ops in the same order."""
+        return self.decode_logits(self.stream_mean_norm(x), row_major=row_major, consume=True)
+
+    def decode_logits(self, hn, *, row_major: bool = False, consume: bool = False) -> ttnn.Tensor:
+        """The decode logits of a normalized hidden ``hn [1, 1, 8, 4096]`` bf16 (this DP row's lanes): "mesh"
+        ``ccl.ag_dp_rows`` -> ``[1, 1, 32, 4096]`` -> :meth:`project`; "tp" :meth:`project`. Output as
+        :meth:`forward_decode` (TILE, or ROW_MAJOR with ``row_major``). Trace-safe.
+
+        ``hn`` is the post-final-norm hidden (:meth:`stream_mean_norm` of the residual streams) or the MTP layer's
+        ``final_layernorm`` output (``tt/mtp.py``; README §17). ``consume=True`` frees ``hn`` (what
+        :meth:`forward_decode` does); by default it is kept, so the speculative decode step can feed the same ``hn`` to
+        the MTP layer after the main head (features design §3.8.1)."""
+        x = hn
         if self.vocab_split == "mesh":
-            g = self.ccl.ag_dp_rows(hn, memory_config=self.memory_config)  # [1, 1, 32, 4096]
-            ttnn.deallocate(hn)
-            hn = g
-        logits = self.project(hn)
-        ttnn.deallocate(hn)
+            x = self.ccl.ag_dp_rows(hn, memory_config=self.memory_config)  # [1, 1, 32, 4096]
+            if consume:
+                ttnn.deallocate(hn)
+        logits = self.project(x)
+        if x is not hn or consume:
+            ttnn.deallocate(x)
         if row_major:
             rm = self.logits_rm(logits)
             ttnn.deallocate(logits)

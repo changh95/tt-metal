@@ -5,8 +5,10 @@
 
 Builds ``<TT cache root>/<tag>/mesh4x8/{global,L<nn>}/*.tensorbin`` part by part (``global`` = embedding, final norm and
 LM head; ``L<nn>`` = one decoder layer: 2 mHC sites, attention, the two RMSNorms, the dense MLP or the MoE with router,
-experts and shared expert). Each part is built by the **serving constructors** with ``cache=True``
-(``tt.decoder.MotifDecoderLayer``; ``tt.embedding.MotifEmbedding`` + ``tt.lm_head.MotifLMHead``), so the files are
+experts and shared expert; ``L53`` = the MTP layer ``model.mtp_layers.0``, part kind ``mtp``: its attention, dense MLP,
+input projection and 4 RMSNorms, ``--mtp``; features design §3.6.5). Each part is built by the **serving constructors**
+with ``cache=True`` (``tt.decoder.MotifDecoderLayer``; ``tt.embedding.MotifEmbedding`` + ``tt.lm_head.MotifLMHead``;
+``tt.mtp.MotifMTP``), so the files are
 exactly the ones the model loads, with the same mesh shape and dtype policy (both are in the cache path). No transform
 is re-derived here. The mesh is the serving mesh ``(4, 8)`` unless ``--mesh`` says otherwise (``MESH_DEVICE`` is NOT
 read: the plugin preset ``BH-Galaxy`` maps to (8, 4), whose cache directory the (4, 8) server never opens).
@@ -109,6 +111,7 @@ EST_CORE_BYTES = {
     "global": 8_576,  # final_norm.weight
     "dense": 355_152_448,  # attention 192.6 MB, dense MLP 160.5 MB, mHC projections 2.1 MB, norms
     "moe": 6_652_399_104,  # experts 6.42 GB, attention, shared expert, composite router (prefill), local ids, mHC
+    "mtp": 420_183_552,  # MTP layer L53: attention 192.6 MB, dense MLP 160.5 MB, input_proj 67.1 MB, 4 norms (no mHC)
 }
 EST_VARIANT_BYTES = {
     ("router", "composite"): 0,  # moe.router.weight + expert_bias: built for either router (prefill uses them): core
@@ -124,7 +127,10 @@ GUARD_FACTOR = 1.10
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DISK, EXIT_SOURCE, EXIT_VERIFY = 0, 1, 2, 3, 4, 5
 
-KINDS = ("global", "dense", "moe")
+KINDS = ("global", "dense", "moe")  # the main model's part kinds (EST_PART_BYTES, ConvertOptions.all_variants)
+MTP_KIND = "mtp"  # the MTP layer's part (L<num_hidden_layers> = L53; one per checkpoint MTP layer, Motif-3 has one)
+PART_KINDS = KINDS + (MTP_KIND,)
+MTP_PREFIX = "model.mtp_layers.0"  # its checkpoint tensors (weights.mtp_name(); shard 104, kept in BF16)
 ROUTER_CHOICES = ("composite", "exact_fp32", "both")
 SINKHORN_CHOICES = ("motif", "stock", "both")
 LM_HEAD_CHOICES = ("mesh", "tp", "both")
@@ -135,7 +141,8 @@ VARIANT_VALUES = {
     "lm_head_split": ("mesh", "tp"),
     "embedding": ("replicated", "sharded"),
 }
-VARIANT_KEYS = {"global": ("lm_head_split", "embedding"), "dense": ("mhc_sinkhorn",), "moe": ("router", "mhc_sinkhorn")}
+VARIANT_KEYS = {"global": ("lm_head_split", "embedding"), "dense": ("mhc_sinkhorn",), "moe": ("router", "mhc_sinkhorn"),
+                MTP_KIND: ()}  # the MTP layer has no option variants (no mHC, no router)
 SERVING_DEFAULTS = {"router": "composite", "mhc_sinkhorn": "motif", "lm_head_split": "mesh", "embedding": "replicated"}
 _CFG_DEFAULT_ATTR = {"router": "router_logits", "mhc_sinkhorn": "mhc_sinkhorn"}  # env-selectable serving defaults
 
@@ -144,7 +151,7 @@ _CFG_DEFAULT_ATTR = {"router": "router_logits", "mhc_sinkhorn": "mhc_sinkhorn"} 
 CODE_FINGERPRINT_FILES = tuple(
     f"models/demos/motif3/tt/{n}"
     for n in ("weights.py", "model_config.py", "decoder.py", "mhc.py", "attention.py", "polynorm.py", "mlp.py",
-              "moe.py", "embedding.py", "lm_head.py", "kernels/__init__.py", "kernels/router_fp32.py",
+              "moe.py", "embedding.py", "lm_head.py", "mtp.py", "kernels/__init__.py", "kernels/router_fp32.py",
               "kernels/sinkhorn_motif.py")
 ) + (
     "ttnn/ttnn/operations/core.py",
@@ -154,7 +161,7 @@ CODE_FINGERPRINT_FILES = tuple(
     "build/lib/libtt_metal.so",
 )
 
-Part = Optional[int]  # None = the globals, else a decoder layer index
+Part = Optional[int]  # None = the globals, else a decoder layer index (or the MTP layer's, mtp_part(cfg) = 53)
 
 
 class ConvertError(RuntimeError):
@@ -201,11 +208,27 @@ def part_tag(part: Part) -> str:
     return "global" if part is None else f"L{int(part):02d}"
 
 
+def mtp_part(cfg) -> Optional[int]:
+    """The MTP layer's part index (``cfg.mtp_layer_idx`` = ``num_hidden_layers`` = 53: part ``L53``), or ``None``
+    when the checkpoint has no MTP layer (``num_nextn_predict_layers`` 0)."""
+    if int(getattr(cfg, "num_nextn_predict_layers", 0) or 0) < 1 or getattr(cfg, "mtp_layer_idx", None) is None:
+        return None
+    return int(cfg.mtp_layer_idx)
+
+
 def part_kind(cfg, part: Part) -> str:
-    """``global`` | ``dense`` | ``moe``."""
+    """``global`` | ``dense`` | ``moe`` | ``mtp`` (the MTP layer, :func:`mtp_part`)."""
     if part is None:
         return "global"
+    if int(part) == mtp_part(cfg):
+        return MTP_KIND
     return "moe" if cfg.layer(int(part)).is_moe else "dense"
+
+
+def part_spec(cfg, part: int):
+    """The part's ``LayerSpec``: ``cfg.layer(l)`` for a decoder layer, ``cfg.mtp_layer_spec()`` for the MTP layer
+    (``cfg.layer(53)`` does not exist)."""
+    return cfg.mtp_layer_spec() if int(part) == mtp_part(cfg) else cfg.layer(int(part))
 
 
 def estimate_part_bytes(kind: str, variants: Optional[Mapping[str, Sequence[str]]] = None) -> int:
@@ -474,11 +497,19 @@ class CountingSource:
 
 def missing_source_tensors(source, cfg, part: Part) -> List[str]:
     """HF tensors the part needs that are not (completely) on disk (``HFWeightLoader.available``: index + shard size
-    check). Globals: embedding, final norm, LM head; a layer: every ``model.layers.{l}.*`` tensor of the index."""
+    check). Globals: embedding, final norm, LM head; a layer: every ``model.layers.{l}.*`` tensor of the index; the MTP
+    part: the 19 ``model.mtp_layers.0.*`` tensors ``tt.mtp.MotifMTP`` reads (``weights.mtp_tensor_names``), so one the
+    index does not list counts as missing too."""
     if not hasattr(source, "available"):
         return []
     if part is None:
         names = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
+    elif int(part) == mtp_part(cfg):
+        from models.demos.motif3.tt import weights as W
+
+        if hasattr(source, "keys") and not W.mtp_names_in(source):
+            return [f"{MTP_PREFIX}.* (no tensors in the index)"]
+        names = W.mtp_tensor_names()
     elif hasattr(source, "layer_names"):
         names = source.layer_names(int(part))
         if not names:
@@ -508,6 +539,8 @@ def module_of(cache_name: Optional[str]) -> str:
     if not cache_name:
         return "uncached"
     n = cache_name
+    if n.startswith("mtp."):
+        return "mtp"  # the MTP layer's input projection and norms
     if n.startswith("attn."):
         return "attention"
     if n.startswith("mhc_"):
@@ -726,6 +759,11 @@ def build_part(mesh, cfg, part: Part, *, source, ccl, rope, variants: Mapping[st
                 add(f"lm_head[{split}]", lambda split=split: MotifLMHead(
                     mesh, cfg, source=source, ccl=ccl, cache=True, vocab_split=split))
             return built
+        if part_kind(cfg, part) == MTP_KIND:  # weights only: no embedding / head (they belong to the globals)
+            from models.demos.motif3.tt.mtp import MotifMTP
+
+            add("mtp_layer", lambda: MotifMTP(mesh, cfg, source=source, ccl=ccl, rope=rope, cache=True))
+            return built
         from models.demos.motif3.tt.decoder import MotifDecoderLayer
 
         l = int(part)
@@ -899,7 +937,8 @@ class Converter:
         if fingerprint is None:  # import every fingerprinted module first: the fingerprint is of the code that runs
             import importlib
 
-            for m in ("decoder", "embedding", "lm_head", "mhc", "moe", "kernels.router_fp32", "kernels.sinkhorn_motif"):
+            for m in ("decoder", "embedding", "lm_head", "mhc", "moe", "mtp", "kernels.router_fp32",
+                      "kernels.sinkhorn_motif"):
                 importlib.import_module(f"models.demos.motif3.tt.{m}")
         self.W = W
         self.mesh = mesh
@@ -1056,7 +1095,7 @@ class Converter:
             "format": FORMAT,
             "part": tag,
             "layer": part,
-            "kind": kind if part is None else f"{self.cfg.layer(int(part)).attn_kind}-attn/{kind}",
+            "kind": kind if part is None else f"{part_spec(self.cfg, part).attn_kind}-attn/{kind}",
             "cache_tag": self.cfg.cache_version_tag,
             "mesh_shape": list(self.cfg.mesh_shape),
             "cache_dir": str(final_dir),
@@ -1273,6 +1312,17 @@ def print_status(cfg, parts: Sequence[Part], options: ConvertOptions, as_json: b
     return sum(not r["complete"] for r in doc["parts"])
 
 
+def mtp_parts(cfg, want: bool) -> List[Part]:
+    """``[53]`` (the MTP part) when wanted and the checkpoint has an MTP layer, else ``[]`` (logged when wanted)."""
+    if not want:
+        return []
+    p = mtp_part(cfg)
+    if p is None:
+        log("the checkpoint has no MTP layer (num_nextn_predict_layers = 0): no MTP part")
+        return []
+    return [p]
+
+
 def resolve_mesh(arg: Optional[str]) -> Tuple[int, int]:
     """``--mesh`` or the serving mesh (4, 8). ``MESH_DEVICE`` is ignored on purpose (``BH-Galaxy`` means (8, 4))."""
     if arg:
@@ -1297,9 +1347,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="Build the Motif-3 TT weight cache (see the module docstring and docs/WEIGHTS_RUNBOOK.md).",
     )
     ap.add_argument("--layers", default=None, help="decoder layers: 0-52 | all | 3,4,10-12 | 36- | none "
-                    "(default: all when --globals is not given either)")
+                    "(default: all when neither --globals nor --mtp is given)")
     ap.add_argument("--globals", dest="globals_", action="store_true", help="also convert the globals")
     ap.add_argument("--no-globals", dest="no_globals", action="store_true", help="never convert the globals")
+    ap.add_argument("--mtp", dest="mtp", action="store_true", help="also convert the MTP layer (part L53, "
+                    "model.mtp_layers.0, ~0.42 GB; part of the default run)")
+    ap.add_argument("--no-mtp", dest="no_mtp", action="store_true", help="never convert the MTP layer")
     ap.add_argument("--target", choices=("mock", "device"), default="mock")
     ap.add_argument("--mock-desc", default=str(DEFAULT_MOCK_DESC), help="mock cluster descriptor (--target mock)")
     ap.add_argument("--mesh", default=None, help="mesh shape (default 4x8, the serving mesh; MESH_DEVICE is ignored)")
@@ -1329,10 +1382,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-lock-check", action="store_true", help="--target device without the devrun.sh lock check")
     a = ap.parse_args(argv)
 
-    if a.layers is None and not a.globals_:
-        layer_spec, want_globals = "all", not a.no_globals
+    if a.layers is None and not a.globals_ and not a.mtp:
+        layer_spec, want_globals, want_mtp = "all", not a.no_globals, not a.no_mtp
     else:
         layer_spec, want_globals = (a.layers or "none"), (a.globals_ and not a.no_globals)
+        want_mtp = a.mtp and not a.no_mtp
     try:
         options = ConvertOptions(router=a.router, mhc_sinkhorn=a.mhc_sinkhorn, lm_head_split=a.lm_head_split,
                                  embedding=a.embedding, hash_files=not a.no_hash)
@@ -1356,7 +1410,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if cfg.num_layers != cfg.num_hidden_layers:
             cfg = MotifTTConfig.from_hf_config(Path(a.weights_dir) if a.weights_dir else None,
                                                num_layers=cfg.num_hidden_layers, **kw)
-        print_status(cfg, ([None] if want_globals else []) + layers, options, as_json=a.json)
+        print_status(cfg, ([None] if want_globals else []) + layers + mtp_parts(cfg, want_mtp), options, as_json=a.json)
         return EXIT_OK
 
     # ---- environment guards, BEFORE ttnn is imported (the mock target is selected through the environment) ----------
@@ -1396,7 +1450,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log_fabric(mesh, f"convert_weights ({a.target})", printer=log)
         cfg = build_cfg(mesh, cache_root=a.cache_root, weights_dir=a.weights_dir)
         layers = parse_layers(layer_spec, cfg.num_hidden_layers)
-        parts: List[Part] = ([None] if want_globals else []) + layers
+        parts: List[Part] = ([None] if want_globals else []) + layers + mtp_parts(cfg, want_mtp)
         serving = serving_cache(cfg)
         log(f"mesh {tuple(mesh.shape)} opened in {time.time() - t0:.1f} s ({a.target}); weights {cfg.weights_dir}; "
             f"cache {cfg.cache_dir} (serving cache: {serving['is_serving_cache']})")

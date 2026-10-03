@@ -28,11 +28,18 @@ Built from the HF ``config.json`` (or a transformers config object, or ``Generat
   (standalone) and the vLLM ``"tt"`` config (``generator_api.SERVING_TT_CONFIG``) all open the mesh with it;
   :func:`require_l1_small` checks an opened mesh;
 * module defaults the decoder passes (``mhc_sinkhorn``, ``router_logits``) and the PolyNorm config semantics
-  (``polynorm_sigmoid_weight``, ``polynorm_output_scale_per_layer``).
+  (``polynorm_sigmoid_weight``, ``polynorm_output_scale_per_layer``);
+* the features of ``docs/features/FEATURES_DESIGN.md`` (chunked prefill, prefix caching, MTP speculation): the span
+  cap and its buckets (``prefill_span_cap``, ``max_prefill_span``, ``prefill_span_buckets``), the resume alignment
+  ``A`` (``prefill_resume_alignment``) and the sp1 program configs it comes from (``resumed_prefill_pc``,
+  :data:`SP1_GLOBAL_CHUNKS`), the sp1 SDPA page-table width, the chunk cost table, ``plan_prefill_row`` with this
+  config's geometry, the KV-R / decode KV-write mode (``kv_replicated_decode``, ``kv_write_mode``) and the MTP layer
+  (``spec_tokens``, ``mtp_layer_spec()``, ``kv_pool_layers``).
 
-Import rule (design §2.1): this module imports only the standard library, ``ttnn`` and ``generator_api`` (stdlib +
-torch; the KV-pool and weights-location helpers shared with the vLLM bridge). It never opens a device and never
-imports other ``models/demos/**`` packages.
+Import rule (design §2.1): this module imports only the standard library, ``ttnn``, ``generator_api`` (stdlib +
+torch; the KV-pool and weights-location helpers shared with the vLLM bridge) and ``prefill_plan`` (stdlib + torch +
+``generator_api``: the prefill planner and its defaults). It never opens a device and never imports other
+``models/demos/**`` packages.
 """
 
 from __future__ import annotations
@@ -53,6 +60,9 @@ from .generator_api import NUM_LANES, SUPPORTED_BLOCK_SIZES, cdiv, check_block_s
 from .generator_api import hf_cache_snapshot as _hf_cache_snapshot
 from .generator_api import kv_cache_bytes_per_chip as _api_kv_cache_bytes_per_chip
 from .generator_api import kv_pool_tokens_from_env, resolve_tt_cache_path, resolve_weights_location
+from .generator_api import DEFAULT_PREFILL_SPAN_CAP, SUPPORTED_SPEC_TOKENS, check_prefill_span_cap, kv_write_mode
+from .generator_api import prefill_span_cap_from_env
+from . import prefill_plan as _plan
 
 # ------------------------------------------------------------------------------------------------------------
 # Paths and versioning
@@ -635,6 +645,48 @@ def sdpa_prefill_pc(kind, grid=(12, 10), seq_len: Optional[int] = None):
     )
 
 
+# Resumed (sp1) prefill, global layers: ttnn.transformer.chunked_scaled_dot_product_attention(Q_abs [1,10,C,576],
+# K = V = the paged latent cache, page_table [1, W'], chunk_start_idx_tensor [1]) (features design D2, §3.2.2).
+# (max bucket, (q_chunk, k_chunk)) entries, ascending: a bucket C uses the first entry with C <= max bucket. Default
+# 64/64 everywhere (D1: A = lcm(64, 64, 64) = 64, vLLM budget 8192 - 64 = 8128). q/k <= 128 (256/128 overflows L1,
+# tt_ops_chunked.md §3.3). Gate G9 decides; review R10's candidate is ((512, (64, 64)), (32768, (128, 128))), which
+# makes A = 128 and the budget 8064 (update generator_api.DEFAULT_PREFILL_ALIGNMENT with it). The chunk start must
+# be a multiple of q and k (the kernels divide it by q_chunk without a device check): prefill_plan aligns every chunk
+# start to cfg.prefill_resume_alignment = lcm(block, every q/k used up to the span cap).
+SP1_GLOBAL_CHUNKS: Tuple[Tuple[int, Tuple[int, int]], ...] = ((32768, (64, 64)),)
+
+
+def sp1_global_chunks(bucket: int, table: Sequence[Tuple[int, Tuple[int, int]]] = SP1_GLOBAL_CHUNKS) -> Tuple[int, int]:
+    """``(q_chunk, k_chunk)`` of the sp1 global op for chunk bucket ``bucket`` (:data:`SP1_GLOBAL_CHUNKS`)."""
+    C = int(bucket)
+    for upto, (q, k) in table:
+        if C <= int(upto):
+            if C % TILE or q % TILE or k % TILE or C % q:
+                raise ValueError(f"sp1 bucket {C} with q/k chunks {(q, k)}: all must be tile multiples, q | C")
+            return int(q), int(k)
+    raise ValueError(f"no sp1 global chunk entry for bucket {C} in {tuple(table)}")
+
+
+def resumed_prefill_pc(kind, bucket: int, grid=(12, 10), swa_tail: int = _plan.DEFAULT_SWA_TAIL):
+    """Program config of an sp1 (resumed) prefill chunk of ``bucket`` rows; pair it with the ``sdpa_prefill`` role.
+
+    * ``"global"``: the flexible chunked SDPA (:func:`sp1_global_chunks`), ``exp_approx_mode=False``.
+    * ``"swa"``: the square ``[tail ‖ chunk]`` causal + window-129 SDPA over ``swa_tail + bucket`` rows, i.e. the G2
+      config :func:`sdpa_prefill_pc` ``("swa", seq_len=swa_tail + bucket)`` (features design §3.2.3).
+    """
+    k = _attn_kind(kind)
+    if k == "swa":
+        return sdpa_prefill_pc("swa", grid, seq_len=int(swa_tail) + int(bucket))
+    qc, kc = sp1_global_chunks(bucket)
+    x, y = _grid_xy(grid)
+    return ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(x, y),
+        q_chunk_size=qc,
+        k_chunk_size=kc,
+        exp_approx_mode=False,
+    )
+
+
 def _subblock_w(per_core_n: int, fp32_acc: bool = True) -> int:
     """Widest out subblock width dividing ``per_core_n`` with ``h x w <= 4`` tiles (fp32 dest acc) or 8 (bf16 dest)."""
     cap = 4 if fp32_acc else 8
@@ -1075,6 +1127,17 @@ class MotifTTConfig:
     l1_small_size: int = DEFAULT_L1_SMALL_SIZE  # what device_params() opens the mesh with (MOTIF3_L1_SMALL_SIZE)
     mesh_l1_small_size: Optional[int] = None  # with a real mesh: its L1_SMALL bytes per core (0 = none: CCL hazard)
 
+    # ---- features (docs/features/FEATURES_DESIGN.md §2-§3; GeneratorSettings via from_settings) -------------------
+    # Span cap (MOTIF3_PREFILL_MAX_BUCKET): the largest bucket a resumed-prefill generator compiles; longer spans are
+    # split into sp0 + sp1 chunks (D8). Effective value: max_prefill_span = min(cap, max_model_len).
+    prefill_span_cap: int = DEFAULT_PREFILL_SPAN_CAP
+    # Eager prefill cost per bucket (s) + sp1 prefix-attention coefficient for the chunk planner [I; G9 / CP-L refine].
+    prefill_cost_table: Dict[int, float] = field(default_factory=lambda: dict(_plan.DEFAULT_PREFILL_COST_TABLE))
+    prefill_sp1_s_per_row_key: float = _plan.DEFAULT_SP1_ATTN_S_PER_ROW_KEY
+    kv_replicated_decode: bool = False  # KV-R: every decode KV write on all 32 chips (on with prefix caching)
+    spec_tokens: int = 0  # MTP self-speculation drafts per step: 0 | 1
+    num_nextn_predict_layers: int = 1  # config.json: MTP layers in the checkpoint (model.mtp_layers.0)
+
     # ---- module defaults the decoder passes (README §4, §10; wave-B1 decisions) ------------------------------------
     # mHC coefficients: "motif" = tt/kernels/sinkhorn_motif (Option B, exact fp32 SFPU, ~3 us/site); "stock" = the
     # pre-clamped mhc_split_sinkhorn fallback (MHC-3; misses the 5e-3 H bound on 1 of 56 real sites).
@@ -1187,6 +1250,8 @@ class MotifTTConfig:
             polynorm_sigmoid_weight=bool(d.get("polynorm_sigmoid_weight", True)),
             polynorm_output_scale_per_layer=_per_layer_scales(d.get("polynorm_output_scale_per_layer")),
             polynorm_bias_clamp=d.get("polynorm_bias_clamp", 0.5),
+            num_nextn_predict_layers=int(d.get("num_nextn_predict_layers", 1)),
+            prefill_span_cap=prefill_span_cap_from_env() or DEFAULT_PREFILL_SPAN_CAP,
             hidden_clamp=d.get("hidden_clamp", 1e6),
             n_streams=int(d.get("mhc_expansion_rate", 4)),
             sinkhorn_iters=int(d.get("mhc_sinkhorn_iters", 20)),
@@ -1268,7 +1333,9 @@ class MotifTTConfig:
         ``max_batch = NUM_LANES`` (the trace always runs 32 lanes), ``dtypes.kv_cache`` from ``kv_cache_dtype``,
         ``kv_block_size`` from ``block_size`` when known (``allocate_kv_cache`` stays authoritative: call
         ``set_kv_geometry`` there), ``weights_dir``, ``tt_cache_root`` (``cache_path``), ``weights_revision``; the
-        fabric from the device. ``overrides`` win."""
+        fabric from the device. Features: ``kv_replicated_decode = settings.kv_replicated`` (KV-R resolved),
+        ``spec_tokens``, ``prefill_span_cap`` when the settings carry one (else ``MOTIF3_PREFILL_MAX_BUCKET`` / 8192).
+        ``overrides`` win."""
         weights = getattr(settings, "weights_path", None)
         local = bool(weights) and Path(weights).is_dir()
         src: Any = None
@@ -1291,6 +1358,10 @@ class MotifTTConfig:
             kw["tt_cache_root"] = Path(settings.cache_path)
         if getattr(settings, "weights_revision", None):
             kw["weights_revision"] = str(settings.weights_revision)
+        kw["kv_replicated_decode"] = bool(getattr(settings, "kv_replicated", False))
+        kw["spec_tokens"] = int(getattr(settings, "spec_tokens", 0) or 0)
+        if getattr(settings, "prefill_span_cap", None) is not None:
+            kw["prefill_span_cap"] = int(settings.prefill_span_cap)
         kw.update(overrides)
         return cls.from_hf_config(src, mesh_device=mesh_device, mesh_shape=mesh_shape, **kw)
 
@@ -1344,6 +1415,23 @@ class MotifTTConfig:
             raise ValueError(f"mhc_sinkhorn must be one of {MHC_SINKHORN_IMPLS}, got {self.mhc_sinkhorn!r}")
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
+        # ---- features ----
+        check_prefill_span_cap(self.prefill_span_cap, self.max_model_len)
+        if self.max_prefill_span not in self.prefill_buckets:
+            raise ValueError(f"span cap {self.max_prefill_span} is not a prefill bucket {self.prefill_buckets}")
+        if not self.prefill_cost_table or any(int(k) < 1 or float(v) <= 0 for k, v in self.prefill_cost_table.items()):
+            raise ValueError(f"prefill_cost_table must map buckets to positive seconds, got {self.prefill_cost_table}")
+        if self.prefill_sp1_s_per_row_key < 0:
+            raise ValueError(f"prefill_sp1_s_per_row_key must be >= 0, got {self.prefill_sp1_s_per_row_key}")
+        if self.kv_replicated_decode not in (True, False):
+            raise TypeError(f"kv_replicated_decode must be a bool, got {self.kv_replicated_decode!r}")
+        if self.spec_tokens not in SUPPORTED_SPEC_TOKENS:
+            raise ValueError(f"spec_tokens must be one of {SUPPORTED_SPEC_TOKENS}, got {self.spec_tokens}")
+        if self.spec_tokens and self.num_nextn_predict_layers < 1:
+            raise ValueError("MTP speculation needs the checkpoint's MTP layer (num_nextn_predict_layers >= 1)")
+        tail = self.prefill_swa_tail
+        if tail % self.kv_block_size:
+            raise ValueError(f"SWA tail {tail} is not a whole number of {self.kv_block_size}-token blocks")
 
     # ======================================================================================================
     # derived model quantities
@@ -1615,6 +1703,128 @@ class MotifTTConfig:
         raise ValueError(f"prompt of {seq_len} tokens exceeds max_model_len {self.max_model_len}")
 
     # ======================================================================================================
+    # resumed / chunked prefill (docs/features/FEATURES_DESIGN.md §3.1-§3.2; tt/prefill_plan.py)
+    # ======================================================================================================
+    @property
+    def max_prefill_span(self) -> int:
+        """Effective span cap ``min(prefill_span_cap, max_model_len)`` (8192): the largest bucket a resumed-prefill
+        generator compiles and runs; longer spans become several chunks (``generator.max_prefill_span``)."""
+        return min(int(self.prefill_span_cap), int(self.max_model_len))
+
+    @property
+    def prefill_span_buckets(self) -> Tuple[int, ...]:
+        """The buckets ``<= max_prefill_span`` (128 ... 8192): what a resumed-prefill generator warms, for sp0 and sp1.
+        ``prefill_buckets`` (all buckets to ``max_model_len``) stays the draft-1 list."""
+        return tuple(b for b in self.prefill_buckets if b <= self.max_prefill_span)
+
+    @property
+    def prefill_swa_tail(self) -> int:
+        """Earlier keys an SWA query sees: window 129 - 1 = 128 (0 without a sliding window). The sp1 SWA path reads
+        that many cached rows before the chunk; ``c0`` is 0 below it."""
+        w = self.effective_sliding_window
+        return 0 if w is None else int(w) - 1
+
+    def sp1_global_chunks(self, bucket: int) -> Tuple[int, int]:
+        """``(q_chunk, k_chunk)`` of the sp1 global op at ``bucket`` (:data:`SP1_GLOBAL_CHUNKS`)."""
+        return sp1_global_chunks(bucket)
+
+    @property
+    def prefill_resume_alignment(self) -> int:
+        """``A = lcm(kv_block_size, q_chunk, k_chunk)`` over every sp1 global config up to the span cap (64 for the
+        defaults: block 64, q/k 64/64). Every chunk start is a multiple of ``A`` (the chunked kernels divide the start
+        by ``q_chunk`` with no device check); vLLM's chunk budget should be ``max_prefill_span - A``."""
+        a = int(self.kv_block_size)
+        for b in self.prefill_span_buckets:
+            q, k = self.sp1_global_chunks(b)
+            a = math.lcm(a, q, k)
+        return a
+
+    @property
+    def sp1_page_table_width(self) -> int:
+        """``W'`` of the sp1 SDPA page table: ``round_up(cdiv(max_model_len + max_prefill_span, block), 8)`` = 640
+        (32768 + 8192 at block 64). Fixed, so one program per bucket; padded with 0 (never -1)."""
+        return _plan.sdpa_table_width(self.max_model_len, self.max_prefill_span, self.kv_block_size)
+
+    def resumed_prefill_pc(self, kind, bucket: int):
+        """sp1 prefill program config (:func:`resumed_prefill_pc`) on this chip's grid; ``kind`` = "global" | "swa" |
+        a ``LayerSpec`` | a layer index."""
+        if isinstance(kind, int) and not isinstance(kind, bool):
+            kind = self.layer(kind)
+        return resumed_prefill_pc(kind, bucket, self.compute_grid, self.prefill_swa_tail)
+
+    def prefill_cost(self, bucket: int, start: int = 0) -> float:
+        """Estimated seconds of one prefill chunk (:func:`prefill_plan.prefill_cost_model` with this config's table)."""
+        return _plan.prefill_cost_model(self.prefill_cost_table, sp1_s_per_row_key=self.prefill_sp1_s_per_row_key)(
+            int(bucket), int(start)
+        )
+
+    def plan_prefill_row(self, start: int, end: int) -> "_plan.RowPlan":
+        """:func:`prefill_plan.plan_prefill_row` with this config's geometry: block size, ``A``, the span buckets, the
+        span cap, the SWA tail and the cost table."""
+        if int(end) > self.max_model_len:
+            raise ValueError(f"prefill row end {end} exceeds max_model_len {self.max_model_len}")
+        return _plan.plan_prefill_row(
+            int(start),
+            int(end),
+            block_size=self.kv_block_size,
+            align=self.prefill_resume_alignment,
+            buckets=self.prefill_span_buckets,
+            span_cap=self.max_prefill_span,
+            swa_tail=self.prefill_swa_tail,
+            cost=_plan.prefill_cost_model(self.prefill_cost_table, sp1_s_per_row_key=self.prefill_sp1_s_per_row_key),
+        )
+
+    # ======================================================================================================
+    # decode KV writes (KV-R) and the MTP layer (docs/features/FEATURES_DESIGN.md §3.4-§3.6)
+    # ======================================================================================================
+    @property
+    def kv_write_mode(self) -> str:
+        """``row`` | ``row_split`` | ``all`` | ``all_split`` (``generator_api.kv_write_mode``): KV-R x speculation.
+        Fixed per server (the decode trace is captured with it); one mode shared by all 53 layers + the MTP layer."""
+        return kv_write_mode(self.kv_replicated_decode, self.spec_tokens > 0)
+
+    @property
+    def mtp_layer_idx(self) -> int:
+        """The MTP layer's index: ``num_hidden_layers`` (53; the reference's ``layer_idx``, TT-cache part ``L53``),
+        whatever ``num_layers`` a truncated run uses."""
+        return int(self.num_hidden_layers)
+
+    def mtp_layer_spec(self) -> LayerSpec:
+        """The MTP layer (``model.mtp_layers.0``): SWA in "all" mode (window 129), plain RoPE (``swa_rope_theta``),
+        softmax scale ``head_dim^-0.5`` = 0.07216878, dense MLP (reference ``MotifMTP``: ``GDLAttention(args, 53,
+        swa=True)``). ``cfg.layer(53)`` does not exist and ``is_moe_layer(53)`` would say MoE: pass this spec
+        explicitly (``MotifAttention(spec=...)``)."""
+        if self.num_nextn_predict_layers < 1:
+            raise ValueError("this checkpoint has no MTP layer (num_nextn_predict_layers = 0)")
+        rope = "plain" if self.swa_rope_theta is not None else ("yarn" if self.rope_type == "yarn" else "plain")
+        return LayerSpec(
+            idx=self.mtp_layer_idx,
+            is_global=False,
+            is_moe=False,
+            window=self.effective_sliding_window,
+            softmax_scale=self.head_dim**-0.5,
+            rope_kind=rope,
+        )
+
+    @property
+    def mtp_kv_layers(self) -> int:
+        """Latent caches beyond the ``num_layers`` main ones: 1 (the MTP layer) with speculation, else 0."""
+        return 1 if self.spec_tokens > 0 else 0
+
+    @property
+    def kv_pool_layers(self) -> int:
+        """Latent caches the generator allocates: ``num_layers + mtp_kv_layers`` (vLLM keeps accounting 53)."""
+        return int(self.num_layers) + self.mtp_kv_layers
+
+    def kv_pool_bytes_per_chip(self) -> int:
+        """:meth:`kv_cache_bytes_per_chip` including the MTP cache (``kv_pool_layers`` layers): 8.73 GB for 53 + 1
+        layers x 4129 blocks of 64 in bfp8."""
+        name = self.dtypes.kv_cache_name
+        if name not in KV_CACHE_DTYPE_BY_NAME:
+            return self.kv_cache_bytes_per_chip() * self.kv_pool_layers // self.num_layers
+        return _api_kv_cache_bytes_per_chip(self.kv_num_blocks, self.kv_block_size, self.kv_pool_layers, name)
+
+    # ======================================================================================================
     # compute kernel configs, program configs and memory configs
     # ======================================================================================================
     def compute_role(self, role: str) -> ComputeRole:
@@ -1806,7 +2016,9 @@ class MotifTTConfig:
             f"kv blocks={self.kv_num_blocks}x{self.kv_block_size} ({kv_src}, {self.dtypes.kv_cache_name}) "
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
-            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits}; cache={self.cache_dir})"
+            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits}; "
+            f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
+            f"spec={self.spec_tokens}; cache={self.cache_dir})"
         )
 
 
@@ -1837,6 +2049,7 @@ __all__ = [
     "ROUTER_DECODE_GRID",
     "ROUTER_LOGITS_IMPLS",
     "SDPA_PREFILL_CHUNKS",
+    "SP1_GLOBAL_CHUNKS",
     "SUPPORTED_BLOCK_SIZES",
     "active_fabric_name",
     "attn_decode_matmul_pcs",
@@ -1863,9 +2076,11 @@ __all__ = [
     "resolve_hf_config_path",
     "resolve_tt_cache_root",
     "resolve_weights_dir",
+    "resumed_prefill_pc",
     "reuse_matmul_pc",
     "rope_scaling_of",
     "router_decode_pc",
     "sdpa_prefill_chunks",
     "sdpa_prefill_pc",
+    "sp1_global_chunks",
 ]

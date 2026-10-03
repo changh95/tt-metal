@@ -27,6 +27,10 @@ Tensor contract (README CONVENTIONS §3):
   int32, ``page_table [8, W]`` int32; this layer's paged latent cache. Trace-safe: fixed shapes, no host round trip.
 * prefill (one user, S = bucket, replicated on all 32 chips): ``X [1, 4, S, 4096]`` -> ``X' [1, 4, S, 4096]``;
   ``page_table [1, >= S / block]`` int32 + this layer's cache (``None`` / ``None`` skips the cache fill: layer tests).
+  Resumed / chunked prefill (README §15): ``chunk=`` = the chunk's ``attention.PrefillChunkInputs`` instead of
+  ``page_table`` (rows at positions ``[chunk.start, chunk.start + S)``; sp1 chunks read the cached prefix).
+* decode with KV-R / the speculative split (README §16): ``kv_write=`` = the step's ``kv_write.DecodeKVWrite``, shared
+  by every layer (``cur_pos`` / ``page_table`` are then its tensors); ``None`` = draft 1.
 
 Inputs are never deallocated (README §10 rule 3); the returned streams are a new tensor. The decode norms run
 width-sharded on 8 x 4 cores (``cfg.decode_norm_configs()``: ~6 us + reshards instead of 65 us on one core,
@@ -190,14 +194,19 @@ class MotifDecoderLayer:
     # ------------------------------------------------------------------------------------------------------------
     # forwards
     # ------------------------------------------------------------------------------------------------------------
-    def forward_decode(self, X, *, rot, cur_pos, page_table, kv_cache, active, taps: Optional[dict] = None):
+    def forward_decode(
+        self, X, *, rot, cur_pos, page_table, kv_cache, active, taps: Optional[dict] = None, kv_write=None
+    ):
         """One decode step of this layer for the 8 lanes of each DP row (trace-safe; see the module docstring).
         ``taps`` (eager debugging only) receives the intermediates ``x_red``, ``attn_in``, ``attn_out``, ``x_mid``,
-        ``ffn_in``, ``ffn_out`` (not freed)."""
+        ``ffn_in``, ``ffn_out`` (not freed). ``kv_write``: the step's ``tt.kv_write.DecodeKVWrite`` (KV-R / the
+        speculative split, README §16), passed to the attention unchanged; ``None`` = the draft-1 8-lane update (bitwise
+        draft 1). With it, ``cur_pos`` / ``page_table`` must be ``kv_write.cur_pos`` / ``kv_write.page_table``."""
         x_red, c1 = self.mhc_attn.pre(X)
         a = self._norm_decode(x_red, self.input_norm)
+        kw = {} if kv_write is None else {"kv_write": kv_write}
         o = self.attn.forward_decode(a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv_cache,
-                                     active=active)
+                                     active=active, **kw)
         X1 = self.mhc_attn.post(X, o, c1)  # frees c1
         y_red, c2 = self.mhc_ffn.pre(X1)
         f = self._norm_decode(y_red, self.post_attn_norm)
@@ -214,13 +223,26 @@ class MotifDecoderLayer:
             _free(x_red, a, o, y_red, f, u, X1)
         return X2
 
-    def forward_prefill(self, X, *, page_table=None, kv_cache=None, taps: Optional[dict] = None):
+    def forward_prefill(self, X, *, page_table=None, kv_cache=None, taps: Optional[dict] = None, chunk=None):
         """Prefill of one user (eager): ``X [1, 4, S, 4096]`` -> ``[1, 4, S, 4096]``; fills this layer's cache for
         positions ``0 .. S-1`` through the first ``cfg.prefill_page_table_entries(S)`` entries of ``page_table``
-        (``kv_cache=None`` skips the fill). ``taps`` as in :meth:`forward_decode`."""
+        (``kv_cache=None`` skips the fill). ``taps`` as in :meth:`forward_decode`.
+
+        ``chunk``: one chunk of a resumed / chunked prefill (features design §3.7.1; README §15): the chunk's
+        ``tt.attention.PrefillChunkInputs`` (fill table, and for an sp1 chunk the SDPA table, start, offset-RoPE rows
+        and SWA tail bounds), built once per chunk and shared by every layer, in place of ``page_table``. ``X`` holds
+        the chunk's bucket rows at positions ``[chunk.start, chunk.start + S)``. Only the attention reads it (every
+        other sub-module is row-local); an sp0 chunk is the draft-1 call with the chunk's fill table, an sp1 chunk
+        needs ``kv_cache`` (it reads the cached prefix)."""
+        if chunk is not None and page_table is not None:
+            raise ValueError("forward_prefill: pass chunk= or page_table=, not both (the chunk carries its fill table)")
         x_red, c1 = self.mhc_attn.pre(X)
         a = self._norm_prefill(x_red, self.input_norm)
-        o = self.attn.forward_prefill(a, page_table=page_table if kv_cache is not None else None, kv_cache=kv_cache)
+        if chunk is not None:
+            o = self.attn.forward_prefill(a, chunk=chunk, kv_cache=kv_cache)
+        else:
+            o = self.attn.forward_prefill(a, page_table=page_table if kv_cache is not None else None,
+                                          kv_cache=kv_cache)
         X1 = self.mhc_attn.post(X, o, c1)
         y_red, c2 = self.mhc_ffn.pre(X1)
         f = self._norm_prefill(y_red, self.post_attn_norm)

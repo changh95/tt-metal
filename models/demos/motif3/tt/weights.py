@@ -55,6 +55,42 @@ def hf_name(layer: Optional[int], suffix: str) -> str:
     return suffix if layer is None else f"model.layers.{int(layer)}.{suffix}"
 
 
+# ---- the MTP layer's names (features design §3.6.5; README §17) ---------------------------------------------------
+MTP_LAYERS_PREFIX = "model.mtp_layers"  # the checkpoint's MTP layers (Motif-3: one, model.mtp_layers.0, shard 104)
+MTP_ATTN_TENSORS = ("wq_a", "q_norm", "wq_b", "wq_b_gate", "wkv_a", "kv_norm", "wkv_b", "lambda_proj", "wo")
+MTP_NORMS = ("embed_norm", "input_layernorm", "post_attention_layernorm", "final_layernorm")
+
+
+def mtp_name(suffix: Optional[str] = None, mtp_idx: int = 0) -> str:
+    """``model.mtp_layers.{mtp_idx}.{suffix}``; ``suffix=None`` gives the module path ``model.mtp_layers.{mtp_idx}``
+    (e.g. ``mtp_name("self_attn")`` is the MTP layer's ``MotifAttention(weight_prefix=)``)."""
+    p = f"{MTP_LAYERS_PREFIX}.{int(mtp_idx)}"
+    return p if suffix is None else f"{p}.{suffix}"
+
+
+def mtp_tensor_names(mtp_idx: int = 0) -> List[str]:
+    """The 19 checkpoint tensors of MTP layer ``mtp_idx``, sorted: the 9 GDLA attention tensors, the dense PolyNorm
+    MLP (``gate_proj`` / ``up_proj`` / ``down_proj`` + ``act_fn.{weight,bias}``), ``input_proj`` and the 4 RMSNorms
+    (reference ``MotifMTP``; all in shard 104 of revision 2ed2ed5c)."""
+    s = [f"self_attn.{k}.weight" for k in MTP_ATTN_TENSORS]
+    s += [f"mlp.{k}_proj.weight" for k in ("gate", "up", "down")] + ["mlp.act_fn.weight", "mlp.act_fn.bias"]
+    s += ["input_proj.weight"] + [f"{n}.weight" for n in MTP_NORMS]
+    return sorted(mtp_name(x, mtp_idx) for x in s)
+
+
+def mtp_names_in(source, mtp_idx: int = 0) -> List[str]:
+    """MTP tensors a weight source lists (``source.keys()``: the checkpoint index, or a dict's keys), sorted."""
+    p = mtp_name(None, mtp_idx) + "."
+    return sorted(n for n in source.keys() if n.startswith(p))
+
+
+def mtp_layer_available(source, mtp_idx: int = 0) -> bool:
+    """Every tensor of MTP layer ``mtp_idx`` that ``tt.mtp.MotifMTP`` reads (:func:`mtp_tensor_names`, all 19) is listed
+    by the source and readable (``source.available``: an ``HFWeightLoader`` also checks that the shard is completely on
+    disk). A source that lists only some of them does not count: the layer would fail at load time."""
+    return all(source.available(n) for n in mtp_tensor_names(mtp_idx))
+
+
 class HFWeightLoader:
     """Lazy, index-driven access to the HF safetensors checkpoint (design §2.3.11; study 01 §6.2, §9.3).
 
@@ -517,6 +553,34 @@ def norm_weight(gamma: torch.Tensor, tile: int = 32) -> torch.Tensor:
     return _f32(gamma).reshape(1, 1, d // tile, tile)
 
 
+# ---- MTP input projection (features design §3.6.2; tt/mtp.py) --------------------------------------------------------
+def mtp_input_proj_rows(cfg: MotifTTConfig, tp: int, in_features: Optional[int] = None) -> List[int]:
+    """Input columns of ``cat[hn, e]`` (``in_features`` = 2 x 4096) that chip ``tp`` multiplies: the "interleaved" K
+    split, ``[k tp, k tp + k)`` of the hidden half and the same range of the embedding half, ``k = 4096 / tp_size`` =
+    512. The chip's input is then ``cat[partition(hn), partition(e)]`` ``[T, 1024]``: two tile-aligned per-chip slices
+    and one concat, never the ``[T, 8192]`` concat (whose temporary is 0.5 GB per chip at T = 32768)."""
+    full = 2 * cfg.hidden_size if in_features is None else int(in_features)
+    half = full // 2
+    if full % 2 or half % cfg.tp:
+        raise ValueError(f"input_proj in_features {full} does not split into 2 x {cfg.tp} slices")
+    k = half // cfg.tp
+    lo = k * int(tp)
+    return list(range(lo, lo + k)) + list(range(half + lo, half + lo + k))
+
+
+def mtp_input_proj_for_chip(input_proj: torch.Tensor, cfg: MotifTTConfig, tp: int) -> torch.Tensor:
+    """Chip ``tp``'s block of the MTP ``input_proj`` (HF ``[4096, 8192]``, ``h = cat[hn, e] @ W^T``): the rows of
+    ``W^T`` for :func:`mtp_input_proj_rows` -> ``[1024, 4096]`` (hidden-half rows first, fp32). Upload
+    ``stack_tp(..., dim=0)`` with ``tp_dim=0``; the per-chip partial products are closed with ``all_reduce(tp)``
+    (exact algebra: the K sum is split into 8 disjoint parts)."""
+    D, K = input_proj.shape
+    if D != cfg.hidden_size or K != 2 * cfg.hidden_size:
+        want = (cfg.hidden_size, 2 * cfg.hidden_size)
+        raise ValueError(f"input_proj has shape {tuple(input_proj.shape)}, expected {want}")
+    rows = torch.tensor(mtp_input_proj_rows(cfg, tp, K), dtype=torch.long)
+    return _f32(input_proj).t()[rows].contiguous()
+
+
 # ============================================================================================================
 # (3) Mesh upload with cache
 # ============================================================================================================
@@ -677,8 +741,17 @@ __all__ = [
     "mhc_projection_blocks",
     "mhc_projection_from_source",
     "mhc_scalars",
+    "MTP_ATTN_TENSORS",
+    "MTP_LAYERS_PREFIX",
+    "MTP_NORMS",
     "mlp_down_for_chip",
     "mlp_gate_up_for_chip",
+    "mtp_input_proj_for_chip",
+    "mtp_input_proj_rows",
+    "mtp_layer_available",
+    "mtp_name",
+    "mtp_names_in",
+    "mtp_tensor_names",
     "norm_weight",
     "polynorm_coefficients",
     "prefill_kv_expansion_for_chip",

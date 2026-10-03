@@ -19,6 +19,7 @@ import torch
 
 import ttnn
 from models.demos.motif3.tt import generator_api as api
+from models.demos.motif3.tt import prefill_plan as pp
 from models.demos.motif3.tt.model_config import (
     CACHE_FORMAT_VERSION,
     COMPUTE_ROLES,
@@ -26,6 +27,8 @@ from models.demos.motif3.tt.model_config import (
     DEFAULT_L1_SMALL_SIZE,
     DEFAULT_WEIGHTS_DIR,
     FP32_ACC_OFF_ROLES,
+    SP1_GLOBAL_CHUNKS,
+    LayerSpec,
     MeshAxes,
     MotifTTConfig,
     compute_config_descriptor,
@@ -39,9 +42,11 @@ from models.demos.motif3.tt.model_config import (
     mesh_shape_from_env,
     require_l1_small,
     resolve_weights_dir,
+    resumed_prefill_pc,
     rope_scaling_of,
     sdpa_prefill_chunks,
     sdpa_prefill_pc,
+    sp1_global_chunks,
 )
 from models.demos.motif3.tt.rope import inv_freq_for_kind
 
@@ -60,6 +65,14 @@ _ENV = (
     "TT_CACHE_PATH",
     "MOTIF3_TT_CACHE_PATH",
     "TT_MODEL_WEIGHTS_REVISION",
+    # features (docs/features/FEATURES_DESIGN.md §1.3)
+    "MOTIF3_PREFIX_CACHING",
+    "MOTIF3_CHUNKED_PREFILL",
+    "MOTIF3_SPEC_DECODE",
+    "MOTIF3_KV_REPLICATED_DECODE",
+    "MOTIF3_PREFILL_MAX_BUCKET",
+    "MOTIF3_PACKED_PREFILL",
+    "MOTIF3_SPEC_VERIFY",
 )
 
 
@@ -800,3 +813,461 @@ def test_tt_cache_root_precedence(tmp_path, monkeypatch):
     assert s.cache_path == "/shared/cache"
     s = api.GeneratorSettings.from_env(hf, max_batch_size=32, max_seq_len=32768, environ={"TT_CACHE_PATH": "/tis/cache"})
     assert s.cache_path == "/tis/cache"
+
+
+# ======================================================================================================
+# Features (docs/features/FEATURES_DESIGN.md §2, §3.1-§3.6; WP1): config fields and the generator contract
+# ======================================================================================================
+def test_features_config_defaults():
+    """Span cap 8192 (D8), A = 64 (D1), W' = 640, SWA tail 128, draft-1 KV writes, no MTP cache until spec is on."""
+    cfg = _cfg()
+    assert cfg.prefill_span_cap == api.DEFAULT_PREFILL_SPAN_CAP == 8192 and cfg.max_prefill_span == 8192
+    assert cfg.prefill_span_buckets == (128, 256, 512, 1024, 2048, 4096, 8192) == pp.span_buckets(32768, 8192)
+    assert cfg.prefill_buckets[-1] == 32768  # the draft-1 bucket list is unchanged
+    assert cfg.prefill_swa_tail == 128 == pp.DEFAULT_SWA_TAIL
+    assert cfg.prefill_resume_alignment == api.DEFAULT_PREFILL_ALIGNMENT == 64
+    assert cfg.sp1_page_table_width == 640 == pp.sdpa_table_width(32768, 8192, 64)
+    assert (
+        pp.recommended_budget(cfg.max_prefill_span, cfg.prefill_resume_alignment) == 8128
+    )  # §1.1 --max-num-batched-tokens
+    assert cfg.kv_write_mode == "row" and cfg.kv_replicated_decode is False and cfg.spec_tokens == 0
+    assert cfg.mtp_kv_layers == 0 and cfg.kv_pool_layers == 53
+    assert cfg.kv_pool_bytes_per_chip() == cfg.kv_cache_bytes_per_chip()
+    assert cfg.num_nextn_predict_layers == 1 and cfg.mtp_layer_idx == 53 == api.MTP_LAYER_IDX
+    assert cfg.prefill_cost_table == dict(pp.DEFAULT_PREFILL_COST_TABLE)
+    assert "span cap=8192 A=64 kv_write=row spec=0" in cfg.describe()
+    cfg.set_kv_geometry(8225, 32)  # block 32: A stays 64 (q/k 64), W' doubles
+    assert cfg.prefill_resume_alignment == 64 and cfg.sp1_page_table_width == 1280
+    small = _cfg(max_model_len=4096)  # max_model_len below the cap: the cap clamps to the last bucket
+    assert small.max_prefill_span == 4096 and small.prefill_span_buckets[-1] == 4096
+    assert small.sp1_page_table_width == 128
+
+
+def test_features_config_env_and_validation(monkeypatch):
+    monkeypatch.setenv("MOTIF3_PREFILL_MAX_BUCKET", "32768")  # restores the draft-1 bucket set
+    cfg = _cfg()
+    assert cfg.max_prefill_span == 32768 and cfg.prefill_span_buckets == cfg.prefill_buckets
+    assert cfg.sp1_page_table_width == 1024
+    monkeypatch.setenv("MOTIF3_PREFILL_MAX_BUCKET", "5000")
+    with pytest.raises(ValueError, match="power of two"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MAX_BUCKET")
+    assert _cfg(prefill_span_cap=4096).prefill_span_buckets[-1] == 4096
+    for bad in (
+        dict(spec_tokens=2),
+        dict(prefill_span_cap=3000),
+        dict(prefill_span_cap=64),
+        dict(prefill_cost_table={}),
+        dict(prefill_cost_table={128: 0.0}),
+        dict(prefill_sp1_s_per_row_key=-1.0),
+        dict(kv_replicated_decode=None),
+        dict(spec_tokens=1, num_nextn_predict_layers=0),
+    ):
+        with pytest.raises((ValueError, TypeError)):
+            _cfg(**bad)
+
+
+@pytest.mark.parametrize(
+    "kvr, spec, mode", [(False, 0, "row"), (False, 1, "row_split"), (True, 0, "all"), (True, 1, "all_split")]
+)
+def test_kv_write_modes(kvr, spec, mode):
+    """KV-R x speculation -> the decode KV-write mode (§3.5); one mode for all 53 layers + the MTP layer."""
+    assert api.kv_write_mode(kvr, bool(spec)) == mode and mode in api.KV_WRITE_MODES
+    cfg = _cfg(kv_replicated_decode=kvr, spec_tokens=spec)
+    assert cfg.kv_write_mode == mode and cfg.mtp_kv_layers == spec and cfg.kv_pool_layers == 53 + spec
+    s = api.GeneratorSettings(prefix_caching=kvr, spec_tokens=spec)  # auto: KV-R iff prefix caching
+    assert s.kv_write_mode == mode and s.kv_replicated == kvr and s.mtp_kv_layers == spec
+
+
+def test_kv_pool_bytes_with_mtp():
+    """The MTP cache is one more [N, 1, 64, 576] layer: +612 B per token per chip in bfp8 (§1.2: the spec plan's
+    extra_bytes_per_token)."""
+    cfg = _cfg(spec_tokens=1)
+    assert (
+        cfg.kv_pool_bytes_per_chip() == 54 * 4129 * 2 * 18 * 1088 == api.kv_cache_bytes_per_chip(4129, 64, 54, "bfp8")
+    )
+    assert cfg.kv_pool_bytes_per_chip() - cfg.kv_cache_bytes_per_chip() == 4129 * 64 * 612
+    assert _cfg(spec_tokens=1, kv_cache_dtype="bf16").kv_pool_bytes_per_chip() == api.kv_cache_bytes_per_chip(
+        4129, 64, 54, "bf16"
+    )
+
+
+def test_mtp_layer_spec_matches_reference():
+    """``model.mtp_layers.0``: SWA "all" mode, window 129, plain RoPE, scale 192^-0.5, dense MLP (reference
+    ``MotifMTP`` = ``GDLAttention(args, 53, swa=True)``); cfg.layer(53) does not exist, hence the explicit spec."""
+    cfg = _cfg()
+    spec = cfg.mtp_layer_spec()
+    assert spec == LayerSpec(
+        idx=53, is_global=False, is_moe=False, window=129, softmax_scale=192**-0.5, rope_kind="plain"
+    )
+    assert spec.is_swa and spec.is_dense and spec.attn_kind == "swa" and spec.sliding_window_size == 129
+    assert abs(spec.softmax_scale - 0.07216878) < 1e-8
+    assert cfg.polynorm_output_scale_for_layer(cfg.mtp_layer_idx) == 0.5
+    assert _cfg(num_layers=4).mtp_layer_spec().idx == 53  # the reference index, whatever a truncated run uses
+    with pytest.raises(IndexError):
+        cfg.layer(53)
+    with pytest.raises(ValueError):
+        _cfg(num_nextn_predict_layers=0).mtp_layer_spec()
+    ref_cfg = pytest.importorskip("models.demos.motif3.reference.config")
+    args = ref_cfg.MotifArgs.from_hf_config(HF_META)
+    assert spec.window == args.effective_sliding_window
+    assert spec.softmax_scale == pytest.approx(args.softmax_scale(53, swa=True), rel=1e-15)
+    assert (spec.rope_kind == "yarn") == args.uses_yarn(53, swa=True)
+    assert cfg.polynorm_output_scale_for_layer(53) == args.polynorm_output_scale_for_layer(53)
+    assert cfg.num_nextn_predict_layers == int(args.num_nextn_predict_layers) == 1
+
+
+def test_resumed_prefill_program_configs():
+    """sp1 global: flexible chunked SDPA with q/k 64/64 (D1, until G9); sp1 SWA: the G2 square config over 128 + C."""
+    mesh = _FakeMesh()
+    cfg = _cfg()
+    want = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(12, 10), q_chunk_size=64, k_chunk_size=64, exp_approx_mode=False
+    )
+    for C in cfg.prefill_span_buckets:
+        assert cfg.sp1_global_chunks(C) == (64, 64)
+        assert repr(cfg.resumed_prefill_pc("global", C)) == repr(want) == repr(resumed_prefill_pc("global", C, mesh))
+        assert repr(cfg.resumed_prefill_pc(0, C)) == repr(want)  # layer 0 is global
+        swa = repr(sdpa_prefill_pc("swa", mesh, seq_len=128 + C))
+        assert repr(cfg.resumed_prefill_pc("swa", C)) == swa == repr(cfg.resumed_prefill_pc(cfg.layer(1), C))
+    for upto, (q, k) in SP1_GLOBAL_CHUNKS:  # tile multiples, <= 128 (256/128 overflows L1), divide A
+        assert q % 32 == 0 and k % 32 == 0 and q <= 128 and k <= 128
+        assert cfg.prefill_resume_alignment % q == 0 and cfg.prefill_resume_alignment % k == 0
+    with pytest.raises(ValueError):
+        sp1_global_chunks(100)
+    with pytest.raises(ValueError):
+        sp1_global_chunks(65536)
+    r10 = ((512, (64, 64)), (32768, (128, 128)))  # review R10's per-bucket candidate -> A = 128, budget 8064
+    assert sp1_global_chunks(512, r10) == (64, 64) and sp1_global_chunks(1024, r10) == (128, 128)
+
+
+def test_cfg_plan_prefill_row_matches_free_function():
+    cfg = _cfg()
+    for s, e in ((0, 1000), (1348, 3000), (6976, 9000), (0, 16736), (32704, 32768), (64, 900)):
+        p = cfg.plan_prefill_row(s, e)
+        q = pp.plan_prefill_row(s, e, block_size=64, align=64, buckets=api.prefill_buckets(32768), span_cap=8192)
+        assert p == q
+        assert pp.plan_cost(p, cfg.prefill_cost) == pytest.approx(pp.plan_cost(q))
+    with pytest.raises(ValueError):
+        cfg.plan_prefill_row(0, 32769)
+    assert cfg.prefill_cost(2048) == pytest.approx(1.55) and cfg.prefill_cost(128, 1000) > cfg.prefill_cost(128, 0)
+    flat = _cfg(prefill_cost_table={b: 1.0 for b in cfg.prefill_buckets}, prefill_sp1_s_per_row_key=0.0)
+    assert [(c.start, c.bucket) for c in flat.plan_prefill_row(0, 2200).chunks] == [(0, 4096)]  # re-measured table
+    cfg.set_kv_geometry(8225, 32)  # the geometry allocate_kv_cache recorded wins
+    p = cfg.plan_prefill_row(100, 1000)
+    assert (p.block_size, p.align, p.w0, p.c0) == (32, 64, 96, 0)
+
+
+def test_from_settings_features(monkeypatch):
+    raw = json.load(open(f"{HF_META}/config.json"))
+    s = api.GeneratorSettings(prefix_caching=True, chunked_prefill=True, spec_tokens=1, prefill_span_cap=4096)
+    cfg = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+    assert cfg.kv_replicated_decode and cfg.spec_tokens == 1 and cfg.kv_write_mode == "all_split"
+    assert cfg.max_prefill_span == 4096 and cfg.kv_pool_layers == 54
+    d1 = MotifTTConfig.from_settings(api.GeneratorSettings(), mesh_shape=(4, 8), hf_config=raw)
+    assert (d1.kv_write_mode, d1.max_prefill_span, d1.spec_tokens) == ("row", 8192, 0)
+    monkeypatch.setenv("MOTIF3_PREFILL_MAX_BUCKET", "16384")  # env when the settings carry no cap; settings win
+    assert (
+        MotifTTConfig.from_settings(api.GeneratorSettings(), mesh_shape=(4, 8), hf_config=raw).max_prefill_span == 16384
+    )
+    assert MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw).max_prefill_span == 4096
+    duck = SimpleNamespace(
+        num_layers=2, max_seq_len=4096, max_batch_size=4, kv_cache_dtype="bfp8"
+    )  # pre-feature object
+    old = MotifTTConfig.from_settings(duck, mesh_shape=(4, 8), hf_config=raw)
+    assert old.kv_write_mode == "row" and old.spec_tokens == 0
+
+
+# ---- generator_api: settings, rows, spec types, the ABC defaults ---------------------------------------------
+def _preq(*, lane, n, start=0, width=512):
+    pt = torch.zeros(width, dtype=torch.int32)
+    pt[: -(-n // 64)] = torch.arange(1, -(-n // 64) + 1, dtype=torch.int32)
+    return api.PrefillRequest(lane=lane, tokens=torch.zeros(n, dtype=torch.int32), page_table=pt, start=start)
+
+
+def test_generator_settings_features():
+    s = api.GeneratorSettings()
+    assert (s.chunked_prefill, s.prefix_caching, s.max_num_batched_tokens, s.long_prefill_token_threshold) == (
+        False,
+        False,
+        None,
+        0,
+    )
+    assert (s.spec_tokens, s.kv_replicated_decode, s.prefill_span_cap, s.packed_prefill, s.spec_verify) == (
+        0,
+        None,
+        None,
+        False,
+        "packed",
+    )
+    assert not s.resumed_prefill and not s.spec_decode and not s.kv_replicated and s.kv_write_mode == "row"
+    assert s.resolved_prefill_span_cap(True) == 8192 and s.resolved_prefill_span_cap(False) == 32768
+    p = api.GeneratorSettings(
+        chunked_prefill=True,
+        prefix_caching=True,
+        max_num_batched_tokens=8128,
+        long_prefill_token_threshold=8128,
+        spec_tokens=1,
+    )
+    assert p.resumed_prefill and p.kv_replicated and p.kv_write_mode == "all_split" and p.mtp_kv_layers == 1
+    assert api.GeneratorSettings(chunked_prefill=True).kv_write_mode == "row"  # chunking alone needs no KV-R
+    assert api.GeneratorSettings(kv_replicated_decode=True).kv_write_mode == "all"  # forced on
+    assert api.GeneratorSettings(max_seq_len=4096).resolved_prefill_span_cap(True) == 4096
+    assert api.GeneratorSettings(prefill_span_cap=32768).resolved_prefill_span_cap(True) == 32768
+    assert api.GeneratorSettings(prefill_span_cap=32768).resolved_prefill_span_cap(False) == 32768
+    assert api.GeneratorSettings(max_seq_len=6144, prefill_span_cap=6144).resolved_prefill_span_cap(True) == 6144
+    with pytest.raises(ValueError, match="resumed prefill"):
+        api.GeneratorSettings(prefill_span_cap=8192).resolved_prefill_span_cap(False)
+    for bad, exc in (
+        (dict(prefix_caching=True, kv_replicated_decode=False), ValueError),  # stale cross-row KV (§3.4)
+        (dict(spec_tokens=2), ValueError),
+        (dict(spec_tokens=-1), ValueError),
+        (dict(max_num_batched_tokens=0), ValueError),
+        (dict(long_prefill_token_threshold=-1), ValueError),
+        (dict(prefill_span_cap=5000), ValueError),
+        (dict(prefill_span_cap=64), ValueError),
+        (dict(spec_verify="tall"), ValueError),
+        (dict(chunked_prefill="yes"), TypeError),
+        (dict(kv_replicated_decode="auto"), TypeError),
+    ):
+        with pytest.raises(exc):
+            api.GeneratorSettings(**bad)
+
+
+def test_generator_settings_from_env_serving():
+    """The bridge's captured vLLM scheduler config (``serving``) + the Motif feature environment."""
+    hf = SimpleNamespace(num_hidden_layers=53)
+    serving = dict(
+        block_size=64,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=8128,
+        long_prefill_token_threshold=8128,
+        enable_prefix_caching=True,
+        prefix_match_unit=None,
+        spec_tokens=1,
+    )
+    assert set(serving) == set(api.SERVING_KEYS)
+    s = api.GeneratorSettings.from_env(hf, max_batch_size=32, max_seq_len=32768, environ={}, serving=serving)
+    assert (s.block_size, s.chunked_prefill, s.prefix_caching, s.max_num_batched_tokens) == (64, True, True, 8128)
+    assert (s.long_prefill_token_threshold, s.spec_tokens) == (8128, 1)
+    assert s.kv_replicated_decode is None and s.kv_replicated and s.kv_write_mode == "all_split"
+    assert s.prefill_span_cap is None and not s.packed_prefill and s.spec_verify == "packed"
+    kw = dict(max_batch_size=32, max_seq_len=32768)
+    assert api.GeneratorSettings.from_env(hf, block_size=32, environ={}, serving=serving, **kw).block_size == 32
+    d1 = api.GeneratorSettings.from_env(hf, environ={}, **kw)
+    assert not d1.resumed_prefill and not d1.spec_decode and d1.kv_write_mode == "row" and d1.block_size is None
+    env = {
+        "MOTIF3_KV_REPLICATED_DECODE": "1",
+        "MOTIF3_PREFILL_MAX_BUCKET": "16384",
+        "MOTIF3_PACKED_PREFILL": "on",
+        "MOTIF3_SPEC_VERIFY": "wide",
+    }
+    s = api.GeneratorSettings.from_env(hf, environ=env, **kw)
+    assert (s.kv_replicated_decode, s.prefill_span_cap, s.packed_prefill, s.spec_verify) == (True, 16384, True, "wide")
+    assert s.kv_write_mode == "all"
+    with pytest.raises(ValueError, match="KV-R"):
+        api.GeneratorSettings.from_env(hf, environ={"MOTIF3_KV_REPLICATED_DECODE": "0"}, serving=serving, **kw)
+    with pytest.raises(ValueError, match="unknown serving"):
+        api.GeneratorSettings.from_env(hf, environ={}, serving={"max_num_batched_token": 8128}, **kw)
+
+
+def test_feature_env_parsers():
+    for name in api.FEATURE_SWITCHES:
+        assert api.feature_switch_from_env(name, {}) is True
+        assert api.feature_switch_from_env(name, {}, default=False) is False
+        assert api.feature_switch_from_env(name, {name: " 0 "}) is False
+        assert api.feature_switch_from_env(name, {name: "Yes"}) is True
+        with pytest.raises(ValueError):
+            api.feature_switch_from_env(name, {name: "ture"})  # a typo raises instead of turning a feature off
+    with pytest.raises(ValueError):
+        api.feature_switch_from_env("MOTIF3_NOPE", {})
+    vals = [api.kv_replicated_decode_from_env({"MOTIF3_KV_REPLICATED_DECODE": v}) for v in ("auto", "", "1", "off")]
+    assert vals == [None, None, True, False] and api.kv_replicated_decode_from_env({}) is None
+    with pytest.raises(ValueError):
+        api.kv_replicated_decode_from_env({"MOTIF3_KV_REPLICATED_DECODE": "maybe"})
+    assert api.prefill_span_cap_from_env({}) is None
+    assert api.prefill_span_cap_from_env({"MOTIF3_PREFILL_MAX_BUCKET": "32768"}) == 32768
+    for bad in ("8000", "65536", "64", "-1", "x"):
+        with pytest.raises(ValueError):
+            api.prefill_span_cap_from_env({"MOTIF3_PREFILL_MAX_BUCKET": bad})
+    assert api.packed_prefill_from_env({}) is False and api.spec_verify_from_env({}) == "packed"
+    with pytest.raises(ValueError):
+        api.spec_verify_from_env({"MOTIF3_SPEC_VERIFY": "both"})
+    assert api.check_prefill_span_cap(6144, 6144) == 6144
+    with pytest.raises(ValueError):
+        api.check_prefill_span_cap(6144, 32768)
+
+
+def test_prefill_request_start():
+    r = _preq(lane=3, n=1000, start=640)
+    assert (r.start, r.end, r.seq_len, r.num_new_tokens, r.resumed) == (640, 1000, 1000, 360, True)
+    r0 = _preq(lane=0, n=5)
+    assert r0.start == 0 and not r0.resumed and r0.num_new_tokens == 5
+    for bad in (-1, 1000, 1001):
+        with pytest.raises(ValueError, match="start"):
+            _preq(lane=0, n=1000, start=bad)
+    legacy = api.PrefillRequest(4, torch.zeros(9, dtype=torch.int32), torch.zeros(512, dtype=torch.int32))
+    assert legacy.start == 0  # draft-1 positional construction keeps working
+
+
+def test_spec_decode_types():
+    pos = torch.full((32,), -1, dtype=torch.int32)
+    pos[[0, 9, 17]] = torch.tensor([100, 5000, 63], dtype=torch.int32)
+    tok = torch.zeros(32, dtype=torch.int32)
+    tok[[0, 9, 17]] = torch.tensor([11, 12, 13], dtype=torch.int32)
+    d = torch.full((32,), -1, dtype=torch.int32)
+    d[[0, 17]] = torch.tensor([7, 0], dtype=torch.int32)  # token id 0 is a valid draft
+    pt = torch.zeros(32, 512, dtype=torch.int32)
+    b = api.SpecDecodeBatch(tokens=tok, positions=pos, draft_tokens=d, page_table=pt)
+    assert b.num_drafts == 2 and b.is_verify and b.page_table_width == 512
+    assert b.idle_lanes == tuple(lane for lane in range(32) if lane not in (0, 9, 17))
+    assert torch.equal(b.has_draft, d >= 0) and torch.equal(b.active, pos >= 0)
+    plain = api.SpecDecodeBatch.from_decode_batch(api.DecodeBatch(tokens=tok, positions=pos, page_table=pt))
+    assert not plain.is_verify and plain.num_drafts == 0 and bool((plain.draft_tokens == -1).all())
+    assert torch.equal(b.anchors().positions, pos) and isinstance(b.anchors(), api.DecodeBatch)
+    bad = d.clone()
+    bad[1] = 5  # lane 1 is inactive
+    with pytest.raises(ValueError, match="inactive lane"):
+        api.SpecDecodeBatch(tokens=tok, positions=pos, draft_tokens=bad, page_table=pt)
+    for kw, exc in (
+        (dict(draft_tokens=torch.full((32,), -2, dtype=torch.int32)), ValueError),
+        (
+            dict(
+                positions=torch.full((32,), -2, dtype=torch.int32),
+                draft_tokens=torch.full((32,), -1, dtype=torch.int32),
+            ),
+            ValueError,
+        ),
+        (dict(draft_tokens=d.long()), TypeError),
+        (dict(tokens=tok[:31]), ValueError),
+        (dict(page_table=pt[:31]), ValueError),
+    ):
+        args = dict(tokens=tok, positions=pos, draft_tokens=d, page_table=pt)
+        args.update(kw)
+        with pytest.raises(exc):
+            api.SpecDecodeBatch(**args)
+    am = torch.zeros(32, 2, dtype=torch.int32)
+    r = api.SpecDecodeResult(logits=None, argmax=am, mtp_argmax=am.clone())
+    assert api.check_spec_result("g", r, want_logits=False, vocab_size=64) is r
+    with pytest.raises(ValueError, match="want_logits=True"):
+        api.check_spec_result("g", r, want_logits=True, vocab_size=64)
+    rl = api.SpecDecodeResult(logits=torch.zeros(32, 64, dtype=torch.bfloat16), argmax=am, mtp_argmax=am)
+    assert api.check_spec_result("g", rl, want_logits=True, vocab_size=64) is rl
+    with pytest.raises(ValueError, match="want_logits=False"):
+        api.check_spec_result("g", rl, want_logits=False, vocab_size=64)
+    with pytest.raises(ValueError):
+        api.check_spec_result("g", rl, want_logits=True, vocab_size=65)
+    with pytest.raises(TypeError):
+        api.check_spec_result("g", (am, am), want_logits=False, vocab_size=64)
+    with pytest.raises(ValueError):
+        api.SpecDecodeResult(logits=None, argmax=torch.zeros(32, 3, dtype=torch.int32), mtp_argmax=am)
+    with pytest.raises(TypeError):
+        api.SpecDecodeResult(logits=None, argmax=am.long(), mtp_argmax=am)
+    with pytest.raises(TypeError):
+        api.SpecDecodeResult(logits=torch.zeros(32, 64, dtype=torch.int32), argmax=am, mtp_argmax=am)
+
+
+class _TinyGenerator(api.MotifGenerator):
+    """A draft-1-style generator: only the abstract members (every feature member keeps its default)."""
+
+    def __init__(self, vocab=64):
+        self._vocab = vocab
+        self.calls = []
+
+    @classmethod
+    def create(cls, *, hf_config, mesh_device, settings):
+        return cls()
+
+    @property
+    def num_layers(self):
+        return 2
+
+    @property
+    def vocab_size(self):
+        return self._vocab
+
+    def allocate_kv_cache(self, *, num_blocks, block_size, num_layers):
+        return "pool"
+
+    def prefill_forward(self, request, *, kv_cache, enable_trace=False):
+        self.calls.append((request.lane, request.seq_len, request.start, enable_trace))
+        out = torch.zeros(self._vocab)
+        out[request.seq_len % self._vocab] = 1.0
+        return out
+
+    def decode_forward(self, batch, *, kv_cache, enable_trace):
+        return torch.zeros(api.NUM_LANES, self._vocab)
+
+    def warmup_prefill(self, *, kv_cache, enable_trace):
+        return None
+
+    def warmup_decode(self, *, kv_cache, enable_trace, page_table_width):
+        return None
+
+
+class _ResumedGenerator(_TinyGenerator):
+    supports_resumed_prefill = True
+    prefill_alignment = 64
+    max_prefill_span = 8192
+    supports_spec_decode = True
+
+
+def test_generator_feature_defaults_and_batch_prefill():
+    g = _TinyGenerator()
+    assert not g.supports_resumed_prefill and g.prefill_alignment == 0 and not g.supports_spec_decode
+    assert g.max_prefill_span == g.max_prefill_len == api.MAX_CONTEXT
+    out = g.prefill_forward_batch([_preq(lane=5, n=10), _preq(lane=1, n=3), _preq(lane=30, n=7)], kv_cache="pool")
+    assert out.shape == (3, 64) and [int(r.argmax()) for r in out] == [10, 3, 7]
+    assert g.calls == [(5, 10, 0, False), (1, 3, 0, False), (30, 7, 0, False)]  # input order: no row reads the cache
+    g.prefill_forward_batch([_preq(lane=0, n=4)], kv_cache="pool", enable_trace=True)
+    assert g.calls[-1] == (0, 4, 0, True)
+    with pytest.raises(NotImplementedError, match="resume"):
+        g.prefill_forward_batch([_preq(lane=0, n=4), _preq(lane=1, n=200, start=64)], kv_cache="pool")
+    assert len(g.calls) == 4  # refused before any row ran
+    with pytest.raises(ValueError, match="distinct lanes"):
+        g.prefill_forward_batch([_preq(lane=2, n=5), _preq(lane=2, n=6)], kv_cache="pool")
+    with pytest.raises(ValueError, match="no rows"):
+        g.prefill_forward_batch([], kv_cache="pool")
+    with pytest.raises(TypeError):
+        g.prefill_forward_batch([object()], kv_cache="pool")
+    with pytest.raises(ValueError, match="at most"):
+        api.check_prefill_batch([_preq(lane=i % 32, n=4) for i in range(33)])
+    batch = api.SpecDecodeBatch.from_decode_batch(
+        api.DecodeBatch(
+            tokens=torch.zeros(32, dtype=torch.int32),
+            positions=torch.full((32,), -1, dtype=torch.int32),
+            page_table=torch.zeros(32, 8, dtype=torch.int32),
+        )
+    )
+    with pytest.raises(NotImplementedError):
+        g.decode_forward_spec(batch, kv_cache="pool", enable_trace=False, want_logits=True)
+
+
+def test_check_generator_features():
+    """A feature vLLM enabled must be supported (§1.5); the resumed geometry must be consistent."""
+    d1, res = _TinyGenerator(), _ResumedGenerator()
+    plain = api.GeneratorSettings(block_size=64)
+    api.check_generator_features(d1, plain)
+    api.check_generator_features(res, plain)
+    for s, what in (
+        (api.GeneratorSettings(chunked_prefill=True), "chunked prefill"),
+        (api.GeneratorSettings(prefix_caching=True), "prefix caching"),
+    ):
+        with pytest.raises(ValueError, match=what):
+            api.check_generator_features(d1, s)
+        api.check_generator_features(res, s)
+    with pytest.raises(ValueError, match="speculative"):
+        api.check_generator_features(d1, api.GeneratorSettings(spec_tokens=1))
+    api.check_generator_features(res, api.GeneratorSettings(spec_tokens=1))
+
+    class BadAlign(_ResumedGenerator):
+        prefill_alignment = 96
+
+    with pytest.raises(ValueError, match="prefill_alignment"):
+        api.check_generator_features(BadAlign(), plain)
+
+    class SplitsWithoutResume(_TinyGenerator):
+        max_prefill_span = 8192
+
+    with pytest.raises(ValueError, match="no resumed prefill"):
+        api.check_generator_features(SplitsWithoutResume(), plain)

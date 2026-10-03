@@ -26,6 +26,9 @@ decode, lanes on dim1 ``cos/sin [1, L, 1, 64]`` TILE   transpose + slice of the 
                                                        HEIGHT_SHARDED (one lane per core) for
                                                        ``rotary_embedding_hf(..., is_decode_mode=True)``
 prefill               ``cos/sin [1, 1, S, 64]`` TILE   host-built table slice for positions ``0..S-1``
+prefill chunk at any  ``cos/sin [1, 1, C, 64]`` TILE   ``ttnn.embedding(rot_idxs [1,C] uint32, table)``:
+start (offset RoPE)                                    one gather per chunk for every layer
+                                                       (``chunk_rope_tables``; features design §3.2.4)
 ====================  ===============================  ===================================================
 
 Two ways to apply it:
@@ -190,6 +193,24 @@ def positions_to_rot_idxs(positions: torch.Tensor, cfg: MotifTTConfig) -> torch.
     return lanes_to_rows(pos.to(torch.int32), cfg, pad_to=32, fill=0)
 
 
+def chunk_rot_rows(positions, max_positions: int) -> torch.Tensor:
+    """Table rows of a prefill chunk's RoPE gather: ``int32 [1, C]`` from the rows' absolute ``positions [C]`` (for
+    an sp1 chunk ``prefill_plan.rope_positions(chunk, max_positions)``, which clamps the padded rows; any positions
+    work, e.g. several requests' rows concatenated). Every position must lie in ``[0, max_positions)`` and ``C`` must
+    be a positive multiple of 32 (the gathered tables are TILE)."""
+    pos = torch.as_tensor(positions)
+    C = int(pos.numel())
+    if C == 0 or C % 32:
+        raise ValueError(f"a chunk's RoPE rows must be a positive multiple of 32, got {C}")
+    if pos.dtype.is_floating_point or pos.dtype == torch.bool:
+        raise TypeError(f"chunk positions must be integers, got {pos.dtype}")
+    pos = pos.reshape(-1).to(torch.int64)
+    lo, hi = int(pos.min()), int(pos.max())
+    if lo < 0 or hi >= int(max_positions):
+        raise ValueError(f"chunk positions [{lo}, {hi}] outside the {int(max_positions)}-row RoPE tables")
+    return pos.to(torch.int32)[None].contiguous()
+
+
 def shard_lanes(
     rows: torch.Tensor,
     cfg: MotifTTConfig,
@@ -323,6 +344,49 @@ class MotifRope:
             use_height_and_width_as_shard_shape=True,
         )
 
+    # ---- prefill chunks at any position (offset RoPE; features design §3.2.4) -----------------------------------
+    def chunk_rot_idxs_host(self, positions):
+        """Host mesh tensor ``[1, C]`` uint32 (replicated; :func:`chunk_rot_rows`) for
+        ``ttnn.copy_host_to_device_tensor`` into a persistent chunk input."""
+        return ttnn.from_torch(
+            chunk_rot_rows(positions, self.max_positions),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._replicate,
+        )
+
+    def chunk_rot_idxs_device(self, positions):
+        """``[1, C]`` uint32 ROW_MAJOR DRAM device tensor (replicated): the rows' table indices
+        (:func:`chunk_rot_rows`)."""
+        return ttnn.from_torch(
+            chunk_rot_rows(positions, self.max_positions),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._replicate,
+        )
+
+    def chunk_cos_sin(self, kind: str, rot_idxs, *, memory_config=None):
+        """``cos/sin [1, 1, C, 64]`` TILE whose row ``i`` is table row ``rot_idxs[0, i]`` (device ops only, so one
+        program per ``C`` whatever the positions, trace-safe): ``ttnn.embedding`` on the ROW_MAJOR tables, the decode
+        gather with ``C`` rows (gate G11b). The values are exact copies of the host bf16 table rows; for rows ``0 ..
+        C-1`` they equal :meth:`prefill_cos_sin` (``kind``, ``C``) bitwise. ``rot_idxs``: ``[1, C]`` uint32
+        (:meth:`chunk_rot_idxs_device`). The caller frees the two tensors."""
+        cos_t, sin_t = self.tables[kind]
+        C = int(rot_idxs.shape[-1])
+        mc = memory_config or ttnn.DRAM_MEMORY_CONFIG
+        out = []
+        for table in (cos_t, sin_t):
+            v = ttnn.embedding(rot_idxs, table, layout=ttnn.TILE_LAYOUT, memory_config=mc)  # [1, C, 64]
+            out.append(ttnn.reshape(v, (1, 1, C, self.dim)))
+        return out[0], out[1]
+
+    def chunk_rope_tables(self, rot_idxs, kinds: Optional[Sequence[str]] = None) -> Dict[str, Tuple]:
+        """``{kind: (cos, sin)}`` of :meth:`chunk_cos_sin` for every kind (default: all tables): build it once per
+        chunk and pass it as ``rot=`` to every layer (``MotifAttention.fill_kv``; the sp1 prefill paths)."""
+        return {k: self.chunk_cos_sin(k, rot_idxs) for k in (kinds if kinds is not None else tuple(self.tables))}
+
     # ---- prefill -----------------------------------------------------------------------------------------
     def prefill_cos_sin(self, kind: str, seq_len: int):
         """``cos/sin [1, 1, S, 64]`` TILE for positions ``0..S-1`` (cached per bucket; prefill starts at 0)."""
@@ -374,6 +438,7 @@ __all__ = [
     "KINDS",
     "MotifRope",
     "apply_rope_torch",
+    "chunk_rot_rows",
     "cos_sin_table",
     "inv_freq_for_kind",
     "inv_freq_for_layer",

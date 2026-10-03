@@ -13,6 +13,21 @@ Dataflow (README CONVENTIONS §2-3)::
     prefill tokens [1|4, S] (one user, S = bucket, replicated) --embed--> X [1, 4, S, 4096]
             for layer: X = layer.forward_prefill(X, page_table [1, S / block], kv[layer])   (fills the cache)
             tile = head.forward_prefill(X, last_index)                    the last token's tile row [1, 1, 32, 6880]
+    chunk   (resumed / chunked prefill, README §15; features design §3.7) one chunk of C = bucket rows at positions
+            [a, a + C): inp = chunk_inputs(host tables)  (PrefillChunkInputs: fill table, sp1 SDPA table / start /
+            offset RoPE / SWA tail, shared by every layer); X = prefill_chunk(tokens [1|4, C], chunk=inp, kv) (sp0 =
+            the draft-1 path through the fill table; sp1 reads the cached prefix). The generator plans the chunks
+            (``cfg.plan_prefill_row``), runs the head on the last one and the MTP layer's KV-only fill on each.
+    decode with KV-R (README §16): the same as decode, with ``kv_write=`` (``tt/kv_write.DecodeKVWrite``) shared by
+            every layer and its ``cur_pos`` / ``page_table`` as FlashMLA's.
+    spec    (MTP self-speculation, the "T32-spec" step; features design §3.8.1, README §17): decode_spec = decode with
+            the step's split ``kv_write`` -> hn = head.stream_mean_norm(X) -> logits (TILE) -> host logits (ROW_MAJOR)
+            + a = head.argmax_decode -> m = mtp.forward_decode(hn, a) (the MTP layer on every lane, its own cache
+            ``pool.mtp`` through the same ``kv_write``). The generator packs drafts into idle lanes (packed verify).
+
+MTP layer (features design §3.6; README §17): ``mtp=True`` (default when ``cfg.spec_tokens``) also builds
+:class:`~models.demos.motif3.tt.mtp.MotifMTP` (part ``L53``, sharing the embedding and the LM head); the pool then
+holds its latent cache as ``pool.mtp`` (``len(pool)`` stays the decoder-layer count).
 
 Weights and the TT cache (README §7, design §2.3.11, CONV-1..4). Every module uploads through ``weights.as_tensor`` with
 a lazy torch source, so a cached tensor never touches the safetensors; the source itself (:class:`LazySource`) opens
@@ -72,12 +87,13 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 import ttnn
 
 from . import weights as W
-from .attention import MotifAttention
+from .attention import MotifAttention, PrefillChunkInputs
 from .ccl import MotifCCL
 from .decoder import MotifDecoderLayer, free_tensors
 from .embedding import MotifEmbedding
 from .lm_head import MotifLMHead
 from .model_config import DEFAULT_HF_META_DIR, MotifTTConfig
+from .mtp import MotifMTP
 from .rope import MotifRope
 
 CACHE_POLICIES = ("auto", "write", "off")
@@ -87,8 +103,9 @@ CACHE_POLICIES = ("auto", "write", "off")
 MIN_FREE_GB = 60.0
 GUARD_FACTOR = 1.10
 # Bytes of one converted part with the serving defaults (scripts/convert_weights.py EST_CORE_BYTES / EST_VARIANT_BYTES,
-# measured 2026-10-02 on layers 0-2 + globals): core files, plus the variant files a cfg-default build adds.
-EST_CORE_BYTES = {"global": 3_607_113_408, "dense": 355_152_448, "moe": 6_652_399_104}  # global: norm + head + embed
+# measured 2026-10-02 on layers 0-2 + globals; the MTP part L53 measured by its conversion): core files, plus the
+# variant files a cfg-default build adds. "mtp": attention, dense MLP, input_proj, 4 norms (no mHC, no router).
+EST_CORE_BYTES = {"global": 3_607_113_408, "dense": 355_152_448, "moe": 6_652_399_104, "mtp": 420_183_552}
 EST_MHC_CONSTS_BYTES = {"motif": 17_152, "stock": 35_840}
 EST_EXACT_ROUTER_BYTES = 3_146_112  # moe.router.weight_fp32k_v1
 LARGEST_SHARD_BYTES = 8_053_063_840  # the largest safetensors shard of the pinned revision (hf_meta/tree.json)
@@ -135,11 +152,20 @@ def room_ok(free_b: int, need_b: int, min_free_gb: float) -> bool:
     return (int(free_b) - GUARD_FACTOR * int(need_b)) / 1e9 >= float(min_free_gb)
 
 
+def is_mtp_part(cfg: MotifTTConfig, layer: Optional[int]) -> bool:
+    """``layer`` is the MTP layer's part (``cfg.mtp_layer_idx`` = 53, TT-cache part ``L53``; features design §3.6.5,
+    review R8: ``cfg.layer(53)`` does not exist)."""
+    return layer is not None and int(layer) == int(cfg.mtp_layer_idx) and int(cfg.num_nextn_predict_layers) >= 1
+
+
 def estimate_part_bytes(cfg: MotifTTConfig, layer: Optional[int]) -> int:
-    """Cache bytes of one part (``layer=None`` = the globals) as :func:`convert_weights` / ``"write"`` build it (the
-    config's defaults: ``cfg.mhc_sinkhorn``, ``cfg.router_logits``, LM head ``"mesh"``, replicated embedding)."""
+    """Cache bytes of one part (``layer=None`` = the globals, ``cfg.mtp_layer_idx`` = the MTP layer ``L53``) as
+    :func:`convert_weights` / ``"write"`` build it (the config's defaults: ``cfg.mhc_sinkhorn``, ``cfg.router_logits``,
+    LM head ``"mesh"``, replicated embedding)."""
     if layer is None:
         return EST_CORE_BYTES["global"]
+    if is_mtp_part(cfg, layer):
+        return EST_CORE_BYTES["mtp"]
     kind = "moe" if cfg.layer(int(layer)).is_moe else "dense"
     n = EST_CORE_BYTES[kind] + EST_MHC_CONSTS_BYTES.get(str(cfg.mhc_sinkhorn), EST_MHC_CONSTS_BYTES["stock"])
     if kind == "moe" and cfg.router_logits == "exact_fp32":
@@ -353,12 +379,17 @@ def _cache_files(cfg: MotifTTConfig, layer: Optional[int]) -> List[str]:
 
 class MotifKVPool:
     """The paged latent pool: one cache ``[num_blocks, 1, block_size, 576]`` per built decoder layer (in
-    ``MotifModel.layer_ids`` order). ``layers[i]`` is the ttnn tensor of ``layer_ids[i]``."""
+    ``MotifModel.layer_ids`` order). ``layers[i]`` is the ttnn tensor of ``layer_ids[i]``.
 
-    def __init__(self, layers: List, layer_ids: Sequence[int], num_blocks: int, block_size: int, dtype):
+    ``mtp``: the MTP layer's cache (same shape and dtype, indexed by the same vLLM block ids, so it travels with
+    prefix hits; features design §3.4) when the model was built with its MTP layer, else ``None``. It is not one of
+    ``layers``: ``len(pool)`` stays the decoder-layer count vLLM accounts for."""
+
+    def __init__(self, layers: List, layer_ids: Sequence[int], num_blocks: int, block_size: int, dtype, mtp=None):
         self.layers = list(layers)
         self.layer_ids = tuple(int(i) for i in layer_ids)
         self.num_blocks, self.block_size, self.dtype = int(num_blocks), int(block_size), dtype
+        self.mtp = mtp
 
     def __len__(self):
         return len(self.layers)
@@ -366,11 +397,17 @@ class MotifKVPool:
     def __getitem__(self, i):
         return self.layers[i]
 
+    @property
+    def mtp_layers(self) -> int:
+        """Caches beyond the decoder layers: 1 with the MTP cache, else 0."""
+        return 0 if self.mtp is None else 1
+
     def deallocate(self) -> None:
-        for t in self.layers:
+        for t in self.layers + ([self.mtp] if self.mtp is not None else []):
             if t is not None and t.is_allocated():
                 ttnn.deallocate(t)
         self.layers = []
+        self.mtp = None
 
 
 class MotifModel:
@@ -386,6 +423,12 @@ class MotifModel:
         vocab_split: LM-head split (``"mesh"`` default, decision EMB-D1; ``"tp"``).
         layer_kwargs: extra kwargs for every :class:`MotifDecoderLayer` (module A/B knobs).
         log: progress printer (layer load times).
+        mtp: also build the MTP layer ``model.mtp_layers.0`` (:class:`~models.demos.motif3.tt.mtp.MotifMTP`, TT-cache
+            part ``L53``, sharing this model's embedding and LM head; features design §3.6). ``None`` (default) =
+            ``cfg.spec_tokens > 0`` (MTP self-speculation). :meth:`allocate_kv_caches` then adds its latent cache
+            (``pool.mtp``), the generator fills it during prefill (KV-only, D9) and :meth:`decode_spec` runs the
+            layer on every decode lane.
+        mtp_kwargs: extra kwargs for :class:`MotifMTP` (A/B knobs).
     """
 
     def __init__(
@@ -401,6 +444,8 @@ class MotifModel:
         vocab_split: str = "mesh",
         layer_kwargs: Optional[dict] = None,
         log: Optional[Callable[[str], None]] = _log_default,
+        mtp: Optional[bool] = None,
+        mtp_kwargs: Optional[dict] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -413,9 +458,13 @@ class MotifModel:
         if len(set(ids)) != len(ids) or ids[0] < 0 or ids[-1] >= cfg.num_layers:
             raise ValueError(f"layers {ids} must be distinct indices in [0, cfg.num_layers={cfg.num_layers})")
         self.layer_ids = tuple(ids)
+        want_mtp = int(cfg.spec_tokens) > 0 if mtp is None else bool(mtp)
+        if want_mtp and int(cfg.num_nextn_predict_layers) < 1:
+            raise ValueError("mtp=True, but this checkpoint has no MTP layer (num_nextn_predict_layers = 0)")
         self.ccl = ccl if ccl is not None else MotifCCL(mesh_device, cfg)
         self.rope = rope if rope is not None else MotifRope(mesh_device, cfg)
-        self._rope_kinds = tuple(sorted({cfg.layer(l).rope_kind for l in ids}))
+        kinds = {cfg.layer(l).rope_kind for l in ids} | ({cfg.mtp_layer_spec().rope_kind} if want_mtp else set())
+        self._rope_kinds = tuple(sorted(kinds))
         self.load_seconds: Dict[str, float] = {}
         self.cache_misses: Dict[str, List[str]] = {}  # "auto": converted parts' tensors uploaded from the source
         self.part_dram_bytes: Dict[str, int] = {}  # device DRAM per chip each part's weights take (allocator view)
@@ -444,6 +493,18 @@ class MotifModel:
             self.load_seconds[f"L{l:02d}"] = time.time() - t1
             spec = cfg.layer(l)
             self.log(f"layer {l} ({spec.kind}) loaded in {self.load_seconds[f'L{l:02d}']:.1f} s (TT cache: {desc})")
+        self.mtp: Optional[MotifMTP] = None
+        if want_mtp:
+            L = int(cfg.mtp_layer_idx)
+            tag = f"L{L:02d}"
+            t1 = time.time()
+            d0 = device_bytes_per_chip(mesh_device)
+            self.mtp, desc = self._build_part(
+                L, lambda c: MotifMTP(mesh_device, cfg, source=self.source, ccl=self.ccl, rope=self.rope,
+                                      embed=self.embed, head=self.head, cache=c, **dict(mtp_kwargs or {})))
+            self._note_dram(tag, d0)
+            self.load_seconds[tag] = time.time() - t1
+            self.log(f"MTP layer {L} (model.mtp_layers.0) loaded in {self.load_seconds[tag]:.1f} s (TT cache: {desc})")
 
     def _note_dram(self, tag: str, before: Optional[Dict[str, int]]) -> None:
         after = device_bytes_per_chip(self.mesh_device)
@@ -485,20 +546,27 @@ class MotifModel:
     # ------------------------------------------------------------------------------------------------------------
     # KV pool (GEN-2)
     # ------------------------------------------------------------------------------------------------------------
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, dtype=None) -> MotifKVPool:
-        """One zero-filled paged latent cache per built layer: ``ttnn.empty`` + on-device ``ttnn.fill(0)`` (G7)."""
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, dtype=None, *, mtp: Optional[bool] = None
+    ) -> MotifKVPool:
+        """One zero-filled paged latent cache per built layer: ``ttnn.empty`` + on-device ``ttnn.fill(0)`` (G7), plus
+        the MTP layer's cache (``pool.mtp``, same shape) when ``mtp`` (default: the model has its MTP layer)."""
         dtype = dtype if dtype is not None else self.cfg.dtypes.kv_cache
         shape = [int(num_blocks), 1, int(block_size), int(self.cfg.kv_latent_dim)]
+        want_mtp = (self.mtp is not None) if mtp is None else bool(mtp)
+        if want_mtp and self.mtp is None:
+            raise ValueError("an MTP cache needs the model's MTP layer (MotifModel(..., mtp=True))")
         caches = []
         try:
-            for _ in self.layer_ids:
+            for _ in range(len(self.layer_ids) + int(want_mtp)):
                 e = ttnn.empty(shape, dtype, ttnn.TILE_LAYOUT, self.mesh_device, ttnn.DRAM_MEMORY_CONFIG)
                 caches.append(ttnn.fill(e, 0.0))
                 ttnn.deallocate(e)
         except Exception:
             _free(*caches)
             raise
-        return MotifKVPool(caches, self.layer_ids, num_blocks, block_size, dtype)
+        mtp_cache = caches.pop() if want_mtp else None
+        return MotifKVPool(caches, self.layer_ids, num_blocks, block_size, dtype, mtp=mtp_cache)
 
     # ------------------------------------------------------------------------------------------------------------
     # forwards
@@ -517,26 +585,35 @@ class MotifModel:
         return n
 
     def decode(self, tokens, *, rot_idxs, cur_pos, page_table, kv_caches, return_streams: bool = False,
-               stop_after: Optional[int] = None):
+               stop_after: Optional[int] = None, kv_write=None):
         """One decode step for all 32 lanes (trace-safe).
 
         Args (persistent device inputs, README §3; per DP row): ``tokens [4, 8]`` uint32 ROW_MAJOR
         (``MotifEmbedding.decode_tokens_host``), ``rot_idxs [1, 32]`` uint32 (``MotifRope.rot_idxs_host``), ``cur_pos
         [8]`` int32 (-1 = inactive lane), ``page_table [8, W]`` int32, ``kv_caches`` (:class:`MotifKVPool` or a list,
         one per built layer).
+        ``kv_write``: the step's ``tt.kv_write.DecodeKVWrite`` (KV-R ``all`` / the speculative split modes, README §16),
+        shared by every layer; ``cur_pos`` / ``page_table`` must then be ``kv_write.cur_pos`` / ``kv_write.page_table``
+        (FlashMLA and the write describe the same lanes). ``None`` = draft 1 (one 8-lane update per DP row).
 
         Returns the device logits ``[1, 1, 32, 6880]`` ROW_MAJOR per chip (read with ``head.logits_to_host``), or with
         ``return_streams`` the residual streams ``[1, 4, 8, 4096]`` after the last layer run."""
         n = self._stop(stop_after)
         kvs = self._check_kv(kv_caches, n)
+        if kv_write is not None:
+            kv_write.check_flash_inputs(cur_pos, page_table)
         X = self.embed.forward_decode(tokens)
         rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
         act = MotifAttention.active_mask_from_cur_pos(cur_pos, self.cfg.lanes_per_row)
+        kw = {} if kv_write is None else {"kv_write": kv_write}
         try:
             for layer, kv in zip(self.layers[:n], kvs):
-                Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act)
+                Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
+                                          **kw)
                 _free(X)
                 X = Xn
+            if kv_write is not None:
+                kv_write.end_step()
         finally:
             _free(act, *[t for cs in rot.values() for t in cs])
         if return_streams:
@@ -544,6 +621,97 @@ class MotifModel:
         logits = self.head.forward_decode(X, row_major=True)
         _free(X)
         return logits
+
+    def decode_spec(self, tokens, *, rot_idxs, kv_write, kv_caches, stop_after: Optional[int] = None,
+                    keep_hidden: bool = False):
+        """One **T32-spec** decode step for all 32 lanes (trace-safe; features design §3.8.1, D10; README §17): the
+        main layers, the LM head, the main argmax and the MTP layer on EVERY lane, in one step::
+
+            X  = embed(tokens) -> 53 layers (kv_write: the step's split / KV-R write, shared by every layer)
+            hn = head.stream_mean_norm(X)                 [1, 1, 8, 4096] per DP row (kept for the MTP layer)
+            lg = head.decode_logits(hn)                   [1, 1, 32, 6880] TILE ("mesh")
+            rm = head.logits_rm(lg)                       ROW_MAJOR: the host logits (ordinary steps read them)
+            a  = head.argmax_decode(lg)                   [1, 1, 1, 32] uint32: a0 / a1 per physical lane
+            m  = mtp.forward_decode(hn, a, ...)           [1, 1, 1, 32] uint32: the MTP draft (m0 / m1)
+
+        The MTP layer writes its latent at the same lanes and positions as the main layers (``pool.mtp``, the same
+        ``kv_write``: call A / call B, KV-R), so every decoded position gets an MTP entry (design G8). ``rm`` is
+        exactly what :meth:`decode` returns for the same step (the same ops on the same logits; the argmax and the MTP
+        layer only read them), and the main caches are written exactly as in :meth:`decode` with ``kv_write`` (an
+        ordinary step's call B is all ``-1``).
+
+        Args (persistent device inputs; README §3): ``tokens [4, 8]`` uint32 per DP row (the physical lanes' input
+        tokens: anchors and packed drafts), ``rot_idxs [1, 32]`` uint32 per DP row (the physical positions),
+        ``kv_write`` (``tt.kv_write.DecodeKVWrite``, required: its ``cur_pos`` / ``page_table`` are FlashMLA's and the
+        ``active`` mask's), ``kv_caches`` (:class:`MotifKVPool` with its MTP cache). ``stop_after``: the first k
+        decoder layers only (plumbing runs; the MTP layer then reads a truncated hidden). ``keep_hidden`` (eager
+        diagnostics only): also return ``hn`` (the caller frees it).
+
+        Returns ``(rm, a, m)`` (``+ (hn,)`` with ``keep_hidden``): read with ``head.logits_to_host(rm)`` /
+        ``head.tokens_to_host(a)`` / ``head.tokens_to_host(m)``."""
+        if self.mtp is None:
+            raise ValueError("decode_spec needs the MTP layer (MotifModel(..., mtp=True))")
+        if kv_write is None:
+            raise ValueError("decode_spec needs the step's kv_write (tt.kv_write.DecodeKVWrite)")
+        mtp_cache = getattr(kv_caches, "mtp", None)
+        if mtp_cache is None:
+            raise ValueError("decode_spec needs the pool's MTP cache (allocate_kv_caches with the MTP layer)")
+        n = self._stop(stop_after)
+        kvs = self._check_kv(kv_caches, n)
+        cur_pos, page_table = kv_write.cur_pos, kv_write.page_table
+        X = self.embed.forward_decode(tokens)
+        rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
+        act = MotifAttention.active_mask_from_cur_pos(cur_pos, self.cfg.lanes_per_row)
+        try:
+            for layer, kv in zip(self.layers[:n], kvs):
+                Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
+                                          kv_write=kv_write)
+                _free(X)
+                X = Xn
+            hn = self.head.stream_mean_norm(X)
+            _free(X)
+            X = None
+            lg = self.head.decode_logits(hn)  # TILE; hn kept for the MTP layer
+            rm = self.head.logits_rm(lg)
+            a = self.head.argmax_decode(lg)
+            _free(lg)
+            m = self.mtp.forward_decode(hn, a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=mtp_cache,
+                                        active=act, kv_write=kv_write)
+            kv_write.end_step()
+        finally:
+            _free(act, *[t for cs in rot.values() for t in cs])
+        if keep_hidden:
+            return rm, a, m, hn
+        _free(hn)
+        return rm, a, m
+
+    def chunk_inputs(self, host) -> PrefillChunkInputs:
+        """Upload one prefill chunk's host tables (``attention.ChunkHostTables``: ``chunk_host_tables`` /
+        ``warmup_chunk_host_tables``) as the :class:`~models.demos.motif3.tt.attention.PrefillChunkInputs` every layer
+        of the chunk shares (eager: a few small copies; sp1 adds the offset-RoPE gathers). Free with ``inp.free()``."""
+        return PrefillChunkInputs.upload(self.mesh_device, self.cfg, self.rope, host)
+
+    def prefill_chunk(self, tokens, *, chunk: PrefillChunkInputs, kv_caches=None, stop_after: Optional[int] = None):
+        """One chunk of a resumed / chunked prefill (eager; features design §3.7.1, README §15): ``tokens`` = device
+        ``[1, C]`` / ``[4, C]`` uint32 (``embed.prefill_tokens_device`` of the chunk's real tokens, padded to the bucket
+        ``C = chunk.bucket``), ``chunk`` = its :class:`PrefillChunkInputs` (:meth:`chunk_inputs`), shared by every
+        layer. Every layer fills its cache through ``chunk.fill_pt`` (``-1`` = skip); sp1 chunks (start > 0) read the
+        cached prefix, so they need ``kv_caches``. Returns the residual streams ``[1, 4, C, 4096]`` after the last layer
+        run (``head.forward_prefill(X, chunk.head_row)`` for the logits; ``head.stream_mean_norm(X)`` for the MTP
+        layer's KV-only fill). Not consumed: ``tokens``, ``chunk``."""
+        n = self._stop(stop_after)
+        kvs = self._check_kv(kv_caches, n)
+        C = int(tokens.shape[-1])
+        if C != int(chunk.bucket):
+            raise ValueError(f"prefill_chunk: {C} token rows, the chunk's bucket is {chunk.bucket}")
+        if chunk.is_sp1 and any(kv is None for kv in kvs):
+            raise ValueError("an sp1 chunk reads the cached prefix: prefill_chunk needs kv_caches")
+        X = self.embed.forward_prefill(tokens)
+        for layer, kv in zip(self.layers[:n], kvs):
+            Xn = layer.forward_prefill(X, chunk=chunk, kv_cache=kv)
+            _free(X)
+            X = Xn
+        return X
 
     def prefill(self, tokens, *, page_table=None, kv_caches=None, last_index: Optional[int] = None,
                 return_streams: bool = False, stop_after: Optional[int] = None):
@@ -568,10 +736,13 @@ class MotifModel:
 
     # ------------------------------------------------------------------------------------------------------------
     def deallocate(self) -> None:
-        """Free every device weight of the model (embedding, layers, head, RoPE tables)."""
+        """Free every device weight of the model (embedding, layers, MTP layer, head, RoPE tables)."""
         for layer in self.layers:
             layer.deallocate()
         self.layers = []
+        if self.mtp is not None:
+            self.mtp.deallocate()
+            self.mtp = None
         free_tensors(self.embed)
         free_tensors(self.head)
         self.head.close()
@@ -588,11 +759,14 @@ def convert_weights(
     include_globals: bool = True,
     log: Callable[[str], None] = _log_default,
     min_free_gb: float = MIN_FREE_GB,
+    include_mtp: bool = False,
 ) -> Dict[str, float]:
     """CONV-1: build the TT weight cache in ``cfg.cache_dir`` (same mesh shape and dtype policy as serving: the cache tag
     includes both), one part at a time, resumable: parts already marked complete are skipped, each finished part is
     marked with ``weights.mark_layer_cached``. Every module is built with ``cache=True`` (which writes exactly its cache
-    files) and freed again; no transform is re-derived here. Returns seconds per converted part.
+    files) and freed again; no transform is re-derived here. Returns seconds per converted part. ``include_mtp`` also
+    converts the MTP layer (part ``L53``, :class:`MotifMTP`; ``scripts/convert_weights.py --mtp`` is the production
+    path).
 
     Disk guard (CONV-3), before each part: the cache filesystem must keep ``min_free_gb`` (60 GB, the production
     scripts' floor) free after 1.1 x the part's size (:func:`estimate_part_bytes`: 6.65 GB per MoE layer, 3.6 GB for the
@@ -606,6 +780,8 @@ def convert_weights(
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
 
     parts: List[Optional[int]] = ([None] if include_globals else []) + ids
+    if include_mtp and int(cfg.num_nextn_predict_layers) >= 1:
+        parts.append(int(cfg.mtp_layer_idx))
     try:
         for part in parts:
             tag = "global" if part is None else f"L{part:02d}"
@@ -626,6 +802,8 @@ def convert_weights(
                 free_tensors(emb)
                 free_tensors(head)
                 head.close()
+            elif is_mtp_part(cfg, part):
+                MotifMTP(mesh_device, cfg, source=source, ccl=ccl, rope=rope, cache=True).deallocate()
             else:
                 layer = MotifDecoderLayer(mesh_device, cfg, part, source=source, ccl=ccl, rope=rope, cache=True)
                 layer.deallocate()
@@ -652,6 +830,7 @@ __all__ = [
     "device_bytes_per_chip",
     "estimate_part_bytes",
     "free_bytes",
+    "is_mtp_part",
     "layer_cache_complete",
     "normalize_cache_policy",
     "read_only_cache",

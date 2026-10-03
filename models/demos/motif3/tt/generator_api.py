@@ -16,9 +16,10 @@ Lanes (design 00 §2.3.10, §3.1)
 -------------------------------
 There are ``NUM_LANES = 32`` decode lanes. Lane ``l`` belongs to DP group ``l // LANES_PER_GROUP`` (8 lanes per
 group): the size-4 mesh axis indexes the group, and the group's 8 chips (the size-8 TP axis) run its 8 lanes.
-A decode step writes a lane's new latent only on its own group's chips, so a request must keep its lane for its
-whole life. The bridge guarantees that (``LaneMap`` in ``generator_vllm.py`` follows vLLM's ``slot_remap``).
-Prefill writes the latent on every chip, so a request that is re-prefilled (preemption) may get any lane.
+A decode step writes a lane's new latent only on its own group's chips (unless KV-R is on, below), so a request must
+keep its lane for its whole life. The bridge guarantees that (``LaneMap`` in ``generator_vllm.py`` follows vLLM's
+``slot_remap``). Prefill writes the latent on every chip, so a request that is re-prefilled (preemption) may get any
+lane, and a chunked prompt may change lane between chunks.
 
 KV cache (design 00 §1.5, §2.3.4; study 05 §7.3)
 ------------------------------------------------
@@ -44,7 +45,29 @@ A position is the absolute token index in the request (0-based). For decode, ``p
 Host tensors only
 -----------------
 Every tensor crossing this interface is a CPU torch tensor. Inputs: ``torch.int32``. Outputs: logits as
-``torch.float32`` or ``torch.bfloat16`` (vLLM's sampler upcasts), never padded past ``vocab_size``.
+``torch.float32`` or ``torch.bfloat16`` (vLLM's sampler upcasts), never padded past ``vocab_size``; argmax ids as
+``torch.int32``.
+
+Features: chunked prefill, prefix caching, MTP speculative decoding (docs/features/FEATURES_DESIGN.md §2)
+---------------------------------------------------------------------------------------------------------
+All three are off unless the bridge turns them on in :class:`GeneratorSettings` (from vLLM's scheduler config); a
+generator that does not override the new members keeps the draft-1 behaviour.
+
+* **Resumed prefill rows.** :class:`PrefillRequest` carries ``start`` (vLLM ``num_computed_tokens``): positions
+  ``[0, start)`` are already in the cache. Full blocks below ``floor(start / block_size)`` are READ-ONLY (they may be
+  shared through vLLM's prefix cache); the generator writes ``[floor(start / bs) * bs, end)`` plus bucket padding
+  inside the request's own last block (or the never-read null block 0). The bridge makes **one**
+  :meth:`MotifGenerator.prefill_forward_batch` call per plugin prefill step; the generator plans the rows
+  (``tt/prefill_plan.py``: resume alignment ``A``, internal chunks of at most ``max_prefill_span`` rows, fill tables
+  with ``-1`` for shared blocks) and runs them writer-first (a row may hit blocks another row of the same call
+  writes).
+* **KV-R** (``GeneratorSettings.kv_replicated``, on whenever prefix caching is): every decode KV write (53 layers +
+  the MTP layer) lands on all 32 chips, so a prefix hit on a block another DP row decode-wrote reads valid KV.
+* **MTP speculative decoding** (``spec_tokens = 1``): the MTP layer (``model.mtp_layers.0``, reference layer index
+  53) keeps its own latent cache, indexed by the same vLLM block ids (the generator allocates it next to the 53
+  layers; vLLM keeps accounting 53). In a speculating launch the bridge calls
+  :meth:`MotifGenerator.decode_forward_spec` for every decode step: ordinary steps (no drafts, host logits) and
+  verify steps (one draft per lane at most, argmax ids only).
 
 Import rule (design 00 §2.1): this module is imported by vLLM's API server, its registry-inspection subprocess and
 EngineCore before any mesh exists. It imports only the standard library and torch, never ttnn or other
@@ -59,7 +82,7 @@ import abc
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -253,6 +276,144 @@ def check_max_model_len(max_model_len: int) -> int:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Features: chunked prefill, prefix caching, MTP speculative decoding (docs/features/FEATURES_DESIGN.md §1.3, §2)
+# ----------------------------------------------------------------------------------------------------------------
+# Class-capability switches of the bridge (read at import time, identical in the API server and EngineCore). They only
+# allow vLLM to enable a feature; vLLM's own flags decide (GeneratorSettings.chunked_prefill / prefix_caching /
+# spec_tokens carry what vLLM enabled).
+FEATURE_SWITCHES = ("MOTIF3_PREFIX_CACHING", "MOTIF3_CHUNKED_PREFILL", "MOTIF3_SPEC_DECODE")
+# Span cap (MOTIF3_PREFILL_MAX_BUCKET): the largest sp0/sp1 bucket a resumed-prefill generator compiles; longer spans
+# are split into chunks inside one prefill_forward_batch call (design D8). 32768 compiles every draft-1 bucket (no
+# forced split; the planner's cost-based head split still turns 16,736 into 16384 + 512).
+DEFAULT_PREFILL_SPAN_CAP = 8192
+# Resume alignment A = lcm(block 64, q_chunk 64, k_chunk 64) of the sp1 global op (design D1; gate G9 may move the
+# large buckets to 128/128, then A = 128). Only for checks that run before the generator exists; the generator's
+# ``prefill_alignment`` is authoritative.
+DEFAULT_PREFILL_ALIGNMENT = 64
+SUPPORTED_SPEC_TOKENS = (0, 1)  # MTP draft tokens per step (num_speculative_tokens): K = 1 only
+MTP_LAYER_IDX = NUM_HIDDEN_LAYERS  # the MTP layer is reference layer 53 (TT-cache part "L53")
+# Decode KV-write modes (tt/kv_write.py): "row" = draft 1 (one 8-lane update per DP row), "row_split" = speculation
+# without KV-R (two 8-lane calls: anchors / plain lanes, then draft lanes), "all" = KV-R (gather the 8-lane latent
+# over DP, one 32-lane update on every chip), "all_split" = KV-R + speculation (production). See kv_write_mode().
+KV_WRITE_MODES = ("row", "row_split", "all", "all_split")
+SPEC_VERIFY_MODES = ("packed", "wide")  # packed = drafts in idle lanes of the 32-lane trace (S1); wide = T64 (S3)
+# Keys of the bridge's captured vLLM scheduler config (``GeneratorSettings.from_env(serving=...)``).
+SERVING_KEYS = (
+    "block_size",
+    "enable_chunked_prefill",
+    "max_num_batched_tokens",
+    "long_prefill_token_threshold",
+    "enable_prefix_caching",
+    "prefix_match_unit",
+    "spec_tokens",
+)
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
+def _parse_switch(name: str, raw: Optional[str], default: bool) -> bool:
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    v = raw.strip().lower()
+    if v in _TRUE:
+        return True
+    if v in _FALSE:
+        return False
+    raise ValueError(f"{name} must be one of {_TRUE + _FALSE}, got {raw!r}")
+
+
+def feature_switch_from_env(name: str, environ: Optional[Mapping[str, str]] = None, default: bool = True) -> bool:
+    """One of :data:`FEATURE_SWITCHES` (``1/true/yes/on`` or ``0/false/no/off``; unset = ``default``). A typo
+    raises instead of silently turning a feature off."""
+    if name not in FEATURE_SWITCHES:
+        raise ValueError(f"unknown feature switch {name!r}; known: {FEATURE_SWITCHES}")
+    env = os.environ if environ is None else environ
+    return _parse_switch(name, env.get(name), default)
+
+
+def kv_replicated_decode_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[bool]:
+    """``MOTIF3_KV_REPLICATED_DECODE``: ``auto`` / unset -> None (= on iff prefix caching), ``1`` -> True (forced on),
+    ``0`` -> False (refused by :class:`GeneratorSettings` when prefix caching is on)."""
+    env = os.environ if environ is None else environ
+    raw = env.get("MOTIF3_KV_REPLICATED_DECODE")
+    if raw is None or raw.strip().lower() in ("", "auto"):
+        return None
+    return _parse_switch("MOTIF3_KV_REPLICATED_DECODE", raw, False)
+
+
+def check_prefill_span_cap(cap: int, max_seq_len: int = MAX_CONTEXT) -> int:
+    """``cap`` if it is a power of two in ``[MIN_PREFILL_BUCKET, MAX_CONTEXT]`` or ``max_seq_len`` itself, else
+    ``ValueError``. The effective cap is ``min(cap, max_seq_len)``, always one of ``prefill_buckets(max_seq_len)``."""
+    c = int(cap)
+    pow2 = c >= MIN_PREFILL_BUCKET and c & (c - 1) == 0 and c <= MAX_CONTEXT
+    if not (pow2 or c == int(max_seq_len)):
+        raise ValueError(
+            f"prefill span cap {c} must be a power of two in [{MIN_PREFILL_BUCKET}, {MAX_CONTEXT}] (a prefill bucket) "
+            f"or max_seq_len {max_seq_len}"
+        )
+    return c
+
+
+def prefill_span_cap_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """``MOTIF3_PREFILL_MAX_BUCKET`` (a power of two in [128, 32768]) or None when unset (the generator's default:
+    :data:`DEFAULT_PREFILL_SPAN_CAP` with resumed prefill, else ``max_seq_len``)."""
+    env = os.environ if environ is None else environ
+    v = _env_int(env, "MOTIF3_PREFILL_MAX_BUCKET")
+    return None if v is None else check_prefill_span_cap(v, MAX_CONTEXT)
+
+
+def packed_prefill_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """``MOTIF3_PACKED_PREFILL`` (default off): optional packed multi-row prefill (design §3.12.1, after gate G15)."""
+    env = os.environ if environ is None else environ
+    return _parse_switch("MOTIF3_PACKED_PREFILL", env.get("MOTIF3_PACKED_PREFILL"), False)
+
+
+def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1) or ``wide`` (the 64-row trace, S3, after gate G16)."""
+    env = os.environ if environ is None else environ
+    v = (env.get("MOTIF3_SPEC_VERIFY") or "packed").strip().lower()
+    if v not in SPEC_VERIFY_MODES:
+        raise ValueError(f"MOTIF3_SPEC_VERIFY must be one of {SPEC_VERIFY_MODES}, got {v!r}")
+    return v
+
+
+def kv_write_mode(kv_replicated: bool, spec: bool) -> str:
+    """The decode KV-write mode (:data:`KV_WRITE_MODES`): ``row`` (draft 1), ``row_split`` (speculation, no KV-R),
+    ``all`` (KV-R), ``all_split`` (KV-R + speculation). The split modes write anchor / plain lanes and draft lanes in
+    two ``paged_update_cache`` calls: two users writing ``p`` and ``p + 1`` of one block in one call race on the
+    shared tile (design §3.5)."""
+    return ("all" if kv_replicated else "row") + ("_split" if spec else "")
+
+
+def check_generator_features(generator: "MotifGenerator", settings: "GeneratorSettings") -> None:
+    """Refuse a generator that cannot serve what vLLM enabled (design §1.5, last row), and a generator whose resumed
+    prefill geometry is inconsistent. Raises ``ValueError``."""
+    name = type(generator).__name__
+    if settings.resumed_prefill and not generator.supports_resumed_prefill:
+        raise ValueError(
+            f"vLLM enabled {'chunked prefill' if settings.chunked_prefill else 'prefix caching'} but {name} has no "
+            f"resumed prefill (supports_resumed_prefill is False); launch with --no-enable-chunked-prefill "
+            f"--no-enable-prefix-caching or set MOTIF3_CHUNKED_PREFILL=0 MOTIF3_PREFIX_CACHING=0"
+        )
+    if settings.spec_decode and not generator.supports_spec_decode:
+        raise ValueError(
+            f"vLLM enabled speculative decoding (num_speculative_tokens={settings.spec_tokens}) but {name} has no "
+            f"decode_forward_spec (supports_spec_decode is False); drop --speculative-config or set "
+            f"MOTIF3_SPEC_DECODE=0"
+        )
+    span, longest = int(generator.max_prefill_span), int(generator.max_prefill_len)
+    if span < MIN_PREFILL_BUCKET or span > longest:
+        raise ValueError(f"{name}.max_prefill_span {span} outside [{MIN_PREFILL_BUCKET}, max_prefill_len {longest}]")
+    if generator.supports_resumed_prefill:
+        A = int(generator.prefill_alignment)
+        if A < 1 or (settings.block_size is not None and A % int(settings.block_size)):
+            raise ValueError(f"{name}.prefill_alignment {A} must be a positive multiple of the block size")
+    elif span < min(longest, int(settings.max_seq_len)):
+        raise ValueError(f"{name} splits spans at {span} rows but has no resumed prefill to run the continuations")
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # Weights location (one precedence order for the bridge and MotifTTConfig; design 00 §2.3.11; WAVE_A_REVIEW M7)
 # ----------------------------------------------------------------------------------------------------------------
 class WeightsLocation(NamedTuple):
@@ -424,6 +585,22 @@ class GeneratorSettings:
         block_size: vLLM ``--block-size`` when the bridge could see it at model init (BRIDGE-4), else None. Only a
             hint for ``create``: ``allocate_kv_cache(block_size=...)`` is authoritative.
         weights_source: which precedence rule produced ``weights_path`` (logged by the bridge).
+
+    Feature fields (docs/features/FEATURES_DESIGN.md §2.1; the defaults are draft 1). They describe what vLLM enabled
+    (the bridge captures vLLM's scheduler config in ``get_max_tokens_all_users``) plus the Motif environment knobs:
+        chunked_prefill: vLLM ``enable_chunked_prefill`` (after the plugin's policy). Rows may start at any position.
+        prefix_caching: vLLM ``enable_prefix_caching``. Rows may start at a block multiple and share read-only blocks.
+        max_num_batched_tokens: vLLM's per-step token budget (None = unknown / chunking off).
+        long_prefill_token_threshold: vLLM's per-request chunk cap (0 = none).
+        spec_tokens: 0, or 1 = MTP self-speculation with K = 1 (``num_speculative_tokens``).
+        kv_replicated_decode: KV-R (every decode KV write on all 32 chips). None = ``auto`` = on iff prefix caching
+            (``MOTIF3_KV_REPLICATED_DECODE``); False with prefix caching on is refused (stale cross-row KV, §3.4).
+        prefill_span_cap: largest prefill bucket (``MOTIF3_PREFILL_MAX_BUCKET``); None = the generator's default
+            (:meth:`resolved_prefill_span_cap`).
+        packed_prefill: optional packed multi-row prefill (``MOTIF3_PACKED_PREFILL``, §3.12.1); a generator without
+            it ignores the flag.
+        spec_verify: ``"packed"`` (drafts in idle lanes of the 32-lane trace) or ``"wide"`` (64-row trace, S3;
+            ``MOTIF3_SPEC_VERIFY``); a generator without the wide trace must refuse ``"wide"`` in ``create``.
     """
 
     max_batch_size: int = NUM_LANES
@@ -436,6 +613,16 @@ class GeneratorSettings:
     optimizations: Optional[str] = None
     block_size: Optional[int] = None
     weights_source: Optional[str] = None
+    # ---- features (all validated; defaults = draft 1) --------------------------------------------------------
+    chunked_prefill: bool = False
+    prefix_caching: bool = False
+    max_num_batched_tokens: Optional[int] = None
+    long_prefill_token_threshold: int = 0
+    spec_tokens: int = 0
+    kv_replicated_decode: Optional[bool] = None
+    prefill_span_cap: Optional[int] = None
+    packed_prefill: bool = False
+    spec_verify: str = "packed"
 
     def __post_init__(self):
         if not 1 <= int(self.max_batch_size) <= NUM_LANES:
@@ -451,11 +638,75 @@ class GeneratorSettings:
             raise ValueError(f"optimizations must be None, 'performance' or 'accuracy', got {self.optimizations!r}")
         if self.block_size is not None:
             check_block_size(self.block_size)
+        for name in ("chunked_prefill", "prefix_caching", "packed_prefill"):
+            if getattr(self, name) not in (True, False):
+                raise TypeError(f"{name} must be a bool, got {getattr(self, name)!r}")
+        if self.kv_replicated_decode not in (None, True, False):
+            raise TypeError(f"kv_replicated_decode must be None (auto) or a bool, got {self.kv_replicated_decode!r}")
+        if self.max_num_batched_tokens is not None and int(self.max_num_batched_tokens) < 1:
+            raise ValueError(f"max_num_batched_tokens must be >= 1, got {self.max_num_batched_tokens}")
+        if int(self.long_prefill_token_threshold) < 0:
+            raise ValueError(f"long_prefill_token_threshold must be >= 0, got {self.long_prefill_token_threshold}")
+        if int(self.spec_tokens) not in SUPPORTED_SPEC_TOKENS:
+            raise ValueError(
+                f"spec_tokens must be one of {SUPPORTED_SPEC_TOKENS} (Motif-3 MTP drafts K = 1), got {self.spec_tokens}"
+            )
+        if self.prefix_caching and self.kv_replicated_decode is False:
+            raise ValueError(
+                "prefix caching needs KV-R (MOTIF3_KV_REPLICATED_DECODE=0 refused): decode writes a lane's KV only on "
+                "its DP row, so a prefix hit on a block another row decode-wrote would read stale KV, and the MoE "
+                "reduce-scatter spreads the error to every row (docs/features/FEATURES_DESIGN.md §3.4)"
+            )
+        if self.prefill_span_cap is not None:
+            check_prefill_span_cap(self.prefill_span_cap, self.max_seq_len)
+        if self.spec_verify not in SPEC_VERIFY_MODES:
+            raise ValueError(f"spec_verify must be one of {SPEC_VERIFY_MODES}, got {self.spec_verify!r}")
 
     @property
     def weights_are_local(self) -> bool:
         """``weights_path`` is a local checkpoint directory (False for an uncached repo id or None)."""
         return self.weights_path is not None and Path(self.weights_path).is_dir()
+
+    # ---- resolved feature facts -------------------------------------------------------------------------------
+    @property
+    def resumed_prefill(self) -> bool:
+        """vLLM may send prefill rows with ``start > 0`` (chunked prefill or prefix caching is on)."""
+        return bool(self.chunked_prefill or self.prefix_caching)
+
+    @property
+    def spec_decode(self) -> bool:
+        """MTP self-speculative decoding is on (``spec_tokens > 0``)."""
+        return int(self.spec_tokens) > 0
+
+    @property
+    def kv_replicated(self) -> bool:
+        """KV-R resolved: ``kv_replicated_decode``, or ``prefix_caching`` when it is None (``auto``)."""
+        return bool(self.prefix_caching) if self.kv_replicated_decode is None else bool(self.kv_replicated_decode)
+
+    @property
+    def kv_write_mode(self) -> str:
+        """:func:`kv_write_mode` of these settings: ``row`` | ``row_split`` | ``all`` | ``all_split``."""
+        return kv_write_mode(self.kv_replicated, self.spec_decode)
+
+    @property
+    def mtp_kv_layers(self) -> int:
+        """Extra latent caches the generator allocates next to the ``num_layers`` main ones: 1 with speculation."""
+        return 1 if self.spec_decode else 0
+
+    def resolved_prefill_span_cap(self, supports_resumed_prefill: bool) -> int:
+        """The span cap a generator uses: ``min(prefill_span_cap or DEFAULT_PREFILL_SPAN_CAP, max_seq_len)`` when it
+        supports resumed prefill (spans above it are split internally, design D8), else ``max_seq_len`` (draft 1:
+        one bucket per prompt). Raises when a cap below ``max_seq_len`` was asked of a generator that cannot split."""
+        L = int(self.max_seq_len)
+        if supports_resumed_prefill:
+            cap = DEFAULT_PREFILL_SPAN_CAP if self.prefill_span_cap is None else int(self.prefill_span_cap)
+            return min(cap, L)
+        if self.prefill_span_cap is not None and min(int(self.prefill_span_cap), L) < L:
+            raise ValueError(
+                f"prefill_span_cap {self.prefill_span_cap} < max_seq_len {L} needs a generator with resumed prefill "
+                f"(spans are split into sp0 + sp1 chunks)"
+            )
+        return L
 
     @classmethod
     def from_env(
@@ -467,8 +718,17 @@ class GeneratorSettings:
         optimizations: Optional[str] = None,
         block_size: Optional[int] = None,
         environ: Optional[Mapping[str, str]] = None,
+        serving: Optional[Mapping[str, Any]] = None,
     ) -> "GeneratorSettings":
-        """Resolve settings from the vLLM arguments plus the documented environment variables."""
+        """Resolve settings from the vLLM arguments plus the documented environment variables.
+
+        ``serving`` is the vLLM scheduler config the bridge captured (keys :data:`SERVING_KEYS`, all optional; an
+        unknown key raises): ``block_size`` (used when ``block_size`` is None), ``enable_chunked_prefill``,
+        ``max_num_batched_tokens``, ``long_prefill_token_threshold``, ``enable_prefix_caching``,
+        ``prefix_match_unit`` (checked by ``prefill_plan.check_scheduler_config``, not stored) and ``spec_tokens``
+        (vLLM ``num_speculative_tokens`` after the platform published ``effective_k``). None = draft 1. Environment:
+        ``MOTIF3_KV_REPLICATED_DECODE``, ``MOTIF3_PREFILL_MAX_BUCKET``, ``MOTIF3_PACKED_PREFILL``,
+        ``MOTIF3_SPEC_VERIFY``."""
         env = os.environ if environ is None else environ
         hf_layers = int(getattr(hf_config, "num_hidden_layers", NUM_HIDDEN_LAYERS))
         env_layers = _env_int(env, "MOTIF3_NUM_LAYERS")
@@ -477,6 +737,16 @@ class GeneratorSettings:
             raise ValueError(f"MOTIF3_NUM_LAYERS={num_layers} outside [1, {hf_layers}]")
         kv_dtype = (env.get("MOTIF3_KV_CACHE_DTYPE") or DEFAULT_KV_CACHE_DTYPE).strip().lower()
         loc = resolve_weights_location(hf_config, env)
+        sv = dict(serving or {})
+        unknown = sorted(set(sv) - set(SERVING_KEYS))
+        if unknown:
+            raise ValueError(f"unknown serving config keys {unknown}; known: {SERVING_KEYS}")
+        if block_size is None and sv.get("block_size") is not None:
+            block_size = int(sv["block_size"])
+
+        def opt_int(key: str) -> Optional[int]:
+            return None if sv.get(key) is None else int(sv[key])
+
         return cls(
             max_batch_size=int(max_batch_size),
             max_seq_len=int(max_seq_len),
@@ -488,6 +758,15 @@ class GeneratorSettings:
             optimizations=optimizations,
             block_size=None if block_size is None else int(block_size),
             weights_source=loc.source,
+            chunked_prefill=bool(sv.get("enable_chunked_prefill") or False),
+            prefix_caching=bool(sv.get("enable_prefix_caching") or False),
+            max_num_batched_tokens=opt_int("max_num_batched_tokens"),
+            long_prefill_token_threshold=int(sv.get("long_prefill_token_threshold") or 0),
+            spec_tokens=int(sv.get("spec_tokens") or 0),
+            kv_replicated_decode=kv_replicated_decode_from_env(env),
+            prefill_span_cap=prefill_span_cap_from_env(env),
+            packed_prefill=packed_prefill_from_env(env),
+            spec_verify=spec_verify_from_env(env),
         )
 
 
@@ -513,25 +792,36 @@ def _check_int32(name: str, t: torch.Tensor, ndim: int) -> None:
 
 @dataclass(frozen=True)
 class PrefillRequest:
-    """One prompt to prefill (draft 1 prefills one request per call, eager, padded to a bucket).
+    """One prefill row: a new prompt, a chunk of a long prompt, or the uncached rest after a prefix-cache hit.
 
     Attributes:
         lane: destination lane in ``[0, NUM_LANES)``. Its DP group (``lane // 8``) runs every later decode step of
-            this request. Draft-1 prefill writes the latent on every chip, so the lane only matters to lane-owned
-            state (none in draft 1; the G1-fallback SWA ring and a v1 per-group prefill would use it).
-        tokens: ``torch.int32 [S]``, the request's tokens at positions ``0 .. S-1`` (``1 <= S <= max_seq_len``),
-            unpadded. For a request resumed after preemption this is prompt + every generated token.
+            this request. Prefill writes the latent on every chip, so the lane only matters to lane-owned state (none:
+            the paged cache is the only state, and a chunked request may change lane between chunks).
+        tokens: ``torch.int32 [end]``, ALL the request's tokens at positions ``0 .. end-1`` (``1 <= end <=
+            max_seq_len``), unpadded: the cached prefix, earlier chunks and this chunk's new tokens. For a request
+            resumed after preemption this is prompt + every generated token.
         page_table: ``torch.int32 [W]``, the request's vLLM block ids in position order (W = the server's
             page-table width, ``min(ceil(max_seq_len / block_size), num_blocks)``). Entries
-            ``0 .. ceil(S / block_size) - 1`` are real blocks (>= 1); the rest are 0 (null block), so bucket-padding
-            writes past them land in block 0. The bridge zeroes that tail itself: vLLM's persistent block-table rows
-            keep stale ids there, often of blocks other live requests own now. Never write through a page-table
-            entry the bridge did not hand over.
+            ``0 .. ceil(end / block_size) - 1`` are real blocks (>= 1); the rest are 0 (null block). The bridge zeroes
+            that tail itself: vLLM's persistent block-table rows keep stale ids there, often of blocks other live
+            requests own now. Never write through a page-table entry the bridge did not hand over. The same block id
+            may appear in several rows of one call (a shared prefix), never twice in one row.
+        start: positions ``[0, start)`` are already in the cache (vLLM ``num_computed_tokens``: a prefix-cache hit,
+            a multiple of the block size, or the end of the previous chunk, any integer); ``0 <= start < end``.
+
+    Contract (features design §2.1): full blocks below ``floor(start / block_size)`` are READ-ONLY (they may be
+    cached and shared with other requests); the generator writes positions ``[floor(start / bs) * bs, end)`` and may
+    write bucket padding only into the request's own last block (decode overwrites it before reading) or the null
+    block 0 (never read: only dropped padding rows read it) -- never into another block. The logits returned are those
+    of position ``end - 1`` (also for an intermediate chunk: the plugin does not say which chunk is the last).
+    ``start = 0`` is draft 1.
     """
 
     lane: int
     tokens: torch.Tensor
     page_table: torch.Tensor
+    start: int = 0
 
     def __post_init__(self):
         if not 0 <= int(self.lane) < NUM_LANES:
@@ -540,10 +830,30 @@ class PrefillRequest:
         _check_int32("page_table", self.page_table, 1)
         if self.tokens.shape[0] < 1:
             raise ValueError("empty prompt")
+        if not 0 <= int(self.start) < int(self.tokens.shape[0]):
+            raise ValueError(
+                f"start must be in [0, end={int(self.tokens.shape[0])}) (positions [0, start) are cached and at least "
+                f"one position is computed), got {self.start}"
+            )
 
     @property
     def seq_len(self) -> int:
+        """``end``: one past the last position of this row (the logits are for ``end - 1``)."""
         return int(self.tokens.shape[0])
+
+    @property
+    def end(self) -> int:
+        return int(self.tokens.shape[0])
+
+    @property
+    def resumed(self) -> bool:
+        """``start > 0``: the row reads a cached prefix (or recomputes part of it)."""
+        return int(self.start) > 0
+
+    @property
+    def num_new_tokens(self) -> int:
+        """Positions vLLM scheduled in this row: ``end - start``."""
+        return self.end - int(self.start)
 
 
 @dataclass(frozen=True)
@@ -582,6 +892,159 @@ class DecodeBatch:
         return int(self.page_table.shape[1])
 
 
+@dataclass(frozen=True)
+class SpecDecodeBatch:
+    """One decode step of a speculating launch (``spec_tokens = 1``), all ``NUM_LANES`` lanes in OWNER-lane order
+    (lane = the request's own lane, as in :class:`DecodeBatch`). Ordinary steps carry no draft; verify steps carry at
+    most one draft per lane.
+
+    Attributes:
+        tokens: ``torch.int32 [NUM_LANES]``: the anchor token (the last committed token) of each lane; 0 for inactive
+            lanes.
+        positions: ``torch.int32 [NUM_LANES]``: the anchor's position ``n`` (its KV write slot); ``-1`` = inactive.
+            Active positions are ``< max_seq_len``, and ``< max_seq_len - 1`` on drafted lanes.
+        draft_tokens: ``torch.int32 [NUM_LANES]``: the draft for position ``n + 1``; ``-1`` = no draft (always on an
+            ordinary step and on inactive lanes).
+        page_table: ``torch.int32 [NUM_LANES, W]``: each lane's block ids for positions ``0 .. n`` (``0 .. n + 1``
+            on drafted lanes), zero after; all zero for inactive lanes. W is the decode trace's fixed width.
+
+    Idle lanes (``positions == -1``) belong to nobody this step: the generator may borrow them to run drafts (packed
+    verify, design §3.8.2).
+    """
+
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    draft_tokens: torch.Tensor
+    page_table: torch.Tensor
+
+    def __post_init__(self):
+        _check_int32("tokens", self.tokens, 1)
+        _check_int32("positions", self.positions, 1)
+        _check_int32("draft_tokens", self.draft_tokens, 1)
+        _check_int32("page_table", self.page_table, 2)
+        for name in ("tokens", "positions", "draft_tokens"):
+            if getattr(self, name).shape[0] != NUM_LANES:
+                raise ValueError(
+                    f"spec decode {name} must have {NUM_LANES} lanes, got {tuple(getattr(self, name).shape)}"
+                )
+        if self.page_table.shape[0] != NUM_LANES:
+            raise ValueError(f"page_table must have {NUM_LANES} rows, got {tuple(self.page_table.shape)}")
+        if bool((self.positions < -1).any()):
+            raise ValueError("positions must be -1 (inactive) or >= 0")
+        if bool((self.draft_tokens < -1).any()):
+            raise ValueError("draft_tokens must be -1 (no draft) or a token id >= 0")
+        if bool(((self.draft_tokens >= 0) & (self.positions < 0)).any()):
+            raise ValueError("a draft on an inactive lane (draft_tokens >= 0 where positions == -1)")
+
+    @property
+    def active(self) -> torch.Tensor:
+        """``torch.bool [NUM_LANES]``: lanes that carry a request this step (their owners)."""
+        return self.positions >= 0
+
+    @property
+    def has_draft(self) -> torch.Tensor:
+        """``torch.bool [NUM_LANES]``: owner lanes whose draft must be verified this step."""
+        return self.draft_tokens >= 0
+
+    @property
+    def num_drafts(self) -> int:
+        return int(self.has_draft.sum())
+
+    @property
+    def is_verify(self) -> bool:
+        """At least one draft: the generator returns ``a1`` / ``m1`` for the drafted lanes."""
+        return self.num_drafts > 0
+
+    @property
+    def idle_lanes(self) -> Tuple[int, ...]:
+        """Lanes no request uses this step (``positions == -1``), ascending: the packed verify's partner lanes."""
+        return tuple(int(i) for i in torch.nonzero(self.positions < 0).reshape(-1).tolist())
+
+    @property
+    def page_table_width(self) -> int:
+        return int(self.page_table.shape[1])
+
+    @classmethod
+    def from_decode_batch(cls, batch: "DecodeBatch") -> "SpecDecodeBatch":
+        """The ordinary step (no drafts) of a speculating launch for ``batch``."""
+        return cls(
+            tokens=batch.tokens,
+            positions=batch.positions,
+            draft_tokens=torch.full((NUM_LANES,), -1, dtype=torch.int32),
+            page_table=batch.page_table,
+        )
+
+    def anchors(self) -> "DecodeBatch":
+        """The anchor rows alone as a :class:`DecodeBatch` (drafts dropped)."""
+        return DecodeBatch(tokens=self.tokens, positions=self.positions, page_table=self.page_table)
+
+
+@dataclass(frozen=True)
+class SpecDecodeResult:
+    """What :meth:`MotifGenerator.decode_forward_spec` returns, in OWNER-lane order (fresh host tensors).
+
+    Attributes:
+        logits: ``[NUM_LANES, vocab]`` float32 / bfloat16 host logits of the anchor rows (the next-token logits at
+            position ``n``, exactly what ``decode_forward`` returns) when ``want_logits``, else None (a verify step
+            needs only the ids and skips the logits read).
+        argmax: ``torch.int32 [NUM_LANES, 2]``: column 0 = ``a0``, the target argmax at the anchor (the token at
+            ``n + 1``); column 1 = ``a1``, the target argmax at the draft row (the token at ``n + 2`` if the draft is
+            accepted). Lowest-index tie rule (vLLM's host greedy).
+        mtp_argmax: ``torch.int32 [NUM_LANES, 2]``: the MTP layer's predictions. Column 0 = ``m0`` from the anchor
+            row (MTP input ``(hn_n, a0)`` at ``n``: a draft for ``n + 2``); column 1 = ``m1`` from the draft row
+            (``(hn_{n+1}, a1)`` at ``n + 1``: a draft for ``n + 3``).
+
+    Column 1 of both is meaningful only on drafted lanes; inactive lanes' rows are unspecified (ignore them).
+    """
+
+    logits: Optional[torch.Tensor]
+    argmax: torch.Tensor
+    mtp_argmax: torch.Tensor
+
+    def __post_init__(self):
+        for name in ("argmax", "mtp_argmax"):
+            t = getattr(self, name)
+            _check_int32(name, t, 2)
+            if tuple(t.shape) != (NUM_LANES, 2):
+                raise ValueError(f"{name} must be [{NUM_LANES}, 2], got {tuple(t.shape)}")
+        if self.logits is not None:
+            lg = self.logits
+            if not isinstance(lg, torch.Tensor) or lg.device.type != "cpu" or not lg.is_floating_point():
+                raise TypeError(f"logits must be None or CPU floating-point, got {type(lg).__name__}")
+            if lg.ndim != 2 or lg.shape[0] != NUM_LANES:
+                raise ValueError(f"logits must be [{NUM_LANES}, vocab], got {tuple(lg.shape)}")
+
+
+def check_spec_result(name: str, result: Any, *, want_logits: bool, vocab_size: int) -> SpecDecodeResult:
+    """Validate :meth:`MotifGenerator.decode_forward_spec`'s output: a :class:`SpecDecodeResult`, logits
+    ``[NUM_LANES, vocab_size]`` exactly when ``want_logits`` (None otherwise: the logits read costs ~2.7 ms)."""
+    if not isinstance(result, SpecDecodeResult):
+        raise TypeError(f"{name} must return a SpecDecodeResult, got {type(result).__name__}")
+    if want_logits:
+        if result.logits is None:
+            raise ValueError(f"{name}: want_logits=True but no logits were returned")
+        check_logits(name, result.logits, (NUM_LANES, int(vocab_size)))
+    elif result.logits is not None:
+        raise ValueError(f"{name}: want_logits=False but logits were returned (skip the ~2.7 ms logits read)")
+    return result
+
+
+def check_prefill_batch(requests: Sequence[Any]) -> Tuple[PrefillRequest, ...]:
+    """The rows of one ``prefill_forward_batch`` call: 1 .. ``NUM_LANES`` :class:`PrefillRequest` on distinct lanes."""
+    reqs = tuple(requests)
+    if not reqs:
+        raise ValueError("prefill_forward_batch got no rows")
+    if len(reqs) > NUM_LANES:
+        raise ValueError(f"prefill_forward_batch got {len(reqs)} rows; at most {NUM_LANES}")
+    for i, r in enumerate(reqs):
+        if not isinstance(r, PrefillRequest):
+            raise TypeError(f"row {i} must be a PrefillRequest, got {type(r).__name__}")
+    lanes = [int(r.lane) for r in reqs]
+    if len(set(lanes)) != len(lanes):
+        raise ValueError(f"prefill rows must use distinct lanes, got {lanes}")
+    return reqs
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The runtime interface
 # ----------------------------------------------------------------------------------------------------------------
@@ -592,18 +1055,27 @@ class MotifGenerator(abc.ABC):
     Call order under vLLM (vllm-tt-plugin ``worker.py:221-469``, ``model_runner.py:678-708, 3727-3781``):
 
     1. ``create(hf_config=..., mesh_device=..., settings=...)`` once, after the plugin opened the mesh
-       (``initialize_vllm_model``). Loads/converts weights; must not allocate the KV pool.
+       (``initialize_vllm_model``). Loads/converts weights; must not allocate the KV pool. The bridge then calls
+       :func:`check_generator_features` (a feature vLLM enabled must be supported).
     2. ``allocate_kv_cache(num_blocks=, block_size=, num_layers=)`` once.
     3. ``warmup_prefill(enable_trace=False)`` -> ``warmup_decode(enable_trace=False, page_table_width=W)`` ->
        [``warmup_prefill(enable_trace=True)`` only with plugin ``trace_mode="all"``] ->
        ``warmup_decode(enable_trace=True, page_table_width=W)`` (decode trace capture). Warmup is skipped when
        the plugin runs with ``enable_model_warmup=false`` (bring-up).
-    4. Serving: any interleaving of ``prefill_forward`` (one request per call) and ``decode_forward``;
-       ``release_lane`` when a request on that lane finished or was preempted.
+    4. Serving: any interleaving of prefill steps and decode steps; ``release_lane`` when a request on that lane
+       finished or was preempted.
+       * prefill: ONE ``prefill_forward_batch`` call per plugin step with all of the step's rows (new, resumed and
+         chunk-continuation rows; at most ``NUM_LANES`` rows and ``max_num_batched_tokens`` new tokens). Draft-1
+         bridges called ``prefill_forward`` once per row instead; that remains valid for ``start = 0`` rows.
+       * decode: ``decode_forward`` (non-speculating launch), or ``decode_forward_spec`` for EVERY decode step of a
+         speculating launch (``settings.spec_tokens = 1``; one decode trace serves ordinary and verify steps).
     5. ``release_traces()`` at shutdown while the mesh is still open (the plugin closes the mesh afterwards).
 
     Concurrency: calls are strictly sequential (one EngineCore thread). Every method may raise; a raise must leave
     no partially-applied host state behind (the bridge commits its own lane bookkeeping only after success).
+
+    Feature capabilities (defaults keep draft-1 generators working): ``supports_resumed_prefill``,
+    ``prefill_alignment``, ``max_prefill_span``, ``supports_spec_decode``.
     """
 
     # ---- construction -----------------------------------------------------------------------------------------
@@ -649,8 +1121,37 @@ class MotifGenerator(abc.ABC):
 
     @property
     def max_prefill_len(self) -> int:
-        """Longest prompt ``prefill_forward`` accepts (its largest bucket); >= ``settings.max_seq_len``."""
+        """Longest row (``end``) ``prefill_forward`` / ``prefill_forward_batch`` accept; >= ``settings.max_seq_len``.
+        Draft 1: its largest bucket. With internal chunking (``max_prefill_span < max_prefill_len``) longer rows are
+        split into chunks of at most ``max_prefill_span`` rows."""
         return MAX_CONTEXT
+
+    # ---- feature capabilities (docs/features/FEATURES_DESIGN.md §2.1) ------------------------------------------
+    @property
+    def supports_resumed_prefill(self) -> bool:
+        """``prefill_forward_batch`` accepts rows with ``start > 0`` (chunked prefill, prefix caching). Required
+        whenever ``settings.chunked_prefill`` or ``settings.prefix_caching`` is set."""
+        return False
+
+    @property
+    def prefill_alignment(self) -> int:
+        """Resume alignment ``A`` = ``lcm(block_size, q_chunk, k_chunk)`` of the resumed (sp1) programs: every chunk
+        the generator runs starts at a multiple of it, so a row resumed at ``start`` recomputes up to ``A - 1``
+        cached positions (``prefill_plan``). 0 = no resumed prefill. The bridge checks vLLM's chunk budget against it.
+        """
+        return 0
+
+    @property
+    def max_prefill_span(self) -> int:
+        """The span cap: the largest prefill bucket this generator compiles. Rows longer than it (after the
+        alignment floor) are split into several chunks inside one call (design D8)."""
+        return self.max_prefill_len
+
+    @property
+    def supports_spec_decode(self) -> bool:
+        """``decode_forward_spec`` is implemented (MTP self-speculation, K = 1). Required when
+        ``settings.spec_tokens > 0``."""
+        return False
 
     # ---- KV pool ----------------------------------------------------------------------------------------------
     @abc.abstractmethod
@@ -668,18 +1169,26 @@ class MotifGenerator(abc.ABC):
         never recompute them from the config. Allocate with ``ttnn.empty`` + on-device ``ttnn.fill(0)`` per layer
         (gate G7: ``ttnn.zeros`` of the pool takes ~20 s).
 
+        With ``settings.spec_tokens = 1`` the generator also allocates the MTP layer's cache, same shape and dtype,
+        indexed by the same block ids (so it travels with prefix hits and is freed with the request). ``num_layers``
+        stays vLLM's count of main layers; the per-chip bytes are then
+        ``kv_cache_bytes_per_chip(num_blocks, block_size, num_layers + settings.mtp_kv_layers, dtype)``.
+
         The handle is passed back unchanged as ``kv_cache=`` to every later call; the bridge never looks inside.
         """
 
     # ---- forwards ---------------------------------------------------------------------------------------------
     @abc.abstractmethod
     def prefill_forward(self, request: PrefillRequest, *, kv_cache: Any, enable_trace: bool = False) -> torch.Tensor:
-        """Prefill one request; return the logits of its last token.
+        """Prefill one row; return the logits of its last position ``end - 1``.
 
-        Pads ``request.tokens`` to the smallest bucket ``>= S``, computes the full forward, and writes the latent of
-        positions ``0 .. S-1`` into the request's blocks on every chip. Positions ``S .. bucket-1`` may be written
-        into the request's own last block (decode overwrites them before they are read) or into null block 0
-        (never read); no other block may be written. KV of other lanes/requests must be left untouched.
+        Draft 1 (``request.start == 0``): pads ``request.tokens`` to the smallest bucket ``>= S``, computes the full
+        forward, and writes the latent of positions ``0 .. S-1`` into the request's blocks on every chip. Positions
+        ``S .. bucket-1`` may be written into the request's own last block (decode overwrites them before they are
+        read) or into null block 0 (never read); no other block may be written. KV of other lanes/requests must be
+        left untouched. A generator without resumed prefill may refuse ``start > 0`` (``NotImplementedError``); one
+        with it treats ``prefill_forward(r)`` as ``prefill_forward_batch([r])[0]`` (the :class:`PrefillRequest`
+        contract: nothing below ``floor(start / bs) * bs`` is written).
 
         ``enable_trace`` is True only with plugin ``trace_mode="all"``; draft-1 implementations run eager anyway.
 
@@ -687,14 +1196,48 @@ class MotifGenerator(abc.ABC):
             Host logits for position ``S-1``: ``torch.float32`` or ``torch.bfloat16``, shape ``[vocab_size]``.
         """
 
+    def prefill_forward_batch(
+        self, requests: Sequence[PrefillRequest], *, kv_cache: Any, enable_trace: bool = False
+    ) -> torch.Tensor:
+        """Prefill all rows of one plugin step (ONE call per step); return host logits ``[B, vocab_size]`` (float32 or
+        bfloat16), row ``i`` = position ``requests[i].end - 1``, in INPUT order.
+
+        Rows (:func:`check_prefill_batch`): 1 .. ``NUM_LANES`` :class:`PrefillRequest` on distinct lanes; each obeys
+        the :class:`PrefillRequest` contract (read-only blocks below ``floor(start / bs)``, writes from
+        ``floor(start / bs) * bs``, padding only into the own last block or null block 0). Rows of one call may share
+        read-only prefix blocks, and a row may READ blocks another row of the same call WRITES (vLLM caches full
+        blocks when it allocates them, so a request admitted later in the step can hit them): run writers first
+        (``prefill_plan.order_prefill_requests``) or layer-synchronously. Two rows never write the same block. No
+        per-lane / per-slot state may cross calls (a request may change lane between chunks): the paged cache is the
+        only cross-chunk state. With ``settings.spec_tokens`` the MTP layer's cache is written for the same positions
+        (KV-only: its entry at ``p`` needs ``t_{p+1}``, which for a row's last position is the host argmax of the
+        returned logits), so every prefilled position has an MTP entry (design G8).
+
+        Default (draft-1 generators): every row must have ``start == 0`` (else ``NotImplementedError``); then no row
+        reads the cache, so input order is writer-first, and the rows run one by one through ``prefill_forward``.
+        A generator with ``supports_resumed_prefill`` overrides this (``prefill_plan.plan_prefill_batch``)."""
+        reqs = check_prefill_batch(requests)
+        resumed = [i for i, r in enumerate(reqs) if r.resumed]
+        if resumed:
+            raise NotImplementedError(
+                f"{type(self).__name__}: rows {resumed} resume at start > 0 (chunked prefill / prefix caching), "
+                f"which needs a generator with supports_resumed_prefill and its own prefill_forward_batch"
+            )
+        outs = []
+        for r in reqs:
+            logits = self.prefill_forward(r, kv_cache=kv_cache, enable_trace=enable_trace)
+            outs.append(check_logits(f"{type(self).__name__}.prefill_forward", logits, (int(self.vocab_size),)))
+        return torch.stack(outs)
+
     @abc.abstractmethod
     def decode_forward(self, batch: DecodeBatch, *, kv_cache: Any, enable_trace: bool) -> torch.Tensor:
         """One decode step for every lane.
 
         For each active lane ``l`` (``batch.positions[l] = p >= 0``): writes the latent of ``batch.tokens[l]`` at
         position ``p`` (block ``batch.page_table[l, p // block_size]``, row ``p % block_size``) on the chips of DP
-        group ``l // 8``, attends over positions ``0 .. p`` (global layers) or ``max(0, p - 128) .. p`` (SWA layers,
-        129 keys), and produces the next-token logits. Inactive lanes write nothing.
+        group ``l // 8`` -- on all 32 chips when ``settings.kv_replicated`` (KV-R: then a later prefix hit from any
+        lane reads valid KV) --, attends over positions ``0 .. p`` (global layers) or ``max(0, p - 128) .. p`` (SWA
+        layers, 129 keys), and produces the next-token logits. Inactive lanes write nothing.
 
         ``enable_trace=True``: copy the inputs into the persistent device tensors and replay the trace captured by
         ``warmup_decode(enable_trace=True)``; if no trace was captured (warmup disabled), run eager instead of
@@ -706,6 +1249,40 @@ class MotifGenerator(abc.ABC):
             sampler, so it must not alias a host buffer that a later call overwrites (return a fresh tensor).
         """
 
+    def decode_forward_spec(
+        self, batch: SpecDecodeBatch, *, kv_cache: Any, enable_trace: bool, want_logits: bool
+    ) -> SpecDecodeResult:
+        """One decode step of a speculating launch (``settings.spec_tokens = 1``; design §3.8). Every decode step of
+        such a launch comes here: ordinary steps (no drafts, ``want_logits=True`` for host sampling) and verify steps
+        (``want_logits=False``: the plugin needs only argmax ids).
+
+        For each active owner lane ``l`` (anchor token ``t`` at ``n = batch.positions[l]``):
+          * the main layers (``num_layers``, 53) + the MTP layer write the anchor's latent at ``n`` (block
+            ``page_table[l, n // bs]``);
+          * ``a0`` = target argmax at ``n``, and the MTP layer runs on ``(hn_n, a0)`` at ``n``: ``m0``;
+          * when ``draft_tokens[l] = d >= 0``: ``d`` is evaluated at ``n + 1`` through the SAME page-table row (its KV
+            lands in ``l``'s blocks at ``n + 1``; it attends over ``0 .. n + 1`` including the anchor's ``n``):
+            ``a1`` = target argmax at ``n + 1``, ``m1`` = MTP on ``(hn_{n+1}, a1)``.
+        KV writes land on all 32 chips with ``settings.kv_replicated`` (KV-R), else on the owner's DP row only. A
+        rejected draft's KV at ``n + 1`` is garbage, overwritten by the next step's anchor before any read; vLLM never
+        caches it (it is beyond ``num_computed_tokens``).
+
+        Layout is the generator's business (design §3.8.2, "packed" verify): a draft runs on an IDLE lane (one whose
+        ``positions`` is -1; with KV-R on any DP row, without it on the owner's row) with a copy of the owner's
+        page-table row; anchors and drafts write the cache in two separate ``paged_update_cache`` calls (two users
+        writing ``p`` and ``p + 1`` of one tile in one call race). Drafts that do not fit the idle lanes are run in
+        an overflow pass on their own lanes at ``n + 1``: every draft must be evaluated (if ``d == a0`` the plugin
+        commits ``a1``). The result is the same as running every row on its own lane.
+
+        ``enable_trace``: replay the decode trace (captured by ``warmup_decode(enable_trace=True)``; the overflow
+        pass replays it again), or run eager when none was captured.
+
+        Returns:
+            :class:`SpecDecodeResult` in owner-lane order (``check_spec_result``): ``argmax [32, 2]`` = ``(a0, a1)``,
+            ``mtp_argmax [32, 2]`` = ``(m0, m1)``, ``logits [32, vocab]`` only when ``want_logits``. Fresh tensors.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement speculative decoding")
+
     # ---- warmup -----------------------------------------------------------------------------------------------
     @abc.abstractmethod
     def warmup_prefill(self, *, kv_cache: Any, enable_trace: bool) -> None:
@@ -714,6 +1291,12 @@ class MotifGenerator(abc.ABC):
         No request is live during warmup, so it may write any block of the pool (all-zero page tables keep every
         write in null block 0). Must leave no lane state behind. With ``enable_trace=True`` (plugin
         ``trace_mode="all"``, called before decode capture) a draft-1 generator may return immediately.
+
+        With resumed prefill: compile every ``(path, bucket)`` the generator can run, i.e. sp0 and sp1 for every
+        bucket ``<= max_prefill_span`` (sp1 at a start of 128 with all-zero SDPA tables and all ``-1`` fill tables,
+        so nothing real is written), plus the MTP layer's KV-only prefill fill when ``settings.spec_tokens``. Shapes
+        depend only on ``(path, bucket)`` (starts, block ids, RoPE rows and the LM-head row are device tensors), so
+        nothing compiles after the decode capture (a prefill program compiled after capture can corrupt the trace).
         """
 
     @abc.abstractmethod
@@ -724,12 +1307,17 @@ class MotifGenerator(abc.ABC):
         input tensors ``tokens [32]``, ``positions [32]``, ``page_table [32, W]``). ``enable_trace=True``: capture
         the decode trace (embed -> layers -> LM head; logits read outside the trace). All lanes inactive or
         writing only block 0; no lane state may survive.
+
+        In a speculating launch the one trace is the spec trace (main layers with the split KV write, LM head, main
+        argmax, MTP layer, MTP argmax) that serves ordinary, verify and overflow steps; the KV-write mode
+        (``settings.kv_write_mode``) is fixed at capture.
         """
 
     # ---- lifecycle --------------------------------------------------------------------------------------------
     def release_lane(self, lane: int) -> None:
         """The request on ``lane`` finished or was preempted. Drop lane-owned model state (none in draft 1: the
-        KV lives in vLLM's blocks; the G1-fallback SWA ring would be reset here).
+        KV lives in vLLM's blocks; the G1-fallback SWA ring would be reset here; the speculation bookkeeping --
+        retained argmax / MTP ids per lane -- lives in the bridge, not here).
 
         The plugin delivers it with the NEXT scheduler step (a request finishing in the last step of a burst is
         released only when traffic resumes), but always before that lane is handed to another request's prefill.
@@ -765,12 +1353,16 @@ __all__ = [
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_KV_CACHE_DTYPE",
     "DEFAULT_KV_POOL_TOKENS",
+    "DEFAULT_PREFILL_ALIGNMENT",
+    "DEFAULT_PREFILL_SPAN_CAP",
     "DecodeBatch",
+    "FEATURE_SWITCHES",
     "GeneratorSettings",
     "KV_CACHE_DTYPES",
     "KV_LATENT_DIM",
     "KV_LORA_RANK",
     "KV_POOL_ALIGNMENT",
+    "KV_WRITE_MODES",
     "L1_SMALL_SIZE",
     "LANES_PER_GROUP",
     "MAX_CONTEXT",
@@ -778,6 +1370,7 @@ __all__ = [
     "MAX_MODEL_LEN_ALIGNMENT",
     "MESH_SHAPES",
     "MIN_PREFILL_BUCKET",
+    "MTP_LAYER_IDX",
     "MotifGenerator",
     "NULL_BLOCK_RESERVE_TOKENS",
     "NUM_DP_GROUPS",
@@ -785,23 +1378,38 @@ __all__ = [
     "NUM_LANES",
     "PrefillRequest",
     "QK_ROPE_HEAD_DIM",
+    "SERVING_KEYS",
     "SERVING_TT_CONFIG",
+    "SPEC_VERIFY_MODES",
     "SUPPORTED_BLOCK_SIZES",
+    "SUPPORTED_SPEC_TOKENS",
+    "SpecDecodeBatch",
+    "SpecDecodeResult",
     "VOCAB_SIZE",
     "WeightsLocation",
     "cdiv",
     "check_block_size",
+    "check_generator_features",
     "check_logits",
     "check_max_model_len",
+    "check_prefill_batch",
+    "check_prefill_span_cap",
+    "check_spec_result",
     "check_tt_config",
     "expected_num_blocks",
+    "feature_switch_from_env",
     "hf_cache_snapshot",
     "kv_cache_bytes_per_chip",
     "kv_cache_dtype_from_env",
     "kv_pool_tokens_from_env",
+    "kv_replicated_decode_from_env",
+    "kv_write_mode",
+    "packed_prefill_from_env",
     "plugin_num_blocks",
     "prefill_buckets",
+    "prefill_span_cap_from_env",
     "resolve_tt_cache_path",
     "resolve_weights_location",
     "serving_additional_config",
+    "spec_verify_from_env",
 ]

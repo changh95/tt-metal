@@ -35,7 +35,10 @@ motif3/
     weights.py         HFWeightLoader / DictWeightSource, torch-side transforms, as_tensor + TT weight cache
     rope.py            YaRN / plain tables, MotifRope (decode per-lane gather, prefill tables, HF / composite apply)
     generator_api.py   bridge <-> runtime contract (MotifGenerator ABC, GeneratorSettings, KV-pool sizing, weights
-                       location, the serving "tt" config incl. L1_SMALL_SIZE); torch-only, shared by bridge and config
+                       location, the serving "tt" config incl. L1_SMALL_SIZE; resumed prefill rows, the speculative
+                       decode types, KV-R modes: §15-§17); torch-only, shared by bridge and config
+    prefill_plan.py    resumed / chunked prefill planning (alignment, chunks, fill / SDPA / tail / RoPE tables,
+                       writer-first row order, vLLM scheduler checks; §15); torch-only
     generator_vllm.py  MotifForCausalLM (vLLM bridge; device-free import)
     embedding.py       MotifEmbedding (token gather -> 4 streams)        lm_head.py   MotifLMHead (mean, norm, head)
     mhc.py             MHCSite (pre / post of one mHC site)              attention.py MotifAttention (GDLA)
@@ -582,12 +585,105 @@ checks that the default generator class imports device-free (`test_real_generato
 | `MOTIF3_FABRIC` | `FABRIC_2D_TORUS_XY` (fallback `FABRIC_1D_RING`); with a mesh the device's fabric wins |
 | `MOTIF3_GENERATOR_CLASS` | runtime class for the bridge (`models.demos.motif3.tt.generator:MotifGenerator`) |
 | `MESH_DEVICE` | `"(4, 8)"` for serving (`(8, 4)` also works; `open_motif_mesh()` reads it) |
+| `MOTIF3_PREFIX_CACHING` / `MOTIF3_CHUNKED_PREFILL` / `MOTIF3_SPEC_DECODE` | bridge class capabilities (§15-§17; `generator_api.feature_switch_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises); they only allow a feature, vLLM's flags enable it |
+| `MOTIF3_KV_REPLICATED_DECODE` | KV-R (§16): `auto` (default: on iff prefix caching), `1` (forced on), `0` (refused with prefix caching) |
+| `MOTIF3_PREFILL_MAX_BUCKET` | span cap (§15): largest prefill bucket of a resumed-prefill generator, a power of two in [128, 32768] (8192); longer spans are split into chunks |
+| `MOTIF3_PACKED_PREFILL` | optional packed multi-row prefill (0; only after gate G15) |
+| `MOTIF3_SPEC_VERIFY` | `packed` (default: drafts in idle lanes of the 32-lane trace) or `wide` (64-row verify trace, only after gate G16) |
 
 Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a multiple of 256), `--max-num-seqs 32`,
 `--additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456, "fabric_config":
 "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col", "l1_small_size": 32768}}'` (`generator_api.SERVING_TT_CONFIG`; TIS:
 `override_tt_config`). Without `l1_small_size` the bridge refuses to start (`get_max_tokens_all_users`, in
 `init_device`, before the weights load) and refuses a mesh with less L1_SMALL (`initialize_vllm_model`).
+
+## 15. Resumed and chunked prefill (`tt/prefill_plan.py`; `docs/features/FEATURES_DESIGN.md` §2, §3.1-§3.3, §3.7)
+
+* **Contract** (`generator_api.PrefillRequest`): a prefill row is `PrefillRequest(lane, tokens, page_table, start)` with
+  `tokens` = ALL tokens at positions `0 .. end-1` and positions `[0, start)` already in the cache (vLLM
+  `num_computed_tokens`: a prefix-cache hit, a block multiple, or the end of the previous chunk, any integer). Full
+  blocks below `floor(start / bs)` are **read-only** (they may be shared); the generator writes `[floor(start / bs) *
+  bs, end)` and bucket padding only into the request's own last block. The bridge makes **one**
+  `generator.prefill_forward_batch(requests)` call per plugin step (logits `[B, vocab]` of each row's `end - 1`, in
+  input order). `start = 0` everywhere is draft 1 (the ABC default runs the rows through `prefill_forward`).
+* **Every alignment and table rule lives in `prefill_plan.py`** (pure torch, host-tested exhaustively by
+  `tests/unit/test_prefill_plan.py`). Modules never re-derive them; `cfg.plan_prefill_row(start, end)` is
+  `prefill_plan.plan_prefill_row` with the config's geometry.
+
+  | Quantity | Rule | Default |
+  |---|---|---|
+  | write floor `w0` | `floor(s / bs) * bs`: full blocks below it are never written | |
+  | resume alignment `A` | `cfg.prefill_resume_alignment = lcm(bs, q, k)` of the sp1 global op (`model_config.SP1_GLOBAL_CHUNKS`, gate G9 decides) | 64 |
+  | compute floor `c0` | `floor(s / A) * A`, or 0 when that is below the SWA tail `cfg.prefill_swa_tail` (128) | |
+  | span cap | `cfg.max_prefill_span` (`MOTIF3_PREFILL_MAX_BUCKET`), buckets `cfg.prefill_span_buckets` (128 ... 8192) | 8192 |
+  | chunks | consecutive, `A`-aligned starts; full-cap chunks while more than the cap remains; then one padded chunk, or a head chunk + the rest when the cost table (`cfg.prefill_cost_table`) says it is cheaper | 16,736 -> 8192 + 8192 + 512 |
+  | path | **sp0** (start 0: the draft-1 square causal SDPA over the chunk's own rows, no cache reads) / **sp1** (start > 0: global layers attend over the paged latent from the chunk start; SWA layers read the 128-row tail from the cache) | |
+
+* **Tables per chunk** (`prefill_plan.chunk_tables`): fill table `[C / bs]` with **-1** (skipped by
+  `paged_fill_cache`) for shared blocks (entirely below `w0`) and pure-padding blocks; sp1 SDPA table `[W']`
+  (`cfg.sp1_page_table_width` = 640) with the real block ids, then **0** -- **never -1 in an SDPA table** (the SDPA
+  reader maps every entry as a block id); SWA tail block ids `[128 / bs]` of positions `[a - 128, a)`; RoPE rows
+  `min(a + i, max_model_len - 1)` gathered from the ROW_MAJOR tables. The start, block ids, RoPE rows and the LM-head
+  row are device tensors, so programs depend on `(path, bucket)` only. Every sp1 chunk start is a multiple of the
+  sp1 op's q/k chunk (the kernels divide it by `q_chunk` without a device check): never start an sp1 call anywhere
+  else (assert `start % A == 0`).
+* **Order inside a chunk**: global sp1 fills the chunk's latent **before** the chunked SDPA (its own keys come from the
+  cache); global sp0 and every SWA call fill after their SDPA, as draft 1. **Order of rows**: writer-first
+  (`prefill_plan.order_prefill_requests`): vLLM caches a row's full blocks when it allocates them, so a request
+  admitted later in the same step can hit blocks another row of the same call computes.
+* **No per-lane or per-slot state across chunks**: a request may change lane between chunks; the paged cache is the
+  only cross-chunk state.
+* **Warmup** (§10 rule 6): every `(path, bucket)` with `bucket <= cfg.max_prefill_span` (sp0, sp1, and the MTP KV-only
+  fill with speculation) compiles before the decode capture; the generator refuses any other shape afterwards. The
+  16K / 32K buckets are no longer compiled (the planner splits those spans).
+* **vLLM flags**: `--max-num-batched-tokens` = `--long-prefill-token-threshold` = `span cap - A`
+  (`prefill_plan.recommended_budget`: 8128 for A = 64, 8064 if G9 moves the large buckets to 128/128): a lone prompt's
+  chunk ends are then multiples of `A` (no recompute) and every span fits one bucket. The bridge runs
+  `prefill_plan.check_scheduler_config` at `init_device`: it raises on prefix caching without KV-R or with a
+  `--prefix-match-unit` other than the block size, and warns on unaligned budgets / thresholds, spans over the cap and
+  budgets below `4096 - A` (vLLM's unpinned `vllm serve` default on TT is 2048).
+
+## 16. Decode KV writes: KV-R and the speculative split (`tt/kv_write.py`; features design §3.4-§3.5)
+
+* **KV-R** (`cfg.kv_replicated_decode` = `GeneratorSettings.kv_replicated`): with prefix caching on, every decode KV
+  write (53 layers + the MTP layer) lands on **all 32 chips**. Without it, decode writes a lane's latent only on its DP
+  row, so a prefix hit on such a block from another row (multi-turn chat, preemption-resume on another lane) reads
+  stale KV, and the replicated prefill plus the MoE reduce-scatter spread the error to every row.
+* **Modes** (`cfg.kv_write_mode`, `generator_api.kv_write_mode` / `KV_WRITE_MODES`): one per server, shared by every
+  layer, fixed when the decode trace is captured.
+
+  | Mode | When | Write per layer |
+  |---|---|---|
+  | `row` | draft 1 (no prefix caching, no speculation) | one 8-lane `paged_update_cache` per DP row |
+  | `row_split` | speculation without prefix caching | two 8-lane calls: (A) anchors and plain lanes, (B) draft lanes |
+  | `all` | prefix caching (KV-R) | `ccl.ag_dp_rows` of the `[1, 1, 8, 576]` latent, one 32-lane update on every chip |
+  | `all_split` | prefix caching + speculation (production) | the gathered latent, two 32-lane calls (A, B) |
+
+* **Why two calls**: `paged_update_cache` runs one user per core and read-modify-writes the whole 32-row tile, so two
+  users writing `p` and `p + 1` of one block in one call can lose an update (gate G12). On ordinary steps call B is all
+  -1. FlashMLA runs after both calls.
+* **Guarantees** every path keeps (features design §3.4): (G1) a block's KV depends only on its token prefix and
+  absolute positions; (G2) full blocks below `w0` are never written; (G3) writes precede reads inside a call; (G4)
+  KV-R; (G5) padding only into the own last block; (G7) nothing compiles after the decode capture; (G8) the MTP cache
+  holds an entry for every prefilled and decoded position.
+
+## 17. MTP layer and speculative decoding (`tt/mtp.py`; features design §3.6, §3.8)
+
+* **Layer spec**: `cfg.mtp_layer_spec()` = `LayerSpec(53, is_global=False, is_moe=False, window=129,
+  softmax_scale=0.07216878, rope_kind="plain")` (reference `MotifMTP`: SWA in "all" mode, dense MLP with output scale
+  `cfg.polynorm_output_scale_for_layer(53)` = 0.5, no mHC). `cfg.layer(53)` does not exist and `cfg.is_moe_layer(53)`
+  would say MoE: pass the spec explicitly. `cfg.mtp_layer_idx` = 53 = `num_hidden_layers` (also in truncated runs);
+  weights `model.mtp_layers.0.*` (shard 104, BF16 on disk); TT-cache part `L53`.
+* **Cache**: one more `[N, 1, bs, 576]` latent cache in the KV dtype, indexed by the same vLLM block ids, so it travels
+  with prefix hits and is freed with the request. `cfg.kv_pool_layers` = 53 + `cfg.mtp_kv_layers`; vLLM keeps
+  accounting 53; +612 B per token per chip in bfp8 (`cfg.kv_pool_bytes_per_chip()`).
+* **Prefill is KV-only**: the MTP KV at `p` depends only on `(hn_p, t_{p+1})`, so prefill runs no MTP attention,
+  MLP or head. A row's last position uses the host argmax of its logits as `t_{p+1}`.
+* **Decode** (`settings.spec_tokens = 1`): every decode step calls `generator.decode_forward_spec(SpecDecodeBatch,
+  want_logits=)`. The batch is in owner-lane order; `draft_tokens[l] >= 0` asks for the draft to be verified at `n +
+  1`; lanes with `positions == -1` are idle and may host drafts. The result is `SpecDecodeResult(logits or None,
+  argmax [32, 2] = (a0, a1), mtp_argmax [32, 2] = (m0, m1))`, checked with `generator_api.check_spec_result`. One
+  decode trace (the spec trace) serves ordinary, verify and overflow steps.
 
 ## Status
 
@@ -606,3 +702,10 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
 * Modules (wave B1): embedding, mHC, attention, PolyNorm / MLP, MoE, LM head, the Sinkhorn and router kernels
   (`docs/WAVE_B1_SUMMARY.json`). Decoder, model, generator, TIS integration: the integration wave (WAVE_A_REVIEW
   §5.8-5.11).
+* Features (chunked prefill, prefix caching, MTP speculation; `docs/features/FEATURES_DESIGN.md`), WP1 contract +
+  config (2026-10-02): `generator_api` (`PrefillRequest.start`, `prefill_forward_batch`, `SpecDecodeBatch` /
+  `SpecDecodeResult` / `decode_forward_spec`, the capability properties, the feature `GeneratorSettings` and their
+  environment, `kv_write_mode`, `check_generator_features`), `tt/prefill_plan.py`, the `model_config` feature fields
+  (§15-§17). Host only: `test_prefill_plan.py` (exhaustive planning to 1100 tokens for blocks 32 / 64 and A 64 / 128,
+  samples to 32768, an emulated paged cache under a vLLM-like scheduler) and the `test_infra_config.py` feature tests
+  pass; nothing in the runtime uses them yet (WP2-WP6 build on this contract).

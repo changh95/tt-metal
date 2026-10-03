@@ -605,3 +605,291 @@ Rough MoE-layer decode sum from gate costs alone is about 1.5–1.7 ms, i.e. 75�
 The harness now always ends and releases a capture on exceptions, frees outputs during capture, and never accumulates L1 outputs.
 
 **7. Reference cross-check.** The local goldens were checked against `models/demos/motif3/reference` only for Sinkhorn (exact); that package's API was still changing. Re-point the goldens once it is stable.
+
+---
+
+## 12. Feature gates G9-G13a: chunked prefill, prefix caching, MTP speculative decoding
+
+**Run:** 2026-10-02 16:56-17:21 UTC, host `bh-glx-exp-a03u07`, tt-metal `motif3-bh-galaxy` at `cfd102b90fc` (Release
+build; the `models/` tree carried other work packages' uncommitted edits, none of which these op-level gates import).
+**Mesh:** logical (4, 8); fabric requested `FABRIC_2D_TORUS_XY`, **committed TORUS_Y** (the 4-chip DP axis is a line, as
+in FMV), `l1_small_size` 32768, `trace_region_size` 256 MiB, dispatch axis COL (the serving set).
+**Design:** `docs/features/FEATURES_DESIGN.md` §4 (G9-G13, review R6/R9/R10), D1-D6, D10, §3.1-§3.5, Appendix C.3
+(lead decisions: KV-R adopted and measured here; `tt/kv_write.py` owned by KVW; vLLM budget per G9). Op level only: no
+model code, synthetic data, torch fp32 / fp64 goldens on host-dequantized bfp8 data (the G2/G7 method). G13b (the
+full-model KV-R run) belongs to WP5.
+
+| Item | Location |
+|---|---|
+| Tests | `test_g9_resumed_global_attn.py`, `test_g10_swa_tail.py`, `test_g11_chunk_io.py`, `test_g12_spec_kv_alias.py`, `test_g13_kv_replicated_decode.py` |
+| Raw results | `results/G9.jsonl` ... `results/G13.jsonl` (append-only, last record per case wins); `results/G*_quick.jsonl` = the `MOTIF3_GATES_QUICK=1` smoke run |
+| Host self-checks | every file's `test_*_host_*` (goldens, page tables, lane layouts, probe discrimination on a host emulation): `scripts/hostrun.sh -- python -m pytest -p no:cacheprovider -q <file> -k host` |
+| Run | `scripts/devrun.sh -t 1800 -n gates_g9_g13 -- python -m pytest models/demos/motif3/tests/unit/gates/test_g{9,10,11,12,13}_*.py -s -p no:cacheprovider -k "not host"` (about 6 min for all five) |
+| Knobs | G9: `MOTIF3_G9_ROLES` (`fp32acc,bf16acc`), `MOTIF3_G9_CS` (bucket list) |
+| Logs (`logs/dev/`) | final clean run of all five gates (11 passed, 3 min): `20261002_171722_gates_g9_g13_final.log`; development runs: `20261002_152147_wp0_gates_F.log` (smoke; G10, G11, first G12), `20261002_160208_wp0_gates_G.log` (G9 bf16acc + reference ops, G13 full), `20261002_170543_g9fp32_g12.log` (G9 fp32acc, G12 final), `20261002_170749_g9_buckets_256_1024_4096.log`, `20261002_171142_g13a_correctness_rerun.log`, `20261002_172201_g13a_serving_fp32acc.log` (serving order with the fp32-acc sp1 op), `20261002_171023_g13_dag_diag.log` (diagnostic) |
+
+### 12.1 Verdicts
+
+| Gate | Verdict | Decision / key numbers |
+|---|---|---|
+| **G9** resumed global attention | **PASS with fp32 dest accumulation; FAIL with the `sdpa_prefill` role** | `chunked_scaled_dot_product_attention(Q [1,10,C,576], K = V = latent cache, page_table [1,640], chunk_start_idx_tensor)` is correct and trace-safe: one program per (C, q, k) over all starts, trace captured at s = 128 replays bitwise equal to eager at every start, latent columns bitwise equal to `chunked_flash_mla_prefill` at 1.03-1.07x its time (G9b C++ patch **not needed**). With the `sdpa_prefill` role (bf16 dest) PCC is 0.9978-0.9991 and the worst row down to 0.988 (all 68 cases fail); with HiFi4 + **fp32 dest acc** (the window-free `sdpa_prefill_fp32` role) PCC 0.99983-0.99999, worst row >= 0.99965 (all 68 cases pass). Per-bucket (q, k): 128/128 for C = 128, 64/64 for C = 256-1024, 128/128 for C >= 2048 (§12.2) -> vLLM budget **8064** |
+| **G10** SWA tail | **PASS** (a) and (b) | Tensor-args dim-0 slice of the `[4129,1,64,576]` bfp8 cache: bitwise for every block id, one program, trace-safe. Square `[tail 128 ‖ chunk]` causal + window-129 SDPA: **bitwise equal to the draft-1 single-shot rows `[s, s+C)`** in all 9 (C, s) cases (PCC 0.99971-0.99973 vs fp32), probes exact, window 128 / 130 negatives detected. S-C (C++ window patch) not needed |
+| **G11** chunk I/O | **PASS** | `paged_fill_cache` through fill tables with -1 (leading / trailing / mixed / 4-row packed): bit-exact on 32 chips, skipped blocks untouched. Offset RoPE via `ttnn.embedding` gather: tables bitwise, `rotary_embedding_hf` PCC >= 0.999997, bitwise equal to the draft-1 tables at c0 = 0, no program per offset, trace replay == eager |
+| **G12** spec KV aliasing | **PASS** (one documented limitation) | A/B split bit-exact on all 32 chips (per-row 8-lane and 32-lane gathered, bfp8 and bf16); a single call loses 2-3 (8-lane) / 10-13 (32-lane) updates in **every** trial of three runs, only on same-tile pairs (`p % 64` in {0, 30, 62}). FlashMLA with partner rows: probes exact (row p never sees p+1, row p+1 sees p) in both layouts, SWA and global; **lane relocation bitwise** (review R5: 28 users moved to another lane on another DP row give identical outputs). Limitation: a bf16 cache cannot take one 32-lane `paged_update_cache` (output CB `B x Wt` = 1.18 MB, L1 clash); 2 x 16-lane calls are bit-exact |
+| **G13a** KV-R decode (op level) | **PASS** | KV-R invariant bit-exact on all 32 chips for every write variant, ordinary and verify steps, trace == eager; cross-row partners without KV-R read a stale anchor (negative control: partner PCC down to 0.40). Cost in a 54-layer decode-sized trace: **`all_split` +1.87 ms (1K ctx) / +1.89 ms (8K ctx) per step vs draft-1 `row`** (34.6-34.9 us per layer; +1.68-1.69 ms vs `row_split`) <= 2.0 ms gate (margin 0.11 ms); deferred KV-R +1.35-1.36 ms. Prefill 8K sp0/sp1 after the KV-R decode trace: no static-CB clash, bitwise-identical outputs, no program after capture, main L1 unchanged; trace +0.46 MB per 54 layers |
+
+No named fallback was triggered: G9b (MLA tensor-start C++ patch), S-C (window through the chunked wrappers), per-block
+fills, "spec blocked", and deferred KV-R (Δ > 2 ms) all stay unused. The one design change is G9's compute role.
+
+### 12.2 Decisions published to the work packages
+
+**WP1 (`model_config` / `prefill_plan.py`) and WP2 (attention sp1 global):**
+
+| Bucket C | sp1 global (q, k) | A = lcm(64, q, k) | ms / global layer at s = 128 / 2048 / 8192 / 24448 (fp32 acc, eager) | Runner-up |
+|---|---|---|---|---|
+| 128 | 128 / 128 | 128 | 0.30 / 1.00 / 3.68 / 10.77 | 64/64: 0.39 / 1.18 / 4.38 / 12.82 (A = 64); 32/64: 0.60 / 1.07 / 3.94 / 11.55 (A = 64) |
+| 256 | 64 / 64 | 64 | 0.60 / 1.21 / 4.40 / 12.87 | 128/128: 0.38 / 2.02 / 7.38 / 21.54 |
+| 512 | 64 / 64 | 64 | 0.38 / 1.28 / 4.48 / 12.94 | 128/128: 0.60 / 2.13 / 7.48 / 21.64 |
+| 1024 | 64 / 64 | 64 | 0.50 / 1.48 / 4.80 / 13.74 | 128/128: 0.71 / 2.38 / 7.73 / 21.89 |
+| 2048 | 128 / 128 | 128 | 1.22 / 2.95 / 8.54 / 23.59 | 64/64: 1.67 / 4.12 / 11.97 / 32.64 |
+| 4096 | 128 / 128 | 128 | 4.21 / 7.70 / 19.12 / 49.87 | 64/64: 4.97 / 9.14 / 22.56 / 58.86 |
+| 8192 | 128 / 128 | 128 | 12.28 / 17.86 / 36.47 / 87.06 | 64/64: 18.85 / 27.30 / 54.49 / 127.24 |
+
+* **Compute config of the sp1 global op: HiFi4, `fp32_dest_acc_en=True`, `math_approx_mode=False`** (the existing
+  `sdpa_prefill_fp32` role; the op is window-free, so the legacy kernel's window-mask bug does not apply). The
+  `sdpa_prefill` role (bf16 dest) accumulates the 576-wide QK^T in bf16 and misses the bar everywhere (§12.3).
+* **Alignment.** A start must be a multiple of q and k (§12.3, negative control). With the table, `A(C) = 64` for
+  C <= 1024 and 128 for C >= 2048 (C = 128 may use 32/64 instead, A = 64, at +7 % attention time for s >= 2048, to
+  avoid recomputing 64 rows behind 64-granular prefix hits; 64/64 costs +18-19 %). The planner resolves `c0 = floor(s / A(C)) * A(C)` with C the bucket of `e - c0`
+  (A is monotone in C, so at most one re-plan). A uniform A = 128 with the same (q, k) per bucket is also valid (64/64
+  serves 128-aligned starts) at up to 127 recomputed rows.
+* **vLLM:** `--max-num-batched-tokens 8064 --long-prefill-token-threshold 8064` (lead decision 4: threshold = budget).
+  8064 = 8192 - 128 keeps every span `e - c0 <= 8064 + 127 = 8191` inside the 8192 bucket, and lone-request chunk ends
+  are multiples of 128, so they need no recompute. (8128 would be correct only if every bucket had A = 64.)
+* **SDPA page table** `[1, 640]` (A = 64 starts like 8256 verified), padded with block 0; fill tables `[1, C/64]` with
+  -1 (G11). The flexible start has **no device-side check**: a start of 96 with q = 64 silently answered as start 64
+  (PCC 0.99924 vs the floored golden, 0.869 vs the intended one), so the generator must assert `start % q == 0` and
+  `start % k == 0` before every sp1 call (design R6).
+* **SWA sp1 (S-A):** tail = two tensor-args slices (one `[4]` start / end pair per tail block, shared by all SWA layers)
+  -> `concat(dim=2)` in bfp8 -> typecast bf16 (16.3-16.5 us traced per layer; bf16-then-concat 18.4 us); square SDPA at
+  q/k 128/128 with the `sdpa_prefill` role (no fp32 acc with a window), rows `[128, 128+C)`.
+* **Offset RoPE:** `ttnn.embedding(idx [1, C] uint32, table [1,1,32768,64] RM, layout=TILE)` -> reshape `[1,1,C,64]`;
+  traced 5 / 51 / 198 us per kind (cos + sin) at C = 128 / 2048 / 8192, once per chunk.
+* **sp1 cost model (for `prefill_cost_table` / `prefill_plan.prefill_cost_model`).** Per global layer the measured time is
+  close to linear in the prefix: `t(C, s) = t0(C) + slope(C) * s` with, for the recommended (q, k), slope = 0.43 / 0.50 /
+  0.52 / 0.54 / 0.92 / 1.88 / 3.07 us per prefix key and t0 = 0.30 / 0.60 / 0.38 / 0.50 / 1.22 / 4.21 / 12.28 ms at
+  C = 128 / 256 / 512 / 1024 / 2048 / 4096 / 8192 (x 14 global layers per chunk). The current single constant
+  (`DEFAULT_SP1_ATTN_S_PER_ROW_KEY` = 6.5e-9 s per row-key for 14 layers) matches C >= 1024 (6.1-7.7e-9 measured) but
+  underestimates short chunks behind long prefixes (C = 512: 1.5e-8, C = 256: 2.9e-8, C = 128: 4.8e-8), where the op is
+  bound by K / V streaming, not FLOPs. sp0 chunks keep the draft-1 table.
+
+**KVW (`tt/kv_write.py`), WP5:** G13a passed, so the `all_split` integration may start. Recipe (per layer, before
+FlashMLA): `g = ccl.ag_dp_rows(kv_row [1,1,8,576])` -> `transpose(g, 1, 2, memory_config=32-core HEIGHT_SHARDED [32,576])`
+-> `paged_update_cache(cache, u, update_idxs_tensor=cur_a [32], page_table=pt_all [32,W])` -> the same with `cur_b`
+(all -1 in ordinary steps, 0.2 us). Measured parts (traced): AG(dp) of `[8,576]` 24.0 us (latency-bound; the DP axis is
+a line under TORUS_Y), gather + transpose to the sharded layout 31.9 us, 32-lane update 6.5 us. The sharded alternative
+(`all_gather(dim=1)` of the 8-core sharded `[1,8,1,576]` straight into the 32-core layout) costs the same (31.8 us,
+bitwise-identical results); the DRAM-AG variant is slower (35.7 us). With a **bf16 KV cache** issue the 32 lanes as two
+16-lane calls per kind (the op's output CB is `B x Wt` tiles per core, §12.6). FlashMLA keeps the per-row
+`cur_pos [8]` / `page_table [8, W]`.
+
+**WP4/WP5, plugin:** packed partners on other DP rows are valid only with KV-R (negative control §12.7); with
+`row_split` (no APC) they must stay on the owner's row. Lane relocation is bitwise at the FlashMLA level (R5 evidence;
+G-S5 still owns the full-model probe).
+
+### 12.3 G9 — resumed global attention (`test_g9_resumed_global_attn.py`)
+
+**Setup.** One virtual 32,640-token latent sequence (random N(0,1), bfp8-quantized on the host) in a shuffled
+`[520, 1, 64, 576]` bfp8 cache (block 0 = null). Q `[1,10,C,576]` = N(0,1) x 0.1447 in bf16 (the global softmax scale
+folded into q, op `scale=1.0`). Persistent page table `[1,640]` (real ids for `[0, cdiv(s+C, 64))`, then 0) and start
+`[1]`, rewritten with `copy_host_to_device_tensor` like the generator will. Golden: fp32 causal latent attention with
+V = K over keys `[0, s+i]` (all rows for C <= 2048, ~2.3K sampled rows incl. every 256-row seam for C >= 4096). Cases:
+C in {128, 256, 512, 1024, 2048, 4096, 8192} x s in {128, 2048, 8192, 24448} (+ s = 8256 for the A = 64 configs) x
+(q, k) in {64/64, 128/128} (+ 32/64 at C = 128) x role in {fp32acc, bf16acc}: 2 x 68 cases.
+
+**Accuracy** (PCC on columns `[:512]`; worst = worst query row over 10 heads x 512):
+
+| Role | Min PCC | Max PCC | Worst row | Bar (PCC >= 0.999, target 0.9995, worst row >= 0.998) |
+|---|---|---|---|---|
+| fp32acc (HiFi4, fp32 dest; legacy kernel) | 0.999827 (C 8192, s 24448, 64/64) | 0.999994 | 0.99965 | **pass, target met in all 68 cases** |
+| bf16acc (`sdpa_prefill`: HiFi4, bf16 dest; streaming kernel) | 0.997834 | 0.999126 | 0.98784 | **fail in all 68 cases** (PCC reaches 0.999 only at s = 128, where the worst row is 0.997) |
+
+PCC falls slowly with the prefix (fp32acc: 0.99999 at s = 128, 0.99983-0.99989 at s = 24448). The k_pe columns track
+the latent ones. The bf16-dest loss comes from accumulating QK^T over 18 tiles (576 dims) in a bf16 destination, three
+times the 192-dim expanded case G2 validated; a bf16 latent cache does not help (0.99794 at C 2048 / s 8192, both
+configs). Non-finite values: 0. Replicas: bitwise identical (checked on 3-5 chips per configuration).
+
+**Mechanism** (both roles, every (C, q, k)): program cache **+1 over all starts**, **+0 for the trace**; a trace
+captured at s = 128 replayed at every other start (start and page table rewritten in place) is **bitwise equal to
+eager**. No configuration of either role hit an L1 / static-CB limit.
+
+**Cost** (fp32acc, eager ms per call; §12.2 has the full table): at short prefixes the op is FLOP-bound (C 8192 at
+s 128: 12.3 ms, 65 TFLOP/s per chip); at long prefixes it is bound by K / V streaming (every (head, q-chunk) work unit
+reads its whole prefix, no sharing in causal mode, design R10: at s = 24448 the time hardly depends on C between 256 and
+1024), and the better q chunk is an empirical function of C: 64/64 for C = 256-1024 (1.6-1.7x faster than 128/128 at
+s >= 2048), 128/128 for C = 128 (1.2x) and C >= 2048 (1.2-1.46x). bf16acc is faster at 128/128 (e.g. C 8192 / s 24448:
+69.5 vs 87.1 ms) but fails accuracy; at 64/64 the two roles cost about the same.
+
+**Comparison ops:**
+
+| Item | Result |
+|---|---|
+| K = V op vs `chunked_flash_mla_prefill` (scalar start, one program per start), same role (bf16acc) | latent columns **bitwise equal**; time ratio 1.026-1.070 over (C, s) in {(128, 24448), (512, 8192), (2048, 8192), (2048, 24448), (8192, 8192), (8192, 24448)} x both (q, k). Kill criterion (> 1.5x at C 2048 / s 8192) not met: 1.03 (128/128), 1.06 (64/64) -> **no G9b** |
+| draft-1 expanded global SDPA (sp0, q/k 256/256) | 0.22 / 0.22 / 0.47 / 3.85 ms eager at C = 128 / 512 / 2048 / 8192 (traced 0.027 / 0.16 ms at 128 / 512); the absorbed sp1 op costs ~3.2x at C 8192 even at s = 128 (FLOPs 576 + 576 vs 192 + 192) |
+| negative control: start 96 with q = 64 | detected: PCC 0.869 vs the intended start, 0.99924 vs the floored start 64 (the kernels use `start // q_chunk`) |
+| negative control: page table shifted by one block | detected: PCC 0.968 |
+
+**Impact on the design's estimates [I, from the table]:** a 32K prompt in 8064-token chunks spends about 200 ms per
+global layer in sp1 attention (chunks at s = 8064, 16128, 24192 plus a 512-row tail at 32256) instead of 88.8 ms
+single-shot, i.e. **+1.6 s** over 14 layers on 23.4 s (+7 %); a 128-row suffix behind a 24K hit costs ~10.8 ms per
+global layer (~0.15 s per chunk), consistent with design §8's 0.8-0.9 s TTFT for a 30K document + short question.
+
+### 12.4 G10 — SWA tail (`test_g10_swa_tail.py`)
+
+**(a) Tail gather** on a random `[4129, 1, 64, 576]` bfp8 cache (the serving pool size): `ttnn.slice(cache, start [blk,0,0,0],
+end [blk+1,1,64,576], slice_dim=0, num_devices=4129)` with persistent `[4]` int32 bounds.
+
+| Check | Result |
+|---|---|
+| blk in {1, 2, 2063, 4127, 4128, 2937, 2297, 317}, eager | bitwise equal to the host block on chips 0 / 13 / 31 (never equal to the neighbour) |
+| programs over all block ids | +1 |
+| one slice captured, replayed with rewritten bounds | bitwise |
+| tail = 2 slices -> concat(dim 2) -> bf16, 5 block pairs incl. (4127, 4128), (4128, 1), eager and traced | bitwise; **16.3-16.5 us traced** (concat in bfp8, then typecast), 18.4 us (typecast first); 0.61 / 0.72 ms eager (4 dispatches) |
+
+**(b) Square windowed SDPA** (`Q_cat [1,10,128+C,192]` rows < 128 zero, `K_cat / V_cat [1,2,128+C,192]` = keys
+`[s-128, s+C)`, causal, window 129, q/k 128/128, `sdpa_prefill`), random N(0,1) data (q x 0.0722), V zero-padded
+128 -> 192:
+
+| C | s | PCC square vs fp32 window attention | square vs draft-1 single shot rows [s, s+C) |
+|---|---|---|---|
+| 128 | 128 / 4096 / 30720 | 0.99970 / 0.99973 / 0.99971 | **bitwise equal** (all three) |
+| 1024 | 128 / 4096 / 30720 | 0.99971 / 0.99972 / 0.99972 | **bitwise equal** |
+| 8192 | 128 / 4096 / 24576 | 0.99972 / 0.99972 / 0.99972 | **bitwise equal** |
+
+Bitwise equality holds because `s - 128` is a multiple of the 128-key chunk, so both layouts visit the same K chunks in
+the same order. **Probes** (chunk rows {0, 1, 63, 64, 127, C-1}; orthonormal query directions; key p-128 = +1,
+p-129 = -1 with a larger score, p+1 = +3 with the largest score, each in its own 16 value dims): every row outputs
++1 within 1e-3 at C = 128 / 1024 / 8192; window 128 (p-128 lost) and window 130 (p-129 leaks) are both detected.
+**Cost** (eager): square 0.28 / 0.23 / 0.59 ms vs the draft-1 C-row SDPA 0.10 / 0.10 / 0.49 ms at C = 128 / 1024 /
+8192; the small-C ratios are dispatch-bound, at C = 8192 the square call costs 1.2x.
+
+### 12.5 G11 — chunk I/O (`test_g11_chunk_io.py`)
+
+**(a) Fills** into a random `[520, 1, 64, 576]` bfp8 cache, x pre-quantized (exact expectation), 14 cases:
+
+| C | Tables (skipped blocks) | Result |
+|---|---|---|
+| 128 | all real (0), leading -1 (1), trailing -1 (1), mixed (2) | bit-exact |
+| 2048 | all real, leading (8), trailing (8), mixed (5), 4-row packed (10) | bit-exact |
+| 8192 | all real, leading (32), trailing (32), mixed (5), 4-row packed (10) | bit-exact |
+
+Checked on chips 0 / 13 / 31 after every fill (written blocks exact, -1 blocks and all other blocks unchanged) and on all
+32 chips at the end. Eager 0.29 ms per fill at every C (dispatch-bound). The fill page-table width is C/64 (2 entries at
+C = 128 work; the stick is padded by the buffer alignment).
+
+**(b) Offset RoPE**, C in {128, 2048, 8192} x c0 in {0, 128, 24576, 32704} (the last clamps to row 32767) x {yarn,
+plain}: gathered tables bitwise equal to the host rows on chips 0 and 31; `rotary_embedding_hf` (rope role) PCC
+0.999997-0.999998 for q_pe `[1,10,C,64]` and k_pe `[1,1,C,64]`; at c0 = 0 bitwise equal to the draft-1 path (TILE
+tables uploaded from the host); 3 programs for the first case per C, **0** for the other 7 offsets / kinds and for the
+trace; gather + rotary captured at c0 = 128 and replayed at every c0: bitwise equal to eager.
+
+### 12.6 G12 — spec KV aliasing (`test_g12_spec_kv_alias.py`)
+
+**Layout.** 32 lanes, 8 blocks each; per DP row: owners in slots 0-2 at `p` with `p % 64` cycling through
+{0, 30, 31, 62, 63}, partners in slots 4-6 at `p + 1` with the owner's page-table row, a plain lane (slot 3), an idle lane
+(slot 7, -1). "row": partners on the owner's DP row, per-row tensors (`row_split`). "all": replicated 32-lane tensors,
+the partner of owner (r, k) on row r + 1 (`all_split`, needs KV-R). Rows pre-quantized; the whole cache compared on all
+32 chips (each chip against its row's expectation).
+
+| Case | bfp8 | bf16 |
+|---|---|---|
+| A/B split, 8-lane per row | **bit-exact, 32 chips** | **bit-exact, 32 chips** |
+| A/B split, 32-lane gathered | **bit-exact, 32 chips** | one 32-lane call: **TT_THROW** (static CB region ends at 1,516,576 B, the sharded input sits at 1,466,368 B); as **2 x 16-lane calls: bit-exact** |
+| single call, 6 trials, 8-lane (row 0) | lost 2-3 updates in every trial (3 runs) | lost 2-3 in every trial |
+| single call, 6 trials, 32-lane | lost 10-13 in every trial (3 runs) | (not run: see above) |
+
+Every lost update is on a same-tile pair (`p % 64` in {0, 30, 62}); never on 31 (tile seam), 63 (block seam) or a plain
+lane. A pair can lose both rows (the 18 tile writes of the two cores interleave), which is why the 32-lane count can exceed
+the 8 same-tile pairs. The split is mandatory: the race fired in every trial.
+
+**bf16 limitation.** `paged_update_cache_program_factory.cpp` sizes the output CB as `num_output_tiles = B * Wt` per
+core (B = users of the call): 32 x 18 tiles x 2048 B = 1.18 MB for a bf16 cache (627 KB for bfloat8_b). A bf16 KV cache
+(`MOTIF3_KV_CACHE_DTYPE=bf16`) under KV-R must therefore split each 32-lane call into <= 16-lane calls.
+
+**FlashMLA with partner rows** (G1 config: k_chunk 128, `max_cores_per_head_batch` 16, HiFi4 + fp32 acc), after the
+split write:
+
+| Check | row_split SWA / global | all_split SWA / global |
+|---|---|---|
+| probes (12 pairs): owner outputs 0 in V dims [:256] and 1 in [256:] (sees k_p, not k_{p+1}), partner 1.5 and 0.5 (sees both) | all ok / all ok | all ok / all ok |
+| random data, PCC vs fp64 on the expected cache: overall / worst user | 0.99986 / 0.99979 ; 0.99990 / 0.99975 | 0.99984 / 0.99977 ; 0.99992 / 0.99985 |
+| lane relocation (every user to another lane on another DP row, same query / position / page-table row) | - | **bitwise, 28 / 28 users** (SWA and global) |
+
+The design's per-user bar (0.9999) is below the kernel's own floor (G1: worst SWA user 0.99978 with fp32 acc, without
+partners); the gate uses overall >= 0.9998 and worst user >= 0.9995, and the relocation result shows partner rows compute
+exactly what an ordinary row computes.
+
+### 12.7 G13a — KV-R at op level (`test_g13_kv_replicated_decode.py`)
+
+**Variants** (per layer, then FlashMLA on the per-row `cur_pos [8]` / `page_table [8, W]`): `row` (draft 1), `row_split`
+(spec, no APC), `all` (APC, one 32-lane call), `all_split` (production: two 32-lane calls), `all_split_sag` (sharded
+all-gather), `all_split_dag` (DRAM all-gather), `deferred` (§3.12.3: `row_split` per layer, then one all-gather of the
+54 staged latents and 54 x 2 remote updates).
+
+**Correctness** (3 layer caches `[520,1,64,576]` bfp8; ordinary step and verify step with owners at n and partners at
+n + 1, cross-row partners for the KV-R variants):
+
+| Check | Result |
+|---|---|
+| caches vs the expected writes (layer 0 on all 32 chips, the others on one chip per row; a diagnostic re-run checked every chip of every layer for `all_split` and `all_split_dag`) | **bit-exact** for every variant and step (KV-R: all 32 lanes on every chip; row modes: each row its own) |
+| trace replay vs eager (caches and FlashMLA outputs) | **bitwise** for every variant |
+| FlashMLA vs fp64 golden, worst user | 0.99977-0.99980 (kernel floor) |
+| FlashMLA of `all_split_sag` / `all_split_dag` vs `all_split` (active lanes; idle lanes' rows are never written) | bitwise |
+| negative control: `row_split` with cross-row partners | detected: partner PCC min 0.404, median 0.923 (stale anchor on the partner's row) |
+
+**Cost** (54-layer trace: per layer the KV write, FlashMLA (14 global + 40 SWA), the `wo` AR(tp) `[1,1,8,4096]`;
+caches `[4129,1,64,576]`, W = 512; replay + sync min of 9; the 235 us sync floor cancels in the deltas):
+
+| Variant | step ctx 1K (us) | step ctx 8K (us) | delta vs `row` 1K / 8K (ms) | per layer (us) | trace bytes |
+|---|---|---|---|---|---|
+| `row` (draft 1) | 4308 | 5771 | 0 / 0 | 0 | 3.87 MB |
+| `row_split` | 4497 | 5964 | 0.19 / 0.19 | 3.5 | 3.93 MB |
+| `all` | 5865 | 7345 | 1.56 / 1.57 | 28.8-29.1 | 4.19 MB |
+| **`all_split`** | 6176 | 7656 | **1.87 / 1.89** | **34.6-34.9** | 4.33 MB |
+| `all_split_sag` | 6212 | 7674 | 1.90 / 1.90 | 35.2 | 4.19 MB |
+| `all_split_dag` | 6378 | 7851 | 2.07 / 2.08 | 38.3-38.5 | 4.33 MB |
+| `deferred` | 5663 | 7128 | 1.35 / 1.36 | 25.1 | 4.72 MB |
+
+Verify steps (call B active for 12 partners) cost the same as ordinary ones (8K: `all_split` 7475 us, `row_split` 5854 us).
+Gate: `all_split` +1.89 ms <= 2.0 ms (**pass**, 0.11 ms margin); the §3.12.3 target (<= 1.0 ms) is not reached by
+the deferred variant either (1.36 ms: its 54 x (slice, transpose, 2 updates) tail costs ~25 us per layer). The design's
+estimate (30-35 us per layer, 1.6-1.9 ms per step) holds at its upper end; that is ~2.2 % of the 83.8 ms decode step.
+
+**Serving order / L1** (caches `[4129,...]`): prefill 8K (sp0 global SDPA 256/256, sp0 SWA SDPA, fill, sp1 latent SDPA at
+128/128 and 64/64 in both compute roles, incl. G9's fp32-acc legacy kernel, sp1 square SWA) -> `all_split` decode (54 layers) eager compile, capture, 3 replays -> the prefills
+again -> 3 replays -> prefills: **no static-CB clash, prefill outputs bitwise equal to the first run, 0 programs after
+the capture**, main-L1 allocator bytes unchanged by the KV-R programs (the all-gather semaphores sit in L1_SMALL), decode
+trace 4.1 MiB for the proxy.
+
+### 12.8 Open issues and requests
+
+1. **G9 role and configs (WP1 / WP2):** the sp1 global op needs `sdpa_prefill_fp32` (fp32 dest acc), not
+   `sdpa_prefill`. Requests to WP1 (`tt/model_config.py`, `tt/prefill_plan.py`, `tt/generator_api.py`):
+   `SP1_GLOBAL_CHUNKS = ((128, (128, 128)), (1024, (64, 64)), (32768, (128, 128)))` (§12.2), the docstring of
+   `resumed_prefill_pc("global", C)` pairing it with the `sdpa_prefill_fp32` role, `prefill_resume_alignment` then = 128
+   (its lcm over all buckets; a per-bucket A is an optional refinement), `generator_api.DEFAULT_PREFILL_ALIGNMENT` = 128,
+   and the per-bucket sp1 cost model above instead of the single row-key constant. Request to WP2 (`tt/attention.py`):
+   use that role (and `resumed_prefill_pc`) in the sp1 global path and assert `start % q == 0 and start % k == 0`.
+2. **vLLM budget (WP6 / WP8):** 8064 / threshold 8064 (not 8128). TIS `LLM_YAML` and `check_scheduler_config` should use
+   these values.
+3. **KV-R margin (KVW / WP5):** 1.89 ms of the 2.0 ms budget at op level. The full-model G13b will add whatever L1 / CCL
+   interplay the proxy lacks; if it lands above 2 ms, the measured cheaper path is deferred KV-R (1.36 ms; partners on
+   the owner's row). Not measured [I]: riding the MoE token gather (`ag_dp_rows` of `[8, 4096 + 576]`) would save most
+   of the 24 us KV all-gather in the 51 MoE layers, also with partners on the owner's row. The 32-lane update's static
+   CBs are ~0.9-1.1 MB per core with a bfp8 cache [I: from the program factory's CB formulas; the output CB alone is
+   627 KB]: an L1 buffer kept live above that on the update cores (e.g. mHC's decode L1 intermediates) would clash, and
+   only G13b in the real decode can show it.
+4. **bf16 KV cache + KV-R (KVW):** split the 32-lane write into two 16-lane calls (G12); upstream improvement: size
+   `paged_update_cache`'s output CB per core (`Wt`), not `B x Wt`.
+5. **Upstream ttnn notes:** the flexible chunked SDPA start has no device-side alignment check (silent wrong answer);
+   the streaming SDPA kernel's bf16 destination is inadequate for 576-wide heads.

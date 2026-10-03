@@ -17,6 +17,13 @@ against the reference: the C2 golden state after layer 3 (A, C: real C2 prompts)
 tokens), each through the reference head (mean -> RMSNorm -> lm_head). Decode is teacher-forced (the next input token
 is the prompt's own next token).
 
+``test_serving_order_spec`` runs the same serving order on a SPECULATING launch (MTP layer, spec_tokens = 1, prefix
+caching -> KV-R ``all_split``; features design §3.8, G-S6): ordinary spec steps, verify steps whose draft is the
+prompt's own next token (teacher forced: both the anchor row at ``n`` and the draft row at ``n + 1`` are checked
+against the CPU reference; the draft row's logits through the generator's ``spec_observer``), a prefill (bucket 2048)
+between verify steps, the stale page-table tail, an overflow pass (29 more requests: no idle lane), the re-prefill
+bitwise check, and no program compiled after the capture.
+
 Run::
 
     scripts/devrun.sh -t 2400 -n serving_order -- python -m pytest models/demos/motif3/tests/test_serving_order.py \
@@ -71,6 +78,25 @@ class RefHead:
         return torch.nn.functional.linear(self.norm(streams.to(torch.bfloat16).mean(dim=1)), self.lm).float()
 
 
+_REF_B = {}
+
+
+def reference_states_b(ids_b):
+    """The CPU reference prefix model (layers 0-3, bf16 = the C2 numerics) on the long prompt B: streams after layer 3
+    ``[S, 4, 4096]`` (computed once per module run)."""
+    key = tuple(ids_b)
+    if key not in _REF_B:
+        from models.demos.motif3.reference.weights import load_reference_model
+
+        t0 = time.time()
+        ref_model = load_reference_model(layer_ids=tuple(range(N_LAYERS)), dtype=torch.bfloat16, lazy_experts=True)
+        _, xb = ref_model.model(torch.tensor([ids_b]), return_streams=True)  # streams after layer 3 [1, S, 4, 4096]
+        _REF_B[key] = xb[0].contiguous()
+        del ref_model, xb
+        print(f"[serving] CPU reference for the {len(ids_b)}-token prompt B in {time.time() - t0:.1f} s")
+    return _REF_B[key]
+
+
 class _Req:
     def __init__(self, name, ids, S, lane, blocks, states):
         self.name, self.ids, self.S, self.lane, self.blocks, self.states = name, ids, S, lane, blocks, states
@@ -107,14 +133,7 @@ def test_serving_order(mesh_device, device_params):
 
     # ---- the long prompt B and its CPU reference (layers 0-3, bf16 = the C2 numerics) ---------------------------------
     ids_b = prompts["en_technical"].ids + prompts["math_word_problem"].ids  # 1420 tokens
-    t0 = time.time()
-    from models.demos.motif3.reference.weights import load_reference_model
-
-    ref_model = load_reference_model(layer_ids=tuple(range(N_LAYERS)), dtype=torch.bfloat16, lazy_experts=True)
-    _, xb = ref_model.model(torch.tensor([ids_b]), return_streams=True)  # streams after layer 3 [1, S, 4, 4096]
-    states_b = xb[0].contiguous()
-    del ref_model, xb
-    print(f"[serving] CPU reference for the {len(ids_b)}-token prompt B in {time.time() - t0:.1f} s")
+    states_b = reference_states_b(ids_b)
 
     settings = api.GeneratorSettings(max_batch_size=api.NUM_LANES, max_seq_len=MAX_MODEL_LEN, num_layers=N_LAYERS,
                                      weights_path=str(DEFAULT_WEIGHTS_DIR), block_size=BLOCK)
@@ -229,6 +248,187 @@ def _serving_order_body(gen, mesh_device, api, prompts, golden3, head, ids_b, st
     pccs = [p for _, p, _ in log]
     print(f"[serving] {len(log)} logits rows: pcc min {min(pccs):.6f} mean {sum(pccs) / len(pccs):.6f}; top-1 "
           f"{sum(t for *_, t in log)}/{len(log)}")
+    return failures
+
+
+# ============================================================================================================
+# the same serving order on a speculating launch (the T32-spec trace: ordinary, verify and overflow steps)
+# ============================================================================================================
+@pytest.mark.timeout(2400)
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+@torch.no_grad()
+def test_serving_order_spec(mesh_device, device_params):
+    """The serving order on a speculating launch (module docstring): every anchor row's logits AND every draft row's
+    logits (the packed partner or the overflow pass, at ``n + 1``) vs the CPU reference (layers 0-3) at PCC >= 0.99;
+    the device argmax equals the host argmax of the returned logits; the stale page-table tail leaves A's and B's
+    blocks bitwise unchanged; a re-prefill is bitwise equal; the program cache never grows after the capture."""
+    from models.demos.motif3.reference import golden_stream as gs
+    from models.demos.motif3.tt import generator_api as api
+    from models.demos.motif3.tt.ccl import log_fabric
+    from models.demos.motif3.tt.generator import MotifGenerator
+    from models.demos.motif3.tt.model_config import DEFAULT_WEIGHTS_DIR
+    from models.demos.motif3.tt.weights import HFWeightLoader
+
+    try:
+        src = HFWeightLoader()
+    except FileNotFoundError as e:
+        pytest.skip(f"no local checkpoint: {e}")
+    if not all(src.layer_available(l) for l in range(N_LAYERS)):
+        pytest.skip("checkpoint layers 0-3 are not local")
+    if not gs.state_path(GOLDEN_DIR, N_LAYERS - 1).is_file():
+        pytest.skip("C2 golden state after layer 3 missing")
+    log_fabric(mesh_device, "serving_order_spec")
+    prompts = {p.name: p for p in gs.load_prompt_set(GOLDEN_DIR / "prompts.json")}
+    golden3 = {k: v[0] for k, v in gs.load_tensors(gs.state_path(GOLDEN_DIR, N_LAYERS - 1))[0].items()}
+    head = RefHead(src)
+    ids_b = prompts["en_technical"].ids + prompts["math_word_problem"].ids  # 1420 tokens
+    states_b = reference_states_b(ids_b)
+    settings = api.GeneratorSettings(
+        max_batch_size=api.NUM_LANES, max_seq_len=MAX_MODEL_LEN, num_layers=N_LAYERS,
+        weights_path=str(DEFAULT_WEIGHTS_DIR), block_size=BLOCK, chunked_prefill=True, prefix_caching=True,
+        max_num_batched_tokens=1984, long_prefill_token_threshold=1984, spec_tokens=1,
+    )  # fmt: skip
+    gen = MotifGenerator.create(hf_config=None, mesh_device=mesh_device, settings=settings)
+    try:
+        assert gen.spec_launch and gen.serving_path == ("spec", "all_split")
+        failures = _serving_order_spec_body(gen, mesh_device, api, prompts, golden3, head, ids_b, states_b)
+    finally:
+        gen.close()
+    assert not failures, "\n".join(failures)
+
+
+def _serving_order_spec_body(gen, mesh_device, api, prompts, golden3, head, ids_b, states_b) -> list:
+    pool = gen.allocate_kv_cache(num_blocks=NUM_BLOCKS, block_size=BLOCK, num_layers=N_LAYERS)
+    W = math.ceil(MAX_MODEL_LEN / BLOCK)
+    gen.warmup_prefill(kv_cache=pool, enable_trace=False)
+    gen.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
+    gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=W)
+    pc0 = mesh_device.num_program_cache_entries()
+    free_blocks = list(range(1, NUM_BLOCKS))
+    failures, log, live = [], [], {}
+    phys = []
+    gen.spec_observer = lambda plan, i, out: phys.append((plan, i, out))
+    gen.observe_logits = True
+
+    def new_req(name, ids, S, lane, states):
+        blocks = [free_blocks.pop(0) for _ in range(math.ceil((S + 16) / BLOCK))]
+        return _Req(name, ids, S, lane, blocks, states)
+
+    def check(tag, ref_logits, got):
+        st = stats(ref_logits, got.float())
+        top1 = int(got.float().argmax()) == int(ref_logits.argmax())
+        log.append((tag, st["pcc"], top1))
+        print(f"[serving-spec] {tag}: logits pcc={st['pcc']:.6f} top-1 {'ok' if top1 else 'DIFF'}")
+        if not st["pcc"] >= LOGIT_PCC_MIN:
+            failures.append(f"{tag}: {st}")
+
+    def prefill(req, tag, stale_tail=()):
+        pt = torch.zeros(W, dtype=torch.int32)
+        own = math.ceil(req.S / BLOCK)
+        pt[:own] = torch.tensor(req.blocks[:own], dtype=torch.int32)
+        if stale_tail:
+            pt[own:] = torch.tensor(list(stale_tail), dtype=torch.int32).repeat(W)[: W - own]
+        logits = gen.prefill_forward(
+            api.PrefillRequest(lane=req.lane, tokens=torch.tensor(req.ids[: req.S], dtype=torch.int32), page_table=pt),
+            kv_cache=pool,
+        )
+        if req.states is not None:
+            check(f"{tag} prefill S={req.S}", head(req.states[req.S - 1 : req.S].float())[0], logits)
+        return logits
+
+    def step(tag, verify, checked=None):
+        """One spec step for every live request (teacher forced: the anchor is the prompt's token at its position, the
+        draft (verify) its next token); the anchor rows and the draft rows (n + 1) vs the reference."""
+        checked = live if checked is None else checked
+        tokens = torch.zeros(api.NUM_LANES, dtype=torch.int32)
+        pos = torch.full((api.NUM_LANES,), -1, dtype=torch.int32)
+        draft = torch.full((api.NUM_LANES,), -1, dtype=torch.int32)
+        table = torch.zeros(api.NUM_LANES, W, dtype=torch.int32)
+        for r in live.values():
+            tokens[r.lane], pos[r.lane] = r.ids[r.pos], r.pos
+            table[r.lane, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.int32)
+            if verify and r.name in checked:
+                draft[r.lane] = r.ids[r.pos + 1]
+        phys.clear()
+        res = gen.decode_forward_spec(
+            api.SpecDecodeBatch(tokens=tokens, positions=pos, draft_tokens=draft, page_table=table), kv_cache=pool,
+            enable_trace=True, want_logits=True,
+        )  # fmt: skip
+        plan = phys[0][0]
+        for r in live.values():
+            if r.name not in checked:
+                r.t += 1
+                continue
+            got = res.logits[r.lane]
+            if int(res.argmax[r.lane, 0]) != int(got.float().argmax()):
+                failures.append(f"{tag} {r.name}: device a0 != host argmax of the logits")
+            check(f"{tag} anchor {r.name}@lane{r.lane} pos {r.pos}", head(r.states[r.pos : r.pos + 1].float())[0], got)
+            if verify:
+                if r.lane in plan.partner_of:
+                    k, lane = 0, plan.partner_of[r.lane]
+                else:
+                    k, lane = 1, r.lane
+                row = phys[k][2]["logits"][lane]
+                where = f"partner lane {lane}" if k == 0 else "overflow pass"
+                check(f"{tag} draft {r.name} pos {r.pos + 1} ({where})",
+                      head(r.states[r.pos + 1 : r.pos + 2].float())[0], row)  # fmt: skip
+                if int(res.argmax[r.lane, 1]) != int(row.float().argmax()):
+                    failures.append(f"{tag} {r.name}: a1 != host argmax of the draft row")
+                r.t += 2
+            else:
+                r.t += 1
+        return plan
+
+    pa = prompts["chat_default"]
+    A = new_req("A", pa.ids, len(pa.ids) - 13, 0, golden3[pa.name])
+    logits_a = prefill(A, "A")
+    live["A"] = A
+    step("A ordinary", False)
+    step("A ordinary", False)
+    step("A verify", True)
+    B = new_req("B", ids_b, len(ids_b) - 10, 9, states_b)
+    prefill(B, "B (global layer 0 at bucket 2048 after spec steps)")
+    live["B"] = B
+    for _ in range(2):
+        plan = step("A+B verify", True)
+    pc = prompts["python_code"]
+    C = new_req("C", pc.ids, len(pc.ids) - 6, 17, golden3[pc.name])
+    others = A.blocks + B.blocks
+    kv_before = kv_blocks(pool, others)
+    prefill(C, "C (stale tail: A's and B's live block ids past C's own blocks)", stale_tail=others)
+    intact = all(torch.equal(a, b) for a, b in zip(kv_before, kv_blocks(pool, others)))
+    print(f"[serving-spec] A's and B's KV blocks after C's prefill with a stale tail: bitwise unchanged {intact}")
+    if not intact:
+        failures.append("prefill C wrote through stale page-table entries into A's / B's KV blocks")
+    live["C"] = C
+    # 29 filler requests (no reference): every lane busy, so the drafts of A, B and C run in the overflow pass
+    lanes = [l for l in range(api.NUM_LANES) if l not in (A.lane, B.lane, C.lane)]
+    pool_ids = [t for p in prompts.values() for t in p.ids]
+    for i, lane in enumerate(lanes):
+        f = new_req(f"fill{i}", pool_ids[37 * i : 37 * i + 110], 100, lane, None)  # 100 prompt + 10 decode tokens
+        prefill(f, f"filler {i}")
+        live[f.name] = f
+    plan = step("A+B+C verify, every lane busy", True, checked=("A", "B", "C"))
+    print(f"[serving-spec] overflow step: partners {plan.partner_of}, overflow {plan.overflow}, "
+          f"passes {len(plan.passes)}")
+    if sorted(plan.overflow) != sorted([A.lane, B.lane, C.lane]):
+        failures.append(f"expected A, B, C in the overflow pass, got {plan.overflow}")
+    for name in [n for n in live if n.startswith("fill")]:
+        live.pop(name)
+    A2 = new_req("A2", pa.ids, A.S, 25, golden3[pa.name])
+    logits_a2 = prefill(A2, "A' (A's prompt again, lane 25, new blocks)")
+    if not torch.equal(logits_a, logits_a2):
+        failures.append("re-prefill of A after spec steps differs from the first prefill")
+    live["A2"] = A2
+    step("A+B+C+A' ordinary", False)
+    step("A+B+C+A' verify", True)
+    pcc = [p for _, p, _ in log]
+    print(f"[serving-spec] {len(log)} logits rows: pcc min {min(pcc):.6f} mean {sum(pcc) / len(pcc):.6f}; top-1 "
+          f"{sum(t for *_, t in log)}/{len(log)}; program cache {pc0} -> {mesh_device.num_program_cache_entries()}; "
+          f"stats {gen.stats}")  # fmt: skip
+    if mesh_device.num_program_cache_entries() != pc0:
+        failures.append(f"programs compiled after the capture: {pc0} -> {mesh_device.num_program_cache_entries()}")
+    gen.spec_observer, gen.observe_logits = None, False
     return failures
 
 

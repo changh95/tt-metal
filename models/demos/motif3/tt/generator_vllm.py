@@ -3,8 +3,9 @@
 """vLLM bridge for Motif-3 on a Blackhole Galaxy: ``MotifForCausalLM`` (vllm-tt-plugin plain-class contract).
 
 This module is imported by vLLM's API server, by its registry-inspection subprocess and by EngineCore before the
-mesh is open (study 05 §2). Its import is device-free: it pulls in only the standard library, numpy, torch, loguru
-and ``generator_api``. vLLM, ttnn and the TT runtime are imported lazily, inside the methods that need them.
+mesh is open (study 05 §2). Its import is device-free: it pulls in only the standard library, numpy, torch, loguru,
+``generator_api`` and ``prefill_plan`` (torch-only). vLLM, ttnn, vllm-tt-plugin and the TT runtime are imported
+lazily, inside the methods that need them.
 
 Registration (design 00 §5.1; study 05 §3)
 ------------------------------------------
@@ -20,13 +21,27 @@ the bare name must come from ``TT_MODEL_CLASS_OVERRIDES``, which registers both 
     export PYTHONPATH=$TT_METAL_HOME                                                 # every process imports models.*
     export MESH_DEVICE="(4, 8)"  VLLM_ENGINE_READY_TIMEOUT_S=14400  HF_MODEL=<snapshot dir>  TT_CACHE_PATH=<cache>
 
-Launch flags (design 00 §5.1): ``--trust-remote-code --max-num-seqs 32 --block-size 64 --max-model-len 32768
---no-enable-prefix-caching --additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456,
-"fabric_config": "FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col", "l1_small_size": 32768}}'``
-(``generator_api.SERVING_TT_CONFIG`` / ``serving_additional_config()``). Never ``--tensor-parallel-size`` or
-``--disable-sliding-window``. Optional parsers: see ``models/demos/motif3/vllm_plugins``. ``--block-size`` must be 32
-or 64 (the sizes gates G1/G7 validated) and ``--max-model-len`` a multiple of 256 (the last prefill bucket is
-``max_model_len`` itself); both are refused in ``get_max_tokens_all_users``, before any weight is loaded.
+Launch flags
+------------
+Always (design 00 §5.1): ``--trust-remote-code --max-num-seqs 32 --block-size 64 --max-model-len 32768
+--additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456, "fabric_config":
+"FABRIC_2D_TORUS_XY", "dispatch_core_axis": "col", "l1_small_size": 32768}}'`` (``generator_api.SERVING_TT_CONFIG`` /
+``serving_additional_config()``). Never ``--tensor-parallel-size`` or ``--disable-sliding-window``. Optional parsers:
+see ``models/demos/motif3/vllm_plugins``. ``--block-size`` must be 32 or 64 (the sizes gates G1/G7 validated) and
+``--max-model-len`` a multiple of 256 (the last prefill bucket is ``max_model_len`` itself); both are refused in
+``get_max_tokens_all_users``, before any weight is loaded.
+
+Chunked prefill + prefix caching + MTP speculation (``docs/features/FEATURES_DESIGN.md`` §1.1;
+:data:`FEATURE_VLLM_ARGS`), with ``MOTIF3_PREFIX_CACHING=1 MOTIF3_CHUNKED_PREFILL=1 MOTIF3_SPEC_DECODE=1`` exported in
+the API server and EngineCore alike: ``--enable-chunked-prefill --max-num-batched-tokens 8128
+--long-prefill-token-threshold 8128 --enable-prefix-caching --speculative-config '{"method": "custom_class", "model":
+"vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}' --no-async-scheduling`` plus ``"tt":
+{..., "decode_interleave_prefill_steps": 1, "decode_interleave_decode_steps": 1}``. The budget and the threshold are
+``prefill_plan.recommended_budget(span cap 8192, A)`` = 8128 (A = 64; 8064 if gate G9 moves the large buckets to
+q/k 128). Honest benchmarks add ``--no-enable-prefix-caching`` (or a per-request ``cache_salt``); sampled traffic
+before the plugin's PS-1 (``SpecPlan.verify_requires_speculable_rows``) is installed, and evals that need logprobs or
+structured output, drop ``--speculative-config``. Features off (draft 1): ``MOTIF3_*=0``, or
+``--no-enable-chunked-prefill --no-enable-prefix-caching`` and no ``--speculative-config``.
 
 L1_SMALL (attention P0, ``generator_api.L1_SMALL_SIZE``): the plugin opens the mesh with the ``"l1_small_size"`` of the
 ``"tt"`` config (``vllm_tt_plugin/worker.py`` ``device_params_from_tt_config``) and with no L1_SMALL region when the key
@@ -41,19 +56,33 @@ order ``MotifTTConfig`` uses); the resolved path and the rule that matched are l
 
 What the plugin calls, and what this class does
 ------------------------------------------------
-* ``model_capabilities`` (class level, read before any instance exists): draft 1 declares no device sampling, no
-  prefix caching, no chunked prefill, no async decode, no speculative decoding, and ``supports_device_penalties:
-  False`` explicitly (the plugin's default for that key is True).
+* ``model_capabilities`` (class level, read before any instance exists, :func:`model_capabilities_from_env`): no
+  device sampling, no async decode, ``supports_device_penalties: False`` explicitly (the plugin's default for that key
+  is True); ``supports_prefix_caching`` / ``supports_chunked_prefill`` / ``supports_spec_decode`` follow the feature
+  switches ``MOTIF3_PREFIX_CACHING`` / ``MOTIF3_CHUNKED_PREFILL`` / ``MOTIF3_SPEC_DECODE`` (they only *allow* a
+  feature; vLLM's flags enable it). Speculation declares the model-owned drafter: ``spec_requirements``
+  ``(device_propose, hidden_feed)`` with ``spec_hidden_handoff`` ``(on_device,)``.
+* ``spec_plan`` (classmethod, config time, never raises): K = 1, packed verify (``lanes_per_request=2``), the MTP
+  latent cache as ``extra_bytes_per_token`` (612 B per chip in bfp8), ``supports_narrow_decode=True`` and, when the
+  installed plugin has it, ``verify_requires_speculable_rows=True`` (PS-1). Refuses K < 1, ``max_num_seqs > 32``,
+  any method but ``custom_class`` and a checkpoint without ``model.mtp_layers.0.*``.
 * ``get_max_tokens_all_users``: the usable KV pool (``MOTIF3_KV_POOL_TOKENS``, default 262,144) plus a 32-token
   reserve that makes the plugin allocate exactly one extra block for vLLM's null block, which upstream
-  ``get_num_available_blocks_tt`` does not budget (``vllm_tt_plugin/worker.py:553-675``; ``block_pool.py:190``).
+  ``get_num_available_blocks_tt`` does not budget (``vllm_tt_plugin/worker.py:553-675``; ``block_pool.py:190``). It
+  also captures vLLM's scheduler config (:func:`serving_config_of`) for ``initialize_vllm_model`` and runs the
+  fail-fast checks of features design §1.5 (:func:`check_serving_config`); the memory check counts the MTP layer.
 * ``get_kv_cache_spec``: one ``MLAAttentionSpec(num_kv_heads=1, head_size=576)`` per decoder layer, so the plugin's
   allocation hint is ``(num_blocks, 1, block_size, 576)`` instead of the default ``FullAttentionSpec(16, 192, sw=128)``.
+  The MTP layer's cache is model-owned (indexed by the same block ids) and is NOT a vLLM layer.
 * ``allocate_kv_cache[_per_layer]``: validates that hint and asks the generator for the latent pool.
-* ``prefill_forward`` / ``decode_forward``: translate vLLM rows and state slots into Motif lanes (``LaneMap``), zero
-  the stale block ids vLLM leaves past each request's blocks in reused block-table rows (a bucket-padded prefill would
-  otherwise overwrite another live request's KV), call the generator, and return host logits ``[B, 1, vocab]``
-  (draft 1 samples on the host).
+* ``prefill_forward``: translates vLLM rows and state slots into Motif lanes (``LaneMap``), zeroes the stale block ids
+  vLLM leaves past each request's blocks in reused block-table rows (a bucket-padded prefill would otherwise overwrite
+  another live request's KV), and makes ONE ``generator.prefill_forward_batch`` call with every row of the step (new,
+  resumed after a prefix hit, or a chunk continuation: ``PrefillRequest.start`` = vLLM ``num_computed_tokens``).
+* ``decode_forward``: an ordinary step returns host logits ``[B, 1, vocab]`` (host sampling); in a speculating launch
+  it runs ``generator.decode_forward_spec`` and a verify step (``[B, 2]`` block + ``num_valid_drafts`` /
+  ``accepted_counts`` / ``spec_mode="argmax_ids"``) returns ``VerifyOutput(argmax_ids [B, 2])``.
+* ``propose_draft_tokens``: host only; the drafts are the MTP predictions the last decode step already computed.
 * ``warmup_model_prefill`` / ``warmup_model_decode`` / ``release_request`` / ``release_persistent_capture``.
 
 Decode-reload contract v1, partial adapter (``vllm-tt-plugin/docs/DECODE_RELOAD_CONTRACT.md``): every decode must
@@ -63,18 +92,28 @@ carry ``reload_inputs=True`` (always the case without ``supports_async_decode``)
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
+import inspect
+import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from loguru import logger
 
+from . import prefill_plan
 from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL_BLOCK_RESERVE_TOKENS etc.)
+    DEFAULT_BLOCK_SIZE,
     DEFAULT_KV_POOL_TOKENS,
+    DEFAULT_PREFILL_ALIGNMENT,
+    DEFAULT_PREFILL_SPAN_CAP,
+    FEATURE_SWITCHES,
     KV_LATENT_DIM,
     KV_LORA_RANK,
     KV_POOL_ALIGNMENT,
@@ -83,25 +122,38 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     MAX_CONTEXT,
     MAX_KV_POOL_TOKENS,
     MESH_SHAPES,
+    MTP_LAYER_IDX,
     NULL_BLOCK_RESERVE_TOKENS,
+    NUM_DP_GROUPS,
     NUM_HIDDEN_LAYERS,
     NUM_LANES,
     QK_ROPE_HEAD_DIM,
     SERVING_TT_CONFIG,
     SUPPORTED_BLOCK_SIZES,
+    SUPPORTED_SPEC_TOKENS,
     DecodeBatch,
     GeneratorSettings,
     MotifGenerator,
     PrefillRequest,
+    SpecDecodeBatch,
+    SpecDecodeResult,
     cdiv,
     check_block_size,
+    check_generator_features,
     check_logits,
     check_max_model_len,
+    check_prefill_batch,
+    check_spec_result,
     check_tt_config,
+    feature_switch_from_env,
     kv_cache_bytes_per_chip,
     kv_cache_dtype_from_env,
     kv_pool_tokens_from_env,
+    kv_replicated_decode_from_env,
     plugin_num_blocks,
+    prefill_span_cap_from_env,
+    resolve_tt_cache_path,
+    resolve_weights_location,
     serving_additional_config,
 )
 
@@ -114,22 +166,310 @@ DEFAULT_GENERATOR_CLASS = "models.demos.motif3.tt.generator:MotifGenerator"
 DEFAULT_KV_MAX_GB_PER_CHIP = 16.0  # 34.2 GB DRAM - 14.2 GB weights - ~4 GB activations/trace/CCL (design 00 §1.1)
 REQUIRED_NUM_DEVICES = 32
 
-# The --block-size of the VllmConfig this process serves, as seen by ``get_max_tokens_all_users`` (which the plugin
-# calls in ``init_device`` inside ``set_current_vllm_config``). ``initialize_vllm_model`` runs later, in
-# ``load_model``, where vLLM sets no current config, so this is how the block size reaches GeneratorSettings
-# (BRIDGE-4). A hint only: allocate_kv_cache's hint is authoritative.
-_SEEN_VLLM_BLOCK_SIZE: Optional[int] = None
+# ---- Features (docs/features/FEATURES_DESIGN.md §1.1-§1.3) -------------------------------------------------------
+# Value of an UNSET feature switch: on (design §1.3, "1 once the code lands"). The default generator
+# (tt/generator.py MotifGenerator) serves resumed prefill (chunked prefill, prefix caching) and MTP speculation, so the
+# class allows all three and vLLM's own flags decide what is enabled. A launch that leaves vLLM's defaults alone (TIS:
+# no --enable-chunked-prefill flag, a 32768 budget) therefore runs chunked prefill; --no-enable-prefix-caching and no
+# --speculative-config keep the other two off. MOTIF3_*=0 restores the draft-1 capabilities exactly.
+FEATURE_SWITCH_DEFAULT = True
 
-# Keyword arguments the plugin can send that this draft-1 adapter cannot honour.
+# The model-owned drafter (vllm-tt-plugin docs/SPEC_DECODE_CONTRACT.md §4b): the only speculative method Motif serves.
+SPEC_METHOD = "custom_class"
+MODEL_OWNED_DRAFTER = "vllm_tt_plugin.model_owned_drafter"
+SPEC_REQUIREMENTS = ("device_propose", "hidden_feed")  # the MTP layer reads the target's last hidden, on device
+SPEC_HIDDEN_HANDOFF = ("on_device",)  # keeps supports_narrow_decode (SPEC_DECODE_CONTRACT.md §1a)
+SPEC_ACCEPT_MODE = "argmax_ids"
+SPEC_LANES_PER_REQUEST = 2  # packed verify: the owner's lane + one idle partner lane per draft (features design §3.8.2)
+SPECULATIVE_CONFIG = {"method": SPEC_METHOD, "model": MODEL_OWNED_DRAFTER, "num_speculative_tokens": 1}
+
+MTP_WEIGHT_PREFIX = "model.mtp_layers.0."
+CHECKPOINT_INDEX = "model.safetensors.index.json"
+
+# The vLLM flags of the production launch (features design §1.1 with the lead decision: threshold = budget).
+FEATURE_VLLM_ARGS = (
+    "--enable-chunked-prefill",
+    "--max-num-batched-tokens",
+    str(prefill_plan.recommended_budget(DEFAULT_PREFILL_SPAN_CAP, DEFAULT_PREFILL_ALIGNMENT)),
+    "--long-prefill-token-threshold",
+    str(prefill_plan.recommended_budget(DEFAULT_PREFILL_SPAN_CAP, DEFAULT_PREFILL_ALIGNMENT)),
+    "--enable-prefix-caching",
+    "--speculative-config",
+    json.dumps(SPECULATIVE_CONFIG),
+    "--no-async-scheduling",
+)
+
+# The scheduler config of the VllmConfig this process serves, as seen by ``get_max_tokens_all_users`` (which the plugin
+# calls in ``init_device`` inside ``set_current_vllm_config``). ``initialize_vllm_model`` runs later, in
+# ``load_model``, where vLLM sets no current config, so this is how the block size (BRIDGE-4) and the enabled features
+# reach GeneratorSettings. ``allocate_kv_cache``'s hint stays authoritative for the block size.
+_SEEN_VLLM_BLOCK_SIZE: Optional[int] = None
+_SEEN_VLLM_SERVING: Optional[Dict[str, Any]] = None
+
+# Keyword arguments the plugin can send that this adapter cannot honour. The speculative ones
+# (num_valid_drafts / accepted_counts / spec_mode) are explicit parameters of decode_forward: honoured on a
+# speculating launch, refused otherwise.
 _UNSUPPORTED_KWARGS = {
     "page_tables_per_layer": "multi-group (hybrid) KV cache configs; Motif-3 declares one uniform MLA spec",
-    "num_valid_drafts": "speculative decoding",
-    "accepted_counts": "speculative decoding",
-    "spec_mode": "speculative decoding",
     "rope_deltas_all_users": "M-RoPE",
     "prompt_tokens": "device-side penalties (no device sampling in draft 1)",
     "output_tokens": "device-side penalties (no device sampling in draft 1)",
 }
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Feature switches and class capabilities (features design §1.2)
+# ----------------------------------------------------------------------------------------------------------------
+def feature_switches(environ: Optional[Mapping[str, str]] = None) -> Dict[str, bool]:
+    """``{switch: allowed}`` for :data:`generator_api.FEATURE_SWITCHES` (``1/true/yes/on`` or ``0/false/no/off``; unset
+    = :data:`FEATURE_SWITCH_DEFAULT`; a typo raises instead of silently turning a feature off)."""
+    env = os.environ if environ is None else environ
+    return {name: feature_switch_from_env(name, env, default=FEATURE_SWITCH_DEFAULT) for name in FEATURE_SWITCHES}
+
+
+def model_capabilities_from_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """The class-level ``model_capabilities`` for this environment (the API server and EngineCore must see the same
+    switches: the plugin reads the dict from the class in both, before any instance exists, ``platform.py:1817-1822``).
+
+    The switches only *allow* a feature; vLLM's own flags decide (vLLM 0.26 enables chunked prefill and prefix caching
+    by default for a model that allows them). With every switch off this is exactly the draft-1 dict."""
+    sw = feature_switches(environ)
+    caps: Dict[str, Any] = {
+        "supports_prefix_caching": sw["MOTIF3_PREFIX_CACHING"],
+        "supports_chunked_prefill": sw["MOTIF3_CHUNKED_PREFILL"],
+        "supports_async_decode": False,
+        "supports_sample_on_device": False,  # v1: True + "max_device_top_k": 32
+        "supports_device_penalties": False,  # the plugin's default for an absent key is True
+        "supports_spec_decode": sw["MOTIF3_SPEC_DECODE"],
+        "supports_async_spec_decode": False,
+        "output_tokens_per_step": 1,  # > 1 would select the block-output rail and disable chunked prefill
+    }
+    if sw["MOTIF3_SPEC_DECODE"]:
+        caps["spec_requirements"] = SPEC_REQUIREMENTS
+        caps["spec_hidden_handoff"] = SPEC_HIDDEN_HANDOFF
+    return caps
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Speculative plan helpers (config time: pure, never raise)
+# ----------------------------------------------------------------------------------------------------------------
+def mtp_extra_bytes_per_token(kv_cache_dtype: str) -> int:
+    """``SpecPlan.extra_bytes_per_token``: device bytes per KV token the MTP layer's latent cache adds, PER CHIP.
+
+    The unit, settled from the plugin code: the field is "device bytes per KV token beyond the target KV"
+    (``vllm_tt_plugin/spec_decode.py`` SpecPlan) and is declared but not budgeted (no reader in the plugin; contract
+    §3: "need a bytes-per-KV-token conversion the block-count function does not have"). The plugin sizes the target
+    KV per logical copy (``worker._available_kv_cache_memory_bytes_for_num_blocks`` = ``page_size_bytes x
+    num_blocks``, no device multiplier), and the tt-metal convention of issue #110 is per chip
+    (``models/demos/gemma4/tt/generator_vllm.py`` spec_plan). Motif's latent cache is replicated on every chip, so per
+    chip = per logical copy: one ``[*, 576]`` row of one more layer = 612 B in bfp8 (576 x 1088 / 1024), 1152 B in
+    bf16. Device-wide it is 32 x that (one copy per chip)."""
+    return kv_cache_bytes_per_chip(1, DEFAULT_BLOCK_SIZE, 1, kv_cache_dtype) // DEFAULT_BLOCK_SIZE
+
+
+def spec_plan_supports_speculable_rows() -> bool:
+    """The installed vllm-tt-plugin's ``SpecPlan`` has ``verify_requires_speculable_rows`` (PS-1: no verify step holds
+    a sampled or penalized request). False when the plugin predates it or is not importable."""
+    try:
+        from vllm_tt_plugin.spec_decode import SpecPlan
+    except Exception:  # pragma: no cover - no plugin: nothing to declare it to
+        return False
+    return any(f.name == "verify_requires_speculable_rows" for f in dataclasses.fields(SpecPlan))
+
+
+def mtp_weights_status(vllm_config: Any = None, environ: Optional[Mapping[str, str]] = None) -> Tuple[bool, str]:
+    """``(available, why)`` for the MTP layer's weights (``model.mtp_layers.0.*``, shard 104 of the checkpoint), cheap
+    and device-free (``spec_plan`` runs at config time in the API server and in EngineCore). Never raises.
+
+    Available when the checkpoint config does not declare ``num_nextn_predict_layers = 0`` and one of: a converted TT
+    cache part ``L53`` (its ``.complete`` marker under ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``); a local checkpoint
+    (``generator_api.resolve_weights_location``) whose ``model.safetensors.index.json`` maps ``model.mtp_layers.0.*``
+    to shard files that are present; a checkpoint the generator downloads at load time (an uncached repo id, or no
+    location at all)."""
+    try:
+        env = os.environ if environ is None else environ
+        model_config = getattr(vllm_config, "model_config", None)
+        hf = getattr(model_config, "hf_text_config", None) or getattr(model_config, "hf_config", None)
+        n = getattr(hf, "num_nextn_predict_layers", None)
+        if n is not None and int(n) < 1:
+            return False, f"the checkpoint config declares num_nextn_predict_layers={n}: no MTP layer to draft with"
+        reasons: List[str] = []
+        root = resolve_tt_cache_path(env)
+        if root:
+            markers = sorted(Path(root).glob(f"motif3-*/mesh*/L{MTP_LAYER_IDX:02d}/.complete"))
+            if markers:
+                return True, f"converted TT cache part {markers[0].parent}"
+            reasons.append(f"no converted L{MTP_LAYER_IDX:02d} part under the TT cache {root}")
+        name = getattr(hf, "_name_or_path", None) or getattr(model_config, "model", None)
+        loc = resolve_weights_location(SimpleNamespace(_name_or_path=name), env)
+        if loc.path is None:
+            return True, "no checkpoint location given (the generator's default snapshot); not verified here"
+        if not loc.is_local:
+            return True, f"{loc.source}: downloaded with the rest of the checkpoint at load time"
+        d = Path(loc.path)
+        index = d / CHECKPOINT_INDEX
+        if index.is_file():
+            try:
+                weight_map = json.loads(index.read_text())["weight_map"]
+            except Exception as exc:
+                reasons.append(f"unreadable {index}: {exc!r}")
+            else:
+                files = sorted({str(v) for k, v in weight_map.items() if str(k).startswith(MTP_WEIGHT_PREFIX)})
+                if not files:
+                    reasons.append(f"{index} maps no {MTP_WEIGHT_PREFIX}* tensor")
+                else:
+                    missing = [f for f in files if not (d / f).is_file()]
+                    if not missing:
+                        return True, f"checkpoint {d} ({', '.join(files)})"
+                    reasons.append(f"the checkpoint {d} lacks {missing}, which hold {MTP_WEIGHT_PREFIX}*")
+        else:
+            reasons.append(f"no {CHECKPOINT_INDEX} in the checkpoint {d}")
+        return False, f"Motif-3 MTP weights ({MTP_WEIGHT_PREFIX}*) not found: " + "; ".join(reasons)
+    except Exception as exc:  # spec_plan must not raise: report the failure as the reason
+        return False, f"cannot locate the Motif-3 MTP weights ({MTP_WEIGHT_PREFIX}*): {exc!r}"
+
+
+def _spec_plan(vllm_config: Any, max_num_seqs: int, requested_k: int):
+    from vllm_tt_plugin.spec_decode import SpecPlan, SpecReject
+
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    method = getattr(spec_cfg, "method", None)
+    if method is not None and str(method) != SPEC_METHOD:
+        return SpecReject(
+            reason=(
+                f"Motif-3 drafts with its own MTP layer (model.mtp_layers.0) only; got speculative method "
+                f"{method!r}. Use --speculative-config '{json.dumps(SPECULATIVE_CONFIG)}'"
+            ),
+            supported_k=(1,),
+        )
+    if not 1 <= max_num_seqs <= NUM_LANES:
+        return SpecReject(
+            reason=f"Motif-3 speculates on its {NUM_LANES}-lane decode trace; max_num_seqs={max_num_seqs}",
+            supported_k=(),
+        )
+    if requested_k < 1:
+        return SpecReject(
+            reason=f"num_speculative_tokens={requested_k}: Motif-3 has one MTP layer and drafts K = 1",
+            supported_k=(1,),
+        )
+    ok, why = mtp_weights_status(vllm_config)
+    if not ok:
+        return SpecReject(reason=why, supported_k=())
+    kwargs: Dict[str, Any] = dict(
+        effective_k=1,  # one MTP layer; Motif's README: K = 1 is optimal. The platform publishes it back.
+        lanes_per_request=SPEC_LANES_PER_REQUEST,
+        extra_bytes_per_seq=0,  # no per-request device state (MTP weights and the trace are per launch)
+        extra_bytes_per_token=mtp_extra_bytes_per_token(kv_cache_dtype_from_env()),
+        accept_modes=(SPEC_ACCEPT_MODE,),
+        drafter_state="internal",  # the MTP cache is model-owned, indexed by the target's block ids
+        supports_narrow_decode=True,  # an ordinary step is the [B, 1] decode (the same spec trace, host logits)
+    )
+    if spec_plan_supports_speculable_rows():
+        kwargs["verify_requires_speculable_rows"] = True  # PS-1: a verify step never holds a sampled request
+    else:
+        logger.warning(
+            "Motif-3 spec_plan: the installed vllm-tt-plugin has no SpecPlan.verify_requires_speculable_rows (PS-1), "
+            "so a sampled or penalized request that shares a verify step commits the target argmax. Serve sampled "
+            "traffic without --speculative-config until a plugin with PS-1 is installed."
+        )
+    return SpecPlan(**kwargs)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# vLLM scheduler config capture and fail-fast checks (features design §1.5, §3.9 item 2)
+# ----------------------------------------------------------------------------------------------------------------
+def serving_config_of(vllm_config: Any) -> Optional[Dict[str, Any]]:
+    """The scheduler facts of ``vllm_config`` that ``GeneratorSettings.from_env(serving=...)`` takes
+    (``generator_api.SERVING_KEYS``), or None when it carries no cache config (a partial config in a direct call).
+    Read after the platform's capability policy ran (``TTWorker.init_device`` -> ``check_and_update_config``), so a
+    feature the class does not allow is already off here; ``spec_tokens`` is vLLM's ``num_speculative_tokens`` after
+    the platform published ``SpecPlan.effective_k`` back into it."""
+    cache = getattr(vllm_config, "cache_config", None)
+    if cache is None or getattr(cache, "block_size", None) is None:
+        return None
+    sched = getattr(vllm_config, "scheduler_config", None)
+    spec = getattr(vllm_config, "speculative_config", None)
+    budget = getattr(sched, "max_num_batched_tokens", None)
+    unit = getattr(cache, "prefix_match_unit", None)
+    return {
+        "block_size": int(cache.block_size),
+        "enable_chunked_prefill": bool(getattr(sched, "enable_chunked_prefill", False)),
+        "max_num_batched_tokens": None if budget is None else int(budget),
+        "long_prefill_token_threshold": int(getattr(sched, "long_prefill_token_threshold", 0) or 0),
+        "enable_prefix_caching": bool(getattr(cache, "enable_prefix_caching", False)),
+        "prefix_match_unit": None if unit is None else int(unit),
+        "spec_tokens": 0 if spec is None else int(getattr(spec, "num_speculative_tokens", 0) or 0),
+    }
+
+
+def check_serving_config(
+    serving: Mapping[str, Any],
+    *,
+    max_model_len: Optional[int] = None,
+    align: int = DEFAULT_PREFILL_ALIGNMENT,
+    span_cap: Optional[int] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    """Features design §1.5 on a captured serving config: raises on configurations that would serve wrong outputs
+    (prefix caching without KV-R, a ``--prefix-match-unit`` other than the block size, ``num_speculative_tokens`` not
+    in :data:`generator_api.SUPPORTED_SPEC_TOKENS`), returns the performance warnings
+    (``prefill_plan.check_scheduler_config``). ``align`` / ``span_cap`` default to the values a generator uses before
+    it exists (``DEFAULT_PREFILL_ALIGNMENT``; ``MOTIF3_PREFILL_MAX_BUCKET`` or 8192, at most ``max_model_len``);
+    ``initialize_vllm_model`` re-checks with the generator's own ``prefill_alignment`` / ``max_prefill_span``."""
+    env = os.environ if environ is None else environ
+    k = int(serving.get("spec_tokens") or 0)
+    if k not in SUPPORTED_SPEC_TOKENS:
+        raise ValueError(
+            f"num_speculative_tokens={k}: Motif-3 drafts K = 1 with its MTP layer (spec_plan publishes effective_k=1)"
+        )
+    prefix = bool(serving.get("enable_prefix_caching"))
+    forced = kv_replicated_decode_from_env(env)
+    kv_replicated = prefix if forced is None else bool(forced)
+    if span_cap is None:
+        span_cap = prefill_span_cap_from_env(env) or DEFAULT_PREFILL_SPAN_CAP
+        if max_model_len is not None:
+            span_cap = min(int(span_cap), int(max_model_len))
+    budget = serving.get("max_num_batched_tokens")
+    return prefill_plan.check_scheduler_config(
+        chunked=bool(serving.get("enable_chunked_prefill")),
+        budget=None if budget is None else int(budget),
+        threshold=int(serving.get("long_prefill_token_threshold") or 0),
+        align=int(align),
+        span_cap=int(span_cap),
+        prefix_caching=prefix,
+        prefix_match_unit=serving.get("prefix_match_unit"),
+        block_size=int(serving["block_size"]),
+        kv_replicated=kv_replicated,
+    )
+
+
+def _inherits_default(impl: type, name: str) -> bool:
+    """``impl`` does not override ``MotifGenerator.<name>`` (whose default says "unsupported")."""
+    return inspect.getattr_static(impl, name, None) is MotifGenerator.__dict__[name]
+
+
+def precheck_generator_class(impl: type, settings: GeneratorSettings) -> None:
+    """Refuse, BEFORE ``create`` loads the weights (an hour on a cold cache), a generator class that keeps
+    ``MotifGenerator``'s "unsupported" default for a feature vLLM enabled. A class that overrides the property is
+    checked on the instance by ``generator_api.check_generator_features`` right after ``create``."""
+    name = f"{impl.__module__}.{impl.__name__}"
+    if settings.resumed_prefill and _inherits_default(impl, "supports_resumed_prefill"):
+        enabled = " and ".join(
+            f
+            for f, on in (("chunked prefill", settings.chunked_prefill), ("prefix caching", settings.prefix_caching))
+            if on
+        )
+        raise ValueError(
+            f"vLLM enabled {enabled}, but the generator class {name} has no resumed prefill (supports_resumed_prefill "
+            f"is MotifGenerator's default False); launch with --no-enable-chunked-prefill --no-enable-prefix-caching, "
+            f"or set MOTIF3_CHUNKED_PREFILL=0 MOTIF3_PREFIX_CACHING=0 (API server and EngineCore)"
+        )
+    if settings.spec_decode and _inherits_default(impl, "supports_spec_decode"):
+        raise ValueError(
+            f"vLLM enabled speculative decoding (num_speculative_tokens={settings.spec_tokens}), but the generator "
+            f"class {name} has no decode_forward_spec (supports_spec_decode is MotifGenerator's default False); drop "
+            f"--speculative-config or set MOTIF3_SPEC_DECODE=0"
+        )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -159,6 +499,15 @@ def _vllm_block_size() -> Optional[int]:
     if cache_config is not None and getattr(cache_config, "block_size", None) is not None:
         return int(cache_config.block_size)
     return _SEEN_VLLM_BLOCK_SIZE
+
+
+def _vllm_serving_config() -> Optional[Dict[str, Any]]:
+    """vLLM's scheduler facts for this process (:func:`serving_config_of`): the current VllmConfig's, else the ones
+    ``get_max_tokens_all_users`` captured in ``init_device``; None = unknown (draft 1: every feature off)."""
+    serving = serving_config_of(_current_vllm_config())
+    if serving is not None:
+        return serving
+    return None if _SEEN_VLLM_SERVING is None else dict(_SEEN_VLLM_SERVING)
 
 
 def _current_vllm_config():
@@ -237,7 +586,7 @@ def _validate_mesh_l1_small(mesh_device: Any) -> Optional[int]:
         raise ValueError(
             f"the plugin opened the mesh with {size} B of L1_SMALL per core; Motif-3 needs >= {L1_SMALL_SIZE} for its "
             f"CCL semaphores (generator_api.L1_SMALL_SIZE). Launch with --additional-config "
-            f"'{{\"tt\": {{..., \"l1_small_size\": {L1_SMALL_SIZE}}}}}' (TIS: override_tt_config l1_small_size)"
+            f'\'{{"tt": {{..., "l1_small_size": {L1_SMALL_SIZE}}}}}\' (TIS: override_tt_config l1_small_size)'
         )
     return size
 
@@ -268,9 +617,11 @@ class LaneMap:
     The plugin keeps each request's device state in a *state slot* (``vllm_tt_plugin/model_runner.py:1093-1238``):
     prefill row ``i`` initialises slot ``empty_slots[i]``; decode row ``i`` reads slot ``slot_remap[i]`` (identity
     when None); after the decode is accepted, slot ``i`` holds what slot ``slot_remap[i]`` held. Motif's per-request
-    device state is its lane (decode writes a lane's KV only on its DP group's chips), so this keeps
-    ``slot_to_lane``, an injective map onto lanes, and applies each accepted remap exactly once
-    (``docs/DECODE_RELOAD_CONTRACT.md:43-93``). KV data never moves; lanes are stable for the life of a request.
+    device state is its lane (decode writes a lane's KV only on its DP group's chips unless KV-R is on, and the
+    speculation bookkeeping is keyed by lane), so this keeps ``slot_to_lane``, an injective map onto lanes, and applies
+    each accepted remap exactly once (``docs/DECODE_RELOAD_CONTRACT.md:43-93``). KV data never moves; lanes are stable
+    for the life of a request. A prefill may land a request on any lane (prefill writes every chip), so a chunked
+    prompt may change lane between chunks.
 
     The initial map deals slots round-robin over the 4 DP groups (slot 0 -> lane 0, 1 -> 8, 2 -> 16, 3 -> 24,
     4 -> 1, ...): vLLM fills low slots first, so a lightly loaded server spreads its requests over the groups and
@@ -331,17 +682,62 @@ class MotifKVCache:
 
     num_blocks: int
     block_size: int
-    num_layers: int  # caches the generator allocated (== generator.num_layers)
+    num_layers: int  # main-layer caches the generator allocated (== generator.num_layers)
     vllm_num_layers: int  # layers vLLM accounts for (53, or more than num_layers in a truncated run)
     kv_cache_dtype: str  # device dtype: "bfp8" | "bf16"
     vllm_dtype: Any  # torch dtype vLLM accounted with (bookkeeping only)
     page_table_width: int  # W of every page table sent to the generator
-    bytes_per_chip: int
+    bytes_per_chip: int  # main layers + the MTP layer
     device_cache: Any  # the generator's handle
+    mtp_layers: int = 0  # 1 when the generator also holds the MTP layer's cache (speculation); vLLM never sees it
 
     @property
     def shape(self) -> Tuple[int, int, int, int]:
         return (self.num_blocks, 1, self.block_size, KV_LATENT_DIM)
+
+    @property
+    def device_layers(self) -> int:
+        """Latent caches on device: the main layers plus the MTP layer."""
+        return self.num_layers + self.mtp_layers
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Speculation bookkeeping (features design §3.8.3, §3.9 item 4)
+# ----------------------------------------------------------------------------------------------------------------
+class SpecRetained(NamedTuple):
+    """What one decode step computed for a lane, kept on the host until ``propose_draft_tokens`` reads it.
+
+    ``pos0`` is the step's anchor position ``n``; ``argmax`` is ``(a0,)`` or, when the lane carried a draft, ``(a0,
+    a1)``: the target's choice at ``n`` (the token at ``n + 1``) and at ``n + 1``; ``mtp`` is ``(m0,)`` / ``(m0, m1)``:
+    the MTP layer's drafts for ``n + 2`` and ``n + 3``. The plugin commits ``argmax[:count]`` for a greedy row, so the
+    next draft is ``mtp[count - 1]``."""
+
+    pos0: int
+    argmax: Tuple[int, ...]
+    mtp: Tuple[int, ...]
+
+    @property
+    def drafted(self) -> bool:
+        return len(self.argmax) > 1
+
+
+@dataclass
+class SpecStats:
+    """Speculation counters of one bridge (logged at shutdown; read by tests)."""
+
+    ordinary_steps: int = 0  # decode steps sent as the ordinary [B, 1] call
+    verify_steps: int = 0  # decode steps sent as the [B, 2] verify block
+    drafts_verified: int = 0  # verify rows that carried a draft
+    proposals: int = 0  # propose_draft_tokens calls
+    drafts_offered: int = 0  # rows offered a draft
+    accepted: int = 0  # verified drafts the plugin accepted (count 2)
+    rejected: int = 0  # verified drafts the plugin rejected (count 1)
+    declined_stale: int = 0  # live rows with no retained step at the committed position
+    declined_mismatch: int = 0  # committed tokens are not the retained argmax (a sampled row)
+    declined_budget: int = 0  # no idle lane left for the draft in the next step
+
+    def as_dict(self) -> Dict[str, int]:
+        return dataclasses.asdict(self)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -362,17 +758,9 @@ class MotifForCausalLM:
     # Partial v1 adapter: async decode stays off, so the plugin sends reload_inputs=True on every decode.
     decode_input_update_contract = 1
 
-    # Read by the plugin from the CLASS at config time (platform.py:1815-1822), before any instance exists.
-    model_capabilities = {
-        "supports_prefix_caching": False,
-        "supports_chunked_prefill": False,
-        "supports_async_decode": False,
-        "supports_sample_on_device": False,  # v1: True + "max_device_top_k": 32
-        "supports_device_penalties": False,  # the plugin's default for an absent key is True
-        "supports_spec_decode": False,  # MTP self-speculation is v1+
-        "supports_async_spec_decode": False,
-        "output_tokens_per_step": 1,
-    }
+    # Read by the plugin from the CLASS at config time (platform.py:1815-1822), before any instance exists; the
+    # feature switches are read when this module is imported (identical in the API server and EngineCore).
+    model_capabilities = model_capabilities_from_env()
 
     def __init__(
         self,
@@ -400,11 +788,19 @@ class MotifForCausalLM:
             raise ValueError(
                 f"generator runs {generator.num_layers} layers but settings.num_layers={self.settings.num_layers}"
             )
+        # A feature vLLM enabled must be one the generator serves (features design §1.5, last row).
+        check_generator_features(generator, self.settings)
         self.vocab_size = int(generator.vocab_size)
         self._lanes = LaneMap(self.settings.max_batch_size)
         self._kv: Optional[MotifKVCache] = None
         self._prefill_warmed = False  # every bucket compiled (required before decode trace capture)
         self._warned: set = set()
+        # Speculation (settings.spec_tokens = 1): every decode step goes through generator.decode_forward_spec and the
+        # bridge keeps, per OWNER lane, what the last step computed (lanes are stable for a request's life).
+        self._spec = bool(self.settings.spec_decode)
+        self._retained: Dict[int, SpecRetained] = {}
+        self._propose_calls = 0
+        self.spec_stats = SpecStats()
 
     # ---- vLLM model-inspection protocol (registry._ModelInfo); never executed on TT ---------------------------
     def embed_input_ids(self, input_ids):
@@ -420,6 +816,26 @@ class MotifForCausalLM:
         """No torch submodules. vLLM's in-process ``LLMEngine`` finalizer (``VLLM_ENABLE_V1_MULTIPROCESSING=0``) walks
         ``model.modules()`` to drop torch.compile hooks (``vllm/v1/engine/llm_engine.py:437-443``)."""
         return iter(())
+
+    # ---- speculative feasibility (config time) -------------------------------------------------------------
+    @classmethod
+    def spec_plan(cls, vllm_config, max_num_seqs, requested_k):
+        """The plugin's speculative admission hook (``SPEC_DECODE_CONTRACT.md`` §2), called positionally at config time
+        in the API server and again in EngineCore, before any instance exists. Never raises and reads no ``get_tt_*``
+        helper: every refusal is a ``SpecReject`` whose reason the plugin quotes.
+
+        Returns ``SpecPlan(effective_k=1, lanes_per_request=2, extra_bytes_per_seq=0,
+        extra_bytes_per_token=mtp_extra_bytes_per_token(MOTIF3_KV_CACHE_DTYPE), accept_modes=("argmax_ids",),
+        drafter_state="internal", supports_narrow_decode=True[, verify_requires_speculable_rows=True])``; the last
+        field only when the installed plugin has it (:func:`spec_plan_supports_speculable_rows`). Refuses: a method
+        other than ``custom_class``; ``max_num_seqs`` outside ``[1, 32]``; ``requested_k < 1``; missing MTP weights
+        (:func:`mtp_weights_status`)."""
+        try:
+            return _spec_plan(vllm_config, int(max_num_seqs), int(requested_k))
+        except Exception as exc:  # the contract forbids raising; the reason carries the failure
+            from vllm_tt_plugin.spec_decode import SpecReject
+
+            return SpecReject(reason=f"Motif-3 spec_plan failed: {exc!r}", supported_k=())
 
     # ---- construction ---------------------------------------------------------------------------------------------
     @classmethod
@@ -439,9 +855,12 @@ class MotifForCausalLM:
         plugin's ``ttnn.MeshDevice``; ``max_batch_size`` = ``max_num_seqs``; ``max_seq_len`` = ``max_model_len``
         (a multiple of 256). Weights (``generator_api.resolve_weights_location``): ``MOTIF3_WEIGHTS_DIR`` >
         ``HF_MODEL`` (dir) > HF-cache snapshot of a repo-id ``HF_MODEL`` at ``TT_MODEL_WEIGHTS_REVISION`` >
-        ``hf_config._name_or_path``; TT cache: ``TT_CACHE_PATH``. ``settings.block_size`` carries vLLM's
-        ``--block-size`` when it was visible (BRIDGE-4). The runtime class is ``MOTIF3_GENERATOR_CLASS`` (default
-        ``models.demos.motif3.tt.generator:MotifGenerator``), imported here, never at module import time.
+        ``hf_config._name_or_path``; TT cache: ``TT_CACHE_PATH``. ``settings`` carries vLLM's ``--block-size``
+        (BRIDGE-4) and the features vLLM enabled (chunked prefill, prefix caching, ``num_speculative_tokens``),
+        captured by ``get_max_tokens_all_users`` in ``init_device``. The runtime class is ``MOTIF3_GENERATOR_CLASS``
+        (default ``models.demos.motif3.tt.generator:MotifGenerator``), imported here, never at module import time; a
+        class that cannot serve an enabled feature is refused before ``create`` loads the weights
+        (:func:`precheck_generator_class`), the instance right after (``check_generator_features``).
         """
         if int(tt_data_parallel) != 1:
             raise ValueError(
@@ -451,14 +870,17 @@ class MotifForCausalLM:
         _validate_mesh(mesh_device)
         l1_small = _validate_mesh_l1_small(mesh_device)
         _validate_hf_config(hf_config)
+        serving = _vllm_serving_config()
         settings = GeneratorSettings.from_env(
             hf_config,
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             optimizations=optimizations,
             block_size=_vllm_block_size(),
+            serving=serving,
         )
         impl = _resolve_generator_class()
+        precheck_generator_class(impl, settings)
         logger.info(
             "Motif-3 vLLM bridge: generator={}.{} layers={}/{} max_batch={} max_seq_len={} block_size={} kv_dtype={} "
             "weights={} ({}, revision {}) l1_small={}",
@@ -475,10 +897,37 @@ class MotifForCausalLM:
             settings.weights_revision,
             l1_small,
         )
+        logger.info(
+            "Motif-3 features: chunked_prefill={} (budget {}, threshold {}) prefix_caching={} kv_replicated={} "
+            "spec_tokens={} kv_write={} span_cap={} spec_verify={}",
+            settings.chunked_prefill,
+            settings.max_num_batched_tokens,
+            settings.long_prefill_token_threshold,
+            settings.prefix_caching,
+            settings.kv_replicated,
+            settings.spec_tokens,
+            settings.kv_write_mode,
+            settings.prefill_span_cap,
+            settings.spec_verify,
+        )
         generator = impl.create(hf_config=hf_config, mesh_device=mesh_device, settings=settings)
         if int(generator.vocab_size) != int(getattr(hf_config, "vocab_size", generator.vocab_size)):
             raise ValueError(f"generator vocab {generator.vocab_size} != config vocab {hf_config.vocab_size}")
-        return cls(generator, settings)
+        bridge = cls(generator, settings)
+        bridge._check_generator_geometry(serving)
+        return bridge
+
+    def _check_generator_geometry(self, serving: Optional[Mapping[str, Any]]) -> None:
+        """Re-run the scheduler checks of :func:`check_serving_config` with the generator's own resume alignment and
+        span cap (``init_device`` used the defaults) and log the warnings that geometry adds."""
+        if serving is None or not self.settings.resumed_prefill:
+            return
+        L = int(self.settings.max_seq_len)
+        assumed = check_serving_config(serving, max_model_len=L)
+        A, cap = int(self.generator.prefill_alignment), int(self.generator.max_prefill_span)
+        for w in check_serving_config(serving, max_model_len=L, align=A, span_cap=cap):
+            if w not in assumed:
+                logger.warning("Motif-3 serving config (generator A={}, span cap {}): {}", A, cap, w)
 
     # ---- KV pool sizing (runs in init_device, before the weights load) ------------------------------------------
     @classmethod
@@ -498,10 +947,15 @@ class MotifForCausalLM:
         blocks; the 32-token reserve makes that exactly one extra block for every supported block size, which vLLM's
         ``BlockPool`` then takes as its null block. Net: 32 users x (pool/32 tokens + one output block) fit exactly
         (4129 blocks of 64 for the defaults). Raises early (before an hour of weight loading) on configurations
-        draft 1 cannot serve, including a ``max_model_len`` that is not a multiple of 256 (BRIDGE-3) and, when vLLM's
+        Motif-3 cannot serve, including a ``max_model_len`` that is not a multiple of 256 (BRIDGE-3) and, when vLLM's
         current config is visible, a ``"tt"`` additional config without ``l1_small_size >= L1_SMALL_SIZE``.
+
+        With vLLM's current config visible (EngineCore's ``init_device``), it also captures the scheduler facts
+        (:func:`serving_config_of`) for ``initialize_vllm_model`` and runs the features-design §1.5 checks
+        (:func:`check_serving_config`: raises on prefix caching without KV-R or a foreign ``--prefix-match-unit``,
+        logs performance warnings); the memory check then counts the MTP layer's cache when vLLM speculates.
         """
-        global _SEEN_VLLM_BLOCK_SIZE
+        global _SEEN_VLLM_BLOCK_SIZE, _SEEN_VLLM_SERVING
         if int(tt_data_parallel) != 1:
             raise ValueError(f"Motif-3 needs tt_data_parallel=1 (one engine over the mesh), got {tt_data_parallel}")
         if int(num_devices) != REQUIRED_NUM_DEVICES:
@@ -525,30 +979,49 @@ class MotifForCausalLM:
         # EngineCore's init_device); otherwise use the largest supported block (an upper bound).
         block_size = max(SUPPORTED_BLOCK_SIZES)
         num_layers = NUM_HIDDEN_LAYERS
+        mtp_layers = 0
         vllm_config = _current_vllm_config()
         tt_config = _tt_config_of(vllm_config)
         if tt_config is not None:  # the plugin opened (or will open) the mesh with exactly this l1_small_size
             check_tt_config(tt_config, where="vLLM --additional-config 'tt'")
         if vllm_config is not None and getattr(vllm_config, "cache_config", None) is not None:
             block_size = validate_block_size(vllm_config.cache_config.block_size)
-            _SEEN_VLLM_BLOCK_SIZE = block_size  # for initialize_vllm_model, which runs without a current config
             try:
                 num_layers = int(vllm_config.model_config.hf_text_config.num_hidden_layers)
             except Exception:  # pragma: no cover - partial configs
                 pass
+            serving = serving_config_of(vllm_config)
+            if serving is not None:
+                for warning in check_serving_config(serving, max_model_len=max_model_len):
+                    logger.warning("Motif-3 serving config: {}", warning)
+                mtp_layers = 1 if serving["spec_tokens"] else 0
+                logger.info(
+                    "Motif-3 serving config: chunked_prefill={} (max_num_batched_tokens {}, "
+                    "long_prefill_token_threshold {}) prefix_caching={} (prefix_match_unit {}) "
+                    "num_speculative_tokens={}",
+                    serving["enable_chunked_prefill"],
+                    serving["max_num_batched_tokens"],
+                    serving["long_prefill_token_threshold"],
+                    serving["enable_prefix_caching"],
+                    serving["prefix_match_unit"],
+                    serving["spec_tokens"],
+                )
+            _SEEN_VLLM_BLOCK_SIZE = block_size  # for initialize_vllm_model, which runs without a current config
+            _SEEN_VLLM_SERVING = serving
         env_layers = os.environ.get("MOTIF3_NUM_LAYERS", "").strip()
         if env_layers.isdecimal() and int(env_layers) > 0:
             num_layers = min(num_layers, int(env_layers))
         kv_dtype = kv_cache_dtype_from_env()
         tokens = pool + NULL_BLOCK_RESERVE_TOKENS
         blocks = plugin_num_blocks(tokens, block_size, int(max_num_seqs or NUM_LANES))
-        need = kv_cache_bytes_per_chip(blocks, block_size, num_layers, kv_dtype)
+        need = kv_cache_bytes_per_chip(blocks, block_size, num_layers + mtp_layers, kv_dtype)
         cap = kv_max_bytes_per_chip()
         if need > cap:
+            mtp = " + the MTP layer" if mtp_layers else ""
             raise ValueError(
-                f"a {pool}-token {kv_dtype} latent pool ({blocks} blocks of {block_size}, {num_layers} layers) needs "
-                f"{need / 1e9:.2f} GB per chip, over the {cap / 1e9:.2f} GB KV budget (MOTIF3_KV_MAX_GB_PER_CHIP); "
-                f"lower MOTIF3_KV_POOL_TOKENS"
+                f"a {pool}-token {kv_dtype} latent pool ({blocks} blocks of {block_size}, {num_layers} layers{mtp}) "
+                f"needs {need / 1e9:.2f} GB per chip, over the {cap / 1e9:.2f} GB KV budget "
+                f"(MOTIF3_KV_MAX_GB_PER_CHIP); lower MOTIF3_KV_POOL_TOKENS"
             )
         return tokens
 
@@ -561,7 +1034,9 @@ class MotifForCausalLM:
         the per-layer allocation hint ``(num_blocks, 1, block_size, 576)``. vLLM's dtype is bookkeeping only (the
         block count is fixed by ``get_max_tokens_all_users``); the device dtype is ``MOTIF3_KV_CACHE_DTYPE``. The
         39 sliding-window layers are paged like the global ones (window 129 is applied in the kernels), as every TT
-        hybrid model does today (study 05 §7.3 option A).
+        hybrid model does today (study 05 §7.3 option A). The MTP layer (speculation) is NOT listed: its cache is
+        model-owned, indexed by the same block ids, so it travels with prefix hits and is freed with the request; the
+        single-group allocation would silently drop a 54th entry (features design §3.4).
         """
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
@@ -599,8 +1074,9 @@ class MotifForCausalLM:
 
         Expects ``kv_cache_shape == (num_blocks, 1, block_size, 576)`` (the hint from ``get_kv_cache_spec``: heads
         ``1 // min(32, 1) = 1``) and ``num_layers`` = vLLM's attention-layer count (53). Allocates
-        ``generator.num_layers`` caches (fewer than vLLM counts only in a ``MOTIF3_NUM_LAYERS`` truncated run) and
-        returns a ``MotifKVCache``.
+        ``generator.num_layers`` caches (fewer than vLLM counts only in a ``MOTIF3_NUM_LAYERS`` truncated run), plus
+        the MTP layer's cache when ``settings.spec_tokens`` (the generator adds it itself), and returns a
+        ``MotifKVCache``.
         """
         shape = tuple(int(s) for s in kv_cache_shape)
         if len(shape) != 4 or shape[1] != 1 or shape[3] != KV_LATENT_DIM:
@@ -628,12 +1104,13 @@ class MotifForCausalLM:
         if vllm_layers > layers:
             logger.info("Motif-3 truncated run: allocating {} of vLLM's {} layer caches", layers, vllm_layers)
         kv_dtype = self.settings.kv_cache_dtype
-        need = kv_cache_bytes_per_chip(num_blocks, block_size, layers, kv_dtype)
+        mtp = int(self.settings.mtp_kv_layers)
+        need = kv_cache_bytes_per_chip(num_blocks, block_size, layers + mtp, kv_dtype)
         cap = kv_max_bytes_per_chip()
         if need > cap:
             raise ValueError(
-                f"KV pool {shape} x {layers} layers ({kv_dtype}) needs {need / 1e9:.2f} GB per chip, over the "
-                f"{cap / 1e9:.2f} GB budget (MOTIF3_KV_MAX_GB_PER_CHIP)"
+                f"KV pool {shape} x {layers} layers{' + the MTP layer' if mtp else ''} ({kv_dtype}) needs "
+                f"{need / 1e9:.2f} GB per chip, over the {cap / 1e9:.2f} GB budget (MOTIF3_KV_MAX_GB_PER_CHIP)"
             )
         width = min(cdiv(self.settings.max_seq_len, block_size), num_blocks)
         handle = self.generator.allocate_kv_cache(num_blocks=num_blocks, block_size=block_size, num_layers=layers)
@@ -647,14 +1124,16 @@ class MotifForCausalLM:
             page_table_width=width,
             bytes_per_chip=need,
             device_cache=handle,
+            mtp_layers=mtp,
         )
         logger.info(
-            "Motif-3 KV pool: {} blocks x {} tokens ({} usable after vLLM's null block) x {} layers, {} on device "
+            "Motif-3 KV pool: {} blocks x {} tokens ({} usable after vLLM's null block) x {} layers{}, {} on device "
             "(vLLM accounts {}), {:.2f} GB per chip, page-table width {}",
             num_blocks,
             block_size,
             (num_blocks - 1) * block_size,
             layers,
+            " + the MTP layer" if mtp else "",
             kv_dtype,
             dtype,
             need / 1e9,
@@ -709,12 +1188,12 @@ class MotifForCausalLM:
         if pt.shape[1] < width:
             pt = torch.nn.functional.pad(pt, (0, width - pt.shape[1]))
         valid = torch.arange(width)[None, :] < need[:, None]
-        real = pt[valid]
-        if bool((real < 1).any()):
+        fitted = pt * valid  # the row's own block ids, then 0 (null block); int32
+        if bool(((fitted < 1) & valid).any()):
             raise ValueError(f"{where}: a position this step needs is on the null block (block id 0)")
-        if bool((real >= kv.num_blocks).any()):
+        if bool((fitted >= kv.num_blocks).any()):
             raise ValueError(f"{where}: page_table has block ids outside [1, {kv.num_blocks})")
-        return torch.where(valid, pt, torch.zeros_like(pt)).contiguous()
+        return fitted.contiguous()
 
     def _reject_unsupported(self, kwargs: dict, where: str) -> None:
         if "reset_batch" in kwargs:
@@ -743,29 +1222,34 @@ class MotifForCausalLM:
         empty_slots=None,
         **kwargs,
     ):
-        """Prefill a batch of new or resumed requests, one at a time (``model_runner.py:3059-3123``).
+        """Prefill every row of one plugin step with ONE ``generator.prefill_forward_batch`` call
+        (``model_runner.py:3155-3219``; features design §2.3).
 
         Args (all keyword, as the plugin sends them):
-            tokens: ``torch.int32 [B, max(prompt_lens)]``; row ``i`` is valid up to ``prompt_lens[i]`` (stale after).
-            page_table: ``torch.int32 [B, W]`` vLLM block table rows. Entries past ``ceil(prompt_lens[i] / bs)`` can
-                be stale ids of other requests' blocks (rows are reused uncleared); they are zeroed before the generator
-                sees them, so bucket-padding writes go to null block 0.
+            tokens: ``torch.int32 [B, max(prompt_lens)]``; row ``i`` holds ALL its tokens from position 0 up to
+                ``prompt_lens[i]`` (the cached prefix, earlier chunks, this chunk; prompt + generated tokens for a
+                request resumed after preemption), stale after.
+            page_table: ``torch.int32 [B, W]`` vLLM block table rows: shared cached blocks, then the request's own
+                blocks (plus speculative lookahead blocks), then stale ids of other requests' blocks (rows are reused
+                uncleared). Entries past ``ceil(prompt_lens[i] / bs)`` are zeroed before the generator sees them.
             kv_cache: the ``MotifKVCache`` from ``allocate_kv_cache``.
-            prompt_lens: numpy int64 ``[B]``: end of the chunk = full length (prompt + generated tokens for a
-                resumed request); chunked prefill is disabled.
-            start_pos: numpy int32 ``[B]``: tokens already computed; always 0 here (no prefix caching / chunking).
-            enable_trace: plugin ``trace_mode == "all"``; passed through (draft-1 prefill is eager).
+            prompt_lens: numpy int64 ``[B]``: END of the chunk vLLM scheduled (not the sequence length).
+            start_pos: numpy int32 ``[B]``: ``num_computed_tokens`` = positions already in the cache (a prefix-cache
+                hit: a block multiple; a chunk continuation: any integer). Must be 0 unless vLLM enabled chunked
+                prefill or prefix caching for this launch (``settings.resumed_prefill``).
+            enable_trace: plugin ``trace_mode == "all"``; passed through (prefill is eager).
             sampling_params: only with device sampling (never declared) -> raises if given.
-            empty_slots: ``list[int]`` destination state slot per row (always sent outside lane mode).
+            empty_slots: ``list[int]`` destination state slot per row (always sent outside lane mode). A chunked
+                request may get another slot (lane) for each chunk: no lane state crosses chunks.
 
         Returns:
-            Host logits ``[B, 1, vocab]`` (float32 or bfloat16) for each row's last token; the plugin's host sampler
-            reads ``[rows, -1, :]``.
+            Host logits ``[B, 1, vocab]`` (float32 or bfloat16) of each row's position ``prompt_lens[i] - 1`` (also for
+            an intermediate chunk, whose sample the plugin discards); the plugin's host sampler reads ``[rows, -1, :]``.
         """
         kv = self._check_kv(kv_cache)
         self._reject_unsupported(kwargs, "prefill_forward")
         if sampling_params is not None:
-            raise NotImplementedError("Motif-3 draft 1 samples on the host; sampling_params implies device sampling")
+            raise NotImplementedError("Motif-3 samples on the host; sampling_params implies device sampling")
         ends = np.asarray(prompt_lens, dtype=np.int64).reshape(-1)
         rows = int(ends.shape[0])
         if rows < 1:
@@ -790,30 +1274,38 @@ class MotifForCausalLM:
         max_len = min(self.settings.max_seq_len, int(self.generator.max_prefill_len))
         for i in range(rows):
             start, end = int(starts[i]), int(ends[i])
-            if start != 0:
-                raise NotImplementedError(
-                    f"row {i}: start_pos={start}; Motif-3 draft 1 has no prefix caching or chunked prefill"
-                )
             if not 1 <= end <= min(int(tokens_t.shape[1]), max_len):
                 raise ValueError(f"row {i}: prompt length {end} outside [1, {min(int(tokens_t.shape[1]), max_len)}]")
+            if start != 0 and not self.settings.resumed_prefill:
+                raise NotImplementedError(
+                    f"row {i}: start_pos={start}, but vLLM enabled neither prefix caching nor chunked prefill for "
+                    f"this launch (GeneratorSettings), so every prefill row must start at 0"
+                )
+            if not 0 <= start < end:
+                raise ValueError(f"row {i}: start_pos={start} outside [0, prompt_lens={end})")
         table = torch.as_tensor(page_table)
         if table.ndim != 2 or table.shape[0] < rows:
             raise ValueError(f"prefill page_table {tuple(table.shape)} has fewer rows than the {rows} prompts")
         need = torch.as_tensor([cdiv(int(e), kv.block_size) for e in ends], dtype=torch.int64)
         pt = self._fit_page_table(table[:rows], kv, need, "prefill_forward")
-        requests = [
-            PrefillRequest(
-                lane=lanes[i],
-                tokens=tokens_t[i, : int(ends[i])].to(torch.int32).contiguous(),
-                page_table=pt[i].clone(),
-            )
-            for i in range(rows)
-        ]
-        outputs = []
-        for req in requests:
-            logits = self.generator.prefill_forward(req, kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
-            outputs.append(check_logits("MotifGenerator.prefill_forward", logits, (self.vocab_size,)))
-        return torch.stack(outputs).unsqueeze(1)
+        requests = check_prefill_batch(
+            [
+                PrefillRequest(
+                    lane=lanes[i],
+                    tokens=tokens_t[i, : int(ends[i])].to(torch.int32).contiguous(),
+                    page_table=pt[i].clone(),
+                    start=int(starts[i]),
+                )
+                for i in range(rows)
+            ]
+        )
+        logits = self.generator.prefill_forward_batch(
+            requests, kv_cache=kv.device_cache, enable_trace=bool(enable_trace)
+        )
+        check_logits("MotifGenerator.prefill_forward_batch", logits, (rows, self.vocab_size))
+        for lane in lanes:  # the lane now belongs to the prefilled request; the plugin never proposes after a prefill
+            self._retained.pop(lane, None)
+        return logits.unsqueeze(1)
 
     # ---- decode ---------------------------------------------------------------------------------------------------
     def decode_forward(
@@ -830,14 +1322,21 @@ class MotifForCausalLM:
         reload_page_table=False,
         reload_sampling_params=False,
         reset_sampling_state=False,
+        num_valid_drafts=None,
+        accepted_counts=None,
+        spec_mode=None,
         **kwargs,
     ):
         """One decode step (``async_decode.py:1144-1292``).
 
         Args (keyword, as the plugin sends them):
-            tokens: ``torch.int32 [B, 1]`` (B = ``max_num_seqs``, front-packed; padding rows token 0).
-            start_pos: ``torch.int32 [B]`` position of each input token = KV write slot; padding rows ``-1``.
-            page_table: ``torch.int32 [B, W]`` (padding rows 0; entries past ``start_pos // bs`` are zeroed, as above).
+            tokens: ``torch.int32 [B, 1]`` (B = ``max_num_seqs``, front-packed; padding rows token 0); a verify step
+                sends the ``[B, 2]`` candidate block: column 0 the row's last committed token, column 1 its draft
+                (``PLACEHOLDER_TOKEN_ID`` = -1 where ``num_valid_drafts`` is 0).
+            start_pos: ``torch.int32 [B]`` position of each input token = KV write slot; padding rows ``-1``. A verify
+                step sends ``[B, 2]``: column 1 = column 0 + 1 on drafted rows, -1 elsewhere.
+            page_table: ``torch.int32 [B, W]`` (padding rows 0; entries past the row's last position's block are
+                zeroed, as above).
             kv_cache: the ``MotifKVCache``.
             enable_trace: plugin ``trace_mode in ("all", "decode_only")``.
             read_from_device: ignored; the result is always a host tensor (the plugin then skips its read hooks).
@@ -847,14 +1346,35 @@ class MotifForCausalLM:
             reload_inputs / reload_page_table / reload_sampling_params / reset_sampling_state: contract-v1 commands.
                 Without async decode the plugin always sends ``reload_inputs=True`` and False for the rest; there is
                 no device sampler state to reload or reset.
+            num_valid_drafts / accepted_counts: ``torch.int32 [B]``, a verify step only (``SPEC_DECODE_CONTRACT.md``
+                §4a; refused on a launch without speculation). ``accepted_counts`` is informational: Motif's
+                speculative state is the retained ids (``propose_draft_tokens`` receives the counts itself).
+            spec_mode: ``"argmax_ids"`` on a verify step.
 
         Returns:
-            Host logits ``[B, 1, vocab]`` in row order (rows of padding are don't-care).
+            Host logits ``[B, 1, vocab]`` in row order (rows of padding are don't-care); a verify step returns
+            ``VerifyOutput(spec_mode="argmax_ids", argmax_ids=int32 [B, 2], hidden=None)``: column 0 = the target's
+            choice after the row's last committed token, column 1 = its choice after the draft (``-1`` on rows without
+            one). In a speculating launch every step runs ``generator.decode_forward_spec`` (one decode trace) and the
+            bridge retains, per lane, the MTP drafts ``propose_draft_tokens`` hands out next.
         """
         kv = self._check_kv(kv_cache)
         self._reject_unsupported(kwargs, "decode_forward")
+        spec_args = (num_valid_drafts, accepted_counts, spec_mode)
+        is_verify = any(a is not None for a in spec_args)
+        if is_verify and not self._spec:
+            raise NotImplementedError(
+                "decode_forward: num_valid_drafts / accepted_counts / spec_mode (speculative decoding) are not "
+                "supported: vLLM enabled no speculation for this launch (GeneratorSettings.spec_tokens = 0)"
+            )
+        if is_verify and any(a is None for a in spec_args):
+            missing = [n for n, a in zip(("num_valid_drafts", "accepted_counts", "spec_mode"), spec_args) if a is None]
+            raise ValueError(
+                f"decode_forward: a verify step carries num_valid_drafts, accepted_counts and spec_mode together; "
+                f"missing {missing}"
+            )
         if sampling_params is not None:
-            raise NotImplementedError("Motif-3 draft 1 samples on the host; sampling_params implies device sampling")
+            raise NotImplementedError("Motif-3 samples on the host; sampling_params implies device sampling")
         if not reload_inputs:
             raise NotImplementedError(
                 "MotifForCausalLM is a partial decode-reload v1 adapter: every decode must reload its inputs "
@@ -862,9 +1382,16 @@ class MotifForCausalLM:
             )
         if reload_page_table:
             raise ValueError("reload_page_table is only legal with reload_inputs=False (plugin contract)")
+        if is_verify:
+            return self._decode_verify(
+                kv, tokens, start_pos, page_table, slot_remap, num_valid_drafts, accepted_counts, spec_mode,
+                bool(enable_trace),
+            )  # fmt: skip
         tok = torch.as_tensor(tokens)
         if tok.ndim == 2:
             if tok.shape[1] != 1:
+                if self._spec:
+                    raise ValueError(f"decode tokens {tuple(tok.shape)} without spec_mode: a verify block needs it")
                 raise NotImplementedError(f"decode tokens {tuple(tok.shape)}: one token per row (no speculation)")
             tok = tok[:, 0]
         if tok.ndim != 1:
@@ -887,15 +1414,258 @@ class MotifForCausalLM:
         lane_pos[lane_idx] = pos
         lane_pt[lane_idx] = pt
         batch = DecodeBatch(tokens=lane_tokens, positions=lane_pos, page_table=lane_pt)
-        logits = self.generator.decode_forward(batch, kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
-        check_logits("MotifGenerator.decode_forward", logits, (NUM_LANES, self.vocab_size))
+        retained: Dict[int, SpecRetained] = {}
+        if self._spec:
+            result = self.generator.decode_forward_spec(
+                SpecDecodeBatch.from_decode_batch(batch),
+                kv_cache=kv.device_cache,
+                enable_trace=bool(enable_trace),
+                want_logits=True,
+            )
+            check_spec_result(
+                "MotifGenerator.decode_forward_spec", result, want_logits=True, vocab_size=self.vocab_size
+            )
+            retained = self._spec_retained(result, lanes, pos.tolist(), active.tolist(), [False] * rows)
+            logits = result.logits
+        else:
+            logits = self.generator.decode_forward(batch, kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
+            check_logits("MotifGenerator.decode_forward", logits, (NUM_LANES, self.vocab_size))
         # Accepted: commit the slot move exactly once (the plugin settles its own map right after we return).
         self._lanes.commit(slot_remap)
+        if self._spec:
+            self._retained.update(retained)
+            self.spec_stats.ordinary_steps += 1
         if lanes == list(range(rows)):
             out = logits[:rows]
         else:
             out = logits.index_select(0, lane_idx)
         return out.unsqueeze(1)
+
+    def _decode_verify(
+        self,
+        kv: MotifKVCache,
+        tokens,
+        start_pos,
+        page_table,
+        slot_remap,
+        num_valid_drafts,
+        accepted_counts,
+        spec_mode,
+        enable_trace: bool,
+    ):
+        """A verify step (``SPEC_DECODE_CONTRACT.md`` §4a, §6): ``[B, 1+K]`` candidate block -> ``generator.
+        decode_forward_spec(want_logits=False)`` -> ``VerifyOutput(argmax_ids [B, 1+K])``."""
+        from vllm_tt_plugin.spec_decode import (
+            ACCEPT_MODE_ARGMAX_IDS,
+            PLACEHOLDER_TOKEN_ID,
+            VerifyOutput,
+            check_spec_side_tensors,
+        )
+
+        if spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+            raise NotImplementedError(
+                f"Motif-3 verifies in spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} only, got {spec_mode!r}"
+            )
+        K = int(self.settings.spec_tokens)
+        tok = torch.as_tensor(tokens)
+        pos = torch.as_tensor(start_pos)
+        if tok.ndim != 2 or tok.shape[1] != 1 + K or tuple(pos.shape) != tuple(tok.shape):
+            raise ValueError(
+                f"verify block must be tokens [B, {1 + K}] and start_pos [B, {1 + K}] (K = {K}), got "
+                f"{tuple(tok.shape)} / {tuple(pos.shape)}"
+            )
+        rows = int(tok.shape[0])
+        check_spec_side_tensors(num_valid_drafts, accepted_counts, rows, K, call="Motif-3 verify")
+        # One pass over host lists: the same checks as tensor ops, without ~30 tiny torch calls per step.
+        tok_l, pos_l, nv_l = tok.tolist(), pos.tolist(), num_valid_drafts.tolist()
+        L, V, bs = int(self.settings.max_seq_len), self.vocab_size, kv.block_size
+        active, drafted, anchor, need = [], [], [], []
+        for i in range(rows):
+            (p0, p1), d = pos_l[i], nv_l[i] > 0
+            if not -1 <= p0 < L:
+                raise ValueError(f"verify anchor positions must be -1 or in [0, {L}), got {[p[0] for p in pos_l]}")
+            if d and p0 < 0:
+                raise ValueError("verify: a draft on a padding row (num_valid_drafts > 0 where start_pos is -1)")
+            if d and p1 != p0 + 1:
+                raise ValueError(f"verify: a draft must sit at the anchor position + 1, got start_pos {pos_l}")
+            if not d and p1 != -1:
+                raise ValueError(f"verify: a padded draft column must carry position -1, got start_pos {pos_l}")
+            if d and p1 >= L:
+                raise ValueError(f"verify: a draft position reaches max_model_len {L}")
+            if d and not 0 <= tok_l[i][1] < V:
+                raise ValueError(f"verify: a draft token outside [0, {V}): {tok_l[i][1]}")
+            active.append(p0 >= 0)
+            drafted.append(d)
+            anchor.append(p0)
+            need.append(((p1 if d else p0) // bs + 1) if p0 >= 0 else 0)
+        pt = self._fit_page_table(page_table, kv, torch.tensor(need, dtype=torch.int64), "decode_forward (verify)")
+        lanes = self._lanes.decode_lanes(rows, slot_remap)
+        lane_tokens, lane_pos, lane_draft = [0] * NUM_LANES, [-1] * NUM_LANES, [-1] * NUM_LANES
+        for i, lane in enumerate(lanes):
+            if active[i]:
+                lane_tokens[lane], lane_pos[lane] = tok_l[i][0], anchor[i]
+                if drafted[i]:
+                    lane_draft[lane] = tok_l[i][1]
+        lane_idx = torch.tensor(lanes, dtype=torch.long)
+        lane_pt = torch.zeros((NUM_LANES, pt.shape[1]), dtype=torch.int32)
+        lane_pt[lane_idx] = pt
+        batch = SpecDecodeBatch(
+            tokens=torch.tensor(lane_tokens, dtype=torch.int32),
+            positions=torch.tensor(lane_pos, dtype=torch.int32),
+            draft_tokens=torch.tensor(lane_draft, dtype=torch.int32),
+            page_table=lane_pt,
+        )
+        result = self.generator.decode_forward_spec(
+            batch, kv_cache=kv.device_cache, enable_trace=enable_trace, want_logits=False
+        )
+        check_spec_result("MotifGenerator.decode_forward_spec", result, want_logits=False, vocab_size=self.vocab_size)
+        retained = self._spec_retained(result, lanes, anchor, active, drafted)
+        # Accepted: commit the slot move exactly once, then the retained ids.
+        self._lanes.commit(slot_remap)
+        self._retained.update(retained)
+        self.spec_stats.verify_steps += 1
+        self.spec_stats.drafts_verified += sum(drafted)
+        argmax = result.argmax.tolist()
+        ids = [
+            [argmax[lane][0] if on else 0, argmax[lane][1] if d else PLACEHOLDER_TOKEN_ID]
+            for lane, on, d in zip(lanes, active, drafted)
+        ]
+        return VerifyOutput(
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=torch.tensor(ids, dtype=torch.int32), hidden=None
+        )
+
+    def _spec_retained(
+        self,
+        result: SpecDecodeResult,
+        lanes: Sequence[int],
+        anchor_pos: Sequence[int],
+        active: Sequence[bool],
+        drafted: Sequence[bool],
+    ) -> Dict[int, SpecRetained]:
+        """The per-lane entries a step leaves for ``propose_draft_tokens``, validated (ids in the vocabulary on every
+        active owner lane; column 1 on drafted lanes) before anything is committed."""
+        out: Dict[int, SpecRetained] = {}
+        V = self.vocab_size
+        argmax, mtp = result.argmax.tolist(), result.mtp_argmax.tolist()  # host lists: no per-element tensor indexing
+        for lane, on, d, p in zip(lanes, active, drafted, anchor_pos):
+            if not on:
+                continue
+            cols = 2 if d else 1
+            a, m = tuple(argmax[lane][:cols]), tuple(mtp[lane][:cols])
+            if not all(0 <= x < V for x in a + m):
+                raise ValueError(
+                    f"MotifGenerator.decode_forward_spec: lane {lane} returned argmax {a} / MTP argmax {m} outside "
+                    f"[0, {V})"
+                )
+            out[int(lane)] = SpecRetained(int(p), a, m)
+        return out
+
+    def _draft_budget(self, live_lanes: Sequence[int]) -> Callable[[int], bool]:
+        """``take(owner_lane) -> bool``: whether the next step still has an idle lane for one more draft. A draft runs
+        on a lane no request uses (packed verify, features design §3.8.2): with KV-R any idle lane (every chip holds
+        every lane's KV), without it an idle lane of the owner's DP row. A draft past the budget would cost the
+        generator a second trace replay (its overflow pass), so it is declined instead."""
+        if self.settings.kv_replicated:
+            left = {None: NUM_LANES - len(set(live_lanes))}
+
+            def key(lane: int):
+                return None
+
+        else:
+            left = {g: LANES_PER_GROUP for g in range(NUM_DP_GROUPS)}
+            for lane in set(live_lanes):
+                left[lane // LANES_PER_GROUP] -= 1
+
+            def key(lane: int):
+                return int(lane) // LANES_PER_GROUP
+
+        def take(lane: int) -> bool:
+            k = key(lane)
+            if left[k] <= 0:
+                return False
+            left[k] -= 1
+            return True
+
+        return take
+
+    def propose_draft_tokens(self, num_drafts, committed_tokens, committed_positions, accepted_counts, hidden=None):
+        """The model-owned drafter (``SPEC_DECODE_CONTRACT.md`` §4b; features design §3.8.3, §3.9 item 4): host only.
+
+        Called by the plugin after every decode step of a speculating launch (never after a prefill), with that step's
+        rows (padding included): ``committed_tokens [B, 1+K]`` (the committed prefix, ``-1`` after it),
+        ``committed_positions [B, 1+K]`` (column 0 = the first committed token's position, -1 on padding rows) and
+        ``accepted_counts [B]`` (how many tokens each row committed). The MTP layer already ran on every row of that
+        step (``SpecRetained``), so the draft for the next step is ``mtp[count - 1]`` of the row's lane (the remap of
+        the step is committed, so row ``i`` is state slot ``i``):
+
+        * ordinary step or rejected draft (count 1, committed ``a0``): ``m0`` (for ``n + 2``);
+        * accepted draft (count 2, committed ``(d = a0, a1)``): ``m1`` (for ``n + 3``).
+
+        A row is declined (``num_valid`` 0, always legal) when it is padding, when the lane holds no step anchored at
+        ``committed_positions[i, 0] - 1``, when the committed tokens are not the retained argmax (a sampled row: its
+        next anchor is not what the MTP drafted after), or when the next step has no idle lane left for its draft
+        (:meth:`_draft_budget`; rows are visited from a rotating start so capped drafting is fair). ``hidden`` is
+        ignored (the MTP state stays on device: ``spec_hidden_handoff`` ``on_device``).
+
+        Returns ``DraftOutput(draft_token_ids=int32 [B, K], num_valid=int32 [B])``."""
+        from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID, DraftOutput
+
+        if not self._spec:
+            raise RuntimeError("propose_draft_tokens on a launch without speculative decoding (spec_tokens = 0)")
+        K = int(num_drafts)
+        if K != int(self.settings.spec_tokens):
+            raise ValueError(f"propose_draft_tokens: K = {K}, but this launch drafts {self.settings.spec_tokens}")
+        committed = torch.as_tensor(committed_tokens)
+        positions = torch.as_tensor(committed_positions)
+        counts = torch.as_tensor(accepted_counts).reshape(-1)
+        if committed.ndim != 2 or committed.shape[1] != 1 + K or tuple(positions.shape) != tuple(committed.shape):
+            raise ValueError(
+                f"propose_draft_tokens: committed tokens / positions must be [B, {1 + K}], got "
+                f"{tuple(committed.shape)} / {tuple(positions.shape)}"
+            )
+        B = int(committed.shape[0])
+        if not 1 <= B <= self._lanes.num_slots or counts.shape[0] != B:
+            raise ValueError(
+                f"propose_draft_tokens: {B} rows (counts {tuple(counts.shape)}) for {self._lanes.num_slots} slots"
+            )
+        first_pos = positions[:, 0].tolist()  # host lists: no per-element tensor indexing on the hot path
+        count_l, committed_l = counts.tolist(), committed.tolist()
+        live = [p >= 0 for p in first_pos]
+        if any(on and not 1 <= c <= 1 + K for on, c in zip(live, count_l)):
+            raise ValueError(f"propose_draft_tokens: accepted_counts outside [1, {1 + K}]: {count_l}")
+        lanes = self._lanes.slot_to_lane[:B]
+        take = self._draft_budget([lane for lane, on in zip(lanes, live) if on])
+        draft_l = [PLACEHOLDER_TOKEN_ID] * B
+        valid_l = [0] * B
+        stats = self.spec_stats
+        stats.proposals += 1
+        first = self._propose_calls % B
+        self._propose_calls += 1
+        for k in range(B):
+            i = (first + k) % B
+            if not live[i]:
+                continue
+            st = self._retained.get(lanes[i])
+            c = int(count_l[i])
+            if st is None or first_pos[i] != st.pos0 + 1 or c > len(st.argmax):
+                stats.declined_stale += 1
+                continue
+            if st.drafted:
+                if c == 2:
+                    stats.accepted += 1
+                else:
+                    stats.rejected += 1
+            if tuple(committed_l[i][:c]) != st.argmax[:c]:
+                stats.declined_mismatch += 1
+                continue
+            if not take(lanes[i]):
+                stats.declined_budget += 1
+                continue
+            draft_l[i] = st.mtp[c - 1]
+            valid_l[i] = 1
+            stats.drafts_offered += 1
+        drafts = torch.tensor(draft_l, dtype=torch.int32).reshape(B, K)
+        return DraftOutput(draft_token_ids=drafts, num_valid=torch.tensor(valid_l, dtype=torch.int32))
 
     def read_decode_output(self, tt_out, async_read=False):
         """``decode_forward`` already returns host logits; nothing is outstanding on the device."""
@@ -905,7 +1675,7 @@ class MotifForCausalLM:
 
     def process_decode_output_host(self, tt_out, is_tokens=False):
         if is_tokens:
-            raise NotImplementedError("Motif-3 draft 1 has no device sampling; decode returns logits")
+            raise NotImplementedError("Motif-3 has no device sampling; decode returns logits")
         if not isinstance(tt_out, torch.Tensor):
             raise TypeError(f"expected host logits, got {type(tt_out)}")
         return tt_out
@@ -914,26 +1684,26 @@ class MotifForCausalLM:
     def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device=False, **kwargs):
         """Plugin phase 1 (eager) and, only with ``trace_mode="all"``, phase 2 (``model_runner.py:3727-3781``).
 
-        Compiles every prefill bucket before any decode trace exists (a prefill shape compiled after capture can
-        corrupt the trace).
+        Compiles every prefill shape (every ``(path, bucket)`` up to the span cap with resumed prefill) before any
+        decode trace exists (a prefill shape compiled after capture can corrupt the trace).
         """
         kv = self._check_kv(kv_cache)
         if can_sample_on_device:
-            raise ValueError("Motif-3 draft 1 does not sample on device (unset sample_on_device_mode)")
+            raise ValueError("Motif-3 does not sample on device (unset sample_on_device_mode)")
         self.generator.warmup_prefill(kv_cache=kv.device_cache, enable_trace=bool(enable_trace))
         self._prefill_warmed = True
 
     def warmup_model_decode(
         self, kv_cache, enable_trace, max_batch_size, num_blocks, can_sample_on_device=False, **kwargs
     ):
-        """Eager decode warmup, then decode trace capture (``enable_trace=True``).
+        """Eager decode warmup, then decode trace capture (``enable_trace=True``; the spec trace when speculating).
 
         ``num_blocks`` is the plugin's page-table width (``max_num_blocks_per_req``), fixed for the server's life;
         ``max_batch_size`` is ``max_num_seqs``.
         """
         kv = self._check_kv(kv_cache)
         if can_sample_on_device:
-            raise ValueError("Motif-3 draft 1 does not sample on device (unset sample_on_device_mode)")
+            raise ValueError("Motif-3 does not sample on device (unset sample_on_device_mode)")
         if not 1 <= int(max_batch_size) <= self._lanes.num_slots:
             raise ValueError(f"decode warmup for {max_batch_size} rows, the bridge has {self._lanes.num_slots} slots")
         width = int(num_blocks)
@@ -954,11 +1724,22 @@ class MotifForCausalLM:
 
     # ---- lifecycle ------------------------------------------------------------------------------------------------
     def release_request(self, slot):
-        """A request finished or was preempted while owning state ``slot`` (``model_runner.py:851-868``)."""
-        self.generator.release_lane(self._lanes.lane_of_slot(slot))
+        """A request finished or was preempted while owning state ``slot`` (``model_runner.py:851-868``): drop the
+        lane's retained speculation entry and tell the generator."""
+        lane = self._lanes.lane_of_slot(slot)
+        self._retained.pop(lane, None)
+        self.generator.release_lane(lane)
 
     def release_persistent_capture(self):
-        """Shutdown, mesh still open (``model_runner.py:392-419``): free the decode trace."""
+        """Shutdown, mesh still open (``model_runner.py:392-419``): log the bridge's speculation counters and the
+        generator's own counters (``MotifGenerator.stats``: prefill calls / rows / chunks / sp1 chunks / recomputed
+        rows / MTP fills, decode and spec steps, drafts, packed drafts, cross-row partners, overflow passes), then free
+        the decode trace."""
+        if self._spec:
+            logger.info("Motif-3 speculation: {}", self.spec_stats.as_dict())
+        stats = getattr(self.generator, "stats", None)
+        if isinstance(stats, Mapping) and stats:
+            logger.info("Motif-3 generator: {}", dict(stats))
         self.generator.release_traces()
 
     def close(self):
@@ -967,21 +1748,41 @@ class MotifForCausalLM:
 
 __all__ = [
     "ARCHITECTURE",
+    "CHECKPOINT_INDEX",
     "DEFAULT_GENERATOR_CLASS",
     "DEFAULT_KV_POOL_TOKENS",
+    "FEATURE_SWITCH_DEFAULT",
+    "FEATURE_VLLM_ARGS",
     "KV_POOL_ALIGNMENT",
     "L1_SMALL_SIZE",
     "LaneMap",
     "MAIN_CLASS",
     "MAX_KV_POOL_TOKENS",
+    "MODEL_OWNED_DRAFTER",
+    "MTP_WEIGHT_PREFIX",
     "MotifForCausalLM",
     "MotifKVCache",
     "NULL_BLOCK_RESERVE_TOKENS",
     "SERVING_TT_CONFIG",
+    "SPECULATIVE_CONFIG",
+    "SPEC_HIDDEN_HANDOFF",
+    "SPEC_LANES_PER_REQUEST",
+    "SPEC_METHOD",
+    "SPEC_REQUIREMENTS",
+    "SpecRetained",
+    "SpecStats",
     "TT_MODEL_CLASS_OVERRIDES",
+    "check_serving_config",
+    "feature_switches",
     "kv_max_bytes_per_chip",
     "kv_pool_tokens_from_env",
+    "model_capabilities_from_env",
+    "mtp_extra_bytes_per_token",
+    "mtp_weights_status",
     "plugin_num_blocks",
+    "precheck_generator_class",
     "serving_additional_config",
+    "serving_config_of",
+    "spec_plan_supports_speculable_rows",
     "validate_block_size",
 ]
