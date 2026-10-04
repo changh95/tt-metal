@@ -38,7 +38,12 @@ motif3/
                        location, the serving "tt" config incl. L1_SMALL_SIZE; resumed prefill rows, the speculative
                        decode types, KV-R modes: §15-§17); torch-only, shared by bridge and config
     prefill_plan.py    resumed / chunked prefill planning (alignment, chunks, fill / SDPA / tail / RoPE tables,
-                       writer-first row order, vLLM scheduler checks; §15); torch-only
+                       writer-first row order, vLLM scheduler checks; §15) and the packed passes (§18); torch-only
+    verify_plan.py     T64 verify planning: the 64-row step layout, trace choice per step, c* (§18); torch-only
+    kv_write.py        DecodeKVWrite: decode KV writes (KV-R, the speculative split, the 64-row T64 writer; §16, §18)
+    mtp.py             MotifMTP: the MTP layer (KV-only prefill fill, decode drafts; §17)
+    sampling.py        MotifDeviceSampler: exact on-device sampling inside the decode trace
+                       (docs/sampling/DEVICE_SAMPLER.md)
     generator_vllm.py  MotifForCausalLM (vLLM bridge; device-free import)
     embedding.py       MotifEmbedding (token gather -> 4 streams)        lm_head.py   MotifLMHead (mean, norm, head)
     mhc.py             MHCSite (pre / post of one mHC site)              attention.py MotifAttention (GDLA)
@@ -50,8 +55,11 @@ motif3/
     unit/test_infra_*.py   shared-infra tests (CPU: config, rope, weights, import; device: test_infra_device.py,
                            test_infra_l1_small.py)
     unit/test_<module>.py  module tests (each owner's)
-    unit/gates/            device op gates G0-G8 (results in unit/gates/results, summary GATES_RESULTS.md)
+    unit/gates/            device op gates G0-G13a, G15 / G16 (results in unit/gates/results, summary GATES_RESULTS.md,
+                           which also records the model-level P5 / T64 gates in §13.7)
     test_generator_vllm_host.py   vLLM bridge host suite (real vLLM + plugin, fake generator)
+    test_resumed_prefill.py, test_spec_decode_device.py, test_pt_soak.py   model-level device tests (CP-*, G16 /
+                           G-S5w / G-S6w-lite, CP9-P / G-X)
 ```
 
 ## Running tests
@@ -173,7 +181,9 @@ shared infra (or ask its owner) instead of re-deriving it locally.
 * Inactive lanes: position `-1` (paged_update_cache / FlashMLA skip it), rot index 0, outputs masked with
   `ttnn.where(active, o, 0)` (design §2.3.4 step 12). Attention **requires** the per-step `active` mask (below).
 * Prefill: one user per call, padded to a bucket `S` in `cfg.prefill_buckets` (128 ... 32768, powers of 2; all
-  warmed before decode capture), **replicated on all 32 chips** (design §3.3). `paged_fill_cache` gets exactly the
+  warmed before decode capture), **replicated on all 32 chips** (design §3.3). That is draft 1; serving now makes one
+  `prefill_forward_batch` call per vLLM step with all its rows, in chunks of buckets up to the 8192 span cap (§15), and
+  with packed prefill several short chunks share one pass of `T = B * S` rows (§18). `paged_fill_cache` gets exactly the
   bucket's first `cfg.prefill_page_table_entries(S)` page-table entries, so every bucket has one fixed program shape
   whatever the page-table width is (M10).
 * **Per decode step, once, shared by all 53 layers** (attention wave B1): `rot = MotifAttention.decode_rope_tables(
@@ -346,6 +356,33 @@ test_module_program_configs_match_the_modules`; a grid that does not fit `cfg.co
   (a module-local transform carries its own version in the name, e.g. `attn.v2.*`). Random weights:
   `cache_name=None`. Cached files reload in the memory config they were built with (DRAM interleaved); re-shard after
   loading if needed. Test caches go under `tt_cache/test/<module>/` and stay small.
+* **Cache policy** (`MotifModel(cache=...)`, `tt/model.py` module docstring). Serving takes it from
+  `MOTIF3_TT_CACHE_POLICY` (`GeneratorSettings.tt_cache_policy`): `MotifGenerator.create` passes it to `MotifModel`
+  unless its model kwargs carry `cache`, and its `create:` log line shows `TT cache policy '<policy>'`. The policy
+  acts per part (`global`, each `L<nn>`, the MTP layer `L53`); a part is complete when its `.complete` marker exists.
+  * `auto` (default): a complete part loads from the cache. A tensor missing from it (an option variant) is uploaded
+    from the checkpoint, listed in `model.cache_misses` and not written. A part that is not complete loads from the
+    BF16 checkpoint and **nothing is written**, so every start converts it again in memory: about 30 s per MoE layer,
+    about 26 min for the 51 MoE layers (`docs/WEIGHTS_RUNBOOK.md` §7).
+  * `write`: a part that is not complete is converted, written under `cfg.cache_dir` and marked complete (the marker
+    lists its files), after the disk guard: the cache filesystem must keep `model.MIN_FREE_GB` = 60 GB free after
+    `GUARD_FACTOR` 1.1 × the part's estimated size (`estimate_part_bytes`: 3.6 GB globals, 0.36 GB per dense layer,
+    6.65 GB per MoE layer, 0.42 GB for `L53`). Otherwise `DiskGuardError` stops the start before that part; the parts
+    already written stay marked, and the next start resumes after them. So the first start writes the cache and later
+    starts load it. A complete part loads as under `auto`, except that a missing variant file is written into it
+    (without the guard; the marker is kept). Disk: about 344 GB for the full bfp8 cache (344.2 GB on this host:
+    globals, 53 layers and `L53`) on top of the 630 GB BF16 checkpoint, and the 60 GB floor on top of both.
+    Measured on 2026-10-04 (TORUS_XY; `logs/dev/20261004_071616_final_c1_cache_write.log`; BF16 shards in the page
+    cache): writing took 8.1 s for the globals, 2.8 s per dense layer and 34.0 s for MoE layer 2, and the next start
+    loaded the same four parts in 1.4 s with no cache miss. At these rates a first start of the full model spends
+    about 29 min converting (51 MoE layers), plus the BF16 reads when the shards are not in the page cache.
+  * `off`: the cache is never read or written; every tensor comes from the checkpoint (random-weight tests).
+  * The production converter `scripts/convert_weights.py` (`docs/WEIGHTS_RUNBOOK.md`: staging, sha256, verification,
+    option variants, the mock target that needs no device) builds the same files with the same constructors: the 84
+    files `write` produced for the globals and layers 0-2 are byte-identical (`cmp`) to the production cache's. The
+    production cache also holds option-variant files a default build does not write (stock mHC constants, the
+    exact-fp32 router, 8 per dense and 9 per MoE layer). `write` covers a server started on a host where nobody ran
+    the converter.
 * **Cache names per module** (wave B1; the module docstrings are authoritative; mapping tags: `rep`, `tp<d>`,
   `dp<d>tp<d>`). Every module reads its source lazily, so it builds from the TT cache alone once these exist:
 
@@ -387,6 +424,14 @@ semaphores to manage, trace-safe once compiled; `num_links` / topology come from
   composite all-reduce's ~7 (9-26 us faster for the PolyNorm moments). Equal to `polynorm._ar_ag_sum` bitwise.
 * **Size-1 axes** (small test meshes such as (1, 8)): every collective returns a **new** tensor (`ttnn.clone`),
   never its input, so a caller's free of the CCL input is always safe (MoE wave B1; §10 rule 3).
+* **Ring all-gather race** (FEATURES_REVIEW P1 and F3; `docs/determinism/INVESTIGATION.md`, `docs/p5_t64/f3.md`): on an
+  even ring, ttnn's multicast all-gather factory can signal completion before its alternate-route pages land, so the
+  next op reads stale tiles. `MotifCCL(ring_gather=cfg.ring_gather)` (`MOTIF3_RING_GATHER`, §14) runs the gathers its
+  predicate (`_ag_race_prone`) marks as `ttnn.all_broadcast` + `ttnn.concat`, bitwise the same data: `safe` (the default
+  since B0 `277df0e9f2d`) all of them, decode included (+0.26-0.45 ms per decode step); `lean` only the multi-page ones
+  and those of `race_free=True` calls (the MoE prefill combine); `native` none. `MOTIF3_SPEC_VERIFY=wide` / `auto`
+  refuse anything but `safe` (F3N rule R1, §18), and `test_infra_config.py::test_r1_no_raw_ttnn_collectives_outside_ccl`
+  fails on a raw ttnn collective under `tt/` outside `ccl.py`.
 
 Draft-1 CCL schedule (design §3.2): attention `wo` AR(tp); dense MLP AR(tp) (+ PolyNorm moments `ar_exact(tp)`); MoE
 decode `ag_dp_rows` -> local experts -> AR(dp) -> `partition(dim=2, "dp")` -> + shared partial (`add_partial`) ->
@@ -554,7 +599,7 @@ Module APIs (the module docstrings are authoritative; wave-B1 summary in `docs/W
 * `ttnn.generic_op`: one eager call per shape before a trace capture (§10 rule 6).
 * Host side of serving: torch's intra-op OpenMP workers spinning after a large host op (e.g. vLLM's sampler upcast of
   14 MB of logits, `torch.cat`) slowed the next 32-chip device read from 0.5 to 2.4-3.2 ms (lm_head); avoid torch
-  parallel ops right before device reads (`OMP_WAIT_POLICY=PASSIVE` is the serving-side candidate, TIS runbook).
+  parallel ops right before device reads (`OMP_WAIT_POLICY=PASSIVE` is set in both TIS specs, TIS runbook pitfall 29).
 
 ## 13. Import rule
 
@@ -568,30 +613,47 @@ checks that the default generator class imports device-free (`test_real_generato
 
 ## 14. Environment
 
-| Variable | Meaning (default) |
-|---|---|
-| `MOTIF3_WEIGHTS_DIR` | checkpoint dir; wins over everything (set but missing raises) |
-| `HF_MODEL` | snapshot dir (TIS), or a repo id resolved through the HF cache at `TT_MODEL_WEIGHTS_REVISION` |
-| `MOTIF3_TT_CACHE_PATH` | TT weight-cache root; wins over `TT_CACHE_PATH` (shares a converted cache with a TIS server without the runbook's symlink, CONV-2) |
-| `TT_CACHE_PATH` | TT weight-cache root (`/home/ttuser/hchang/experiments/motif-3/tt_cache`); TIS sets it under its host volume |
-| `TT_MODEL_WEIGHTS_REVISION` | checkpoint revision in the cache tag and for repo-id resolution (`2ed2ed5c...`) |
-| `MOTIF3_NUM_LAYERS` | truncated bring-up runs (53) |
-| `MOTIF3_KV_POOL_TOKENS` | usable KV pool tokens, a multiple of 128 (262144 -> 4129 blocks of 64 with the reserve) |
-| `MOTIF3_KV_CACHE_DTYPE` | `bfp8` (default) or `bf16` (needs a smaller pool) |
-| `MOTIF3_KV_MAX_GB_PER_CHIP` | KV budget for the bridge's fail-fast check (16) |
-| `MOTIF3_MAX_MODEL_LEN` | max context for host-built configs (32768; serving takes vLLM's `--max-model-len`) |
-| `MOTIF3_TRACE_REGION_SIZE` | trace region bytes (268435456) |
-| `MOTIF3_L1_SMALL_SIZE` | L1_SMALL bytes per core for `device_params()` / `open_motif_mesh()` (32768; experiments only) |
-| `MOTIF3_ROUTER_LOGITS` | `cfg.router_logits`: `composite` (default) or `exact_fp32` (decision D1 A/B) |
-| `MOTIF3_FABRIC` | `FABRIC_2D_TORUS_XY` (fallback `FABRIC_1D_RING`); with a mesh the device's fabric wins |
-| `MOTIF3_GENERATOR_CLASS` | runtime class for the bridge (`models.demos.motif3.tt.generator:MotifGenerator`) |
-| `MESH_DEVICE` | `"(4, 8)"` for serving (`(8, 4)` also works; `open_motif_mesh()` reads it) |
-| `MOTIF3_PREFIX_CACHING` / `MOTIF3_CHUNKED_PREFILL` / `MOTIF3_SPEC_DECODE` | bridge class capabilities (§15-§17; `generator_api.feature_switch_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises; default on); they only allow a feature, vLLM's flags enable it. `MOTIF3_*=0` alone is **not** draft 1 for prompts over 8192 tokens: the span cap still splits them (sp0 + sp1). Draft-1 behaviour is the pair `MOTIF3_*=0` + `MOTIF3_PREFILL_MAX_BUCKET=32768` (below) |
-| `MOTIF3_DEVICE_SAMPLING` | bridge class capability `supports_sample_on_device` (`generator_vllm.device_sampling_switch`: `1/true/yes/on` or `0/false/no/off`, a typo raises; default on, never with `max_device_top_k`). It only allows device sampling; the `"tt"` config's `"sample_on_device_mode": "decode_only"` enables it (the production launch below), and with the switch at `0` the plugin refuses that mode at boot. `0` and no `sample_on_device_mode` is draft 1's host sampling (rollback) |
-| `MOTIF3_KV_REPLICATED_DECODE` | KV-R (§16): `auto` (default: on iff prefix caching), `1` (forced on), `0` (refused with prefix caching) |
-| `MOTIF3_PREFILL_MAX_BUCKET` | span cap (§15): largest prefill bucket of a resumed-prefill generator, a power of two in [128, 32768] (8192); longer spans are split into chunks. `32768` restores the draft-1 single-shot buckets (rollback, with `MOTIF3_*=0`) |
-| `MOTIF3_PACKED_PREFILL` | optional packed multi-row prefill (0; only after gate G15) |
-| `MOTIF3_SPEC_VERIFY` | `packed` (default: drafts in idle lanes of the 32-lane trace) or `wide` (64-row verify trace, only after gate G16) |
+Every environment variable `tt/*.py` reads (`os.environ`; grep of B1 `d3597ae4977`, plus `MOTIF3_TT_CACHE_POLICY`
+and `MOTIF3_WIDE_STEP_RATIO`, added after it). "Validated" names the function that refuses a bad value. Under TIS,
+the specs set `MESH_DEVICE`, `MOTIF3_KV_POOL_TOKENS`, `OMP_WAIT_POLICY`, `MOTIF3_PACKED_PREFILL`,
+`MOTIF3_TT_CACHE_POLICY` (both specs) and `MOTIF3_SPEC_VERIFY` (MTP spec), and a spec value beats a shell export; TIS
+itself sets `HF_MODEL` and `TT_CACHE_PATH`; every other variable reaches the server from the shell
+(`docs/TIS_RUNBOOK.md` §1.2, §2.1, pitfall 34).
+
+| Variable | Default | Effect | Validated |
+|---|---|---|---|
+| `MOTIF3_WEIGHTS_DIR` | unset | checkpoint dir; wins over everything | `generator_api.resolve_weights_location`: set but not a directory raises |
+| `HF_MODEL` | unset | snapshot dir (TIS), or a repo id resolved through the HF cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`) at `TT_MODEL_WEIGHTS_REVISION` | `resolve_weights_location`: neither a directory nor an `org/name` repo id raises |
+| `MOTIF3_TT_CACHE_PATH` | unset | TT weight-cache root; wins over `TT_CACHE_PATH` (shares a converted cache with a TIS server without the runbook's symlink, CONV-2) | `generator_api.resolve_tt_cache_path`: the first non-empty value wins, no check |
+| `TT_CACHE_PATH` | `/home/ttuser/hchang/experiments/motif-3/tt_cache` | TT weight-cache root; TIS sets it under its host volume | as above |
+| `MOTIF3_TT_CACHE_POLICY` | `auto` in the code; **`write` in both TIS specs** | how the model build uses the TT cache (§7, "Cache policy"): `auto` loads the parts a converter marked complete and never writes, so a start without a converted cache converts the BF16 checkpoint in memory every time (~26 min for the MoE layers); `write` converts, writes and marks every part that is not complete, after the disk guard (60 GB must stay free after 1.1 × the part), so the first start writes the cache (~344 GB) and later starts load it; `off` never uses the cache. `MotifGenerator.create` passes it to `MotifModel(cache=...)` unless its model kwargs carry `cache`, and logs it at the end of its `create:` line | `generator_api.tt_cache_policy_from_env` (case and blanks ignored) and `check_tt_cache_policy` (`GeneratorSettings`, again in `create` before anything loads): `auto` / `write` / `off`, a typo raises |
+| `TT_MODEL_WEIGHTS_REVISION` | `2ed2ed5c...` | checkpoint revision in the cache tag and for repo-id resolution | none |
+| `MOTIF3_NUM_LAYERS` | 53 | truncated bring-up runs | `GeneratorSettings.from_env` and `MotifTTConfig.validate`: outside [1, 53] raises |
+| `MOTIF3_KV_POOL_TOKENS` | 262144 | usable KV pool tokens (262144 -> 4129 blocks of 64 with the reserve); TIS `max_tokens_all_users_override` must equal it | `generator_api.kv_pool_tokens_from_env`: a multiple of 128 in [128, 4194304] |
+| `MOTIF3_KV_CACHE_DTYPE` | `bfp8` | or `bf16` (needs a smaller pool; A = 64, §15) | `kv_cache_dtype_from_env`, `GeneratorSettings` |
+| `MOTIF3_KV_MAX_GB_PER_CHIP` | 16 | KV budget of the bridge's fail-fast memory check | `generator_vllm.kv_max_bytes_per_chip`: must be positive |
+| `MOTIF3_MAX_MODEL_LEN` | 32768 | max context for host-built configs (serving takes vLLM's `--max-model-len`) | `MotifTTConfig.validate`: a positive multiple of 32 |
+| `MOTIF3_TRACE_REGION_SIZE` | 268435456 | trace region bytes of `device_params()` / `open_motif_mesh()` (serving: the `"tt"` config's `trace_region_size`) | integer parse only |
+| `MOTIF3_L1_SMALL_SIZE` | 32768 | L1_SMALL bytes per core for `device_params()` / `open_motif_mesh()` (experiments only) | `device_params`, `MotifTTConfig.validate`: >= 0; `create` refuses a mesh with less than 32768 (`require_l1_small`) |
+| `MOTIF3_FABRIC` | `FABRIC_2D_TORUS_XY` | fallback `FABRIC_1D_RING`; with a mesh the device's fabric wins | `model_config.fabric_config_from_name`: an unknown name raises |
+| `MESH_DEVICE` | `(4, 8)` | `"(4, 8)"` for serving (`(8, 4)` also works; `open_motif_mesh()` reads it; the plugin's preset names map to (8, 4)) | `model_config.mesh_shape_from_env`: not a 2D shape raises |
+| `MOTIF3_ROUTER_LOGITS` | `composite` | `cfg.router_logits`: `composite` or `exact_fp32` (decision D1 A/B; `tt/kernels/router_fp32`, +24 µs per MoE layer). The exact kernel runs at 32 gathered decode rows and, since B1, at the 64 rows of a T64 step (review I-2) | `MotifTTConfig.validate`: the two values; with `MOTIF3_SPEC_VERIFY=auto`, the T64 row count must be in `model_config.ROUTER_EXACT_FP32_DECODE_ROWS` (= `moe.EXACT_ROUTER_DECODE_ROWS` = (32, 64)), re-checked in `MotifGenerator._check_wide_launch` |
+| `MOTIF3_RING_GATHER` | `safe` | `cfg.ring_gather` (`MotifCCL`, §8): `safe` routes every race-prone TP-ring all-gather through `all_broadcast` + `concat` (lead decision 2026-10-03, B0; +0.26-0.45 ms per decode step); `lean` keeps the single-page decode gathers native; `native` is the plain `ttnn.all_gather`, which races (`docs/determinism/INVESTIGATION.md`; FEATURES_REVIEW P1 and F3) | `MotifTTConfig.validate`: the three values, and `MOTIF3_SPEC_VERIFY=wide` / `auto` with speculation refuse anything but `safe` (F3N rule R1); `_check_wide_launch` re-checks the config and the model's `MotifCCL`; every other launch logs a warning once |
+| `MOTIF3_GENERATOR_CLASS` | `models.demos.motif3.tt.generator:MotifGenerator` | runtime class for the bridge | `generator_vllm._resolve_generator_class`: `module:Class`, a `MotifGenerator` subclass |
+| `MOTIF3_PREFIX_CACHING` / `MOTIF3_CHUNKED_PREFILL` / `MOTIF3_SPEC_DECODE` | on | bridge class capabilities (§15-§17); they only allow a feature, vLLM's flags enable it. `MOTIF3_*=0` alone is **not** draft 1 for prompts over 8192 tokens: the span cap still splits them (sp0 + sp1). Draft-1 behaviour is the pair `MOTIF3_*=0` + `MOTIF3_PREFILL_MAX_BUCKET=32768` (below) | `generator_api.feature_switch_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises |
+| `MOTIF3_DEVICE_SAMPLING` | on | bridge class capability `supports_sample_on_device` (never with `max_device_top_k`). It only allows device sampling; the `"tt"` config's `"sample_on_device_mode": "decode_only"` enables it (the production launch below). `0` and no `sample_on_device_mode` is draft 1's host sampling (rollback) | `generator_vllm.device_sampling_switch`: a typo raises; with the switch at `0` the plugin refuses `sample_on_device_mode` at boot |
+| `MOTIF3_SAMPLING_LOG_EVERY` | 2000 | decode steps between the bridge's `Motif-3 device sampling: {...}` JSON lines; `0` = only at shutdown | none: a value that is not a decimal integer falls back to 2000 (`MotifForCausalLM.__init__`) |
+| `MOTIF3_KV_REPLICATED_DECODE` | `auto` | KV-R (§16): `auto` (on iff prefix caching), `1` (forced on), `0` | `kv_replicated_decode_from_env`; `GeneratorSettings` refuses `0` with prefix caching |
+| `MOTIF3_PREFILL_MAX_BUCKET` | 8192 | span cap (§15): largest prefill bucket of a resumed-prefill generator; longer spans are split into chunks. `32768` restores the draft-1 single-shot buckets (rollback, with `MOTIF3_*=0`) | `check_prefill_span_cap`: a power of two in [128, 32768] |
+| `MOTIF3_PACKED_PREFILL` | `0` in the code; **`1` in both TIS specs** (`motif3_galaxy`, `motif3_galaxy_mtp`; TIS `f0484e96`) | packed multi-row prefill (P5, §18): the short chunks of one prefill call run as packed passes. With it on, a request's greedy and seeded tokens depend on which requests share its pass (near-tie flips at the bucket floor; the lead signed this contract off on 2026-10-04, `docs/P5_T64_REVIEW.md` §8, I-1). `0` restores per-row prefill (under TIS only through a runtime spec JSON, `docs/TIS_RUNBOOK.md` §4.2) | `generator_api.packed_prefill_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises |
+| `MOTIF3_PACKED_PREFILL_MAX_SEG` | 1024 | P5: the largest packed segment S (one of 64 / 128 / 256 / 512 / 1024; caps the pk0 and pk1 segment sizes); a chunk of more rows runs solo | `check_packed_prefill_max_seg` (`GeneratorSettings`, `MotifTTConfig`) |
+| `MOTIF3_PACKED_PREFILL_MAX_TOKENS` | 8192 | P5: the largest packed pass T = B × S (also bounded by the span cap) | `check_packed_prefill_max_tokens`: a power of two in [128, 32768] |
+| `MOTIF3_PACKED_PREFILL_PK1` | on | P5: also pack resumed (sp1) chunks that share a start (pk1, both SWA tail variants); off, they run solo (gate G15a's fallback) | `packed_prefill_pk1_from_env`: a typo raises |
+| `MOTIF3_PACKED_WARMUP` | `attention` | P5 warm-up per packed shape: `attention` = the attention of one global and one SWA layer on zeros (56 shapes in 2.2 s per boot, `docs/P5_T64_RESULTS.md` §3.1); `full` = one full packed pass per shape (~60-70 s; for program-cache growth) | `packed_warmup_from_env`: `attention` / `full` |
+| `MOTIF3_SPEC_VERIFY` | `packed` in the code; **`auto` in the MTP TIS spec** (`motif3_galaxy_mtp`) | verify mode of a speculating launch (no effect without `--speculative-config`; §18): **`packed`** = one T32-spec decode trace, drafts on idle lanes, drafts without one in a second replay (overflow pass); **`wide`** = the 64-row T64 trace alone serves every step (ordinary steps with idle draft rows, the device sampler on its anchor rows; the one-trace fallback); **`auto`** = both traces, each captured once at warmup (T32 first): T32 for ordinary and sampled steps and for verify steps whose drafts fit idle lanes, one T64 replay for every other verify step | `spec_verify_from_env`: `packed` / `wide` / `auto`, a typo raises. `wide` / `auto` are refused unless `ring_gather="safe"` on the config and on the model's `MotifCCL` (`MotifTTConfig.validate`, `MotifGenerator._check_wide_launch`; F3N rule R1, review edit R-E5), with a split KV-write mode and the LM head's `mesh` vocab split (`_check_wide_launch`). `auto` + `MOTIF3_ROUTER_LOGITS=exact_fp32` is accepted at rows (32, 64) since B1 (see that row) |
+| `MOTIF3_WIDE_MIN_LANES` | unset (the generator's c*) | `auto` only: the live-lane count from which every live lane drafts (33 = never). Unset: c* = `verify_plan.crossover_lanes(alpha, cfg.wide_step_ratio)` from the running acceptance pulled toward the prior 0.85 and r = 1.13 (`MOTIF3_WIDE_STEP_RATIO`), clamped to [17, 33]: 19 at the prior | `check_wide_min_lanes`: [1, 33] |
+| `MOTIF3_WIDE_STEP_RATIO` | unset (`model_config.DEFAULT_WIDE_STEP_RATIO` = 1.13) | `auto` only: the T64 / T32-spec step-time ratio r of c* (`GeneratorSettings.wide_step_ratio` → `MotifTTConfig.from_settings` → `cfg.wide_step_ratio`; scripts that build the config with `from_hf_config` do not read it). At the prior 0.85, c* is 17 / 19 / 20 / 22 for r = 1.0 / 1.13 / 1.2 / 1.3, and 33 (never) once r - 1 reaches the acceptance. The default 1.13 is the design's estimate; gate G16 measured 1.119 / 1.134 / 1.174 at 1K / 8K / 32K (`all_split`; `tests/unit/gates/GATES_RESULTS.md` §13.7) on the TORUS_Y fabric. Set this after re-measuring r on another fabric. Unset gives exactly the config without it; the `create:` line shows r on a T64 launch | `generator_api.check_wide_step_ratio` (`GeneratorSettings`), the rule of `MotifTTConfig.validate`: finite and >= 1 |
+| `OMP_WAIT_POLICY` | unset (both TIS specs: `PASSIVE`) | not used by the model: `MotifGenerator.create` warns on a speculating launch without `PASSIVE` (torch's spinning OpenMP workers added 4.7 ms per verify step) | none (a warning) |
 
 Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a multiple of 256), `--max-num-seqs 32`,
 `--additional-config '{"tt": {"trace_mode": "decode_only", "trace_region_size": 268435456, "fabric_config":
@@ -599,14 +661,19 @@ Serving flags: `--block-size 64` (32 also allowed), `--max-model-len 32768` (a m
 `override_tt_config`). Without `l1_small_size` the bridge refuses to start (`get_max_tokens_all_users`, in
 `init_device`, before the weights load) and refuses a mesh with less L1_SMALL (`initialize_vllm_model`).
 
-Launches (lead decisions; TIS dev spec `id_motif3-galaxy_Motif-3_blackhole_galaxy`, `docs/TIS_RUNBOOK.md` §1):
+Launches (lead decisions; TIS dev specs `motif3_galaxy` and `motif3_galaxy_mtp` at TIS `f0484e96`,
+`docs/TIS_RUNBOOK.md` §1). Every number below was measured on this host with TORUS_Y committed instead of TORUS_XY
+(§1; `docs/P5_T64_REVIEW.md` I-5), through direct `vllm serve` (`docs/P5_T64_RESULTS.md`, "RESULTS" below;
+throughput: greedy, thinking on, 256 tokens):
 
-| Launch | vLLM flags on top of the above | Use |
+| Launch | vLLM flags and env on top of the above | Use |
 |---|---|---|
-| **production default** | `--enable-chunked-prefill --max-num-batched-tokens 8064 --long-prefill-token-threshold 8064 --enable-prefix-caching --no-async-scheduling`; `"tt"` adds `"sample_on_device_mode": "decode_only"` (device sampling; the bridge must declare `supports_sample_on_device`, no `max_device_top_k`) and `"decode_interleave_prefill_steps": 1, "decode_interleave_decode_steps": 1`; env `OMP_WAIT_POLICY=PASSIVE` | all traffic |
-| MTP opt-in | the production default + `--speculative-config '{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}'` (TIS impl `motif3-galaxy-mtp`) | greedy / agentic / low-concurrency serving and the TIS greedy benchmarks (~1.9x decode for greedy rows at c <= 8). Sampled traffic gets no speedup, and while a sampled request is live nothing speculates (PS-1). With device sampling no step-time cost was measurable against the production default (`docs/sampling/DEVICE_SAMPLER.md` §11: sampled TPOT 92-96 vs 94-98 ms at c = 1-32, greedy at c = 32 95.2 vs 96.5 ms; separate runs); the +4-7 ms per sampled step and -2.5 % at c = 32 of `FEATURES_RESULTS.md` §3.8 were host-sampling numbers. vLLM refuses sampled `min_p` and `logit_bias`, the plugin `logprobs`, structured output, `bad_words`, `allowed_token_ids` and `min_tokens` on it |
-| honest benchmark | either of the above + `--no-enable-prefix-caching` (KV-R then off: decode skips its ~1.9 ms) | `vllm bench` repeats identical prompts: prefix hits would flatter TTFT |
-| rollback (draft-1 behaviour) | `MOTIF3_PREFIX_CACHING=0 MOTIF3_CHUNKED_PREFILL=0 MOTIF3_SPEC_DECODE=0 MOTIF3_DEVICE_SAMPLING=0 MOTIF3_PREFILL_MAX_BUCKET=32768`, the draft-1 flags (`--max-num-batched-tokens 32768 --no-enable-prefix-caching`, no speculative or interleave keys) and no `sample_on_device_mode` (host sampling); keep `OMP_WAIT_POLICY=PASSIVE` | A/B against draft 1: the `docs/SERVING_RESULTS.md` server also ran with PASSIVE (its §4), and the TIS rollback cannot drop it (a spec env value overrides a shell export). Against a draft-1 launch without it, the rollback is 2.5-4 ms per step faster (`docs/SERVING_SMOKE.md` §7.2) |
+| **production default** (`motif3_galaxy`) | `--enable-chunked-prefill --max-num-batched-tokens 8064 --long-prefill-token-threshold 8064 --enable-prefix-caching --no-async-scheduling`; `"tt"` adds `"sample_on_device_mode": "decode_only"` (device sampling; the bridge must declare `supports_sample_on_device`, no `max_device_top_k`) and `"decode_interleave_prefill_steps": 1, "decode_interleave_decode_steps": 1`; env `OMP_WAIT_POLICY=PASSIVE` **`MOTIF3_PACKED_PREFILL=1`** (§18) | all traffic. A burst of 32 short prompts gets its first tokens after 2.42 s instead of 22.66 s per row, 32 prompts behind a shared 2K system prompt after 5.29 s instead of 25.75 s, and a decoding request stalls at most 1.70 s instead of 22.0 s (RESULTS §3.2). A request's tokens then depend on which requests share its prefill pass (§18, I-1) |
+| **MTP opt-in** (`motif3_galaxy_mtp`) | the production default + `--speculative-config '{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}'` + env **`MOTIF3_SPEC_VERIFY=auto`** (T32-spec and T64 decode traces, §18) | greedy / agentic / low-concurrency serving and the TIS greedy benchmarks. Greedy rows decode 1.89-1.91x faster than without MTP at c <= 16 and 1.70-1.71x at c = 20-32 (c = 32: 559.2 vs 327.9 tok/s), with greedy and seeded tokens identical to the launch without speculation (RESULTS §3.4-§3.5). Sampled traffic gets no speedup, and while a sampled request is live nothing speculates (PS-1); sampled TPOT 93.4-95.0 ms against 95.1-96.4 ms without MTP (RESULTS §3.6). vLLM refuses sampled `min_p` and `logit_bias`, the plugin `logprobs`, structured output, `bad_words`, `allowed_token_ids` and `min_tokens` on it |
+| honest benchmark | either of the above + `--no-enable-prefix-caching` (KV-R then off: decode skips its ~1.9 ms; with MTP, `auto` runs T64 with `row_split` writes, gates G16 and G-S5w (iv) in `tests/unit/gates/GATES_RESULTS.md` §13.7) | `vllm bench` repeats identical prompts: prefix hits would flatter TTFT |
+| P5 off (per-row prefill) | either of the above with `MOTIF3_PACKED_PREFILL=0` (under TIS a runtime spec JSON, `docs/TIS_RUNBOOK.md` §4.2: a shell export does not override a spec value) | outputs that do not depend on the concurrent traffic (A/B against earlier results, sample-level reproducibility); bursts prefill row by row again |
+| T64 off (`packed` verify) | the MTP launch with `MOTIF3_SPEC_VERIFY=packed` (TIS: a runtime spec JSON) | one T32-spec decode trace, drafts only on idle lanes: identical to `auto` at c <= 16, 1.53x / 1.30x / 1.02x at c = 20 / 24 / 32 (RESULTS §3.4) |
+| rollback (draft-1 behaviour) | `MOTIF3_PREFIX_CACHING=0 MOTIF3_CHUNKED_PREFILL=0 MOTIF3_SPEC_DECODE=0 MOTIF3_DEVICE_SAMPLING=0 MOTIF3_PREFILL_MAX_BUCKET=32768`, `MOTIF3_PACKED_PREFILL` unset or `0`, the draft-1 flags (`--max-num-batched-tokens 32768 --no-enable-prefix-caching`, no speculative or interleave keys) and no `sample_on_device_mode` (host sampling); keep `OMP_WAIT_POLICY=PASSIVE` | A/B against draft 1: the `docs/SERVING_RESULTS.md` server also ran with PASSIVE (its §4), and the TIS rollback cannot drop it (a spec env value overrides a shell export). Against a draft-1 launch without it, the rollback is 2.5-4 ms per step faster (`docs/SERVING_SMOKE.md` §7.2) |
 
 The budget is `prefill_plan.recommended_budget(8192, A)` = 8064 for A = 128 (§15); the bridge's `FEATURE_VLLM_ARGS`
 derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks against the generator's real A at init.
@@ -649,7 +716,8 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
   only cross-chunk state.
 * **Warmup** (§10 rule 6): every `(path, bucket)` with `bucket <= cfg.max_prefill_span` (sp0, sp1, and the MTP KV-only
   fill with speculation) compiles before the decode capture; the generator refuses any other shape afterwards. The
-  16K / 32K buckets are no longer compiled (the planner splits those spans).
+  16K / 32K buckets are no longer compiled (the planner splits those spans). With packed prefill on, the 56 packed
+  shapes follow (§18); after the capture a pass of an unwarmed packed shape runs solo instead of being refused.
 * **vLLM flags**: `--max-num-batched-tokens` = `--long-prefill-token-threshold` = `span cap - A`
   (`prefill_plan.recommended_budget`: **8064** for A = 128; 8128 only for an all-64/64 table): a lone prompt's chunk
   ends are then multiples of `A` (no recompute) and every span fits one bucket. A prefix hit at an odd multiple of 64
@@ -699,11 +767,98 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
 * **Decode** (`settings.spec_tokens = 1`): every decode step calls `generator.decode_forward_spec(SpecDecodeBatch,
   want_logits=)`. The batch is in owner-lane order; `draft_tokens[l] >= 0` asks for the draft to be verified at `n +
   1`; lanes with `positions == -1` are idle and may host drafts. The result is `SpecDecodeResult(logits or None,
-  argmax [32, 2] = (a0, a1), mtp_argmax [32, 2] = (m0, m1))`, checked with `generator_api.check_spec_result`. One
-  decode trace (the spec trace) serves ordinary, verify and overflow steps.
+  argmax [32, 2] = (a0, a1), mtp_argmax [32, 2] = (m0, m1))`, checked with `generator_api.check_spec_result`. With
+  `MOTIF3_SPEC_VERIFY=packed` one decode trace (the T32-spec trace) serves ordinary, verify and overflow steps; `auto`
+  (the MTP spec's mode) adds the 64-row T64 trace for the verify steps whose drafts do not fit idle lanes, and `wide`
+  serves every step from T64 (§18). The bridge contract above is the same in every mode.
+
+## 18. Packed prefill (P5) and the 64-row speculative verify (T64) (`docs/p5_t64/P5_T64_DESIGN.md` §2-§4)
+
+Shipped in B1 `d3597ae4977` (2026-10-04). Gates: `tests/unit/gates/GATES_RESULTS.md` §13 (op level) and §13.7 (model
+level); serving: `docs/P5_T64_RESULTS.md`; review and the lead's decisions: `docs/P5_T64_REVIEW.md` §8.
+
+* **P5 switch.** `MOTIF3_PACKED_PREFILL` (§14): off in the code, on in both TIS specs. The bridge is unchanged: one
+  `prefill_forward_batch` call per plugin step and the same per-row logits; only the generator's passes change.
+* **Passes** (`prefill_plan.plan_prefill_passes`, host only, exhaustively tested in `tests/unit/test_prefill_plan.py`).
+  A chunk of `r` rows becomes a segment of `S` rows, the smallest of `cfg.pack_seg_buckets` (64 ... 1024) or, for a
+  resumed chunk, `cfg.pack_sp1_seg_buckets` (128 ... 1024) that holds it. Segments whose dependencies have run (the
+  row's previous chunk; for an sp1 segment, every writer of its row's read-only prefix `[0, w0)`, review edit R-E1)
+  group as **pk0** (start 0, by `S`) or **pk1** (one common start `a`, by `(S, a)`). Groups are cut into passes of `B`
+  segments (`B` in 2, 4, 8, 16, 32; dummy segments fill it), `T = B * S` rows, a compiled bucket <= 8192. Everything
+  else runs **solo**: bitwise the per-row path of §15, in writer-first order.
+* **Device dataflow of a pass.** Every op runs once at bucket `T`; only the attention treats the segments apart: pk0
+  one batched causal SDPA (a view + transpose of `[1, H, T, d]`), pk1 global one batched chunked SDPA with one
+  page-table row per segment, pk1 SWA `[tail || segment]` squares with the tails gathered once (`shared`) or per
+  segment (`distinct`, review edit R-E2). The RoPE rows, the fill table and the LM-head row are per segment; the MTP
+  KV-only fill runs once per pass. Gate G15 found every segment bitwise equal to the per-row attention at the
+  planner's bucket.
+* **Warm-up and refusals.** The 56 packed shapes of the production geometry (`cfg.packed_prefill_shapes()`: pk0
+  `(T, S)`, pk1 `(T, S)` x both tail variants) compile after the 14 solo shapes and before the decode capture
+  (`MOTIF3_PACKED_WARMUP=attention`: 2.2 s per boot). After the capture a pass of an unwarmed shape runs solo
+  (`packed_solo_fallbacks`), and a packed plan that fails its own checks makes the call run unpacked
+  (`packed_plan_errors`). Packing never refuses a call; both counters were 0 on every launch of
+  `docs/P5_T64_RESULTS.md` ("RESULTS", §3.8).
+* **The batch-dependence contract (P5_T64_REVIEW I-1, signed off by the lead on 2026-10-04).** A packed row runs the
+  row-local programs (the MoE above all) at `M = T` instead of its own bucket, so its numerics are those of the
+  pass's bucket: the "floor". Gate CP-P: KV rows of layers 0-2 bitwise per request, last-token PCC against the
+  per-row path 0.9965-0.9985 (median per case), the same as one row run per-row at bucket `T`; the same packed call
+  twice bitwise (GATES_RESULTS §13.7). Through vLLM every greedy divergence starts at a near tie (both tokens in the
+  top 3, <= 1.125 nats) and no judged answer changed (RESULTS §3.3). So a request's greedy and seeded tokens depend on
+  which requests share its prefill pass; the same batch reproduces exactly. The device sampler and decode stay
+  batch-invariant. `MOTIF3_PACKED_PREFILL=0` restores per-row prefill. Making the MoE prefill row-invariant across `M`
+  is post-release work.
+* **T64 rows** (`tt/verify_plan.py`, `MotifModel.decode_wide`, `tt/kv_write.py`). Per DP row 16 rows: `[8 anchors at
+  n | the same lanes' 8 drafts at n + 1]`, each draft with its owner's page-table row. The split-order gather puts the
+  anchors in T32 lane order in rows 0..31 and the drafts in 32..63. `DecodeKVWrite(rows=64)` writes the anchors (call
+  A) before the drafts (call B), both before FlashMLA. FlashMLA option A'': two B = 8 calls on global layers, one B =
+  16 call on SWA layers and the MTP layer, so **T64 rows are bitwise the T32 rows**. The MoE, LM head and argmax run
+  their M = 64 configs (a module refuses an M it was not built for). `WideStepPlan.result` maps rows back to
+  `argmax[l] = (a[l], a[32 + l])`: the bridge contract of §17 is unchanged.
+* **Verify modes** (`MOTIF3_SPEC_VERIFY`, §14). `auto` routes each step on the host (`verify_plan.choose_verify_kind`):
+  ordinary steps, steps that want logits or sampling, and verify steps whose drafts all fit idle lanes run on T32;
+  every other verify step is ONE T64 replay (bridge verify steps never want logits, so `auto` never takes the
+  overflow pass, review edit R-E6). The bridge drafts every live lane from c* live lanes (19 at the acceptance prior
+  0.85; `MOTIF3_WIDE_MIN_LANES`) and keeps the idle-lane budget below it. The device sampler runs inside the T32
+  trace; the T64 trace of `auto` is argmax only (PS-1 keeps sampled rows out of verify steps).
+* **Two decode traces** are safe under the rules R1-R6 of P5_T64_DESIGN §2.3 (F3N, `docs/p5_t64/f3.md` §6: F3 was the
+  TP-ring all-gather race that `ring_gather="safe"` closes, not a trace effect), each enforced in code: R1 `safe` ring
+  gathers (`MotifTTConfig.validate`, `_check_wide_launch`); R2 every prefill shape and every decode path compiled before
+  the first capture; R3 persistent inputs allocated before it (`_stage_path` refuses after a capture); R4 a trace's
+  outputs read before another trace replays (`_replay`); R5 one capture per path, no re-capture while serving; R6 the
+  second trace's outputs acknowledged for the allocation tracker. Gates G-S6w-lite and G-X (33 min, plus the tracker
+  variant) held them (GATES_RESULTS §13.7).
+* **Cost and speed.** T64 / T32-spec device step 1.119 at 1K and 1.134 at 8K context (G16; `cfg.wide_step_ratio`
+  1.13 feeds c*); T64 trace region 6.26 MiB per bank; boot +2.2 s packed warm-up, +2.3 s eager decode warm-up and
+  +6.0 s T64 capture (RESULTS §3.1). Throughput and burst numbers: the launches table of §14. All of them come from
+  this host's TORUS_Y fabric (§1; `docs/P5_T64_REVIEW.md` I-5). On a healthy TORUS_XY the DP axis is a ring and the
+  T64 gathers on it take the safe path, so G16's ratio would move: re-measure it after a Galaxy reset.
 
 ## Status
 
+* **Shipped state (2026-10-04): tt-metal B1 `d3597ae4977`, TIS `f0484e96`, vllm-tt-plugin `3f70daa`.** Two launches of
+  the same code (§14):
+  * **production default** (TIS `motif3_galaxy`): chunked prefill (budget = threshold = 8064), prefix caching with
+    KV-R decode writes, exact on-device sampling in the decode trace (`tt/sampling.py`,
+    `docs/sampling/DEVICE_SAMPLER.md`), packed multi-row prefill (`MOTIF3_PACKED_PREFILL=1`, §18),
+    `OMP_WAIT_POLICY=PASSIVE`, `ring_gather="safe"`, the composite router, 32 lanes, `max_model_len` 32768, a KV pool
+    of 262144 tokens;
+  * **MTP opt-in** (TIS `motif3_galaxy_mtp`): the same plus `--speculative-config` (MTP, K = 1) and
+    `MOTIF3_SPEC_VERIFY=auto` (the T32-spec and T64 decode traces, switching at c* ~ 19 live lanes, §18).
+
+  Headline numbers (`docs/P5_T64_RESULTS.md`): a burst of 32 short prompts gets its first tokens after 2.42 s instead
+  of 22.66 s, and a decoding request stalls at most 1.70 s instead of 22.0 s while it arrives; greedy MTP decode is
+  1.89-1.91x the launch without MTP at c <= 16 and 1.70-1.71x at c = 20-32 (559.2 vs 327.9 tok/s at c = 32), with
+  greedy and seeded tokens identical to it. Every number comes from this host's degraded fabric: TORUS_Y committed
+  instead of TORUS_XY (§1; `docs/P5_T64_REVIEW.md` I-5; restoring it needs a Galaxy reset with sudo). Contract (I-1,
+  signed off by the lead on 2026-10-04, `docs/P5_T64_REVIEW.md` §8): with packed prefill a request's greedy and
+  seeded tokens may depend on which requests share its prefill pass (near-tie flips at the bucket floor; quality
+  unchanged); `MOTIF3_PACKED_PREFILL=0` restores per-row prefill (§14). Gates: `tests/unit/gates/GATES_RESULTS.md`
+  §13 and §13.7; host suites on this tree: 440 passed (`logs/host/20261004_045052_lead_p5t64_host_all.log`). The
+  coverage items of review I-3 (preemption with prefix hits under packing, `MOTIF3_SPEC_VERIFY=wide` and the
+  honest-benchmark MTP launch through vLLM, the TIS before / after points of P5_T64_DESIGN §7.6) belong to the final
+  validation workflow of 2026-10-04; their results go to `docs/P5_T64_RESULTS.md` and the TIS reports. Open
+  follow-ups: `docs/P5_T64_RESULTS.md` finding 2 (the MTP launch keeps 32 host threads busy while it decodes), the
+  G16 / G13b re-measurement on a healthy torus (I-5), and a row-invariant MoE prefill (§18).
 * Shared infra (this README, `tt/model_config.py`, `tt/ccl.py`, `tt/weights.py`, `tt/rope.py`, `tt/generator_api.py`,
   `tt/generator_vllm.py`, `test_infra_*`, the bridge host suite): wave-B shared fixes INFRA-1..8 and BRIDGE-1..4 of
   `docs/WAVE_A_REVIEW.md` §5 (2026-10-01), then the wave-B1 shared changes (2026-10-02): L1_SMALL (device params,
@@ -715,7 +870,9 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
   builders) and `test_infra_l1_small.py` (main L1 untouched by every CCL path, results bitwise equal to plain ttnn;
   attention serving order prefill 1024/4096 -> decode -> prefill again (bitwise equal) -> decode for bfp8 and bf16 KV in
   one session). Measured on a fabric that commits only TORUS_Y (DP axis a line).
-* Gates G0-G8: `tests/unit/gates/` (see `GATES_RESULTS.md`).
+* Gates G0-G8, the feature gates G9-G13a (§12 of `tests/unit/gates/GATES_RESULTS.md`), the P5 / T64 op gates
+  G15a-rest, G-S1w and G16-lite (§13) and the model-level P5 / T64 gates G15b, CP-P, CP9-P, G16, G-S5w, G-S6w-lite and
+  G-X (§13.7).
 * Modules (wave B1): embedding, mHC, attention, PolyNorm / MLP, MoE, LM head, the Sinkhorn and router kernels
   (`docs/WAVE_B1_SUMMARY.json`). Decoder, model, generator, TIS integration: the integration wave (WAVE_A_REVIEW
   §5.8-5.11).
@@ -733,10 +890,12 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
   CP-C / CP-L / CP-X / CP9), `test_spec_decode_device.py`, `test_vllm_features_e2e.py` against live servers.
   Lead decisions: the production default launch is chunked prefill + prefix caching + device sampling (MTP is an
   opt-in launch, §14); the floor-relative accuracy bars of `test_resumed_prefill.py` are signed off; gate G9's
-  per-bucket sp1 q/k (F5: A = 128, budget = threshold = 8064). Open: prefill run-to-run nondeterminism at >= 4K buckets
-  (FEATURES_REVIEW P1), a latent two-trace hazard (F3, so one decode trace), burst TTFT (serial prefill rows, P2).
-  **Needs a lead decision:** two of the signed-off bars fail under F5 (CP-H (ii), CP-L (ii); below), so the
-  full-depth `test_resumed_prefill.py` run is red until the bars are re-signed or the sp1 table changes.
+  per-bucket sp1 q/k (F5: A = 128, budget = threshold = 8064), with CP-H (ii) and CP-L (ii) re-signed under it on
+  2026-10-03 (option (a) of the F5 bullet below; the asserted bars are in the `test_resumed_prefill.py` module
+  docstring). The items open at the time are closed: prefill run-to-run nondeterminism (FEATURES_REVIEW P1) and the
+  "two-trace hazard" (F3) were both the TP-ring all-gather race, fixed by `ring_gather="safe"` in B0 `277df0e9f2d`
+  (`docs/determinism/FIX.md`, `docs/p5_t64/f3.md`); burst TTFT (P2) by packed prefill and MTP at c = 32
+  (FEATURES_REVIEW F1) by the 64-row verify, both in B1 (§18). The MTP launch now captures two decode traces.
 * F5 (2026-10-03): gate G9's per-bucket sp1 global q/k (`prefill_plan.DEFAULT_SP1_GLOBAL_CHUNKS`), A = 128, vLLM budget
   = threshold = 8064 (`recommended_budget`, `generator_api.DEFAULT_PREFILL_ALIGNMENT`, `FEATURE_VLLM_ARGS`, the TIS
   spec) and G9's per-bucket sp1 cost model in the planner (`DEFAULT_SP1_GLOBAL_COST`). Measured on HEAD + F5 alone:
@@ -762,11 +921,12 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
     8128, asserted bar 0.857, the chunked path's own repeat 0.911; NLL 1.893 vs 1.971; the needle found on every
     path); CP-C 4/4 (top-1 vs the cold rows -0.13 .. +0.13 pt), CP-H (iii) pooled -0.06 pt / -0.03 % NLL, CP-X, CP9
     (program cache constant) and the MTP fill pass.
-  * Two single-row bars of the signed-off set fail (open: the lead's call; reproduced bit-identically by the review,
-    `logs/dev/20261003_084206_rev_defaults_f5_snap.log`). **CP-H (ii)**: multi_turn_chat's hit at
-    192 now resumes at 128, and its last row picks the fp32 golden's token (6, golden margin 0.24) where the cold row
-    picks 171 at margin 0.531, just over the 0.5 near-tie bar (KL vs fp32: hit 0.024, cold 0.142); the rule reads
-    the cold row's margin only, while the greedy-stream rule excuses the same token as a near tie (hit margin 0.25).
+  * Two single-row bars of the signed-off set failed (the lead's call, decided on 2026-10-03: option (a) below;
+    reproduced bit-identically by the review, `logs/dev/20261003_084206_rev_defaults_f5_snap.log`). **CP-H (ii)**:
+    multi_turn_chat's hit at 192 now resumes at 128, and its last row picks the fp32 golden's token (6, golden
+    margin 0.24) where the cold row picks 171 at margin 0.531, just over the 0.5 near-tie bar (KL vs fp32: hit 0.024,
+    cold 0.142); the rule reads the cold row's margin only, while the greedy-stream rule excuses the same token as a
+    near tie (hit margin 0.25).
     **CP-L (ii)** (layers 0-3 vs the CPU reference): at 31,972 tokens both chunked paths' worst sampled
     position is 31961 at stream PCC 0.99678, 0.0015 under the single shot's worst (0.99829; bar: within 0.001),
     while their median rises to 0.99988 (64/64: 0.99972; single shot 0.99995) and the mean error (1 - PCC over the
@@ -776,8 +936,8 @@ derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks again
     positions after layers 0 / 1 / 2 / 3 (mean error 0.000176 vs 0.000379 after layer 0) while single positions swing
     both ways from layer to layer (28672: closer through layer 2, 0.9971 vs 0.9996 after layer 3, an MoE layer): the
     chaotic single-row behaviour of CP-H, not a systematic loss.
-  * The decision these two need (lead decision 2 signed off exactly these bars). Both fail on a noisy reference
-    (the cold row's margin; one worst position), not on an F5 defect:
+  * The options for these two (lead decision 2 signed off exactly these bars; the lead took (a) on 2026-10-03). Both
+    fail on a noisy reference (the cold row's margin; one worst position), not on an F5 defect:
     (a) re-sign them with references that are not noisy: CP-H (ii) against the fp32 golden's argmax and margin (the
     hit picks the golden's token), CP-L (ii) on the median or mean error over the 172 positions (both better under
     F5). Only the bar code in `test_resumed_prefill.py` changes; F5's TTFT stays.

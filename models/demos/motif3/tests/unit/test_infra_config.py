@@ -90,6 +90,9 @@ _ENV = (
     "MOTIF3_PACKED_PREFILL_PK1",
     "MOTIF3_PACKED_WARMUP",
     "MOTIF3_WIDE_MIN_LANES",
+    # C1: TT weight-cache policy and the T64 / T32 step ratio
+    "MOTIF3_TT_CACHE_POLICY",
+    "MOTIF3_WIDE_STEP_RATIO",
 )
 
 
@@ -1427,6 +1430,91 @@ def test_p5_t64_env_parsing():
                 parser({name: bad})
         with pytest.raises(ValueError, match=name):
             api.GeneratorSettings.from_env(hf, environ={name: bads[0]}, **kw)
+
+
+def test_tt_cache_policy_settings_and_env():
+    """MOTIF3_TT_CACHE_POLICY -> GeneratorSettings.tt_cache_policy (MotifGenerator.create passes it to
+    MotifModel(cache=...)): default "auto" (every existing launch unchanged), the three names of tt/model.py's
+    CACHE_POLICIES, case and blanks forgiven in the environment only, anything else refused."""
+    model = importlib.import_module("models.demos.motif3.tt.model")
+    assert api.TT_CACHE_POLICIES == model.CACHE_POLICIES == ("auto", "write", "off")
+    assert api.DEFAULT_TT_CACHE_POLICY == "auto" == inspect.signature(model.MotifModel).parameters["cache"].default
+    hf = SimpleNamespace(num_hidden_layers=53)
+    kw = dict(max_batch_size=32, max_seq_len=32768)
+    assert api.GeneratorSettings().tt_cache_policy == "auto"
+    assert api.GeneratorSettings.from_env(hf, environ={}, **kw).tt_cache_policy == "auto"
+    assert api.tt_cache_policy_from_env({}) == "auto"
+    assert api.tt_cache_policy_from_env({"MOTIF3_TT_CACHE_POLICY": " "}) == "auto"
+    for policy in api.TT_CACHE_POLICIES:
+        assert api.GeneratorSettings(tt_cache_policy=policy).tt_cache_policy == policy
+        assert api.check_tt_cache_policy(policy) == policy
+        assert model.normalize_cache_policy(policy) == policy
+        for raw in (policy, f" {policy.upper()} ", policy.capitalize()):
+            assert api.tt_cache_policy_from_env({"MOTIF3_TT_CACHE_POLICY": raw}) == policy
+        s = api.GeneratorSettings.from_env(hf, environ={"MOTIF3_TT_CACHE_POLICY": policy}, **kw)
+        assert s.tt_cache_policy == policy
+    for bad in ("Write", "read", "on", "1", True, None, ""):  # the settings take the parsed (lower-case) name only
+        with pytest.raises(ValueError, match="MOTIF3_TT_CACHE_POLICY"):
+            api.GeneratorSettings(tt_cache_policy=bad)
+    for bad in ("read", "readonly", "1", "true", "rw", "auto,write"):
+        with pytest.raises(ValueError, match="MOTIF3_TT_CACHE_POLICY"):
+            api.tt_cache_policy_from_env({"MOTIF3_TT_CACHE_POLICY": bad})
+        with pytest.raises(ValueError, match="MOTIF3_TT_CACHE_POLICY"):
+            api.GeneratorSettings.from_env(hf, environ={"MOTIF3_TT_CACHE_POLICY": bad}, **kw)
+
+
+def test_wide_step_ratio_override():
+    """MOTIF3_WIDE_STEP_RATIO -> GeneratorSettings.wide_step_ratio -> MotifTTConfig.from_settings: unset keeps exactly
+    today's config (r = DEFAULT_WIDE_STEP_RATIO = 1.13), a value moves r and with it c*, and the check is
+    MotifTTConfig.validate's rule (finite, >= 1)."""
+    from models.demos.motif3.tt import verify_plan as vp
+
+    raw = json.load(open(f"{HF_META}/config.json"))
+    hf = SimpleNamespace(num_hidden_layers=53)
+    kw = dict(max_batch_size=32, max_seq_len=32768)
+    spec = dict(prefix_caching=True, chunked_prefill=True, spec_tokens=1, spec_verify="auto")
+    # unset: None in the settings, the default r, every config field as with the explicit default
+    assert api.GeneratorSettings().wide_step_ratio is None and api.wide_step_ratio_from_env({}) is None
+    assert api.GeneratorSettings.from_env(hf, environ={}, **kw).wide_step_ratio is None
+    assert api.wide_step_ratio_from_env({"MOTIF3_WIDE_STEP_RATIO": "  "}) is None
+    for extra in ({}, spec):
+        unset = MotifTTConfig.from_settings(api.GeneratorSettings(**extra), mesh_shape=(4, 8), hf_config=raw)
+        pinned = MotifTTConfig.from_settings(
+            api.GeneratorSettings(wide_step_ratio=DEFAULT_WIDE_STEP_RATIO, **extra), mesh_shape=(4, 8), hf_config=raw
+        )
+        assert unset.wide_step_ratio == DEFAULT_WIDE_STEP_RATIO == 1.13 and _fields(unset) == _fields(pinned)
+        assert unset.describe() == pinned.describe()
+    # a value: the settings, the config, the T64 line of describe() and c* follow it
+    for value, c_star in ((1.0, 17), (1.13, 19), (1.2, 20), (1.3, 22), (2, 33)):
+        s = api.GeneratorSettings(wide_step_ratio=value, **spec)
+        c = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+        assert c.wide_step_ratio == float(value) and f"r {float(value):g})" in c.describe()
+        assert vp.crossover_lanes(api.DEFAULT_SPEC_ALPHA_PRIOR, c.wide_step_ratio) == c_star, value
+        env = {"MOTIF3_WIDE_STEP_RATIO": f" {value} "}
+        assert api.wide_step_ratio_from_env(env) == float(value)
+        assert api.GeneratorSettings.from_env(hf, environ=env, **kw).wide_step_ratio == float(value)
+    assert api.wide_step_ratio_from_env({"MOTIF3_WIDE_STEP_RATIO": "1.15e0"}) == 1.15
+    # the same rule as MotifTTConfig.validate
+    for value in (0.0, 0.99, 1.0, 1.13, 5.0, -1.0, float("nan"), float("inf"), float("-inf")):
+        try:
+            _cfg(wide_step_ratio=value)
+            cfg_ok = True
+        except ValueError:
+            cfg_ok = False
+        try:
+            api.check_wide_step_ratio(value)
+            api_ok = True
+        except ValueError:
+            api_ok = False
+        assert api_ok == cfg_ok, value
+    for bad, exc in ((0.99, ValueError), (float("nan"), ValueError), (float("inf"), ValueError), (True, TypeError)):
+        with pytest.raises(exc, match="MOTIF3_WIDE_STEP_RATIO"):
+            api.GeneratorSettings(wide_step_ratio=bad)
+    for bad in ("0.99", "0", "-1.2", "nan", "inf", "x", "1,2", "1.2.3"):
+        with pytest.raises(ValueError, match="MOTIF3_WIDE_STEP_RATIO"):
+            api.wide_step_ratio_from_env({"MOTIF3_WIDE_STEP_RATIO": bad})
+        with pytest.raises(ValueError, match="MOTIF3_WIDE_STEP_RATIO"):
+            api.GeneratorSettings.from_env(hf, environ={"MOTIF3_WIDE_STEP_RATIO": bad}, **kw)
 
 
 def test_smoothed_acceptance_prior():

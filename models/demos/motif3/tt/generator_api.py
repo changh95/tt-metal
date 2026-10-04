@@ -94,6 +94,7 @@ from here, so the bridge and the TT config share one implementation.
 from __future__ import annotations
 
 import abc
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -334,12 +335,12 @@ WIDE_ROWS_PER_GROUP = 2 * LANES_PER_GROUP  # 16
 WIDE_MIN_LANES_NEVER = NUM_LANES + 1  # 33: "never draft every lane"
 DEFAULT_SPEC_ALPHA_PRIOR = 0.85  # alpha_0
 SPEC_ALPHA_PRIOR_WEIGHT = 64  # n_0: the prior weighs as much as 64 verified drafts
-# Packed multi-row prefill (P5; docs/p5_t64/P5_T64_DESIGN.md §3; MOTIF3_PACKED_PREFILL stays off until gates CP-P,
-# CP9-P and E2E-P pass). The short chunks of one prefill_forward_batch call run together: B segments of S rows each
-# (B in PACK_BATCHES, dummy segments fill B), T = B * S rows, an existing prefill bucket; only the SDPA, the RoPE rows
-# and the KV fill are per segment. "pk0" = sp0 segments (start 0), "pk1" = sp1 segments at one common start. The
-# generator warms every packed shape (MotifTTConfig.packed_prefill_shapes()) before the decode capture; after it, a pass
-# of an unwarmed shape runs as solo chunks (packing never refuses a call).
+# Packed multi-row prefill (P5; docs/p5_t64/P5_T64_DESIGN.md §3; MOTIF3_PACKED_PREFILL is off in the code and on in
+# both TIS specs since gates CP-P, CP9-P and E2E-P passed). The short chunks of one prefill_forward_batch call run
+# together: B segments of S rows each (B in PACK_BATCHES, dummy segments fill B), T = B * S rows, an existing prefill
+# bucket; only the SDPA, the RoPE rows and the KV fill are per segment. "pk0" = sp0 segments (start 0), "pk1" = sp1
+# segments at one common start. The generator warms every packed shape (MotifTTConfig.packed_prefill_shapes()) before
+# the decode capture; after it, a pass of an unwarmed shape runs as solo chunks (packing never refuses a call).
 PACKED_PASS_KINDS = ("pk0", "pk1")
 PACK_SEG_BUCKETS = (64, 128, 256, 512, 1024)  # pk0 segment rows S: the smallest one >= the chunk's rows
 PACK_SP1_SEG_BUCKETS = (128, 256, 512, 1024)  # pk1 S (S = 64 would need a 64/64 config for the 192-row SWA square)
@@ -418,8 +419,8 @@ def prefill_span_cap_from_env(environ: Optional[Mapping[str, str]] = None) -> Op
 
 
 def packed_prefill_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """``MOTIF3_PACKED_PREFILL`` (default off until gates CP-P / CP9-P / E2E-P): packed multi-row prefill (P5,
-    docs/p5_t64/P5_T64_DESIGN.md §3)."""
+    """``MOTIF3_PACKED_PREFILL`` (default off; both TIS specs set ``1`` since gates CP-P / CP9-P / E2E-P passed):
+    packed multi-row prefill (P5, docs/p5_t64/P5_T64_DESIGN.md §3)."""
     env = os.environ if environ is None else environ
     return _parse_switch("MOTIF3_PACKED_PREFILL", env.get("MOTIF3_PACKED_PREFILL"), False)
 
@@ -509,6 +510,32 @@ def wide_min_lanes_from_env(environ: Optional[Mapping[str, str]] = None) -> Opti
     env = os.environ if environ is None else environ
     v = _env_int(env, "MOTIF3_WIDE_MIN_LANES")
     return None if v is None else check_wide_min_lanes(v)
+
+
+def check_wide_step_ratio(ratio: float) -> float:
+    """``ratio`` as a float if it is a finite T64 / T32-spec step-time ratio ``>= 1`` (the rule
+    ``MotifTTConfig.validate`` applies to ``wide_step_ratio``), else ``ValueError`` (NaN and inf included)."""
+    if isinstance(ratio, bool):
+        raise TypeError(f"the T64 / T32 step ratio (MOTIF3_WIDE_STEP_RATIO) must be a number >= 1, got {ratio!r}")
+    r = float(ratio)
+    if not (math.isfinite(r) and r >= 1.0):
+        raise ValueError(f"the T64 / T32 step ratio (MOTIF3_WIDE_STEP_RATIO) must be finite and >= 1, got {ratio!r}")
+    return r
+
+
+def wide_step_ratio_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[float]:
+    """``MOTIF3_WIDE_STEP_RATIO``: unset = None (``MotifTTConfig.wide_step_ratio`` keeps
+    ``model_config.DEFAULT_WIDE_STEP_RATIO``, 1.13), else the T64 step / T32-spec step device-time ratio ``r`` the
+    ``auto`` drafting crossover ``c*`` uses (:func:`check_wide_step_ratio`: a finite float >= 1)."""
+    env = os.environ if environ is None else environ
+    raw = env.get("MOTIF3_WIDE_STEP_RATIO")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        r = float(raw.strip())
+    except ValueError:
+        raise ValueError(f"MOTIF3_WIDE_STEP_RATIO must be a number >= 1, got {raw!r}") from None
+    return check_wide_step_ratio(r)
 
 
 def check_spec_alpha_prior(prior: float) -> float:
@@ -705,6 +732,36 @@ def resolve_tt_cache_path(environ: Optional[Mapping[str, str]] = None) -> Option
     return None
 
 
+# TT weight-cache policy of the model build (MOTIF3_TT_CACHE_POLICY -> GeneratorSettings.tt_cache_policy ->
+# MotifModel(cache=...) in MotifGenerator.create; tt/model.py module docstring, README §7). Per part (globals, each
+# decoder layer, the MTP layer): "auto" (default) loads a part a converter marked complete and never writes (an unmarked
+# part loads from the checkpoint); "write" also converts an unmarked part, writes it under the cache root and marks it
+# complete (disk guard first: tt/model.py MIN_FREE_GB), so the first start writes the cache and later starts load it;
+# "off" never reads or writes the cache (every tensor from the checkpoint). tt/model.py CACHE_POLICIES lists the same.
+TT_CACHE_POLICIES = ("auto", "write", "off")
+DEFAULT_TT_CACHE_POLICY = "auto"
+
+
+def check_tt_cache_policy(policy: str) -> str:
+    """``policy`` if it is one of :data:`TT_CACHE_POLICIES`, else ``ValueError``."""
+    if policy not in TT_CACHE_POLICIES:
+        raise ValueError(
+            f"the TT weight-cache policy (MOTIF3_TT_CACHE_POLICY) must be one of {TT_CACHE_POLICIES}, got {policy!r}"
+        )
+    return policy
+
+
+def tt_cache_policy_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_TT_CACHE_POLICY``: ``auto`` (default: complete parts load from the TT cache, nothing is written),
+    ``write`` (parts that are not complete are converted and written under the cache root, then load from it on later
+    starts) or ``off`` (no TT cache). See :data:`TT_CACHE_POLICIES`."""
+    env = os.environ if environ is None else environ
+    v = (env.get("MOTIF3_TT_CACHE_POLICY") or "").strip().lower() or DEFAULT_TT_CACHE_POLICY
+    if v not in TT_CACHE_POLICIES:
+        raise ValueError(f"MOTIF3_TT_CACHE_POLICY must be one of {TT_CACHE_POLICIES}, got {v!r}")
+    return v
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------------------------------------------
@@ -745,6 +802,10 @@ class GeneratorSettings:
         weights_revision: ``TT_MODEL_WEIGHTS_REVISION`` (pinned snapshot when ``HF_MODEL`` is a repo id).
         cache_path: TT weight-cache root (:func:`resolve_tt_cache_path`: ``MOTIF3_TT_CACHE_PATH`` > ``TT_CACHE_PATH``),
             or None for the generator's default.
+        tt_cache_policy: how the model build uses the TT cache (``MOTIF3_TT_CACHE_POLICY``, :data:`TT_CACHE_POLICIES`):
+            ``"auto"`` (default; never writes), ``"write"`` (converts and writes the parts that are not complete, disk
+            guard first) or ``"off"``. ``MotifGenerator.create`` passes it to ``MotifModel(cache=...)`` unless its
+            model kwargs carry ``cache``.
         optimizations: plugin ``tt.optimizations`` (None | "performance" | "accuracy"); draft 1 may ignore it.
         block_size: vLLM ``--block-size`` when the bridge could see it at model init (BRIDGE-4), else None. Only a
             hint for ``create``: ``allocate_kv_cache(block_size=...)`` is authoritative.
@@ -783,6 +844,9 @@ class GeneratorSettings:
             33 = never); None (default) = the generator's ``c*`` from the acceptance and the T64 / T32 step ratio.
         spec_alpha_prior: the acceptance prior ``alpha_0`` (default 0.85) of :func:`smoothed_acceptance`; also the
             acceptance :meth:`MotifGenerator.drafts_all_lanes` assumes before any draft was verified.
+        wide_step_ratio: the T64 / T32-spec step ratio ``r`` of ``c*`` (``MOTIF3_WIDE_STEP_RATIO``, a finite float
+            >= 1); None (default) keeps ``MotifTTConfig.wide_step_ratio`` at ``model_config.DEFAULT_WIDE_STEP_RATIO``
+            (1.13). ``MotifTTConfig.from_settings`` maps it.
     """
 
     max_batch_size: int = NUM_LANES
@@ -792,6 +856,7 @@ class GeneratorSettings:
     weights_path: Optional[str] = None
     weights_revision: Optional[str] = None
     cache_path: Optional[str] = None
+    tt_cache_policy: str = DEFAULT_TT_CACHE_POLICY
     optimizations: Optional[str] = None
     block_size: Optional[int] = None
     weights_source: Optional[str] = None
@@ -812,6 +877,7 @@ class GeneratorSettings:
     packed_warmup: str = DEFAULT_PACKED_WARMUP
     wide_min_lanes: Optional[int] = None
     spec_alpha_prior: float = DEFAULT_SPEC_ALPHA_PRIOR
+    wide_step_ratio: Optional[float] = None
 
     def __post_init__(self):
         if not 1 <= int(self.max_batch_size) <= NUM_LANES:
@@ -823,6 +889,7 @@ class GeneratorSettings:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
         if self.kv_cache_dtype not in KV_CACHE_DTYPES:
             raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}, got {self.kv_cache_dtype!r}")
+        check_tt_cache_policy(self.tt_cache_policy)
         if self.optimizations not in (None, "performance", "accuracy"):
             raise ValueError(f"optimizations must be None, 'performance' or 'accuracy', got {self.optimizations!r}")
         if self.block_size is not None:
@@ -857,6 +924,8 @@ class GeneratorSettings:
         if self.wide_min_lanes is not None:
             check_wide_min_lanes(self.wide_min_lanes)
         check_spec_alpha_prior(self.spec_alpha_prior)
+        if self.wide_step_ratio is not None:
+            check_wide_step_ratio(self.wide_step_ratio)
 
     @property
     def weights_are_local(self) -> bool:
@@ -923,10 +992,10 @@ class GeneratorSettings:
         ``max_num_batched_tokens``, ``long_prefill_token_threshold``, ``enable_prefix_caching``,
         ``prefix_match_unit`` (checked by ``prefill_plan.check_scheduler_config``, not stored) and ``spec_tokens``
         (vLLM ``num_speculative_tokens`` after the platform published ``effective_k``). None = draft 1. Environment:
-        ``MOTIF3_KV_REPLICATED_DECODE``, ``MOTIF3_PREFILL_MAX_BUCKET``, ``MOTIF3_PACKED_PREFILL``,
-        ``MOTIF3_PACKED_PREFILL_MAX_SEG``, ``MOTIF3_PACKED_PREFILL_MAX_TOKENS``, ``MOTIF3_PACKED_PREFILL_PK1``,
-        ``MOTIF3_PACKED_WARMUP``, ``MOTIF3_SPEC_VERIFY``, ``MOTIF3_WIDE_MIN_LANES`` (``spec_alpha_prior`` keeps its
-        default)."""
+        ``MOTIF3_TT_CACHE_POLICY``, ``MOTIF3_KV_REPLICATED_DECODE``, ``MOTIF3_PREFILL_MAX_BUCKET``,
+        ``MOTIF3_PACKED_PREFILL``, ``MOTIF3_PACKED_PREFILL_MAX_SEG``, ``MOTIF3_PACKED_PREFILL_MAX_TOKENS``,
+        ``MOTIF3_PACKED_PREFILL_PK1``, ``MOTIF3_PACKED_WARMUP``, ``MOTIF3_SPEC_VERIFY``, ``MOTIF3_WIDE_MIN_LANES``,
+        ``MOTIF3_WIDE_STEP_RATIO`` (``spec_alpha_prior`` keeps its default)."""
         env = os.environ if environ is None else environ
         hf_layers = int(getattr(hf_config, "num_hidden_layers", NUM_HIDDEN_LAYERS))
         env_layers = _env_int(env, "MOTIF3_NUM_LAYERS")
@@ -953,6 +1022,7 @@ class GeneratorSettings:
             weights_path=loc.path,
             weights_revision=loc.revision,
             cache_path=resolve_tt_cache_path(env),
+            tt_cache_policy=tt_cache_policy_from_env(env),
             optimizations=optimizations,
             block_size=None if block_size is None else int(block_size),
             weights_source=loc.source,
@@ -970,6 +1040,7 @@ class GeneratorSettings:
             packed_prefill_pk1=packed_prefill_pk1_from_env(env),
             packed_warmup=packed_warmup_from_env(env),
             wide_min_lanes=wide_min_lanes_from_env(env),
+            wide_step_ratio=wide_step_ratio_from_env(env),
         )
 
 
@@ -1601,6 +1672,7 @@ __all__ = [
     "DEFAULT_PREFILL_ALIGNMENT",
     "DEFAULT_PREFILL_SPAN_CAP",
     "DEFAULT_SPEC_ALPHA_PRIOR",
+    "DEFAULT_TT_CACHE_POLICY",
     "DecodeBatch",
     "FEATURE_SWITCHES",
     "GeneratorSettings",
@@ -1638,6 +1710,7 @@ __all__ = [
     "SUPPORTED_SPEC_TOKENS",
     "SpecDecodeBatch",
     "SpecDecodeResult",
+    "TT_CACHE_POLICIES",
     "VOCAB_SIZE",
     "WIDE_MIN_LANES_NEVER",
     "WIDE_ROWS",
@@ -1655,8 +1728,10 @@ __all__ = [
     "check_prefill_span_cap",
     "check_spec_alpha_prior",
     "check_spec_result",
+    "check_tt_cache_policy",
     "check_tt_config",
     "check_wide_min_lanes",
+    "check_wide_step_ratio",
     "expected_num_blocks",
     "feature_switch_from_env",
     "hf_cache_snapshot",
@@ -1678,5 +1753,7 @@ __all__ = [
     "serving_additional_config",
     "smoothed_acceptance",
     "spec_verify_from_env",
+    "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
+    "wide_step_ratio_from_env",
 ]

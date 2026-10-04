@@ -1117,6 +1117,18 @@ def _host_argmax(lg, cfg, mesh_device) -> torch.Tensor:
     return torch.argmax(full, dim=-1)
 
 
+# Retired 2026-10-04 (lead decision, docs/FINAL_VALIDATION.md §6.2). The in-place G16-lite probes inject the B0 + C1a
+# builders, and the shipped modules refuse them: MotifMoE's F3N rule R3 guard (no 64-row constants without a config
+# that stages T64) and the global layer's flash_groups guard (option A''). The T64 path is covered by the real-module
+# T64 tests (test_moe.py, test_attention_*, test_kv_write.py) and by the model-level G16 (test_t64_g16_step_cost) and
+# G-S5w in test_spec_decode_device.py, which pass on TORUS_XY. Their numbers are in GATES_RESULTS.md §13 (history).
+G16LITE_RETIRED = (
+    "retired 2026-10-04: the shipped MotifMoE / global layer refuse the injected B0 + C1a builders; covered by the "
+    "real-module T64 tests and the model-level G16 / G-S5w (docs/FINAL_VALIDATION.md §6.2)"
+)
+
+
+@pytest.mark.skip(reason=G16LITE_RETIRED)
 @pytest.mark.parametrize("mesh_device, device_params", [MESH], indirect=True, ids=["4x8_serving"])
 def test_g16lite_ops(mesh_device):
     torch.set_num_threads(16)
@@ -1437,6 +1449,7 @@ class LayerInputs:
                 + [t for r in (self.rot8, self.rot8d, self.rot16) for cs in r.values() for t in cs])  # fmt: skip
 
 
+@pytest.mark.skip(reason=G16LITE_RETIRED)
 @pytest.mark.parametrize("mesh_device, device_params", [MESH], indirect=True, ids=["4x8_serving"])
 def test_g16lite_layers(mesh_device):
     from models.demos.motif3.tt.decoder import MotifDecoderLayer, free_tensors

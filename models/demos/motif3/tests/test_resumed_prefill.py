@@ -2046,7 +2046,10 @@ def pooled(ms: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, float]:
 
 def compare_streams(a: Sequence[int], ma: Sequence[float], b: Sequence[int], mb: Sequence[float]) -> Tuple[bool, str]:
     """Greedy streams equal, or equal up to a first divergence where either path's logits were a near tie
-    (margin < NEAR_TIE): after a flip the continuations differ by construction, so nothing later is compared. A
+    (margin <= NEAR_TIE): after a flip the continuations differ by construction, so nothing later is compared. The
+    bound is inclusive since 2026-10-04 (lead decision, docs/FINAL_VALIDATION.md §6.1): bf16 logit margins come in
+    steps of 1/8 here, and on the TORUS_XY fabric CP-H python_code parts at exactly 0.500 between two control tokens
+    (step 11 at 0.250 / 0.125 on TORUS_Y). A
     non-finite margin up to the first divergence (NaN / Inf logits) fails: ``min`` would otherwise return the finite
     margin and excuse a NaN lane."""
     for i, (x, y) in enumerate(zip(a, b)):
@@ -2054,7 +2057,7 @@ def compare_streams(a: Sequence[int], ma: Sequence[float], b: Sequence[int], mb:
         if bad:
             return False, f"non-finite logits margin at step {i} ({', '.join(bad)})"
         if x != y:
-            near = min(ma[i], mb[i]) < NEAR_TIE
+            near = min(ma[i], mb[i]) <= NEAR_TIE
             return (
                 near,
                 f"diverge at step {i} ({x} vs {y}; margins {ma[i]:.3f} / {mb[i]:.3f}{' near tie' if near else ''})",

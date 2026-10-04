@@ -1257,7 +1257,8 @@ class MotifTTConfig:
     # requires ring_gather "safe" (F3N R1) and refuses "auto" with the exact-fp32 router at a T64 row count missing
     # from ROUTER_EXACT_FP32_DECODE_ROWS (R-E7).
     spec_verify: str = "packed"  # "packed" | "wide" | "auto" (generator_api.SPEC_VERIFY_MODES)
-    wide_step_ratio: float = DEFAULT_WIDE_STEP_RATIO  # r = T64 step / T32-spec step: the input of c* (G16 updates it)
+    # r = T64 step / T32-spec step: the input of c* (G16 updates it; MOTIF3_WIDE_STEP_RATIO via from_settings overrides)
+    wide_step_ratio: float = DEFAULT_WIDE_STEP_RATIO
 
     # ---- module defaults the decoder passes (README §4, §10; wave-B1 decisions) ------------------------------------
     # mHC coefficients: "motif" = tt/kernels/sinkhorn_motif (Option B, exact fp32 SFPU, ~3 us/site); "stock" = the
@@ -1468,8 +1469,9 @@ class MotifTTConfig:
         ``spec_tokens``, ``prefill_span_cap`` when the settings carry one (else ``MOTIF3_PREFILL_MAX_BUCKET`` / 8192);
         P5 / T64 (docs/p5_t64/P5_T64_DESIGN.md §8.3): ``pack_seg_buckets`` / ``pack_sp1_seg_buckets`` from
         ``packed_prefill_max_seg`` and ``packed_prefill_pk1``, ``pack_max_tokens = packed_prefill_max_tokens``,
-        ``spec_verify`` (settings objects without these fields keep the environment's / the defaults).
-        ``overrides`` win."""
+        ``spec_verify``, ``wide_step_ratio`` when the settings carry one (``MOTIF3_WIDE_STEP_RATIO``; else
+        :data:`DEFAULT_WIDE_STEP_RATIO`) (settings objects without these fields keep the environment's / the
+        defaults). ``overrides`` win."""
         weights = getattr(settings, "weights_path", None)
         local = bool(weights) and Path(weights).is_dir()
         src: Any = None
@@ -1506,6 +1508,8 @@ class MotifTTConfig:
         if getattr(settings, "packed_prefill_max_tokens", None) is not None:
             kw["pack_max_tokens"] = int(settings.packed_prefill_max_tokens)
         kw["spec_verify"] = str(getattr(settings, "spec_verify", None) or "packed")
+        if getattr(settings, "wide_step_ratio", None) is not None:
+            kw["wide_step_ratio"] = float(settings.wide_step_ratio)
         kw.update(overrides)
         return cls.from_hf_config(src, mesh_device=mesh_device, mesh_shape=mesh_shape, **kw)
 

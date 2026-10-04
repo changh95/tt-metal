@@ -133,6 +133,8 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_PACKED_WARMUP",
         "MOTIF3_SPEC_VERIFY",
         "MOTIF3_WIDE_MIN_LANES",
+        "MOTIF3_TT_CACHE_POLICY",
+        "MOTIF3_WIDE_STEP_RATIO",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -1906,6 +1908,86 @@ def test_serving_config_reaches_the_generator_settings(fake_generator_class, mot
     monkeypatch.setenv("MOTIF3_PREFILL_MAX_BUCKET", "2048")
     model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
     assert model.settings.prefill_span_cap == 2048 and model.generator.max_prefill_span == 2048
+
+
+def test_tt_cache_policy_and_step_ratio_reach_the_generator_settings(
+    fake_generator_class, motif_hf_config, monkeypatch
+):
+    """``MOTIF3_TT_CACHE_POLICY`` and ``MOTIF3_WIDE_STEP_RATIO`` reach ``create`` through the bridge's one settings path
+    (``GeneratorSettings.from_env`` in ``initialize_vllm_model``); unset they are today's ``auto`` / None (= the
+    config's 1.13), and a bad value refuses the launch before ``create``."""
+    monkeypatch.setenv("HF_MODEL", str(_motif_dir()))
+    monkeypatch.delenv("MOTIF3_WEIGHTS_DIR", raising=False)
+    mesh = SimpleNamespace(shape=(4, 8))
+    model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+    assert (model.settings.tt_cache_policy, model.settings.wide_step_ratio) == ("auto", None)
+    for policy in api.TT_CACHE_POLICIES:
+        monkeypatch.setenv("MOTIF3_TT_CACHE_POLICY", f" {policy.upper()} ")
+        monkeypatch.setenv("MOTIF3_WIDE_STEP_RATIO", "1.2")
+        model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+        s = model.generator.settings
+        assert s is model.settings and (s.tt_cache_policy, s.wide_step_ratio) == (policy, 1.2)
+    created = []
+    monkeypatch.setattr(fake_generator_class, "create", classmethod(lambda cls, **kw: created.append(kw)))
+    for name, bad in (("MOTIF3_TT_CACHE_POLICY", "read"), ("MOTIF3_WIDE_STEP_RATIO", "0.9")):
+        monkeypatch.setenv("MOTIF3_TT_CACHE_POLICY", "write")
+        monkeypatch.setenv("MOTIF3_WIDE_STEP_RATIO", "1.2")
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValueError, match=name):
+            gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+    assert created == []  # refused before create (nothing loaded)
+
+
+def test_real_create_passes_the_tt_cache_policy_to_the_model(monkeypatch):
+    """The real ``MotifGenerator.create`` builds ``MotifModel(cache=settings.tt_cache_policy)`` (``MotifModel`` replaced
+    by a recorder that stops ``create``), unless its model kwargs carry ``cache``; it logs the policy in the ``create:``
+    line, maps ``wide_step_ratio`` onto the config, and refuses an invalid policy before the config or any weight."""
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tt.model_config import DEFAULT_WIDE_STEP_RATIO
+
+    class Stop(Exception):
+        pass
+
+    seen = []
+
+    def fake_model(mesh_device, cfg, **kw):
+        seen.append(dict(kw, cfg=cfg))
+        raise Stop
+
+    monkeypatch.setattr(G, "MotifModel", fake_model)
+    weights = str(_motif_dir())
+    mesh = SimpleNamespace(shape=(4, 8))
+
+    def create(settings, **kw):
+        lines = []
+        with pytest.raises(Stop):
+            G.MotifGenerator.create(hf_config=None, mesh_device=mesh, settings=settings, log=lines.append, **kw)
+        return seen[-1], next(line for line in lines if line.startswith("create: MotifTTConfig("))
+
+    got, line = create(api.GeneratorSettings(num_layers=3, weights_path=weights))
+    assert got["cache"] == "auto" and line.endswith("; TT cache policy 'auto')")
+    assert got["cfg"].wide_step_ratio == DEFAULT_WIDE_STEP_RATIO and list(got["layers"]) == [0, 1, 2]
+    for policy in api.TT_CACHE_POLICIES:
+        got, line = create(api.GeneratorSettings(num_layers=3, weights_path=weights, tt_cache_policy=policy))
+        assert got["cache"] == policy and line.endswith(f"; TT cache policy {policy!r})")
+    # explicit model kwargs win (device tests pass their own); a bool maps onto the policy names
+    write = api.GeneratorSettings(num_layers=3, weights_path=weights, tt_cache_policy="write")
+    for explicit, shown in ((True, "write"), (False, "off"), ("auto", "auto")):
+        got, line = create(write, cache=explicit)
+        assert got["cache"] is explicit and line.endswith(f"; TT cache policy {shown!r})")
+    got, _ = create(api.GeneratorSettings(num_layers=3, weights_path=weights, wide_step_ratio=1.2))
+    assert got["cfg"].wide_step_ratio == 1.2
+    # an invalid policy that bypassed GeneratorSettings' check (a frozen field set behind its back) or an invalid
+    # explicit one: ValueError at create, before the config is built or a weight is read
+    n = len(seen)
+    bad = api.GeneratorSettings(num_layers=3, weights_path=weights)
+    object.__setattr__(bad, "tt_cache_policy", "readonly")
+    monkeypatch.setattr(G.MotifTTConfig, "from_settings", classmethod(lambda cls, *a, **k: pytest.fail("config built")))
+    with pytest.raises(ValueError, match="MOTIF3_TT_CACHE_POLICY"):
+        G.MotifGenerator.create(hf_config=None, mesh_device=mesh, settings=bad, log=lambda m: None)
+    with pytest.raises(ValueError, match="cache must be one of"):
+        G.MotifGenerator.create(hf_config=None, mesh_device=mesh, settings=write, log=lambda m: None, cache="rw")
+    assert len(seen) == n
 
 
 def test_initialize_refuses_a_generator_without_the_enabled_features(

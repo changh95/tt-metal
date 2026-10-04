@@ -10,7 +10,8 @@ Lifecycle (vllm-tt-plugin call order, ``generator_api.MotifGenerator`` docstring
    ``MotifTTConfig.from_settings`` (``<weights>/config.json``, ``num_layers``, ``max_model_len``, ``max_batch = 32``, KV
    dtype, fabric from the device, the feature settings: span cap, KV-R, ``spec_tokens``), then the weights
    (:class:`~models.demos.motif3.tt.model.MotifModel`: TT cache where converted, else the HF checkpoint, lazily; with
-   ``spec_tokens = 1`` also the MTP layer, part ``L53``). No KV pool yet.
+   ``spec_tokens = 1`` also the MTP layer, part ``L53``; ``cache`` = ``settings.tt_cache_policy``,
+   ``MOTIF3_TT_CACHE_POLICY``: ``"write"`` also writes and marks the parts it converts). No KV pool yet.
 2. ``allocate_kv_cache(num_blocks=, block_size=, num_layers=)`` (GEN-2): ``cfg.set_kv_geometry`` with the plugin's
    values (4129 x 64 for the serving defaults), one ``ttnn.empty`` + ``ttnn.fill(0)`` cache per layer, plus the MTP
    layer's cache (``pool.mtp``) with speculation.
@@ -206,7 +207,7 @@ from .kv_write import (
     lanes_per_call_for,
 )
 from .lm_head import HostShardReader
-from .model import LazySource, MotifKVPool, MotifModel
+from .model import LazySource, MotifKVPool, MotifModel, normalize_cache_policy
 from .model_config import ROUTER_EXACT_FP32_DECODE_ROWS, MotifTTConfig, require_l1_small
 from .moe import EXACT_ROUTER_DECODE_ROWS
 from .mtp import mtp_next_tokens
@@ -782,16 +783,23 @@ class MotifGenerator(api.MotifGenerator):
         cls, *, hf_config: Any, mesh_device: Any, settings: api.GeneratorSettings, **model_kwargs
     ) -> "MotifGenerator":
         """Build the runtime on the plugin's open mesh (``generator_api.MotifGenerator.create``). ``model_kwargs`` go
-        to :class:`MotifModel` (``cache``, ``vocab_split``, ``layer_kwargs``, ``source``, ``mtp``)."""
+        to :class:`MotifModel` (``cache``, ``vocab_split``, ``layer_kwargs``, ``source``, ``mtp``). ``cache`` defaults
+        to ``settings.tt_cache_policy`` (``MOTIF3_TT_CACHE_POLICY``: ``"auto"`` never writes the TT cache, ``"write"``
+        converts and writes the parts that are not complete; ``tt/model.py``)."""
         log = model_kwargs.pop("log", _log_default)
         l1s = require_l1_small(mesh_device)
+        if "cache" not in model_kwargs:  # an invalid policy is refused here, before anything loads
+            model_kwargs["cache"] = api.check_tt_cache_policy(
+                getattr(settings, "tt_cache_policy", api.DEFAULT_TT_CACHE_POLICY)
+            )
+        cache_policy = normalize_cache_policy(model_kwargs["cache"])
         # spec_verify "wide" / "auto": MotifTTConfig.validate refuses ring_gather != "safe" (F3N R1, R-E5) and "auto"
         # with the exact-fp32 router at an unsupported row count (R-E7) before any weight loads; the constructor
         # re-checks them against the built model (its MotifCCL, its MoE)
         cfg = MotifTTConfig.from_settings(settings, mesh_device=mesh_device, hf_config=hf_config)
         log(
             f"create: {cfg.describe()} (mesh L1_SMALL {l1s} B per core; weights {settings.weights_path} "
-            f"[{settings.weights_source}])"
+            f"[{settings.weights_source}]; TT cache policy {cache_policy!r})"
         )
         if settings.packed_prefill:
             log(

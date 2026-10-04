@@ -60,9 +60,9 @@ Speculative decode (features design §3.8.1; README §17): ``forward_decode`` = 
 consume it by default) and hands it to the MTP layer (``tt/mtp.py``), whose ``final_layernorm`` output goes through
 ``decode_logits`` + :meth:`MotifLMHead.argmax_decode` as well (the shared LM head).
 
-Decision EMB-D1 (2026-10-01; module owner; awaiting the README §3 / §6 and design §2.3.8-2.3.9 update by the shared-
-infra owner): the default vocab split is "mesh" (6880 vocab per chip over all 32 chips) instead of the "tp" split the
-README and the design describe (27520 per TP chip, replicated over DP).
+Decision EMB-D1 (2026-10-01; module owner): the default vocab split is "mesh" (6880 vocab per chip over all 32 chips)
+instead of the "tp" split of design §2.3.8-2.3.9 (27520 per TP chip, replicated over DP). README §3 / §6 document
+"mesh" as the default; the dated design doc still describes "tp".
 
 * Why: the head is DRAM-bandwidth bound. "mesh" streams 56 MB of weight per chip per step instead of 225 MB: device
   time 605 -> 218 us per decode step (traced 606 -> 197 us), and 169 MB less DRAM per chip, for one extra ROW_MAJOR

@@ -49,14 +49,17 @@ are served on any launch without ``--speculative-config`` (those steps sample on
 Packed prefill and full-batch verify (``docs/p5_t64/P5_T64_DESIGN.md``; read by ``GeneratorSettings.from_env`` in
 EngineCore, so export them in the API server and EngineCore alike):
 
-* P5, ``MOTIF3_PACKED_PREFILL=1`` (off until gates CP-P / CP9-P / E2E-P; knobs ``MOTIF3_PACKED_PREFILL_MAX_SEG`` /
-  ``_MAX_TOKENS`` / ``_PK1`` and ``MOTIF3_PACKED_WARMUP``): the generator runs the short chunks of one prefill step
-  together. The bridge is unchanged: ONE ``prefill_forward_batch`` call per step, the same per-row logits.
-* T64, ``MOTIF3_SPEC_VERIFY=auto`` on the MTP launch (``packed`` until gates G-X / G-serve; ``wide`` is the one-trace
-  fallback): a 64-row verify trace next to the 32-lane one. The bridge drafts every live lane once the live lanes reach
-  the generator's ``c*`` (``MotifGenerator.drafts_all_lanes``: about 19 at the acceptance prior 0.85;
-  ``MOTIF3_WIDE_MIN_LANES`` overrides it), and keeps the idle-lane budget below it, so c = 32 greedy traffic speculates
-  too.
+* P5, ``MOTIF3_PACKED_PREFILL=1`` (off in the code; both TIS specs set it since gates CP-P / CP9-P / E2E-P passed;
+  knobs ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1`` and ``MOTIF3_PACKED_WARMUP``): the generator
+  runs the short chunks of one prefill step together. The bridge is unchanged: ONE ``prefill_forward_batch`` call per
+  step. A row's tokens may then depend on which rows share its pass (near-ties only; lead sign-off 2026-10-04,
+  ``docs/P5_T64_REVIEW.md`` §8 I-1).
+* T64, ``MOTIF3_SPEC_VERIFY=auto`` on the MTP launch (``packed`` in the code; the MTP TIS spec sets ``auto`` since
+  gates G-X / G-serve passed; ``wide`` is the one-trace fallback): a 64-row verify trace next to the 32-lane one. The
+  bridge drafts every live lane once the live lanes reach the generator's ``c*`` (``MotifGenerator.drafts_all_lanes``:
+  about 19 at the acceptance prior 0.85 and the T64 / T32 step ratio r = 1.13; ``MOTIF3_WIDE_MIN_LANES`` overrides
+  ``c*``, ``MOTIF3_WIDE_STEP_RATIO`` overrides r), and keeps the idle-lane budget below it, so c = 32 greedy traffic
+  speculates too.
 
 The ``Motif-3 features:`` line, logged once the generator exists, shows ``spec_verify``, ``c*`` and ``packed_prefill``.
 
@@ -75,7 +78,10 @@ decode step.
 
 Weights: ``MOTIF3_WEIGHTS_DIR`` > ``HF_MODEL`` (dir) > the HF-cache snapshot of a repo-id ``HF_MODEL`` at
 ``TT_MODEL_WEIGHTS_REVISION`` > ``hf_config._name_or_path`` (``generator_api.resolve_weights_location``, the same
-order ``MotifTTConfig`` uses); the resolved path and the rule that matched are logged at model init.
+order ``MotifTTConfig`` uses); the resolved path and the rule that matched are logged at model init. TT weight cache:
+``MOTIF3_TT_CACHE_PATH`` > ``TT_CACHE_PATH``, used per ``MOTIF3_TT_CACHE_POLICY``
+(``GeneratorSettings.tt_cache_policy``: ``auto`` never writes it, ``write`` converts and writes the parts that are not
+complete; the generator's ``create:`` line logs the policy).
 
 What the plugin calls, and what this class does
 ------------------------------------------------
@@ -1037,7 +1043,8 @@ class MotifForCausalLM:
         plugin's ``ttnn.MeshDevice``; ``max_batch_size`` = ``max_num_seqs``; ``max_seq_len`` = ``max_model_len``
         (a multiple of 256). Weights (``generator_api.resolve_weights_location``): ``MOTIF3_WEIGHTS_DIR`` >
         ``HF_MODEL`` (dir) > HF-cache snapshot of a repo-id ``HF_MODEL`` at ``TT_MODEL_WEIGHTS_REVISION`` >
-        ``hf_config._name_or_path``; TT cache: ``TT_CACHE_PATH``. ``settings`` carries vLLM's ``--block-size``
+        ``hf_config._name_or_path``; TT cache: ``MOTIF3_TT_CACHE_PATH`` > ``TT_CACHE_PATH``, policy
+        ``MOTIF3_TT_CACHE_POLICY`` (``GeneratorSettings.from_env``). ``settings`` carries vLLM's ``--block-size``
         (BRIDGE-4) and the features vLLM enabled (chunked prefill, prefix caching, ``num_speculative_tokens``),
         captured by ``get_max_tokens_all_users`` in ``init_device``. The runtime class is ``MOTIF3_GENERATOR_CLASS``
         (default ``models.demos.motif3.tt.generator:MotifGenerator``), imported here, never at module import time; a
