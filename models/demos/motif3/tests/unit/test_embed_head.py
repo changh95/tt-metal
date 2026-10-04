@@ -18,6 +18,9 @@ CPU tests (no device; run through the host wrapper with --noconftest)::
 * ``test_cpu_stream_sum_eps_identity``: ``rms_norm(sum_4 x; 16 eps) == rms_norm(mean_4 x; eps)`` **bit-exactly** in the
   reference's bf16 numerics (reference RMSNorm module in bf16), and to fp32 rounding in fp32.
 * ``test_cpu_import_rule``: no other models/demos (or vllm / transformers / safetensors) import at module import time.
+* ``test_cpu_t64_tokens_offsets_configs`` (T64, docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.2): ``decode_token_rows(
+  rows_per_dp=16)``, the 64-column argmax offsets table, the 64-row LM-head GEMM config (== ``model_config.lm_head_pc(
+  m_tiles=2)``, the G16-lite config).
 * ``test_cpu_prepare_real_streams``: writes the layer-1 real-stream golden (reference prefix model, layers 0-1,
   default chat prompt, 145 tokens) to ``tt_cache/test/embed_head/`` (5 MB). The device tests also build it on the fly
   when it is missing.
@@ -48,6 +51,11 @@ then also proves that no device buffer allocated after a capture (including a pr
 * ``test_lm_head_random_weights``: random weights at real dims, both stream reductions and fp32 logits; decode, device
   argmax, prefill.
 * ``test_embed_head_8x4``: the (8, 4) orientation (plugin BH-Galaxy preset) for embedding, both vocab splits.
+* ``test_embed_head_t64`` (WP-D D1; T64 verify step, 16 rows per DP row; globals from the serving TT cache): the
+  split-order / natural-order ``ag_dp_rows`` at 16 rows, the 16-row embedding and split-order id embedding, the
+  16-row final norm, ``decode_logits(halves=2)``, the 64-row argmax, ``logits_rm(rows=32)``, all bitwise == the
+  32-lane calls on all 32 chips; the 32-lane head == B0's committed module; a traced 16-row head == eager; the
+  static-CB end below an L1 pin; traced cost of the 64-row pieces (``-k t64``).
 
 Real-input policy: the real-weight tests skip only when the checkpoint is not local. The layer-1 stream golden is built
 on the fly if missing (never replaced by random streams); the late-layer test skips, naming the missing files, when the
@@ -315,6 +323,55 @@ def test_cpu_assemble_offsets_tokens():
     assert tuple(p.shape) == (4, 128) and p[:, :3].tolist() == [[5, 6, 7]] * 4 and int(p[:, 3:].abs().sum()) == 0
     with pytest.raises(ValueError):
         E.prefill_token_row(torch.arange(129), 128, cfg)
+
+
+def test_cpu_t64_tokens_offsets_configs():
+    """T64 host helpers (docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.2): ``decode_token_rows(rows_per_dp=16)`` packs the 64
+    row-ordered tokens (``16 r + j``) once per stream per DP row (the default 8 lanes unchanged); the 64-column argmax
+    offsets table equals the 32-lane one on every column (row ``32 j`` = shard ``j``'s vocab offset, the rest the
+    sentinel); the LM-head GEMM config of the 64 gathered rows (``m_tiles=2``) equals ``model_config.lm_head_pc`` and
+    the G16-lite config (``per_core_M`` 2, subblock 1 x w), and ``m_tiles=1`` is the unchanged 32-lane config."""
+    from models.demos.motif3.tt import embedding as E
+    from models.demos.motif3.tt import lm_head as LH
+    from models.demos.motif3.tt.model_config import MotifTTConfig
+
+    cfg = _cpu_cfg(vocab_size=32 * 32 * 3)
+    g = torch.Generator().manual_seed(4)
+    ta = torch.randint(0, cfg.vocab_size, (32,), generator=g, dtype=torch.int32)  # anchors, lane order
+    td = torch.randint(0, cfg.vocab_size, (32,), generator=g, dtype=torch.int32)  # drafts, lane order
+    t64 = torch.cat([ta.reshape(4, 8), td.reshape(4, 8)], dim=1).reshape(64)  # row order 16 r + j
+    rows = E.decode_token_rows(t64, cfg, rows_per_dp=16)
+    assert tuple(rows.shape) == (16, 16) and rows.dtype == torch.int32
+    for r in range(4):
+        for s in range(4):
+            assert torch.equal(rows[4 * r + s], torch.cat([ta[8 * r : 8 * r + 8], td[8 * r : 8 * r + 8]]))
+    assert torch.equal(E.decode_token_rows(ta, cfg), E.decode_token_rows(ta, cfg, rows_per_dp=8))
+    assert E.decode_rows_per_dp(cfg) == 8 and E.decode_rows_per_dp(cfg, 16) == 16
+    for bad in (dict(tokens=t64), dict(tokens=ta, rows_per_dp=16), dict(tokens=t64, rows_per_dp=33)):
+        with pytest.raises(ValueError):
+            E.decode_token_rows(bad.pop("tokens"), cfg, **bad)
+    neg = t64.clone()
+    neg[9] = -1  # an idle draft row -> pad token
+    assert int(E.decode_token_rows(neg, cfg, rows_per_dp=16)[0, 9]) == cfg.pad_token_id
+    # argmax offsets for the 64 split-order rows
+    off32, off64 = LH.argmax_offsets(cfg, "mesh"), LH.argmax_offsets(cfg, "mesh", 64)
+    assert tuple(off64.shape) == (1, 1, 32 * cfg.num_chips, 64)
+    for c in range(64):
+        assert torch.equal(off64[..., c], off32[..., c % 32]), c
+    # the 64-row GEMM config
+    real = MotifTTConfig.from_hf_config(mesh_shape=(4, 8))
+    for split in LH.VOCAB_SPLITS:
+        for m in (1, 2):
+            pc = LH.lm_head_program_config(real, split, m_tiles=m)
+            assert repr(pc) == repr(real.lm_head_pc(split, m_tiles=m)), (split, m)
+            assert (pc.per_core_M, pc.out_block_h, pc.out_subblock_h) == (m, m, 1), (split, m)
+        assert repr(LH.lm_head_program_config(real, split)) == repr(LH.lm_head_program_config(real, split, m_tiles=1))
+        assert LH.lm_head_program_config(real, split, "auto", m_tiles=2) is None
+    pc64 = LH.lm_head_program_config(real, "mesh", m_tiles=2)  # G16-lite: mm1d((12, 9), 16, 2, 2, 1, 2, fuse_batch)
+    assert (pc64.compute_with_storage_grid_size.x, pc64.compute_with_storage_grid_size.y) == (12, 9)
+    assert (pc64.in0_block_w, pc64.per_core_N, pc64.out_subblock_w, pc64.fuse_batch) == (16, 2, 2, True)
+    with pytest.raises(ValueError, match="per_core_m"):
+        LH.mcast1d_pc((12, 9), 215, 2, 16, per_core_m=0)
 
 
 def test_cpu_concat_views():
@@ -1389,6 +1446,214 @@ def test_embed_head_8x4(mesh_device, device_params):
                 f"{pp[0]:.6f} / {pp[1]:.6f}")
         _free([lg, head.weight])
     _free([X, Xp])
+
+
+# ============================================================================================================
+# T64: the 64-row verify step (docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4)
+# ============================================================================================================
+def _decode_X16(mesh_device, cfg, lanes_a: torch.Tensor, lanes_d: torch.Tensor, device=True):
+    """Lane-ordered streams of the anchors / drafts ``[32, 4, 4096]`` -> the T64 decode input ``X [1, 4, 16, 4096]``
+    per DP row r = ``[the 8 anchors of lanes 8r.. | their 8 drafts]`` (stream-major), replicated over TP."""
+    import ttnn
+
+    def rows(x):
+        return x.reshape(cfg.dp, cfg.lanes_per_row, 4, -1).permute(0, 2, 1, 3)  # [dp, 4, 8, D]
+
+    r16 = torch.cat([rows(lanes_a), rows(lanes_d)], dim=2).contiguous()  # [dp, 4, 16, D]
+    if device:
+        return _row_sharded(mesh_device, cfg, r16, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+    dims = cfg.axes.mesh_dims(dp_dim=0, tp_dim=None)
+    mapper = ttnn.create_mesh_mapper(
+        mesh_device,
+        ttnn.MeshMapperConfig(
+            [ttnn.PlacementReplicate() if d is None else ttnn.PlacementShard(d) for d in dims],
+            ttnn.MeshShape(*cfg.axes.mesh_shape),
+        ),
+    )
+    return ttnn.from_torch(r16, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
+
+
+def _ids_tt(mesh_device, ids: torch.Tensor):
+    """Ids ``[n]`` -> ``[1, 1, 1, n]`` uint32 ROW_MAJOR on every chip (``argmax_decode``'s output layout)."""
+    import ttnn
+
+    return ttnn.from_torch(ids.reshape(1, 1, 1, -1).to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                           device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device))  # fmt: skip
+
+
+@pytest.mark.parametrize("mesh_device, device_params", _mesh_params(), indirect=True)
+def test_embed_head_t64(mesh_device, device_params):
+    """WP-D (D1) module test of the T64 verify step's gathers, embedding and LM head ("mesh"; P5_T64_DESIGN.md §4.1,
+    §4.2, §4.4), real globals from the serving TT cache: 16 rows per DP row (``[8 anchors | 8 drafts]``) vs the same
+    rows as two 32-lane calls (anchors, drafts), every comparison bitwise on all 32 chips:
+
+    * ``ccl.ag_dp_rows(halves=2)`` at W = 4096 / 576: the split order (rows 0..31 every DP row's first 8 rows in lane
+      order, 32..63 its last 8); ``halves=1`` at 16 rows: the natural order ``16 dp + j``;
+    * embedding: ``decode_tokens_device(tokens [64], rows_per_dp=16)`` -> ``forward_decode`` ``X [1, 4, 16, 4096]`` ==
+      the two 8-lane calls; ``embed_rows_from_device`` of the split-order ids ``[1, 1, 1, 64]`` -> ``[1, 1, 16, 4096]``
+      == the two 32-id calls (the T64 MTP input);
+    * head on real layer-1 streams: ``stream_mean_norm`` at 16 rows == the 8-row calls; ``decode_logits(hn, halves=2)``
+      ``[1, 1, 64, 6880]``: rows 0..31 == the anchors' 32-lane logits, 32..63 == the drafts'; ``argmax_decode`` of
+      them ``[1, 1, 1, 64]`` == the two 32-lane argmaxes == ``torch.argmax`` of the host logits, identical on every
+      chip; ``logits_rm(lg, rows=32)`` == ``logits_rm`` of the anchors' logits (its host read == theirs);
+      ``logits_to_host`` refuses the 64-row logits; the 32-lane head == B0's committed module (git ``HEAD``);
+    * a traced 16-row head (norm, split-order logits, argmax) replayed with new streams == eager;
+    * every new program's static CBs end below a one-page L1 pin; traced cost of the 64-row head pieces vs the 32-lane
+      ones (informational; G16-lite: gather 42.6 vs 27.6 us, GEMM 149.2 vs 143.8 us, argmax 243.5 vs 216.5 us)."""
+    import ttnn
+    from models.demos.motif3.tests.unit.test_moe import _RaisingSource, b0_module, l1_pin, t64_cfg
+    from models.demos.motif3.tt.ccl import MotifCCL, log_fabric
+    from models.demos.motif3.tt.embedding import MotifEmbedding
+    from models.demos.motif3.tt.lm_head import MotifLMHead
+    from models.demos.motif3.tt.model import layer_cache_complete, read_only_cache
+
+    cfg = t64_cfg(mesh_device)
+    log_fabric(mesh_device, "embed_head_t64")
+    print(f"[embed_head] t64: host load average {_load():.1f}; {cfg.describe()}")
+    if not layer_cache_complete(cfg, None):
+        pytest.skip(f"TT-cache part 'global' is not converted ({cfg.cache_dir})")
+    ccl = MotifCCL(mesh_device, cfg)
+    pin = l1_pin(mesh_device)
+    L, D = cfg.lanes_per_row, cfg.hidden_size
+    R, C = cfg.axes.mesh_shape
+    failures = []
+
+    def check(name, ok, detail=""):
+        _report(f"t64 {name}: {'ok' if ok else 'FAIL'}{('; ' + detail) if detail else ''}")
+        if not ok:
+            failures.append(f"{name}: {detail}")
+
+    # ---- the split-order gather -----------------------------------------------------------------------------
+    g = torch.Generator().manual_seed(64)
+    for W in (4096, 576):
+        rows = torch.randn(cfg.dp, 1, 2 * L, W, generator=g).bfloat16()  # DP row r: [1, 1, 16, W]
+        x = _row_sharded(mesh_device, cfg, rows, ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        split = ccl.ag_dp_rows(x, halves=2)
+        nat = ccl.ag_dp_rows(x)
+        ps, pn = _per_chip(split, mesh_device), _per_chip(nat, mesh_device)  # [R, C, 1, 1, 64, W]
+        want_s = torch.cat([rows[:, 0, :L].reshape(-1, W), rows[:, 0, L:].reshape(-1, W)])
+        want_n = rows[:, 0].reshape(-1, W)
+        ok = all(torch.equal(ps[r, c, 0, 0], want_s) and torch.equal(pn[r, c, 0, 0], want_n)
+                 for r in range(R) for c in range(C))  # fmt: skip
+        check(f"ag_dp_rows W={W}: halves=2 split order / halves=1 natural order, all 32 chips", ok)
+        _free([x, split, nat])
+
+    # ---- modules from the TT cache ----------------------------------------------------------------------------------
+    t0 = time.time()
+    with read_only_cache() as misses:
+        emb = MotifEmbedding(mesh_device, cfg, source=_RaisingSource(), ccl=ccl, cache=True)
+        head = MotifLMHead(mesh_device, cfg, source=_RaisingSource(), ccl=ccl, cache=True)
+    assert misses == [], f"tensors missing from the TT cache: {misses}"
+    assert sorted(head._am_wide) == [64] and sorted(head.pc_wide) == [64], (head._am_wide, head.pc_wide)
+    _report(f"t64: embedding + LM head ('mesh', 64-row argmax constants) loaded from the TT cache in "
+            f"{time.time() - t0:.1f} s")
+
+    # ---- embedding ---------------------------------------------------------------------------------------------------
+    ta = torch.randint(0, cfg.vocab_size, (32,), generator=g, dtype=torch.int32)
+    td = torch.randint(0, cfg.vocab_size, (32,), generator=g, dtype=torch.int32)
+    ta[0], td[31] = 0, cfg.vocab_size - 1  # table edges
+    t64 = torch.cat([ta.reshape(cfg.dp, L), td.reshape(cfg.dp, L)], dim=1).reshape(-1)  # row order 16 r + j
+    tok_a, tok_d = emb.decode_tokens_device(ta), emb.decode_tokens_device(td)
+    tok16 = emb.decode_tokens_device(t64, rows_per_dp=2 * L)
+    xa, xd, x16 = emb.forward_decode(tok_a), emb.forward_decode(tok_d), emb.forward_decode(tok16)
+    pa, pd, p16 = _per_chip(xa, mesh_device), _per_chip(xd, mesh_device), _per_chip(x16, mesh_device)
+    check("embedding forward_decode [4, 16] tokens -> X [1, 4, 16, 4096] == two 8-lane calls",
+          list(x16.shape) == [1, 4, 2 * L, D] and torch.equal(p16[..., :L, :], pa) and torch.equal(p16[..., L:, :], pd))
+    _free([xa, xd, x16, tok_a, tok_d, tok16])
+    ids_a, ids_d, ids64 = _ids_tt(mesh_device, ta), _ids_tt(mesh_device, td), _ids_tt(mesh_device, torch.cat([ta, td]))
+    ea, ed, e16 = (emb.embed_rows_from_device(i) for i in (ids_a, ids_d, ids64))
+    pa, pd, p16 = _per_chip(ea, mesh_device), _per_chip(ed, mesh_device), _per_chip(e16, mesh_device)
+    check("embed_rows_from_device split-order ids [1, 1, 1, 64] -> [1, 1, 16, 4096] == two 32-id calls",
+          list(e16.shape) == [1, 1, 2 * L, D] and torch.equal(p16[..., :L, :], pa) and torch.equal(p16[..., L:, :], pd)
+          and ids64.is_allocated())  # fmt: skip
+    _free([ea, ed, e16, ids_a, ids_d, ids64])
+
+    # ---- head on real layer-1 streams --------------------------------------------------------------------------------
+    streams = _require_real_streams()["x"]  # [S, 4, 4096] bf16
+    S = streams.shape[0]
+    sel = torch.linspace(0, S - 1, 64).round().long()
+    la, ld = streams[sel[:32]], streams[sel[32:]]
+    Xa, Xd = _decode_X(mesh_device, cfg, la), _decode_X(mesh_device, cfg, ld)
+    X16 = _decode_X16(mesh_device, cfg, la, ld)
+    hna, hnd, hn16 = head.stream_mean_norm(Xa), head.stream_mean_norm(Xd), head.stream_mean_norm(X16)
+    pa, pd, p16 = _per_chip(hna, mesh_device), _per_chip(hnd, mesh_device), _per_chip(hn16, mesh_device)
+    check("stream_mean_norm at 16 rows == two 8-row calls",
+          torch.equal(p16[..., :L, :], pa) and torch.equal(p16[..., L:, :], pd))
+    lga, lgd = head.decode_logits(hna), head.decode_logits(hnd)
+    lg64 = head.decode_logits(hn16, halves=2)
+    qa, qd, q64 = _per_chip(lga, mesh_device), _per_chip(lgd, mesh_device), _per_chip(lg64, mesh_device)
+    da = float((q64[..., :32, :].float() - qa.float()).abs().max())
+    dd = float((q64[..., 32:, :].float() - qd.float()).abs().max())
+    check("decode_logits(halves=2) [1, 1, 64, 6880]: rows 0..31 == anchors' 32-lane logits, 32..63 == drafts'",
+          list(lg64.shape) == [1, 1, 64, head.vc] and torch.equal(q64[..., :32, :], qa)
+          and torch.equal(q64[..., 32:, :], qd), f"max |diff| {da:.3e} / {dd:.3e}")  # fmt: skip
+    host_a, host_d = head.logits_to_host(lga), head.logits_to_host(lgd)  # [32, V] each
+    am_a, am_d = head.argmax_decode(lga), head.argmax_decode(lgd)
+    am64 = head.argmax_decode(lg64)
+    ta_, td_, t64_ = head.tokens_to_host(am_a), head.tokens_to_host(am_d), head.tokens_to_host(am64)
+    same_chips = all(torch.equal(ttnn.to_torch(t), ttnn.to_torch(ttnn.get_device_tensors(am64)[0]))
+                     for t in ttnn.get_device_tensors(am64))  # fmt: skip
+    ref_am = torch.cat([host_a.float().argmax(-1), host_d.float().argmax(-1)])
+    check("argmax_decode of the 64 rows [1, 1, 1, 64] == the two 32-lane argmaxes == torch.argmax of the host logits",
+          list(am64.shape) == [1, 1, 1, 64] and torch.equal(t64_, torch.cat([ta_, td_])) and torch.equal(t64_, ref_am)
+          and same_chips, f"identical on 32 chips {same_chips}")  # fmt: skip
+    rm32, rma = head.logits_rm(lg64, rows=32), head.logits_rm(lga)
+    check("logits_rm(lg, rows=32) == logits_rm of the anchors' logits; its host read == theirs",
+          torch.equal(_per_chip(rm32, mesh_device), _per_chip(rma, mesh_device))
+          and torch.equal(head.logits_to_host(rm32), host_a))  # fmt: skip
+    # the 32-lane path is bitwise B0's: the committed head (git HEAD) on the anchors' hidden states
+    with read_only_cache() as misses:
+        head_b0 = b0_module("lm_head").MotifLMHead(mesh_device, cfg, source=_RaisingSource(), ccl=ccl, cache=True)
+    assert misses == [], misses
+    lg_b0 = head_b0.decode_logits(hna)
+    am_b0 = head_b0.argmax_decode(lg_b0)
+    check("the 32-lane head (decode_logits, argmax_decode) == B0's committed module",
+          torch.equal(_per_chip(lg_b0, mesh_device), qa) and torch.equal(head_b0.tokens_to_host(am_b0), ta_))
+    _free([lg_b0, am_b0, head_b0.weight, head_b0.gamma])
+    head_b0.close()
+    try:
+        head.logits_to_host(lg64)
+        check("logits_to_host refuses the 64-row logits", False, "no error raised")
+    except ValueError:
+        check("logits_to_host refuses the 64-row logits", True)
+    _free([rm32, rma, am_a, am_d, am64, lga, lgd])
+
+    # ---- traced 16-row head, replayed with new streams ---------------------------------------------------------------
+    with _Capture(mesh_device) as cap:
+        hn_t = head.stream_mean_norm(X16)
+        lg_t = head.decode_logits(hn_t, halves=2, consume=True)
+        am_t = head.argmax_decode(lg_t)
+    try:
+        sel2 = torch.linspace(1, S - 2, 64).round().long()
+        ttnn.copy_host_to_device_tensor(_decode_X16(mesh_device, cfg, streams[sel2[:32]], streams[sel2[32:]],
+                                                    device=False), X16)  # fmt: skip
+        ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+        got_lg, got_am = _per_chip(lg_t, mesh_device), head.tokens_to_host(am_t)
+        hn_e = head.stream_mean_norm(X16)
+        lg_e = head.decode_logits(hn_e, halves=2, consume=True)
+        am_e = head.argmax_decode(lg_e)
+        check("traced 16-row head (norm, split-order logits, argmax) replayed with new streams == eager",
+              torch.equal(got_lg, _per_chip(lg_e, mesh_device)) and torch.equal(got_am, head.tokens_to_host(am_e)))
+        _free([lg_e, am_e])
+    finally:
+        ttnn.release_trace(mesh_device, cap.tid)
+        _free([lg_t, am_t])
+
+    # ---- traced cost of the 64-row pieces (informational) -----------------------------------------------------------
+    lg64 = head.decode_logits(hn16, halves=2)
+    lga = head.decode_logits(hna)
+    for name, f64, f32 in (
+        ("ag_dp_rows [16 | 8 rows, 4096]", lambda: ccl.ag_dp_rows(hn16, halves=2), lambda: ccl.ag_dp_rows(hna)),
+        ("decode_logits (gather + GEMM)", lambda: head.decode_logits(hn16, halves=2), lambda: head.decode_logits(hna)),
+        ("argmax_decode", lambda: head.argmax_decode(lg64), lambda: head.argmax_decode(lga)),
+    ):
+        s64, _, _ = _traced_us(mesh_device, f64, n=64)
+        s32, _, _ = _traced_us(mesh_device, f32, n=64)
+        _report(f"t64 traced {name}: 64 rows {s64:.1f} us vs 32 lanes {s32:.1f} us per call")
+    _free([lg64, lga, hna, hnd, hn16, Xa, Xd, X16, pin, emb.weight, head.weight, head.gamma])
+    head.close()
+    assert not failures, "\n".join(failures)
 
 
 # ============================================================================================================

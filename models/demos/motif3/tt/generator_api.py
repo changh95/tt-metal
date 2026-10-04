@@ -69,6 +69,21 @@ generator that does not override the new members keeps the draft-1 behaviour.
   :meth:`MotifGenerator.decode_forward_spec` for every decode step: ordinary steps (no drafts, host logits) and
   verify steps (one draft per lane at most, argmax ids only).
 
+Features: packed prefill (P5) and full-batch speculative verify (T64) (docs/p5_t64/P5_T64_DESIGN.md)
+----------------------------------------------------------------------------------------------------
+Both leave the per-call contract unchanged; :class:`GeneratorSettings` carries their knobs.
+
+* **Packed prefill** (``packed_prefill``, ``MOTIF3_PACKED_PREFILL``; §3): the generator may run the short chunks of one
+  :meth:`MotifGenerator.prefill_forward_batch` call together, as B segments of S rows in one pass of ``T = B * S``
+  rows (``pk0``: chunks at start 0; ``pk1``: resumed chunks at one common start). The rows' logits, KV writes and
+  read-only blocks are exactly those of the per-row contract. Knobs: ``packed_prefill_max_seg`` /
+  ``packed_prefill_max_tokens`` / ``packed_prefill_pk1`` / ``packed_warmup``.
+* **Speculative verify mode** (``spec_verify``, ``MOTIF3_SPEC_VERIFY``; §2.2, §4): ``"packed"`` runs drafts on idle
+  lanes of the 32-lane trace (T32), ``"wide"`` runs every step in a 64-row trace (T64: per DP row 8 anchors + the 8
+  lanes' drafts), ``"auto"`` captures both and uses T64 only for verify steps whose drafts do not fit idle lanes.
+  :class:`SpecDecodeBatch` / :class:`SpecDecodeResult` stay as they are; the bridge asks
+  :meth:`MotifGenerator.drafts_all_lanes` whether every live lane may draft.
+
 Import rule (design 00 §2.1): this module is imported by vLLM's API server, its registry-inspection subprocess and
 EngineCore before any mesh exists. It imports only the standard library and torch, never ttnn or other
 ``models/demos/**`` packages, and never touches a device (``huggingface_hub`` is imported lazily, only to locate the
@@ -297,7 +312,45 @@ MTP_LAYER_IDX = NUM_HIDDEN_LAYERS  # the MTP layer is reference layer 53 (TT-cac
 # without KV-R (two 8-lane calls: anchors / plain lanes, then draft lanes), "all" = KV-R (gather the 8-lane latent
 # over DP, one 32-lane update on every chip), "all_split" = KV-R + speculation (production). See kv_write_mode().
 KV_WRITE_MODES = ("row", "row_split", "all", "all_split")
-SPEC_VERIFY_MODES = ("packed", "wide")  # packed = drafts in idle lanes of the 32-lane trace (S1); wide = T64 (S3)
+# Speculative verify (MOTIF3_SPEC_VERIFY; docs/p5_t64/P5_T64_DESIGN.md §2.2, §4):
+#   "packed" (default, S1): a draft runs on an idle lane of the 32-lane spec trace (T32); drafts that do not fit run
+#            in a second T32 replay (the overflow pass);
+#   "wide"   (S3): the 64-row trace (T64) alone serves every step (the one-trace fallback);
+#   "auto":  both traces, each captured once at warmup: T32 for ordinary steps and for verify steps whose drafts all
+#            fit idle lanes, one T64 replay for the other verify steps (no overflow pass for bridge traffic).
+# "wide" / "auto" need MotifTTConfig.ring_gather == "safe" (F3N rule R1; the config refuses anything else).
+SPEC_VERIFY_MODES = ("packed", "wide", "auto")
+WIDE_SPEC_VERIFY_MODES = ("wide", "auto")  # the modes that stage and capture the T64 trace
+# T64 rows: per DP row [8 anchors | 8 drafts] (a draft on its owner's DP row at n + 1, with the owner's page-table row),
+# still one 32-row tile row; the gathered step has 64 rows (split order: 0..31 = the anchors in lane order, 32..63 =
+# the drafts).
+WIDE_ROWS = 2 * NUM_LANES  # 64
+WIDE_ROWS_PER_GROUP = 2 * LANES_PER_GROUP  # 16
+# T64 drafting policy (§4.5, §4.7; review edits R-E3, R-E9). In "auto" the bridge drafts every live lane once the live
+# lanes reach c* = verify_plan.crossover_lanes(alpha, MotifTTConfig.wide_step_ratio) in [17, 33] (33 = never), or
+# GeneratorSettings.wide_min_lanes (MOTIF3_WIDE_MIN_LANES) when set; below it the idle-lane budget stays. alpha is the
+# running acceptance pulled toward a prior (smoothed_acceptance): a server whose first traffic is a 32-request burst
+# must still draft, or the idle-lane budget alone would never let it measure alpha.
+WIDE_MIN_LANES_NEVER = NUM_LANES + 1  # 33: "never draft every lane"
+DEFAULT_SPEC_ALPHA_PRIOR = 0.85  # alpha_0
+SPEC_ALPHA_PRIOR_WEIGHT = 64  # n_0: the prior weighs as much as 64 verified drafts
+# Packed multi-row prefill (P5; docs/p5_t64/P5_T64_DESIGN.md §3; MOTIF3_PACKED_PREFILL stays off until gates CP-P,
+# CP9-P and E2E-P pass). The short chunks of one prefill_forward_batch call run together: B segments of S rows each
+# (B in PACK_BATCHES, dummy segments fill B), T = B * S rows, an existing prefill bucket; only the SDPA, the RoPE rows
+# and the KV fill are per segment. "pk0" = sp0 segments (start 0), "pk1" = sp1 segments at one common start. The
+# generator warms every packed shape (MotifTTConfig.packed_prefill_shapes()) before the decode capture; after it, a pass
+# of an unwarmed shape runs as solo chunks (packing never refuses a call).
+PACKED_PASS_KINDS = ("pk0", "pk1")
+PACK_SEG_BUCKETS = (64, 128, 256, 512, 1024)  # pk0 segment rows S: the smallest one >= the chunk's rows
+PACK_SP1_SEG_BUCKETS = (128, 256, 512, 1024)  # pk1 S (S = 64 would need a 64/64 config for the 192-row SWA square)
+PACK_BATCHES = (2, 4, 8, 16, 32)  # B: a pass holds at most the NUM_LANES rows of one call
+# Review edit R-E2: a pk1 pass gathers its SWA tails once ("shared": all B tail sets identical) or per segment
+# ("distinct"). They are different programs, so both are warmed per pk1 shape and the shape key names the variant.
+PK1_TAIL_VARIANTS = ("shared", "distinct")
+DEFAULT_PACKED_PREFILL_MAX_SEG = 1024  # MOTIF3_PACKED_PREFILL_MAX_SEG: the largest packed segment S
+DEFAULT_PACKED_PREFILL_MAX_TOKENS = 8192  # MOTIF3_PACKED_PREFILL_MAX_TOKENS: the largest packed pass T (<= span cap)
+PACKED_WARMUP_MODES = ("attention", "full")  # MOTIF3_PACKED_WARMUP: attention-only warm calls per shape | a full pass
+DEFAULT_PACKED_WARMUP = "attention"
 # Keys of the bridge's captured vLLM scheduler config (``GeneratorSettings.from_env(serving=...)``).
 SERVING_KEYS = (
     "block_size",
@@ -365,18 +418,128 @@ def prefill_span_cap_from_env(environ: Optional[Mapping[str, str]] = None) -> Op
 
 
 def packed_prefill_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """``MOTIF3_PACKED_PREFILL`` (default off): optional packed multi-row prefill (design §3.12.1, after gate G15)."""
+    """``MOTIF3_PACKED_PREFILL`` (default off until gates CP-P / CP9-P / E2E-P): packed multi-row prefill (P5,
+    docs/p5_t64/P5_T64_DESIGN.md §3)."""
     env = os.environ if environ is None else environ
     return _parse_switch("MOTIF3_PACKED_PREFILL", env.get("MOTIF3_PACKED_PREFILL"), False)
 
 
-def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
-    """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1) or ``wide`` (the 64-row trace, S3, after gate G16)."""
+def check_packed_prefill_max_seg(max_seg: int) -> int:
+    """``max_seg`` if it is one of :data:`PACK_SEG_BUCKETS` (the segment sizes gate G15 validates), else
+    ``ValueError``. Segments of more rows never pack: their chunks run solo."""
+    s = int(max_seg)
+    if s not in PACK_SEG_BUCKETS:
+        raise ValueError(
+            f"the largest packed prefill segment (MOTIF3_PACKED_PREFILL_MAX_SEG) must be one of {PACK_SEG_BUCKETS}, "
+            f"got {max_seg!r}"
+        )
+    return s
+
+
+def check_packed_prefill_max_tokens(max_tokens: int) -> int:
+    """``max_tokens`` if it is a power of two in ``[MIN_PREFILL_BUCKET, MAX_CONTEXT]`` (a packed pass of ``T = B * S``
+    rows runs the bucket-T programs), else ``ValueError``. The effective cap is ``min(max_tokens, span cap)``."""
+    t = int(max_tokens)
+    if not (MIN_PREFILL_BUCKET <= t <= MAX_CONTEXT and t & (t - 1) == 0):
+        raise ValueError(
+            f"the largest packed prefill pass (MOTIF3_PACKED_PREFILL_MAX_TOKENS) must be a power of two in "
+            f"[{MIN_PREFILL_BUCKET}, {MAX_CONTEXT}], got {max_tokens!r}"
+        )
+    return t
+
+
+def packed_prefill_max_seg_from_env(environ: Optional[Mapping[str, str]] = None) -> int:
+    """``MOTIF3_PACKED_PREFILL_MAX_SEG``: the largest packed segment S, one of :data:`PACK_SEG_BUCKETS` (default
+    :data:`DEFAULT_PACKED_PREFILL_MAX_SEG` = 1024). It caps the pk0 and the pk1 segment sizes."""
     env = os.environ if environ is None else environ
-    v = (env.get("MOTIF3_SPEC_VERIFY") or "packed").strip().lower()
+    v = _env_int(env, "MOTIF3_PACKED_PREFILL_MAX_SEG")
+    return DEFAULT_PACKED_PREFILL_MAX_SEG if v is None else check_packed_prefill_max_seg(v)
+
+
+def packed_prefill_max_tokens_from_env(environ: Optional[Mapping[str, str]] = None) -> int:
+    """``MOTIF3_PACKED_PREFILL_MAX_TOKENS``: the largest packed pass ``T = B * S`` (a power of two; default
+    :data:`DEFAULT_PACKED_PREFILL_MAX_TOKENS` = 8192)."""
+    env = os.environ if environ is None else environ
+    v = _env_int(env, "MOTIF3_PACKED_PREFILL_MAX_TOKENS")
+    return DEFAULT_PACKED_PREFILL_MAX_TOKENS if v is None else check_packed_prefill_max_tokens(v)
+
+
+def packed_prefill_pk1_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """``MOTIF3_PACKED_PREFILL_PK1`` (default on): pack resumed (sp1) chunks that share a start (P5b). Off: those chunks
+    run solo (gate G15a's fallback for the pk1 SWA square)."""
+    env = os.environ if environ is None else environ
+    return _parse_switch("MOTIF3_PACKED_PREFILL_PK1", env.get("MOTIF3_PACKED_PREFILL_PK1"), True)
+
+
+def packed_warmup_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_PACKED_WARMUP``: ``attention`` (default: per packed shape, the attention of one global and one SWA layer
+    on zeros, ~1 s per boot) or ``full`` (one full packed pass per shape, ~60-70 s)."""
+    env = os.environ if environ is None else environ
+    v = (env.get("MOTIF3_PACKED_WARMUP") or "").strip().lower() or DEFAULT_PACKED_WARMUP
+    if v not in PACKED_WARMUP_MODES:
+        raise ValueError(f"MOTIF3_PACKED_WARMUP must be one of {PACKED_WARMUP_MODES}, got {v!r}")
+    return v
+
+
+def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
+    64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
+    lanes). See :data:`SPEC_VERIFY_MODES`."""
+    env = os.environ if environ is None else environ
+    v = (env.get("MOTIF3_SPEC_VERIFY") or "").strip().lower() or "packed"
     if v not in SPEC_VERIFY_MODES:
         raise ValueError(f"MOTIF3_SPEC_VERIFY must be one of {SPEC_VERIFY_MODES}, got {v!r}")
     return v
+
+
+def check_wide_min_lanes(lanes: int) -> int:
+    """``lanes`` if it is in ``[1, WIDE_MIN_LANES_NEVER]`` (33 = never draft every lane), else ``ValueError``."""
+    n = int(lanes)
+    if not 1 <= n <= WIDE_MIN_LANES_NEVER:
+        raise ValueError(
+            f"the T64 drafting threshold (MOTIF3_WIDE_MIN_LANES) must be a live-lane count in "
+            f"[1, {WIDE_MIN_LANES_NEVER}] ({WIDE_MIN_LANES_NEVER} = never), got {lanes!r}"
+        )
+    return n
+
+
+def wide_min_lanes_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """``MOTIF3_WIDE_MIN_LANES``: unset = None (the generator's acceptance-based ``c*``), else the live-lane count from
+    which an ``auto`` launch drafts every lane (:func:`check_wide_min_lanes`)."""
+    env = os.environ if environ is None else environ
+    v = _env_int(env, "MOTIF3_WIDE_MIN_LANES")
+    return None if v is None else check_wide_min_lanes(v)
+
+
+def check_spec_alpha_prior(prior: float) -> float:
+    """``prior`` as a float if it is an acceptance rate in ``[0, 1]``, else ``ValueError`` (NaN included)."""
+    if isinstance(prior, bool):
+        raise TypeError(f"the acceptance prior must be a number in [0, 1], got {prior!r}")
+    p = float(prior)
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"the acceptance prior must be in [0, 1], got {prior!r}")
+    return p
+
+
+def smoothed_acceptance(
+    accepted: int,
+    verified: int,
+    *,
+    prior: float = DEFAULT_SPEC_ALPHA_PRIOR,
+    weight: int = SPEC_ALPHA_PRIOR_WEIGHT,
+) -> float:
+    """The drafting policy's acceptance estimate (review edit R-E3): ``(accepted + weight * prior) / (verified +
+    weight)``. That is ``prior`` before any draft was verified and tends to the measured rate ``accepted / verified``.
+    ``accepted`` / ``verified``: drafts accepted / verified so far (the bridge's ``SpecStats``), ``0 <= accepted <=
+    verified``; ``prior``: ``GeneratorSettings.spec_alpha_prior``; ``weight``: :data:`SPEC_ALPHA_PRIOR_WEIGHT`."""
+    a, v, w, p = int(accepted), int(verified), int(weight), check_spec_alpha_prior(prior)
+    if not 0 <= a <= v:
+        raise ValueError(f"need 0 <= accepted <= verified, got accepted={accepted}, verified={verified}")
+    if w < 0:
+        raise ValueError(f"the prior weight must be >= 0, got {weight}")
+    if v + w == 0:
+        return p
+    return (a + w * p) / (v + w)
 
 
 def kv_write_mode(kv_replicated: bool, spec: bool) -> str:
@@ -598,10 +761,28 @@ class GeneratorSettings:
             (``MOTIF3_KV_REPLICATED_DECODE``); False with prefix caching on is refused (stale cross-row KV, §3.4).
         prefill_span_cap: largest prefill bucket (``MOTIF3_PREFILL_MAX_BUCKET``); None = the generator's default
             (:meth:`resolved_prefill_span_cap`).
-        packed_prefill: optional packed multi-row prefill (``MOTIF3_PACKED_PREFILL``, §3.12.1); a generator without
-            it ignores the flag.
-        spec_verify: ``"packed"`` (drafts in idle lanes of the 32-lane trace) or ``"wide"`` (64-row trace, S3;
-            ``MOTIF3_SPEC_VERIFY``); a generator without the wide trace must refuse ``"wide"`` in ``create``.
+        packed_prefill: packed multi-row prefill (``MOTIF3_PACKED_PREFILL``, default off; P5,
+            docs/p5_t64/P5_T64_DESIGN.md §3); a generator without it ignores the flag (rows run one after another).
+        spec_verify: the verify mode of a speculating launch (``MOTIF3_SPEC_VERIFY``, :data:`SPEC_VERIFY_MODES`):
+            ``"packed"`` (drafts on idle lanes of the 32-lane trace), ``"wide"`` (the 64-row trace alone) or ``"auto"``
+            (both traces, the 64-row one for verify steps whose drafts do not fit idle lanes). A generator without the
+            64-row trace must refuse ``"wide"`` and ``"auto"`` in ``create``. Without speculation it has no effect.
+
+    Packed-prefill knobs (P5, §3.3-§3.5, §3.9; they matter only with ``packed_prefill``):
+        packed_prefill_max_seg: the largest packed segment S (``MOTIF3_PACKED_PREFILL_MAX_SEG``, one of
+            :data:`PACK_SEG_BUCKETS`, default 1024); a chunk of more rows runs solo.
+        packed_prefill_max_tokens: the largest packed pass ``T = B * S`` (``MOTIF3_PACKED_PREFILL_MAX_TOKENS``, a
+            power of two, default 8192; the effective cap is also bounded by the prefill span cap).
+        packed_prefill_pk1: also pack resumed (sp1) chunks that share a start (``MOTIF3_PACKED_PREFILL_PK1``, default
+            on); off, they run solo.
+        packed_warmup: ``"attention"`` (default; attention-only warm calls per packed shape) or ``"full"`` (one full
+            packed pass per shape) (``MOTIF3_PACKED_WARMUP``, :data:`PACKED_WARMUP_MODES`).
+
+    T64 drafting knobs (§4.5, §4.7; they matter only with ``spec_verify`` ``"auto"``):
+        wide_min_lanes: the live-lane count from which every live lane drafts (``MOTIF3_WIDE_MIN_LANES``, ``[1, 33]``,
+            33 = never); None (default) = the generator's ``c*`` from the acceptance and the T64 / T32 step ratio.
+        spec_alpha_prior: the acceptance prior ``alpha_0`` (default 0.85) of :func:`smoothed_acceptance`; also the
+            acceptance :meth:`MotifGenerator.drafts_all_lanes` assumes before any draft was verified.
     """
 
     max_batch_size: int = NUM_LANES
@@ -624,6 +805,13 @@ class GeneratorSettings:
     prefill_span_cap: Optional[int] = None
     packed_prefill: bool = False
     spec_verify: str = "packed"
+    # ---- packed prefill (P5) and T64 verify knobs (docs/p5_t64/P5_T64_DESIGN.md §3.9, §4.5-§4.7) -----------------
+    packed_prefill_max_seg: int = DEFAULT_PACKED_PREFILL_MAX_SEG
+    packed_prefill_max_tokens: int = DEFAULT_PACKED_PREFILL_MAX_TOKENS
+    packed_prefill_pk1: bool = True
+    packed_warmup: str = DEFAULT_PACKED_WARMUP
+    wide_min_lanes: Optional[int] = None
+    spec_alpha_prior: float = DEFAULT_SPEC_ALPHA_PRIOR
 
     def __post_init__(self):
         if not 1 <= int(self.max_batch_size) <= NUM_LANES:
@@ -639,7 +827,7 @@ class GeneratorSettings:
             raise ValueError(f"optimizations must be None, 'performance' or 'accuracy', got {self.optimizations!r}")
         if self.block_size is not None:
             check_block_size(self.block_size)
-        for name in ("chunked_prefill", "prefix_caching", "packed_prefill"):
+        for name in ("chunked_prefill", "prefix_caching", "packed_prefill", "packed_prefill_pk1"):
             if getattr(self, name) not in (True, False):
                 raise TypeError(f"{name} must be a bool, got {getattr(self, name)!r}")
         if self.kv_replicated_decode not in (None, True, False):
@@ -662,6 +850,13 @@ class GeneratorSettings:
             check_prefill_span_cap(self.prefill_span_cap, self.max_seq_len)
         if self.spec_verify not in SPEC_VERIFY_MODES:
             raise ValueError(f"spec_verify must be one of {SPEC_VERIFY_MODES}, got {self.spec_verify!r}")
+        check_packed_prefill_max_seg(self.packed_prefill_max_seg)
+        check_packed_prefill_max_tokens(self.packed_prefill_max_tokens)
+        if self.packed_warmup not in PACKED_WARMUP_MODES:
+            raise ValueError(f"packed_warmup must be one of {PACKED_WARMUP_MODES}, got {self.packed_warmup!r}")
+        if self.wide_min_lanes is not None:
+            check_wide_min_lanes(self.wide_min_lanes)
+        check_spec_alpha_prior(self.spec_alpha_prior)
 
     @property
     def weights_are_local(self) -> bool:
@@ -729,7 +924,9 @@ class GeneratorSettings:
         ``prefix_match_unit`` (checked by ``prefill_plan.check_scheduler_config``, not stored) and ``spec_tokens``
         (vLLM ``num_speculative_tokens`` after the platform published ``effective_k``). None = draft 1. Environment:
         ``MOTIF3_KV_REPLICATED_DECODE``, ``MOTIF3_PREFILL_MAX_BUCKET``, ``MOTIF3_PACKED_PREFILL``,
-        ``MOTIF3_SPEC_VERIFY``."""
+        ``MOTIF3_PACKED_PREFILL_MAX_SEG``, ``MOTIF3_PACKED_PREFILL_MAX_TOKENS``, ``MOTIF3_PACKED_PREFILL_PK1``,
+        ``MOTIF3_PACKED_WARMUP``, ``MOTIF3_SPEC_VERIFY``, ``MOTIF3_WIDE_MIN_LANES`` (``spec_alpha_prior`` keeps its
+        default)."""
         env = os.environ if environ is None else environ
         hf_layers = int(getattr(hf_config, "num_hidden_layers", NUM_HIDDEN_LAYERS))
         env_layers = _env_int(env, "MOTIF3_NUM_LAYERS")
@@ -768,6 +965,11 @@ class GeneratorSettings:
             prefill_span_cap=prefill_span_cap_from_env(env),
             packed_prefill=packed_prefill_from_env(env),
             spec_verify=spec_verify_from_env(env),
+            packed_prefill_max_seg=packed_prefill_max_seg_from_env(env),
+            packed_prefill_max_tokens=packed_prefill_max_tokens_from_env(env),
+            packed_prefill_pk1=packed_prefill_pk1_from_env(env),
+            packed_warmup=packed_warmup_from_env(env),
+            wide_min_lanes=wide_min_lanes_from_env(env),
         )
 
 
@@ -1069,14 +1271,17 @@ class MotifGenerator(abc.ABC):
          chunk-continuation rows; at most ``NUM_LANES`` rows and ``max_num_batched_tokens`` new tokens). Draft-1
          bridges called ``prefill_forward`` once per row instead; that remains valid for ``start = 0`` rows.
        * decode: ``decode_forward`` (non-speculating launch), or ``decode_forward_spec`` for EVERY decode step of a
-         speculating launch (``settings.spec_tokens = 1``; one decode trace serves ordinary and verify steps).
+         speculating launch (``settings.spec_tokens = 1``; one decode trace serves ordinary and verify steps, two
+         with ``settings.spec_verify="auto"``). Before proposing the next step's drafts the bridge asks
+         ``drafts_all_lanes``.
     5. ``release_traces()`` at shutdown while the mesh is still open (the plugin closes the mesh afterwards).
 
     Concurrency: calls are strictly sequential (one EngineCore thread). Every method may raise; a raise must leave
     no partially-applied host state behind (the bridge commits its own lane bookkeeping only after success).
 
     Feature capabilities (defaults keep draft-1 generators working): ``supports_resumed_prefill``,
-    ``prefill_alignment``, ``max_prefill_span``, ``supports_spec_decode``.
+    ``prefill_alignment``, ``max_prefill_span``, ``supports_spec_decode``; the T64 drafting answer
+    ``drafts_all_lanes`` (default False: the bridge's idle-lane draft budget).
     """
 
     # ---- construction -----------------------------------------------------------------------------------------
@@ -1154,6 +1359,27 @@ class MotifGenerator(abc.ABC):
         ``settings.spec_tokens > 0``."""
         return False
 
+    def drafts_all_lanes(self, live_lanes: Sequence[int], acceptance: Optional[float] = None) -> bool:
+        """Whether the bridge may propose a draft for EVERY live lane of the next decode step (T64 verify,
+        docs/p5_t64/P5_T64_DESIGN.md §4.5, §4.7; review edits R-E3, R-E9). Host only: no device work, no state change.
+
+        Args:
+            live_lanes: the lanes that carry a request in the next step (lane ids in ``[0, NUM_LANES)``, as the bridge's
+                draft budget sees them; duplicates count once).
+            acceptance: the bridge's acceptance estimate (:func:`smoothed_acceptance`, prior
+                ``settings.spec_alpha_prior``), or None before any draft was verified (then the generator assumes
+                ``settings.spec_alpha_prior``).
+
+        Returns:
+            True: every live lane may draft; the generator verifies drafts that do not fit idle lanes in one 64-row step
+            (``spec_verify`` "wide" / "auto"). False: the bridge keeps its idle-lane budget (with KV-R ``32 - live``
+            drafts in all, without it ``8 - active`` per DP row), so every draft fits the 32-lane trace. This default
+            (no 64-row trace) and ``spec_verify="packed"`` answer False. A generator with the 64-row trace answers True
+            in ``"wide"`` and, in ``"auto"``, True iff the live lanes reach ``settings.wide_min_lanes`` when set, else
+            ``c*`` = ``verify_plan.crossover_lanes(acceptance, cfg.wide_step_ratio)`` (17..33, 33 = never).
+        """
+        return False
+
     # ---- KV pool ----------------------------------------------------------------------------------------------
     @abc.abstractmethod
     def allocate_kv_cache(self, *, num_blocks: int, block_size: int, num_layers: int) -> Any:
@@ -1213,6 +1439,10 @@ class MotifGenerator(abc.ABC):
         only cross-chunk state. With ``settings.spec_tokens`` the MTP layer's cache is written for the same positions
         (KV-only: its entry at ``p`` needs ``t_{p+1}``, which for a row's last position is the host argmax of the
         returned logits), so every prefilled position has an MTP entry (design G8).
+
+        With ``settings.packed_prefill`` (P5, docs/p5_t64/P5_T64_DESIGN.md §3) the generator may run short chunks of
+        several rows in one packed pass; every row still gets exactly the logits, KV writes and read-only blocks of
+        this contract (a reader still runs after the writers of the blocks it reads), and the output order is unchanged.
 
         Default (draft-1 generators): every row must have ``start == 0`` (else ``NotImplementedError``); then no row
         reads the cache, so input order is writer-first, and the rows run one by one through ``prefill_forward``.
@@ -1275,6 +1505,11 @@ class MotifGenerator(abc.ABC):
         an overflow pass on their own lanes at ``n + 1``: every draft must be evaluated (if ``d == a0`` the plugin
         commits ``a1``). The result is the same as running every row on its own lane.
 
+        With ``settings.spec_verify`` ``"wide"`` / ``"auto"`` (T64, docs/p5_t64/P5_T64_DESIGN.md §4) a verify step
+        may instead run as one 64-row step: per DP row the 8 lanes' anchors, then their drafts, each draft on its
+        owner's DP row with the owner's page-table row at ``n + 1`` (no idle lanes needed, no overflow pass); in
+        ``"auto"`` only when the drafts do not all fit idle lanes. Same result, same contract.
+
         ``enable_trace``: replay the decode trace (captured by ``warmup_decode(enable_trace=True)``; the overflow
         pass replays it again), or run eager when none was captured.
 
@@ -1298,6 +1533,9 @@ class MotifGenerator(abc.ABC):
         so nothing real is written), plus the MTP layer's KV-only prefill fill when ``settings.spec_tokens``. Shapes
         depend only on ``(path, bucket)`` (starts, block ids, RoPE rows and the LM-head row are device tensors), so
         nothing compiles after the decode capture (a prefill program compiled after capture can corrupt the trace).
+        With ``settings.packed_prefill`` also every packed shape (``MotifTTConfig.packed_prefill_shapes()``: pk0
+        ``(T, S)`` and pk1 ``(T, S)`` with both SWA tail variants); a packed shape left unwarmed runs as solo chunks
+        after the capture.
         """
 
     @abc.abstractmethod
@@ -1311,7 +1549,10 @@ class MotifGenerator(abc.ABC):
 
         In a speculating launch the one trace is the spec trace (main layers with the split KV write, LM head, main
         argmax, MTP layer, MTP argmax) that serves ordinary, verify and overflow steps; the KV-write mode
-        (``settings.kv_write_mode``) is fixed at capture.
+        (``settings.kv_write_mode``) is fixed at capture. ``settings.spec_verify="wide"``: the one trace is the 64-row
+        T64 trace instead; ``"auto"``: both, each staged and run eagerly once before the first capture, then captured
+        once (T32 spec trace first) and never re-captured while serving (F3N rules R2-R5,
+        docs/p5_t64/P5_T64_DESIGN.md §2.3).
         """
 
     # ---- lifecycle --------------------------------------------------------------------------------------------
@@ -1354,8 +1595,12 @@ __all__ = [
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_KV_CACHE_DTYPE",
     "DEFAULT_KV_POOL_TOKENS",
+    "DEFAULT_PACKED_PREFILL_MAX_SEG",
+    "DEFAULT_PACKED_PREFILL_MAX_TOKENS",
+    "DEFAULT_PACKED_WARMUP",
     "DEFAULT_PREFILL_ALIGNMENT",
     "DEFAULT_PREFILL_SPAN_CAP",
+    "DEFAULT_SPEC_ALPHA_PRIOR",
     "DecodeBatch",
     "FEATURE_SWITCHES",
     "GeneratorSettings",
@@ -1377,26 +1622,41 @@ __all__ = [
     "NUM_DP_GROUPS",
     "NUM_HIDDEN_LAYERS",
     "NUM_LANES",
+    "PACKED_PASS_KINDS",
+    "PACKED_WARMUP_MODES",
+    "PACK_BATCHES",
+    "PACK_SEG_BUCKETS",
+    "PACK_SP1_SEG_BUCKETS",
+    "PK1_TAIL_VARIANTS",
     "PrefillRequest",
     "QK_ROPE_HEAD_DIM",
     "SERVING_KEYS",
     "SERVING_TT_CONFIG",
+    "SPEC_ALPHA_PRIOR_WEIGHT",
     "SPEC_VERIFY_MODES",
     "SUPPORTED_BLOCK_SIZES",
     "SUPPORTED_SPEC_TOKENS",
     "SpecDecodeBatch",
     "SpecDecodeResult",
     "VOCAB_SIZE",
+    "WIDE_MIN_LANES_NEVER",
+    "WIDE_ROWS",
+    "WIDE_ROWS_PER_GROUP",
+    "WIDE_SPEC_VERIFY_MODES",
     "WeightsLocation",
     "cdiv",
     "check_block_size",
     "check_generator_features",
     "check_logits",
     "check_max_model_len",
+    "check_packed_prefill_max_seg",
+    "check_packed_prefill_max_tokens",
     "check_prefill_batch",
     "check_prefill_span_cap",
+    "check_spec_alpha_prior",
     "check_spec_result",
     "check_tt_config",
+    "check_wide_min_lanes",
     "expected_num_blocks",
     "feature_switch_from_env",
     "hf_cache_snapshot",
@@ -1406,11 +1666,17 @@ __all__ = [
     "kv_replicated_decode_from_env",
     "kv_write_mode",
     "packed_prefill_from_env",
+    "packed_prefill_max_seg_from_env",
+    "packed_prefill_max_tokens_from_env",
+    "packed_prefill_pk1_from_env",
+    "packed_warmup_from_env",
     "plugin_num_blocks",
     "prefill_buckets",
     "prefill_span_cap_from_env",
     "resolve_tt_cache_path",
     "resolve_weights_location",
     "serving_additional_config",
+    "smoothed_acceptance",
     "spec_verify_from_env",
+    "wide_min_lanes_from_env",
 ]

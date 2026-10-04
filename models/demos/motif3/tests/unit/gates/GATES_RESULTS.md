@@ -893,3 +893,345 @@ trace 4.1 MiB for the proxy.
    `paged_update_cache`'s output CB per core (`Wt`), not `B x Wt`.
 5. **Upstream ttnn notes:** the flexible chunked SDPA start has no device-side alignment check (silent wrong answer);
    the streaming SDPA kernel's bf16 destination is inadequate for 576-wide heads.
+
+---
+
+## 13. P5 / T64 gates: G15a-rest (packed prefill attention), G-S1w (64-row KV write + FlashMLA), G16-lite
+
+**Run:** 2026-10-03 15:27-15:41 UTC, host `bh-glx-exp-a03u07`, tt-metal `motif3-bh-galaxy` at **B0 `277df0e9f2d`** plus
+C1a's uncommitted `tt/generator_api.py` / `tt/model_config.py` (md5 `55ad7175...` / `258aa5f2...`).
+**Isolation:** other work packages were editing `ccl.py`, `kv_write.py`, `moe.py`, `lm_head.py`, `embedding.py` and
+`generator_vllm.py` in the shared tree, so these gates import `models.demos.motif3` from a snapshot:
+- `git archive 277df0e9f2d models/demos/motif3` plus the two C1a files;
+- copies of the root `conftest.py` / `pytest.ini` as the snapshot's root, and the test file itself inside the snapshot
+  (pytest imports a test file's parent packages from the file's own directory);
+- cwd = the snapshot, `PYTHONPATH=<snap>:<tt-metal>`, `MOTIF3_GATES_RESULTS_DIR` = this directory's `results/`.
+
+Every test records the imported package path and the md5 of its modules (`provenance/*` records). The first G15 run
+(`20261003_152055_g15a_rest.log`) imported the live tree by mistake. Its numbers are identical, because the G15 ops run
+no CCL (only `ccl.log_fabric` of a modified file was used), but it is superseded.
+**Mesh:** (4, 8), `FABRIC_2D_TORUS_XY` requested, **TORUS_Y committed** (the DP axis is a line), `l1_small_size`
+32768, trace region 256 MiB, dispatch COL. `ring_gather="safe"` (`MotifCCL` default; every gather of these gates goes
+through `MotifCCL`, F3 rule R1).
+**Design:** `docs/p5_t64/P5_T64_DESIGN.md` §6.2 (G15a-rest, G-S1w; the G16-lite pieces of §6.1), §3.4, §4.1-§4.4;
+notes `docs/p5_t64/p5.md` §14 and `t64.md` §5.1. Op / module level: random data and torch fp32 / fp64 goldens; G16-lite
+uses the real layer-2 / layer-4 / LM-head weights from the TT cache. The T64 KV writers, the two-call FlashMLA and the
+M = 64 configs (C1a's builders) are injected into the test process the way the probes did it. K1, D1, A2 and I2 repeat
+them with the real modules.
+
+| Item | Location |
+|---|---|
+| Tests | `test_g15_packed_prefill.py` (3 device tests, 4 host self-checks); `test_g16_wide_verify.py` (4 device tests, 2 host self-checks) |
+| Raw results | `results/G15.jsonl`, `results/G16.jsonl` (append-only; the last record per case wins) |
+| Host self-checks | `scripts/hostrun.sh -- python -m pytest -p no:cacheprovider -q <file> -k host`: view / transpose model, pk1 tables and tail variants (R-E2), goldens, the T64 layout, B0's KV host model at 16 rows per DP row vs a direct oracle, FlashMLA probe discrimination (`logs/host/20261003_154123_g15_g16_host_final.log`: 6 passed) |
+| Run | `scripts/devrun.sh -t 2400 -n <name> -- bash -c "cd <snap> && MOTIF3_GATES_RESULTS_DIR=<this dir>/results PYTHONPATH=<snap>:<tt-metal> python -m pytest <snap>/models/demos/motif3/tests/unit/gates/<file> -c <snap>/pytest.ini --rootdir <snap> -s -p no:cacheprovider -k 'not host'"`. Test time: G15 ~40 s, G-S1w ~60 s, G16-lite ~35 s, plus ~5 s per mesh open |
+| Logs (`logs/dev/`) | `20261003_152716_g15a_rest_snap.log` (pk0, pk1 global; its pk1 SWA B = 32 cases hit a harness bug, fixed), `20261003_152958_g15c_pk1_swa.log` (pk1 SWA), `20261003_153653_gs1w.log` (G-S1w a + b), `20261003_153806_g16lite.log` (G16-lite ops + layers), `20261003_154007_g16lite_ops_kvw.log` (G16-lite ops again, with the KV-write costs: these op records are the final ones) |
+
+### 13.1 Verdicts
+
+| Gate | Verdict | Key numbers |
+|---|---|---|
+| **G15a-rest (a)** pk0 batched SDPA | **PASS** | All 16 cases ((S, B) x {global, swa}): every segment **bitwise** equal to the single-row SDPA (max \|Δ\| 0). Views metadata-only, replicas identical on 32 chips, CB end below the pin, 0 programs on a repeat. PCC vs fp32 0.99970-0.99983 (SWA; global S ≤ 256). Global S ≥ 512 (q/k 256/256): 0.99960-0.99966, the single-row op's own value (bitwise equal; G2 floor 0.99948). There the design's 0.9997 bar measures the op, not packing (§13.6 item 1) |
+| **G15a-rest (b)** pk1 global | **PASS** | (2, 1024, 2048), (8, 512, 8192) + 1 dummy, (16, 256, 128), (32, 128, 24576) with a shared prefix + 2 dummies, and a bf16 cache (8, 512, 2048): every real segment bitwise (2/2, 7/7, 16/16, 30/30, 8/8). PCC on cols `[:512]` 0.99989-0.99999. Dummies finite. A trace captured at start 8192 and replayed at 2048 / 4096 / 8192 is bitwise equal to eager, 0 programs |
+| **G15a-rest (c)** pk1 SWA square | **PASS** | (32, 128), (8, 512), (2, 1024) x {distinct, shared}. Every real segment is **bitwise** equal to the solo sp1 SWA dataflow (tail gather, latent concat, the batched expansion matmul, Q_cat, square SDPA), and the batched SDPA alone is bitwise equal to single calls. PCC vs fp32 window attention 0.99972-0.99973. Window probes exact at B = 32 / 8 / 2. The program cache stays constant when the tail ids change. A traced replay with rewritten tail bounds is bitwise equal to eager |
+| **G15a-rest (d)** cost | info | §13.3. Traced 4 CN transposes per layer: 115 µs at T 2048, 397 µs at T 8192, so 6 / 21 ms per pass (review D6) |
+| **G-S1w (a)** KV write at 16 rows / DP row | **PASS** | split (KV-R), natural (KV-R) and row_split orders, bfp8 and bf16 caches: every chip's whole cache bitwise == B0's host model (`KVWriteStep.packed_verify` + `apply_kv_writes_host`, 16 rows per DP row) == a direct oracle. The one-call variants lose updates in every trial. The split writer captured and replayed with rewritten inputs is bitwise |
+| **G-S1w (b)** FlashMLA, duplicated page-table rows | **PASS** | A' (2 x B = 8) is bitwise == B = 8 on both kinds at n ≈ 1000 / 4095 / 32000. A (B = 16) is bitwise on SWA; on global, PCC vs B = 8 is 0.99995-0.99997, max \|Δ\| ≤ 0.0078 (documented non-bitwise). PCC vs fp64: overall 0.99980-0.99996, worst user ≥ 0.99977. Pair and edge probes exact (\|Δ\| ≤ 1.4e-13) for B8, A and A' |
+| **G16-lite** | **PASS** (every bitwise check) | Split-order gather correct, 42.7 µs at 16 rows x 4096. LM head M = 64: rows bitwise, argmax 64 == host. MoE L2 at M = 64 (C1a configs): rows bitwise, +174 µs. Whole layers: A'' rows bitwise on L2 and L4; T64 / T32 = 1.108x (L2), 1.172x (L4). Step model **r = 1.119 / 1.126 / 1.174** at 1K / 4K / 32K (design: 1.118 / 1.126 / 1.173) |
+
+No named fallback was triggered:
+- no per-segment SDPA loop;
+- pk1 stays on;
+- S_min stays 64;
+- T64 is not blocked;
+- MoE intermediates stay in L1 (no DRAM fallback).
+
+Review disagreements D6 (the transpose term) and D9 (the B = 32 distinct-tail program count) are measured: §13.3.
+
+### 13.2 Decisions published to the work packages
+
+**WP-A (A1: packed attention; A2: A'').**
+- **G15a passes: build the packed paths of design §3.4 exactly as the gate ran them.** No per-segment fallback is
+  needed for any kind.
+- **pk0:** view `[1, H, T, d] -> [H, B, S, d]` + `ttnn.transpose(0, 1)`, `cfg.sdpa_prefill_pc(kind, seq_len=S)`, role
+  `sdpa_prefill`, window 129 only when S ≥ 129. This is the solo `prefill_sdpa_window_and_config(S)` rule, so S 64 / 128
+  run unwindowed. Then CN back and the view.
+- **pk1 global:** `chunked_scaled_dot_product_attention(qb [B, 10, S, 576], cache, cache, sdpa_pt [B, 640],
+  chunk_start_idx_tensor [a])`, `cfg.resumed_prefill_pc("global", S, kv_dtype=cache.dtype)`, role
+  `sdpa_prefill_fp32`. A dummy copying segment 0's row (R-E2) is harmless.
+- **pk1 SWA**, both tail variants as tested:
+  - `distinct`: 2B tensor-args slices + **one** `concat(dim=2)` of the 2B blocks + view `[B, 1, 128, 576]` + typecast.
+  - `shared`: the solo 2-block gather + typecast + `repeat([B, 1, 1, 1])`.
+  - Then `lat = concat([tail_b, view(kv_row, [B, 1, S, 576])], 2)`, the draft-1 expansion on `[B, ...]` (the
+    `[512, 640]` weight unbatched), `Q_cat = concat([qb[:, :, :128], qb], 2)` and the square SDPA with
+    `cfg.resumed_prefill_pc("swa", S)`, role `sdpa_prefill`. Keep rows `[128, 128 + S)`.
+  - In the tested (B, S), the batched expansion matmul gave per-segment rows bitwise equal to the batch-1 call.
+- **Programs per pk1 shape (attention ops only; first call):**
+  - `distinct` compiles 14 at B ≤ 8, and 18 at B = 32, where ttnn splits the 64-input concat (review D9).
+  - `shared` adds 1 (`repeat`).
+  - Neither variant compiles anything when the tail ids or the start change.
+  - So warming both variants per pk1 shape (R-E2) covers the attention part.
+- **Gotcha (S = 128):** `ttnn.slice(qb, [0, 0, 0, 0], [B, 10, 128, 192])` covers the full extent, so ttnn returns `qb`
+  itself (`slice.cpp` no-op branch). Never deallocate `q_pad` while `qb` is still needed (the gate checks buffer
+  identity). The solo `_prefill_sp1_swa` frees the same buffer twice at C = 128, which is harmless only because both
+  frees follow the concat.
+- **CB end:** every new program fits below the L1 pin (`1533824`), at all tested shapes, bfp8 and bf16.
+- **A2:** A'' is confirmed at op level (G-S1w b) and on whole layers (G16-lite). On SWA layers use one B = 16 call
+  (+0.6-0.9 µs, bitwise). On global layers use two B = 8 calls on `ttnn.slice`s of the 16-row Q, one `[8, W]` page
+  table for both halves (review D3 holds) and `concat(dim=1)`.
+
+**WP-K (K1: `DecodeKVWrite(rows=64)`, `flash_groups`, `verify_plan`).**
+- **Build the split writer exactly as `SplitWriter` in `test_g16_wide_verify.py`:**
+  - untilize (L1);
+  - view `[1, 2, 8, 576]`;
+  - `MotifCCL.all_gather(dim=2, "dp")` (L1);
+  - view `[1, 1, 64, 576]` and tilize (DRAM);
+  - slice rows `[0, 32)` and `[32, 64)`, each transposed to the 32-core sharded update layout;
+  - call A (`cur_a [32]`) and call B (`cur_b [32]`), one replicated `pt [32, W]`.
+- **Correctness:** bitwise on all 32 chips. bf16 caches: 2 x 16 users per kind (R-E8), also bitwise.
+- **Cost per layer (traced):**
+
+  | Writer | T32 | T64 | Δ |
+  |---|---:|---:|---:|
+  | bfp8 `all_split` (T64: split order) | 41.2 µs | 58.8 µs | +17.6 µs, ≈ 0.95 ms per step |
+  | bfp8 natural order | — | 66.6 µs | — |
+  | bfp8 `row_split` | 11.7 µs | 16.9 µs | +5.2 µs |
+  | bf16 `all_split` (T64: split order) | 62.8 µs | 124.2 µs | +61.4 µs |
+
+  For bf16, consider the production chunk pattern (one transpose to DRAM, then per 16-user chunk `slice` +
+  `to_memory_config`) in place of a transpose per call (§13.6 item 3).
+- **Host model:** `KVWriteStep.wide_verify` = `packed_verify` with `partner_of = {16 r + j: 16 r + 8 + j}` on the 64
+  natural-order rows. B0's `check_kv_write_step` / `apply_kv_writes_host` with `lanes_per_row=16` (`lanes_per_call` 32
+  for bfp8, 16 for bf16) reproduce the device caches of all three orders bit-exactly. The split order changes only the
+  call grouping, not the final cache.
+- **The A / B split is mandatory.** The one-call variants lost updates in every trial:
+  - natural: 21-22 of 52 writes per trial with 32-user calls (bfp8), 19-23 with 16-user calls (bf16);
+  - row_split, 16 users per call: 5-7 of the DP row's 13.
+- **`flash_groups()`:** one group at 8 rows per DP row. At 16 rows: one B = 16 group on SWA layers, two B = 8 groups
+  (anchors at n, drafts at n + 1) on global layers. The edge probes are exact at `n % 64` ∈ {0, 31, 63} up to
+  n = 32063.
+
+**WP-I (I1: P5 generator; I2: T64 generator).**
+- **I1:** packed passes are validated at the attention level.
+  - Warm both pk1 tail variants per shape (§13.2 WP-A).
+  - The program cache stays constant across tail ids and starts. The dataflows are trace-safe (trace == eager), though
+    prefill stays eager by design.
+  - Cost inputs for the planner, per layer, eager: §13.3.
+- **I2:** G16-lite on B0 with safe gathers reproduces the probe within ~1-2 %.
+  - Layer costs: L2 +179.6 µs (A'', 1.108x); L4 +297.9 µs (A'', 1.172x).
+  - Op deltas:
+
+    | Op | Δ |
+    |---|---:|
+    | MoE M = 64 | +174.3 µs |
+    | LM head GEMM | +6.3 µs |
+    | Argmax 64 | +30.0 µs |
+    | Split gather | +15.1 µs |
+    | KV-R write | +17.6 µs |
+    | Global FlashMLA A' at 1K / 4K / 32K | +57.6 / +111.2 / +471.5 µs |
+
+  - The design's step model (`t64_model2.py` method) on these numbers gives T64 / T32 = 1.119 / 1.126 / 1.174 at
+    1K / 4K / 32K with A'' (A: 1.112 / 1.115 / 1.165). G16's bar (≤ 1.20) is expected to hold; the kill bar (1.30) is
+    far.
+  - The M = 64 programs (MoE with L1 intermediates, LM head, argmax, FlashMLA B16, 16-user and 32-user updates) all fit
+    below the L1 pin.
+  - Only `router_logits="composite"` was run. The exact-fp32 router at M = 64 is D1's (R-E7).
+
+**WP-D (D1) and WP-C (C1b), for information.**
+- **D1:** the injected C1a M = 64 configs give bitwise rows and fit L1:
+  - router: `router_decode_pc(m_tiles=2)` + the fused-sigmoid variant;
+  - experts: `experts_gate_up_pc(m_tiles=2)` (10 x 8) and `experts_down_pc(m_tiles=2)` (8 x 8);
+  - LM head: `lm_head_pc("mesh", m_tiles=2)`.
+
+  D1 can adopt them as they are. The split-order gather costs the same as `ag_dp_rows` at 16 rows (42.7 / 27.2 µs at
+  W 4096 / 576) and is correct for both widths.
+- **C1b cost model:**
+  - The CN-transpose term scales with T: 6 ms per pass at T 2048, 21 ms at 8192 (not the 85 ms of D6).
+  - The pk1 SWA attention dataflow costs 5.5 ms per layer eager at B = 32 with distinct tails and 1.55 ms with shared
+    ones, ≈ 0.21 s vs 0.06 s per pass over 39 SWA layers. The 2B-slice tail gather accounts for the 3.9 ms difference
+    (≈ 0.15 s per pass; the design assumed 0.3-0.4 s).
+  - pk1 global costs 36.7 ms per layer at B = 32, a = 24576 (≈ 0.51 s per pass) and 19.0 ms at B = 8, a = 8192.
+
+### 13.3 G15a-rest details (`test_g15_packed_prefill.py`)
+
+**(a) pk0.** Random bf16 q / k / v (scales folded, V zero-padded 128 -> 192). The single-row reference is the
+`[1, H, S, d]` SDPA with the same program / compute config. Eager wall times include the 3 input + 1 output transposes
+(host-dispatch bound at this size).
+
+| kind | S | B | T | q/k | window | segments bitwise | PCC vs fp32 (worst) | packed ms | B singles ms | 4 transposes ms | programs (1st call) |
+|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|
+| global | 1024 | 2 | 2048 | 256/256 | - | 2/2 | 0.99960 | 0.60 | 0.56 | 0.34 | 6 |
+| swa | 1024 | 2 | 2048 | 128/128 | 129 | 2/2 | 0.99974 | 0.44 | 0.22 | 0.32 | 1 |
+| global | 1024 | 4 | 4096 | 256/256 | - | 4/4 | 0.99961 | 0.56 | 1.08 | 0.34 | 4 |
+| swa | 1024 | 4 | 4096 | 128/128 | 129 | 4/4 | 0.99975 | 0.48 | 0.40 | 0.32 | 1 |
+| global | 1024 | 8 | 8192 | 256/256 | - | 8/8 | 0.99960 | 1.10 | 2.13 | 0.42 | 4 |
+| swa | 1024 | 8 | 8192 | 128/128 | 129 | 8/8 | 0.99975 | 0.86 | 0.73 | 0.42 | 1 |
+| global | 512 | 2 | 1024 | 256/256 | - | 2/2 | 0.99966 | 0.43 | 0.37 | 0.33 | 4 |
+| swa | 512 | 2 | 1024 | 128/128 | 129 | 2/2 | 0.99977 | 0.43 | 0.22 | 0.32 | 1 |
+| global | 512 | 16 | 8192 | 256/256 | - | 16/16 | 0.99966 | 0.87 | 2.71 | 0.42 | 4 |
+| swa | 512 | 16 | 8192 | 128/128 | 129 | 16/16 | 0.99977 | 0.84 | 1.36 | 0.42 | 1 |
+| global | 256 | 32 | 8192 | 256/256 | - | 32/32 | 0.99970 | 0.73 | 2.57 | 0.42 | 4 |
+| swa | 256 | 32 | 8192 | 128/128 | 129 | 32/32 | 0.99979 | 0.79 | 2.58 | 0.42 | 1 |
+| global | 128 | 2 | 256 | 128/128 | - | 2/2 | 0.99978 | 0.66 | 0.32 | 0.52 | 4 |
+| swa | 128 | 2 | 256 | 128/128 | - | 2/2 | 0.99980 | 0.92 | 0.43 | 0.73 | 0 |
+| global | 64 | 2 | 128 | 64/64 | - | 2/2 | 0.99982 | 0.91 | 0.43 | 0.72 | 4 |
+| swa | 64 | 2 | 128 | 64/64 | - | 2/2 | 0.99983 | 0.90 | 0.43 | 0.72 | 0 |
+
+**(d) the transpose term, traced** (q, k, v in and o out of one attention layer; every program compiled before the
+first capture):
+
+| T | traced per layer | per pass (53 layers) |
+|---:|---:|---:|
+| 2048 (S 256, B 8) | 115.4 µs | 6.1 ms |
+| 8192 (S 1024, B 8) | 397.3 µs | 21.1 ms |
+
+**(b) pk1 global.** Real-size bfp8 cache `[4129, 1, 64, 576]` (block 0 zero, 1588 random blocks) and a bf16 cache
+variant. Distinct prefixes unless marked. Dummies copy segment 0's SDPA row (R-E2). The reference is the single-row
+chunked SDPA (`[1, 10, S, 576]`, its own `[1, 640]` row, the same start tensor). Eager ms per call.
+
+| cache | B | S | a | prefix | dummies | q/k | real segments bitwise | PCC cols :512 (worst) | packed ms | singles ms | programs |
+|---|---:|---:|---:|---|---:|---|---|---:|---:|---:|---:|
+| bfp8 | 2 | 1024 | 2048 | distinct | 0 | 64/64 | 2/2 | 0.999973 | 3.73 | 3.03 | 5 |
+| bfp8 | 8 | 512 | 8192 | distinct | 1 | 64/64 | 7/7 | 0.999936 | 18.98 | 31.34 | 3 |
+| bfp8 | 16 | 256 | 128 | distinct | 0 | 64/64 | 16/16 | 0.999992 | 1.34 | 3.04 | 3 |
+| bfp8 | 32 | 128 | 24576 | shared | 2 | 128/128 | 30/30 | 0.999894 | 36.71 | 324.16 | 3 |
+| bf16 | 8 | 512 | 2048 | distinct | 0 | 64/64 | 8/8 | 0.999975 | 9.32 | 10.83 | 1 |
+
+Trace check: the (8, 512) case captured at 8192 and replayed with the start tensor rewritten to 2048 / 4096 / 8192 is
+bitwise equal to eager at each start, with 0 programs during the capture and the replays.
+
+**(c) pk1 SWA.** Start 2048, tails = the cache blocks of positions `[a - 128, a)`, random latent rows and a random
+`[512, 640]` expansion (per group `[k_nope | v | 0]`, bf16). The golden is fp32 window attention at absolute positions
+over the expanded `[tail | chunk]` keys. Eager ms per SWA layer. The program column gives the first call / the call
+after a tail-id rewrite (in run order: each distinct case first, then its shared case).
+
+| tails | B | S | dummies | tail blocks | bitwise vs solo dataflow | SDPA alone bitwise | PCC vs window fp32 (worst) | programs | packed ms | B solo ms |
+|---|---:|---:|---:|---:|---|---|---:|---|---:|---:|
+| distinct | 32 | 128 | 2 | 64 | 30/30 | 30/30 | 0.999727 | 18 / 0 | 5.47 | 32.88 |
+| shared | 32 | 128 | 0 | 2 | 32/32 | 32/32 | 0.999716 | 1 / 0 | 1.55 | 32.45 |
+| distinct | 8 | 512 | 0 | 16 | 8/8 | 8/8 | 0.999722 | 14 / 0 | 2.29 | 9.03 |
+| shared | 8 | 512 | 0 | 2 | 8/8 | 8/8 | 0.999727 | 1 / 0 | 1.55 | 9.11 |
+| distinct | 2 | 1024 | 0 | 4 | 2/2 | 2/2 | 0.999725 | 14 / 0 | 1.55 | 2.38 |
+| shared | 2 | 1024 | 0 | 2 | 2/2 | 2/2 | 0.999726 | 1 / 0 | 1.51 | 2.38 |
+
+**Probes** (G10's square-layout probes, one independent set per segment, rows {0, 1, 63, 64, 127, S - 1}): every
+segment exact at B = 32 / 8 / 2. **Traces:** all six cases, captured at tail set 1 and replayed at sets 2 and 1, are
+bitwise equal to eager, with 0 programs.
+
+### 13.4 G-S1w details (`test_g16_wide_verify.py::test_gs1w_*`)
+
+**(a) KV write.**
+- Cache: `[264, 1, 64, 576]` (G12 geometry), compared whole on all 32 chips. Rows are pre-quantized to the cache dtype.
+- Layout per DP row: local lane 7 idle, lane 6 an anchor without a draft, lanes 0-5 anchor + draft. Anchors cycle
+  through `p % 64` ∈ {0, 30, 31, 62, 63} (15 same-tile anchor / draft pairs).
+- 52 writes in all: 28 anchors + 24 drafts.
+
+| order | cache | users / call | calls / layer | mismatching chips | host model == direct oracle | CB |
+|---|---|---:|---:|---|---|---|
+| split (KV-R) | bfp8 | 32 | 2 | none | yes | fits |
+| natural (KV-R) | bfp8 | 32 | 4 | none | yes | fits |
+| row_split | bfp8 | 16 | 2 | none | yes | fits |
+| split (KV-R) | bf16 | 16 | 4 | none | yes | fits |
+| natural (KV-R) | bf16 | 16 | 8 | none | yes | fits |
+| row_split | bf16 | 16 | 2 | none | yes | fits |
+
+One-call variants (3 trials each; lost anchor / draft updates per trial, chip 0):
+
+| variant | bfp8 | bf16 |
+|---|---|---|
+| natural, one call per chunk | 10/12, 10/12, 9/12 | 8/15, 9/13, 5/14 |
+| row_split, one call per DP row | 1/4, 3/4, 3/4 | 3/4, 3/4, 2/4 |
+
+Trace check: the split writer was captured, the base cache restored, the step-2 inputs (positions, page tables, latent)
+written, and the trace replayed. All 32 chips are bitwise equal to the host model, with 0 programs.
+
+**(b) FlashMLA.**
+- 8 users per call on a real-size bfp8 cache, `W = 512`. Positions: `[base, b64, b64 + 31, b64 + 63, b64 - 64, b64 - 33,
+  b64 - 1, base + 1]`, so `n % 64` covers {0, 31, 63}.
+- Drafts at n + 1 carry their owner's page-table row. Scale folded into q (op scale 1.0).
+- G1 config: `cfg.flash_mla_decode_pc()`, role `sdpa_decode`.
+
+| kind | n ≈ | A' == B8 | A == B8 | A vs B8 PCC / max \|Δ\| | PCC vs fp64 overall / worst user | probes (pair, edges) |
+|---|---:|---|---|---|---|---|
+| swa | 1000 | bitwise | bitwise | 1.0 / 0 | 0.99981 / 0.99979 | exact / exact |
+| global | 1000 | bitwise | no | 0.99997 / 0.0078 | 0.99986 / 0.99983 | exact / exact |
+| swa | 4095 | bitwise | bitwise | 1.0 / 0 | 0.99981 / 0.99979 | exact / exact |
+| global | 4095 | bitwise | no | 0.99995 / 0.0039 | 0.99989 / 0.99987 | exact / exact |
+| swa | 32000 | bitwise | bitwise | 1.0 / 0 | 0.99980 / 0.99977 | exact / exact |
+| global | 32000 | bitwise | no | 0.99996 / 0.0029 | 0.99996 / 0.99992 | exact / exact |
+
+What each probe checks:
+- **Pair probe (G12):** the anchor outputs V(n) only; the draft averages V(n) and V(n + 1).
+- **Edge probe, SWA:** the anchor attends key n - 128 and masks n - 129 and n + 1. The draft attends n - 127 and masks
+  n - 128 and n + 2.
+- **Edge probe, global:** the anchor masks n + 1; the draft masks n + 2.
+
+Worst deviation over all probes: 1.4e-13.
+
+Traced per-call cost (µs):
+
+| kind | n ≈ | B8 | A (B16) | A' (2 x B8 + slices + concat) |
+|---|---:|---:|---:|---:|
+| swa | 1000 | 29.9 | 30.8 (+0.9) | 68.7 |
+| swa | 4095 | 30.6 | 30.6 (0) | 68.9 |
+| swa | 32000 | 30.0 | 30.6 (+0.6) | 68.9 |
+| global | 1000 | 50.3 | 71.7 (+21.4) | 107.9 (+57.6) |
+| global | 4095 | 103.1 | 148.3 (+45.2) | 214.3 (+111.2) |
+| global | 32000 | 463.8 | 884.0 (+420.2) | 935.3 (+471.5) |
+
+### 13.5 G16-lite details (`test_g16_wide_verify.py::test_g16lite_*`)
+
+Traced per call (slope method). M = 64 runs with the C1a configs injected into the module instances.
+
+| Op | T32 | T64 | Δ | Bitwise |
+|---|---:|---:|---:|---|
+| `ag_dp_rows` W 4096: 8 -> 16 rows / split order | 27.6 | 42.7 / 42.7 | +15.1 | order checked vs host, replicas 32 |
+| `ag_dp_rows` W 576: 8 -> 16 rows / split order | 24.3 | 27.3 / 27.2 | +2.9 | order checked |
+| LM head GEMM `[M, 4096] @ [4096, 6880]` | 143.8 | 150.1 | +6.3 | rows 0..31 on every chip |
+| argmax 32 -> 64 rows | 219.0 | 249.0 | +30.0 | == host argmax; rows 0..31 == argmax 32 |
+| MoE L2 module `forward_decode`, 8 -> 16 rows per DP row | 1040.3 | 1214.6 | +174.3 | rows 0..7 of every DP row, every chip |
+| KV write bfp8: `all_split` -> split / natural; `row_split` | 41.2; 11.7 | 58.8 / 66.6; 16.9 | +17.6; +5.2 | (G-S1w a) |
+| KV write bf16: `all_split` -> split / natural; `row_split` | 62.8; 12.1 | 124.2 / 138.9; 18.0 | +61.4; +5.9 | (G-S1w a) |
+
+**Whole decoder layers at 4K context** (zero cache; T32 = the production `DecodeKVWrite` `all_split` at 8 rows per DP
+row; T64 = 16 rows, the split writer, MoE at M = 64). Bitwise is checked at 1K context on a random cache: the T64 anchor
+rows vs the T32 rows, and the draft rows vs a T32 step at n + 1 that sees the anchors' latents.
+
+| layer | T32 | T64 A (B16) | T64 A' (2 x B8) | T64 A'' | A'' Δ / ratio | rows bitwise |
+|---|---:|---:|---:|---:|---|---|
+| L2 (SWA + MoE) | 1655.8 | 1839.7 | 1869.0 | 1835.4 (= A) | +179.6 / 1.108 | A, A', A'': yes / yes |
+| L4 (global + MoE) | 1729.0 | 1955.7 | 2026.0 | 2026.9 (= A') | +297.9 / 1.172 | A: no (max \|Δ\| 0.0156); A', A'': yes / yes |
+
+**Step model.** The design's `t64_model2.py` method, re-run on these records:
+- 38 L2-like and 13 L4-like layer deltas, the global FlashMLA part moved to each context;
+- layers 0 / 1 and the MTP layer: their attention part only;
+- the head delta twice.
+
+| Context | T32-spec | T64 A'' | r | T64 A | r |
+|---|---:|---:|---:|---:|---:|
+| 1K | 87.09 ms | 97.43 ms | 1.119 | 96.87 ms | 1.112 |
+| 4K | 87.83 ms | 98.92 ms | 1.126 | 97.94 ms | 1.115 |
+| 32K | 92.88 ms | 109.02 ms | 1.174 | 108.24 ms | 1.165 |
+
+The T32 base, 87.09 ms at 1K, is FRV's, measured with HEAD's gathers. B0's `safe` gathers add 0.26-0.45 ms to every
+step, T32 and T64 alike [DET §6]. The real number is G16's (the full traced step).
+
+### 13.6 Open issues and requests
+
+1. **pk0 global PCC bar (lead).** At S ≥ 512 the global-layer SDPA (q/k 256/256, `sdpa_prefill` role) gives PCC
+   0.99960-0.99966 vs fp32, for the single-row op as well. The packed call is bitwise equal to it, so the gate passes
+   on bitwise equality with a 0.9994 sanity floor and records `design_bar_0p9997_met` per case. Raising the op's own
+   accuracy is the existing `sdpa_prefill_fp32_acc="auto"` opt-in (window-free calls). It is independent of P5 and
+   would change the solo numerics too.
+2. **WP-A:** the `ttnn.slice` full-extent no-op at S = 128 (§13.2).
+3. **WP-K:** with a bf16 KV cache, the T64 split writer as injected (one transpose per 16-user call) costs 124 µs per
+   layer (+61 µs, ≈ +3.3 ms per step). Measure the production chunk pattern for bf16. bfp8, the production dtype, is
+   +17.6 µs.
+4. **Re-runs after the WPs land.** These gates import B0 + C1a from a snapshot, and the T64 writers / M = 64 configs are
+   injected. K1 (`DecodeKVWrite(rows=64)` + G-S1w b with the real writer), D1 (module tests) and A2 / I2 (G16) repeat
+   them with the real modules. Point the snapshot at the new tree (or run in place once the tree is quiet).
+5. **CB-end method.** A one-page L1 tensor sits at `1533824`, the top of main L1, just below the L1_SMALL CCL
+   semaphores. tt-metal re-validates static CBs against the lowest L1 buffer on every enqueue, so a program whose CBs
+   reach the pin raises with its CB end. Nothing reached it.
+6. **Fabric:** committed TORUS_Y, so the DP axis is a line and its gathers run on a line, as in every gate since
+   2026-10-02.

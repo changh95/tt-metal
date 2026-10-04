@@ -15,8 +15,8 @@ threading of ``chunk=`` / ``kv_write=``, the KV-R decode wiring, the MTP part's 
 
 Device tests (the real 53-layer model from the TT cache, every weight from the cache; one generator boot shared by the
 module: serving pool, chunked prefill + prefix caching -> KV-R decode, MTP on -> its cache filled during prefill; ONE
-captured decode trace, the serving spec trace (``all_split``), as in serving: see ``MULTI_TRACE_NOTE`` for why a
-second one is not captured)::
+captured decode trace, the serving spec trace (``all_split``) of a ``packed`` launch; ``MULTI_TRACE_NOTE`` has the
+history of the second trace this module does not capture, and why several traces are safe now)::
 
     scripts/devrun.sh -t 3600 -n wp4_cp -- python -m pytest models/demos/motif3/tests/test_resumed_prefill.py \
         -k "not cpu and not host" -s -p no:cacheprovider --timeout=0
@@ -66,12 +66,36 @@ CP-L (i)    last-512 top-1 >= 0.98 (confident rows), NLL     top-1 >= the weaker
             within +-1 %                                     repeated, teacher-forced decode) - 0.05; NLL <= single
                                                              shot + 1 % (one-sided); needle; greedy answer
 CP-L (ii)   chunked vs single-shot TT streams >= 0.999       every path vs the CPU reference >= 0.99, chunked no
-                                                             further from it than the single shot (0.001)
-CP-H (ii)   last-token PCC >= 0.999                          same argmax unless margin < 0.5; greedy streams; plus the
-                                                             pooled bars of CP-H (iii) and CP-C (asserted as designed)
+                                                             further from it than the single shot (0.001) in the
+                                                             median and the mean error over the sampled positions
+                                                             (lead decision 2026-10-03, F5; the worst position is
+                                                             reported)
+CP-H (ii)   last-token PCC >= 0.999                          the hit row's argmax is the fp32 golden's unless the
+                                                             golden's margin < 0.5 (lead decision 2026-10-03, F5; the
+                                                             pre-F5 rule against the cold row is reported); greedy
+                                                             streams; plus the pooled bars of CP-H (iii) and CP-C
+                                                             (asserted as designed)
 CP-X        last-token PCC >= 0.999 (CP-H tolerances)        argmax rule; suffix median >= the sp1 floor - 0.003;
                                                              greedy streams; the negative control detected
+CP-P        last-token PCC >= 0.999, cache rows >= 0.99999   within 2 x the bucket floor (per row at the packed
+            (packed vs per-row)                              pass's T) in the median / pooled and per segment, the
+                                                             head rows and L0-L2 rows exact; count bars + 1 (logged);
+                                                             signed off by the lead 2026-10-04 (P5_T64_REVIEW I-1):
+                                                             see ``test_cp_p_packed_vs_per_row``
 =========== ================================================ =========================================================
+
+* **CP-P** (P5 packed prefill, design §6.2): each case runs the same call per row (packing off) and packed (twice),
+  on separate blocks, in the shared session (it warms the packed shapes before the capture, ``MOTIF3_CP_PACKED``):
+  (i) 32 short prompts (C2 prefixes + text, 20-64 tokens: pk0 S 64, T 2048) and 32 of 65-128 tokens (S 128,
+  T 4096); (ii) 32 rows sharing a 2K prefix in one call (solo sp0 2048 + pk1 S 128 B 32 a 2048, shared tails);
+  (iii) the mixed step; (iv) 64-token template hits; (v) a same-step hit behind a writer with an internal split;
+  (vi) the odd-block same-step hit of review edit R-E1; (vii) 8 sessions resumed at one start (pk1, distinct tails,
+  R-E2). Checks: the expected pass kinds; per row the same argmax unless the per-row margin < 0.5; teacher-forced
+  top-1 / NLL; 32 greedy tokens and the MTP draft acceptance; the repeat bitwise; cache rows (L0, L1, L2, the last
+  layer, MTP) vs per-row and blocks outside the call's fill set untouched; per segment (P5 review finding 2): the
+  head rows exact, each row's last-token logits and written cache rows (L0-L2 near-bitwise) against the floor; the
+  call wall time. ``test_cp_p_burst_ttft_report``: burst TTFT and the decode stall of a packed burst between traced
+  decode steps.
 """
 
 from __future__ import annotations
@@ -137,11 +161,16 @@ class FakeT:
 
 
 class FakeChunk:
-    """What ``model.chunk_inputs`` returns: the host tables, plus a free counter."""
+    """What ``model.chunk_inputs`` returns: the host tables (a chunk's ``ChunkHostTables`` or a packed pass's
+    ``PackedHostTables``), plus a free counter."""
 
     def __init__(self, host):
         self.host = host
         self.path, self.start, self.bucket, self.end = host.path, int(host.start), int(host.bucket), int(host.end)
+        self.is_packed = bool(host.is_packed)
+        self.reads_cache = bool(host.reads_cache)
+        self.segments = int(getattr(host, "segments", 1))
+        self.seg_rows = getattr(host, "seg_rows", None)
         self.freed = 0
 
     @property
@@ -197,6 +226,7 @@ class FakeHead:
 
     def forward_prefill(self, X, row):
         self.m.ops.append(("head", X.bucket, row))
+        assert 0 <= row < X.bucket and X.h[row] != PAD, f"the head reads padding row {row}"
         return FakeT(h=X.h[row], row=int(row))
 
     def prefill_logits_to_host(self, tile, row):
@@ -206,17 +236,21 @@ class FakeHead:
         return out
 
     def stream_mean_norm(self, X):
-        return FakeT(h=X.h, start=X.start, end=X.end, tokens=X.tokens, bucket=X.bucket)
+        return FakeT(**{k: v for k, v in X.__dict__.items() if k != "alive"})
 
 
 class FakeMTP:
     """KV-only MTP fill: writes ``(p, t_{p+1})`` through the chunk's fill table and checks the next tokens: known
-    tokens, except the row's last known position, which must take the argmax of the returned logits (``h % V``)."""
+    tokens, except the row's last known position, which must take the argmax of the returned logits (``h % V``). A
+    packed pass: the same per real segment (its rows at ``k S``, its slice of the fill table); padding rows and dummy
+    segments carry the pad token and write nothing."""
 
     def __init__(self, model):
         self.m = model
 
     def fill_kv_prefill(self, hn, nxt, *, kv_cache, chunk):
+        if chunk.is_packed:
+            return self._fill_packed(hn, nxt, kv_cache, chunk)
         m, host = self.m, chunk.host
         a, C, end, bs = int(host.start), int(host.bucket), int(host.end), int(host.block_size)
         n_known = m.known_tokens[id(hn.tokens)]  # the request's token count (set by prefill_chunk)
@@ -235,12 +269,46 @@ class FakeMTP:
                 p = a + j * bs + q
                 kv_cache[(blk, q)] = (p, nxt.ids[j * bs + q]) if p < end else (p, PAD)
 
+    def _fill_packed(self, hn, nxt, kv_cache, chunk):
+        m, host = self.m, chunk.host
+        p_, reqs = m.current_pass
+        B, S, T, bs = int(host.segments), int(host.seg_rows), int(host.bucket), int(host.block_size)
+        assert len(nxt.ids) == T and hn.bucket == T, (len(nxt.ids), hn.bucket, T)
+        pad = int(m.cfg.pad_token_id)
+        for k in range(B):
+            sg = host.segment(k)
+            rows = nxt.ids[k * S : (k + 1) * S]
+            if k >= len(p_.segments):
+                assert all(t == pad for t in rows), f"dummy segment {k}: MTP next tokens {set(rows)}, not padding"
+                assert int(sg.fill.max()) < 0, f"dummy segment {k} writes the MTP cache"
+                continue
+            g = p_.segments[k]
+            req = reqs[g.row]
+            a, e = int(sg.start), int(sg.end)
+            assert (a, e) == (g.start, g.end)
+            for r in range(e - a):
+                p = a + r
+                want = int(req.tokens[p + 1]) if p + 1 < req.end else hn.h[k * S + r] % m.V  # known, else the argmax
+                assert rows[r] == want, f"MTP next token of row {g.row} position {p}: {rows[r]}, expected {want}"
+            assert all(t == pad for t in rows[e - a :]), f"segment {k}: MTP padding rows {set(rows[e - a:])}"
+            for j, blk in enumerate(sg.fill[0].tolist()):
+                if blk < 0:
+                    continue
+                for q in range(bs):
+                    p = a + j * bs + q
+                    kv_cache[(blk, q)] = (p, rows[j * bs + q]) if p < e else (p, PAD)
+        m.ops.append(("mtp", T))
+
 
 class FakeModel:
     """The part of ``MotifModel`` the generator's prefill uses, on an :class:`EmuPool`. ``prefill_chunk`` emulates the
     attention's reads: an sp1 chunk reads positions ``[0, a)`` through its SDPA table (global layers; every entry must
     hold its position's prefix hash and chain correctly) and ``[a - 128, a)`` through its tail blocks (SWA layers; must
-    equal the SDPA reads); the fill writes the chunk's rows through the fill table, never into a complete block."""
+    equal the SDPA reads), and its own rows in blocks the fill skips (shared blocks below ``w0`` when ``c0 < w0``: the
+    global layers fill first and read rows ``[c0, w0)`` from the cache, review edit R-E1) must already hold exactly
+    the KV the chunk computes there; the fill writes the chunk's rows through the fill table, never into a complete
+    block. A packed pass (P5): every segment (``PackedHostTables.segment(k)``) the same, with ALL reads of the pass
+    before any of its writes (no segment may depend on a write of its own pass) and dummy segments writing nothing."""
 
     def __init__(self, cfg: MotifTTConfig, *, mtp: bool = True, true_tokens=None):
         self.cfg = cfg
@@ -256,7 +324,9 @@ class FakeModel:
         self.next_known: Dict[int, int] = {}
         self.chunks: List[FakeChunk] = []
         self.true_tokens = true_tokens  # {request id: tokens} for the next-token lookup (set by the harness)
-        self.current = None  # the PrefillRequest being run (set by the harness's chunk_inputs hook)
+        self.current = None  # the PrefillRequest being run (set by the harness's _run_chunk hook)
+        self.current_pass = None  # (PrefillPass, requests) of the packed pass being run (the _run_packed hook)
+        self.warm_calls: List[Tuple] = []  # warm_attention calls: (shape, layers, mtp)
 
     def allocate_kv_caches(self, num_blocks, block_size, dtype=None, *, mtp=None):
         return EmuPool(num_blocks, block_size, self.mtp is not None if mtp is None else mtp)
@@ -267,27 +337,71 @@ class FakeModel:
         self.ops.append(("inputs", host.path, int(host.bucket)))
         return ch
 
+    def warm_attention(self, chunk, kv_caches, *, layers=None, mtp=False):
+        host = chunk.host
+        assert host.is_packed and int(host.fill.max()) < 0, "a packed warm-up input writes nothing"
+        assert not host.reads_cache or int(host.sdpa.max()) == 0, "a pk1 warm-up reads only the null block"
+        self.warm_calls.append((host.shape, layers, bool(mtp)))
+        self.ops.append(("warm_attention", host.shape, bool(mtp)))
+        return (0, 1)
+
+    @staticmethod
+    def _read_prefix(host, kv) -> int:
+        """The sp1 reads of one chunk / segment before its rows: ``[0, a)`` through the SDPA table, the SWA tail
+        through the tail blocks. Returns the prefix hash at ``a - 1``."""
+        a, bs = int(host.start), int(host.block_size)
+        sd = host.sdpa[0].tolist()
+        prev = None
+        for q in range(a):
+            got = kv.get((sd[q // bs], q % bs), EMPTY)
+            assert got is not EMPTY and got[0] == q and got[1] != PAD, f"sp1 read of position {q}: {got}"
+            if prev is not None:
+                assert got[2] == chain(prev[2], got[1]), f"position {q}: KV of another prefix (stale block)"
+            prev = got
+        tail = host.tail.tolist()
+        T = len(tail) * bs
+        for q in range(a - T, a):
+            t = kv.get((tail[(q - a + T) // bs], q % bs), EMPTY)
+            assert t == kv.get((sd[q // bs], q % bs)), f"SWA tail row {q} differs from the SDPA table's"
+        return prev[2]
+
+    @staticmethod
+    def _check_unfilled_rows(host, kv, tokens, hs) -> None:
+        """R-E1: the global layers read the chunk's rows whose block the fill skips (shared, below ``w0``) from the
+        cache: they must already hold this row's KV (written by an earlier pass / call)."""
+        a, e, bs = int(host.start), int(host.end), int(host.block_size)
+        fill, sd = host.fill[0].tolist(), host.sdpa[0].tolist()
+        for r in range(e - a):
+            if fill[r // bs] >= 0:
+                continue
+            q = a + r
+            got = kv.get((sd[q // bs], q % bs), EMPTY)
+            assert got == (q, tokens[r], hs[r]), f"global read of unfilled row {q} (c0 < w0): {got}, not this row's KV"
+
+    @staticmethod
+    def _write(host, pool, tokens, hs) -> None:
+        a, e, bs, kv = int(host.start), int(host.end), int(host.block_size), pool.kv
+        for j, blk in enumerate(host.fill[0].tolist()):  # sp0 / SWA fill after, global sp1 before its SDPA: same here
+            if blk < 0:
+                continue
+            assert blk not in pool.complete, f"block {blk} is complete (maybe shared) and is written again"
+            for q in range(bs):
+                p = a + j * bs + q
+                kv[(blk, q)] = (p, tokens[j * bs + q], hs[j * bs + q]) if p < e else (p, PAD, PAD)
+        for j, blk in enumerate(host.fill[0].tolist()):
+            if blk >= 0 and all(kv.get((blk, q), (0, PAD))[1] != PAD for q in range(bs)):
+                pool.complete.add(blk)
+
     def prefill_chunk(self, tok, *, chunk, kv_caches):
         host, pool = chunk.host, kv_caches
+        if host.is_packed:
+            return self._prefill_packed(tok, host, pool)
         a, C, end, bs = int(host.start), int(host.bucket), int(host.end), int(host.block_size)
         assert tok.bucket == C and tok.real == end - a, (tok.bucket, tok.real, C, end, a)
         self.ops.append(("layers", host.path, C, a))
         kv = pool.kv
         if host.path == PP.SP1:
-            sd = host.sdpa[0].tolist()
-            prev = None
-            for q in range(a):
-                got = kv.get((sd[q // bs], q % bs), EMPTY)
-                assert got is not EMPTY and got[0] == q and got[1] != PAD, f"sp1 read of position {q}: {got}"
-                if prev is not None:
-                    assert got[2] == chain(prev[2], got[1]), f"position {q}: KV of another prefix (stale block)"
-                prev = got
-            tail = host.tail.tolist()
-            T = len(tail) * bs
-            for q in range(a - T, a):
-                t = kv.get((tail[(q - a + T) // bs], q % bs), EMPTY)
-                assert t == kv.get((sd[q // bs], q % bs)), f"SWA tail row {q} differs from the SDPA table's"
-            h = prev[2]
+            h = self._read_prefix(host, kv)
         else:
             assert a == 0
             h = H0
@@ -298,16 +412,9 @@ class FakeModel:
                 hs.append(h)
             else:
                 hs.append(PAD)
-        for j, blk in enumerate(host.fill[0].tolist()):  # sp0 / SWA fill after, global sp1 before its SDPA: same here
-            if blk < 0:
-                continue
-            assert blk not in pool.complete, f"block {blk} is complete (maybe shared) and is written again"
-            for q in range(bs):
-                p = a + j * bs + q
-                kv[(blk, q)] = (p, tok.tokens[j * bs + q], hs[j * bs + q]) if p < end else (p, PAD, PAD)
-        for j, blk in enumerate(host.fill[0].tolist()):
-            if blk >= 0 and all(kv.get((blk, q), (0, PAD))[1] != PAD for q in range(bs)):
-                pool.complete.add(blk)
+        if host.path == PP.SP1 and int(host.fill.max()) >= 0:  # (a warm-up chunk writes and checks nothing)
+            self._check_unfilled_rows(host, kv, tok.tokens, hs)
+        self._write(host, pool, tok.tokens, hs)
         req = self.current
         X = FakeT(h=hs, start=a, end=end, tokens=tok.tokens[: end - a], bucket=C)
         if req is not None:  # None: a warm-up chunk
@@ -316,26 +423,65 @@ class FakeModel:
                 self.next_known[id(X.tokens)] = int(req.tokens[end])
         return X
 
+    def _prefill_packed(self, tok, host, pool):
+        B, S, T = int(host.segments), int(host.seg_rows), int(host.bucket)
+        assert tok.bucket == T and tok.real == T, (tok.bucket, tok.real, T)
+        self.ops.append(("layers", host.path, T, int(host.start), S, B))
+        p_, reqs = self.current_pass
+        assert (p_.tokens, p_.seg_rows, p_.batch, p_.kind) == (T, S, B, host.path), (p_.describe(), host.shape)
+        pad = int(self.cfg.pad_token_id)
+        kv = pool.kv
+        segs = [host.segment(k) for k in range(B)]
+        heads = [self._read_prefix(sg, kv) if sg.is_sp1 else H0 for sg in segs]  # every read of the pass first
+        hs: List[Any] = [PAD] * T
+        for k, sg in enumerate(segs):
+            rows = tok.tokens[k * S : (k + 1) * S]
+            if k >= len(p_.segments):  # a dummy: pad tokens, writes nothing, outputs dropped
+                assert all(t == pad for t in rows) and int(sg.fill.max()) < 0, f"dummy segment {k}"
+                continue
+            g = p_.segments[k]
+            a, e = int(sg.start), int(sg.end)
+            assert (a, e) == (g.start, g.end), (k, a, e, g)
+            assert rows[: e - a] == [int(t) for t in reqs[g.row].tokens[a:e]], f"segment {k}: not row {g.row}'s tokens"
+            assert all(t == pad for t in rows[e - a :]), f"segment {k}: padding rows are not the pad token"
+            h = heads[k]
+            for r in range(e - a):
+                h = chain(h, rows[r])
+                hs[k * S + r] = h
+            if sg.is_sp1:
+                self._check_unfilled_rows(sg, kv, rows, hs[k * S : (k + 1) * S])
+        for k, sg in enumerate(segs[: len(p_.segments)]):  # then every write
+            self._write(sg, pool, tok.tokens[k * S : (k + 1) * S], hs[k * S : (k + 1) * S])
+        return FakeT(h=hs, start=int(host.start), end=int(host.end), tokens=list(tok.tokens), bucket=T, packed=True)
+
     def deallocate(self):
         pass
 
 
-def fake_generator(cfg: MotifTTConfig, monkeypatch, *, mtp: bool = True, num_blocks: int = 20000):
-    """A ``MotifGenerator`` on a :class:`FakeModel` (no device): ``ttnn.deallocate`` recorded, the pool emulated."""
+def fake_generator(
+    cfg: MotifTTConfig, monkeypatch, *, mtp: bool = True, num_blocks: int = 20000, packed: bool = False, log=None
+):
+    """A ``MotifGenerator`` on a :class:`FakeModel` (no device): ``ttnn.deallocate`` recorded, the pool emulated.
+    ``packed``: packed prefill on (``gen.packed_prefill``)."""
     from models.demos.motif3.tt import generator as G
 
     freed = []
     monkeypatch.setattr(G.ttnn, "deallocate", lambda t, *a, **k: freed.append(t), raising=False)
     model = FakeModel(cfg, mtp=mtp)
-    gen = G.MotifGenerator(None, cfg, model, log=None)
-    # the fake model needs the request of the chunk being run (for the next-token checks): wrap _run_row
-    orig = gen._run_row
+    gen = G.MotifGenerator(None, cfg, model, log=log)
+    gen.packed_prefill = bool(packed)
+    # the fake model needs the request(s) of the chunk / pass being run (for the token and next-token checks)
+    orig_chunk, orig_packed = gen._run_chunk, gen._run_packed
 
-    def run_row(job, pool):
+    def run_chunk(job, ch, host, pool):
         model.current = job.request
-        return orig(job, pool)
+        return orig_chunk(job, ch, host, pool)
 
-    gen._run_row = run_row
+    def run_packed(batch, p, host, pool):
+        model.current_pass = (p, batch.requests)
+        return orig_packed(batch, p, host, pool)
+
+    gen._run_chunk, gen._run_packed = run_chunk, run_packed
     pool = model.allocate_kv_caches(num_blocks, cfg.kv_block_size)
     gen._pool = pool
     return gen, model, pool, freed
@@ -803,7 +949,7 @@ def test_cpu_decoder_and_model_thread_chunk_and_kv_write(monkeypatch):
     layer.is_moe, layer.mlp = False, SimpleNamespace(forward_prefill=lambda f: "u", forward_decode=lambda f: "u")
     layer.input_norm = layer.post_attn_norm = "g"
     layer.eps, layer.ckc_norm, layer.norm_mc, layer.norm_pc = 1e-5, None, None, None
-    chunk = SimpleNamespace(is_sp1=True, bucket=256)
+    chunk = SimpleNamespace(is_sp1=True, reads_cache=True, path=PP.SP1, bucket=256)
     assert layer.forward_prefill("X", chunk=chunk, kv_cache="kv") == "X2"
     assert seen["prefill"] == {"chunk": chunk, "kv_cache": "kv"}
     layer.forward_prefill("X", page_table="pt", kv_cache="kv")
@@ -847,6 +993,13 @@ def test_cpu_decoder_and_model_thread_chunk_and_kv_write(monkeypatch):
         model.prefill_chunk(SimpleNamespace(shape=(1, 128)), chunk=chunk, kv_caches=["k0", "k1", "k2"])
     with pytest.raises(ValueError, match="needs kv_caches"):
         model.prefill_chunk(tok, chunk=chunk)
+    # review edit R-E11: the kv-cache guard keys on reads_cache (a pk1 pass is not is_sp1); pk0 reads no cache
+    pk1 = SimpleNamespace(is_sp1=False, reads_cache=True, is_packed=True, path="pk1", bucket=256)
+    with pytest.raises(ValueError, match="a pk1 pass reads the cached prefix: prefill_chunk needs kv_caches"):
+        model.prefill_chunk(tok, chunk=pk1)
+    got.clear()
+    pk0 = SimpleNamespace(is_sp1=False, reads_cache=False, is_packed=True, path="pk0", bucket=256)
+    assert model.prefill_chunk(tok, chunk=pk0) == "X2" and [g[2] for g in got] == [{"chunk": pk0, "kv_cache": None}] * 3
     got.clear()
     ends = []
 
@@ -871,6 +1024,70 @@ def test_cpu_decoder_and_model_thread_chunk_and_kv_write(monkeypatch):
     got.clear()
     model.decode("t", rot_idxs="r", cur_pos="c", page_table="p", kv_caches=["k0", "k1", "k2"])
     assert all("kv_write" not in g[2] for g in got)
+
+
+def test_cpu_model_warm_attention(monkeypatch):
+    """``MotifModel.warm_attention`` (P5 warm-up, design §3.5): one zero input ``[1, 1, T, hidden]`` (allocated and
+    freed), the attention of the first built global and the first built SWA layer with the warm-up chunk and each
+    layer's own cache, the MTP layer's packed fill (pad next tokens, the pool's MTP cache) only with ``mtp=True``;
+    explicit ``layers``; refusals: a layer that is not built, a pk1 input without caches, ``mtp=True`` without the MTP
+    cache. Nothing else runs."""
+    from models.demos.motif3.tt import model as M
+
+    events = []
+    fake = SimpleNamespace(
+        bfloat16="bf16", TILE_LAYOUT="tile", DRAM_MEMORY_CONFIG="dram",
+        empty=lambda shape, dt, lay, dev, mc: events.append(("empty", tuple(shape), dt, lay, mc)) or "E",
+        fill=lambda e, v: events.append(("fill", e, v)) or "X0",
+        deallocate=lambda t: events.append(("free", t)),
+    )  # fmt: skip
+    monkeypatch.setattr(M, "ttnn", fake)
+    model = object.__new__(M.MotifModel)
+    model.cfg = host_cfg()
+    model.mesh_device = "mesh"
+    model.layer_ids = (0, 1, 2, 3, 4, 5)  # L0 / L4 global, the rest SWA (l % 4 == 0)
+
+    class Attn:
+        def __init__(self, i):
+            self.i = i
+
+        def forward_prefill(self, x, *, chunk, kv_cache):
+            events.append(("attn", self.i, x, chunk.bucket, kv_cache))
+            return f"o{self.i}"
+
+    model.layers = [SimpleNamespace(attn=Attn(i)) for i in model.layer_ids]
+    model.embed = SimpleNamespace(rows_tokens_device=lambda t, rows: events.append(("nxt", t.tolist(), rows)) or "N")
+    model.mtp = SimpleNamespace(
+        fill_kv_prefill=lambda hn, nxt, *, kv_cache, chunk: events.append(("mtp", hn, nxt, kv_cache, chunk.bucket))
+    )
+    caches = M.MotifKVPool([f"kv{i}" for i in range(6)], model.layer_ids, 10, 64, "bfp8", mtp="kvm")
+    pk0 = SimpleNamespace(bucket=256, reads_cache=False, path="pk0")
+    pk1 = SimpleNamespace(bucket=512, reads_cache=True, path="pk1")
+    assert model.attention_warm_layers() == (0, 1)
+    assert model.warm_attention(pk0, caches) == (0, 1)
+    assert events == [
+        ("empty", (1, 1, 256, model.cfg.hidden_size), "bf16", "tile", "dram"), ("fill", "E", 0.0),
+        ("attn", 0, "X0", 256, "kv0"), ("free", "o0"), ("attn", 1, "X0", 256, "kv1"), ("free", "o1"),
+        ("free", "E"), ("free", "X0"),
+    ]  # fmt: skip
+    events.clear()
+    assert model.warm_attention(pk1, caches, layers=(4, 5), mtp=True) == (4, 5)
+    pad = int(model.cfg.pad_token_id)
+    assert [e[0] for e in events] == ["empty", "fill", "attn", "free", "attn", "free", "nxt", "mtp", "free", "free",
+                                      "free"]  # fmt: skip
+    assert events[2][1] == 4 and events[4][1] == 5 and events[2][4] == "kv4" and events[4][4] == "kv5"
+    assert events[6] == ("nxt", [pad] * 512, 512) and events[7] == ("mtp", "X0", "N", "kvm", 512)
+    events.clear()
+    with pytest.raises(ValueError, match="not built"):
+        model.warm_attention(pk0, caches, layers=(7,))
+    with pytest.raises(ValueError, match="pk1 input reads the paged cache"):
+        model.warm_attention(pk1, None)
+    with pytest.raises(ValueError, match="MTP cache"):
+        model.warm_attention(pk0, [f"kv{i}" for i in range(6)], mtp=True)
+    assert events == [], "a refused warm-up runs nothing"
+    model.mtp = None
+    model.warm_attention(pk0, caches, mtp=True)  # no MTP layer: mtp is ignored
+    assert "mtp" not in [e[0] for e in events]
 
 
 def test_cpu_generator_decode_kv_write_wiring(monkeypatch):
@@ -926,9 +1143,595 @@ def test_cpu_generator_decode_kv_write_wiring(monkeypatch):
 
 
 # ======================================================================================================================
+# host tests: packed prefill (P5, docs/p5_t64/P5_T64_DESIGN.md §3) at generator level, on the emulated cache
+# ======================================================================================================================
+P5_NUM_BLOCKS = 1 << 17  # test_prefill_plan._Ids hands out block ids below 2**17
+
+
+def _p5_req(lane: int, tokens: Sequence[int], start: int, blocks: Sequence[int]) -> api.PrefillRequest:
+    return _rows_of(list(tokens), start, len(tokens), list(blocks), width=512, lane=lane)
+
+
+def _p5_scenarios(seed: int = 0) -> Dict[str, List[api.PrefillRequest]]:
+    """The design §3.3 scenarios (P5N App. A) and CP-P (vi) with consistent tokens (a hit row's cached prefix is the
+    writer's tokens): 32 x 34 cold; 32 sharing a 2K prefix in one step; 32 behind a 64-token template (hit < 128,
+    c0 = 0); the mixed step; the R-E1 odd-block same-step hit (``test_prefill_plan._odd_hit_call``)."""
+    from models.demos.motif3.tests.unit.test_prefill_plan import _Ids, _odd_hit_call
+
+    rng = random.Random(seed)
+    ids = _Ids(seed)
+
+    def tok(n):
+        return [rng.randrange(5000) for _ in range(n)]
+
+    out = {"burst": [_p5_req(i, tok(34), 0, ids.take(1)) for i in range(32)]}
+    P, shared = tok(2048), ids.take(32)
+    out["shared_2k"] = [_p5_req(0, P + tok(60), 0, shared + ids.take(1))] + [
+        _p5_req(i, P + tok(62), 2048, shared + ids.take(1)) for i in range(1, 32)
+    ]
+    Tm, tmpl = tok(64), ids.take(1)
+    out["template"] = [_p5_req(0, Tm + tok(26), 0, tmpl + ids.take(1))] + [
+        _p5_req(i, Tm + tok(31), 64, tmpl + ids.take(1)) for i in range(1, 32)
+    ]
+    lens = [40] * 24 + [300, 350, 400, 420, 480, 500] + [1500, 1500]
+    out["mixed"] = [_p5_req(i, tok(n), 0, ids.take(api.cdiv(n, 64))) for i, n in enumerate(lens)]
+    out["odd_hit"] = _odd_hit_call(ids)[0]
+    return out
+
+
+P5_EXPECTED_PASSES = {  # the planner's passes at the production geometry (test_prefill_plan.test_p5_design_scenarios)
+    "burst": ["pk0 T=2048 S=64 B=32 (32 real) a=0"],
+    "shared_2k": ["solo sp0 C=2048 a=0 (row 0 chunk 0)", "pk1 T=4096 S=128 B=32 (32 real) a=2048 tails=shared"],
+    "template": ["pk0 T=4096 S=128 B=32 (32 real) a=0"],
+    "mixed": [
+        "pk0 T=2048 S=64 B=32 (24 real) a=0",
+        "pk0 T=1024 S=512 B=2 (2 real) a=0",
+        "pk0 T=2048 S=512 B=4 (4 real) a=0",
+        "solo sp0 C=2048 a=0 (row 30 chunk 0)",
+        "solo sp0 C=2048 a=0 (row 31 chunk 0)",
+    ],
+    "odd_hit": [
+        "solo sp0 C=2048 a=0 (row 0 chunk 0)",
+        "solo sp0 C=2048 a=0 (row 1 chunk 0)",
+        "solo sp1 C=128 a=2048 (row 0 chunk 1)",
+        "solo sp1 C=256 a=2048 (row 1 chunk 1)",
+        "pk1 T=256 S=128 B=2 (2 real) a=2048 tails=shared",
+    ],
+}
+
+
+def _p5_check_call(gen, pool, reqs: Sequence[api.PrefillRequest], logits: torch.Tensor) -> None:
+    """Every row's logits are those of its full token prefix; the MTP cache holds ``(p, t_{p+1})`` at every position
+    the call wrote (``[w0, end)``; the row's argmax stand-in at its last position)."""
+    V, bs = int(gen.cfg.vocab_size), int(gen.cfg.kv_block_size)
+    assert tuple(logits.shape) == (len(reqs), V)
+    for i, r in enumerate(reqs):
+        h = prefix_hashes(r.tokens.tolist())
+        assert int(logits[i].float().argmax()) == h[r.end - 1] % V, f"row {i}: logits of another prefix"
+        if pool.mtp_kv is None:
+            continue
+        for p in range(gen.last_prefill.jobs[i].plan.w0, r.end):
+            got = pool.mtp_kv.get((int(r.page_table[p // bs]), p % bs))
+            nxt = int(r.tokens[p + 1]) if p + 1 < r.end else h[r.end - 1] % V
+            assert got == (p, nxt), f"row {i}: MTP entry of position {p}: {got}, expected {(p, nxt)}"
+
+
+def _p5_pair(cfg, monkeypatch, **kw):
+    """A packing-on and a packing-off fake generator on separate emulated pools."""
+    return (fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS, **kw),
+            fake_generator(cfg, monkeypatch, packed=False, num_blocks=P5_NUM_BLOCKS, **kw))  # fmt: skip
+
+
+def test_cpu_packed_design_scenarios(monkeypatch):
+    """P5 at generator level on the design §3.3 scenarios and CP-P (vi) (production geometry: A = 128, bs 64, span cap
+    8192, the config's segment sizes): the passes are the planner's (``P5_EXPECTED_PASSES``); every row's logits and
+    every cache entry (main and MTP) equal the packing-off call's on the same rows (the emulated cache is exact, so
+    "packed == per-row" is equality here); every pass uploads its inputs once and frees them once, the LM head runs
+    once per row and the MTP fill once per pass; the observers see each solo chunk / packed pass once with its rows;
+    the counters; a packed call runs no more device passes than chunks."""
+    cfg = host_cfg()
+    for name, reqs in _p5_scenarios().items():
+        (gp, mp, pool_p, _), (gs, ms, pool_s, _) = _p5_pair(cfg, monkeypatch)
+        seen = []
+        gp.pass_observer = lambda b, p, X: seen.append(("pass", p.shape, X.bucket))
+        gp.chunk_observer = lambda job, ch, X: seen.append(("chunk", (ch.path, ch.bucket), X.bucket))
+        lp = gp.prefill_forward_batch(reqs, kv_cache=pool_p)
+        ls = gs.prefill_forward_batch(reqs, kv_cache=pool_s)
+        batch = gp.last_prefill
+        assert batch.packed and not gs.last_prefill.packed
+        assert [p.describe() for p in batch.passes] == P5_EXPECTED_PASSES[name], (name, batch.describe())
+        assert torch.equal(lp, ls), f"{name}: packed logits != per-row logits"
+        assert pool_p.kv == pool_s.kv and pool_p.mtp_kv == pool_s.mtp_kv, f"{name}: packed cache != per-row cache"
+        _p5_check_call(gp, pool_p, reqs, lp)
+        n = len(batch.passes)
+        assert len(mp.chunks) == n and all(c.freed == 1 for c in mp.chunks), "one upload and one free per pass"
+        assert sum(o[0] == "head" for o in mp.ops) == len(reqs) and sum(o[0] == "mtp" for o in mp.ops) == n
+        assert seen == [("pass" if p.is_packed else "chunk", p.shape, p.tokens) for p in batch.passes]
+        assert batch.shapes == {p.shape for p in batch.passes} and n <= batch.chunks
+        st, pk = gp.stats, batch.packed_passes
+        assert (st["packed_calls"], st["packed_passes"], st["solo_passes"]) == (1, len(pk), n - len(pk))
+        assert st["packed_pk1_passes"] == sum(p.kind == PP.PK1 for p in pk)
+        assert st["packed_segments"] == sum(len(p.segments) for p in pk)
+        assert st["packed_dummy_segments"] == sum(p.dummies for p in pk)
+        assert st["packed_padding_rows"] == sum(p.padding_rows for p in pk) and st["packed_solo_fallbacks"] == 0
+        assert st["packed_plan_errors"] == 0 and batch.plan_error is None
+        assert st["prefill_chunks"] == gs.stats["prefill_chunks"] == batch.chunks == gs.stats["solo_passes"]
+        assert st["mtp_fills"] == n and gs.stats["mtp_fills"] == batch.chunks and gs.stats["packed_passes"] == 0
+        assert {"last_prefill_s", "last_prefill_plan_s"} <= set(gp.timings)
+        log(f"P5 host scenario {name}: {batch.describe()}")
+
+
+@pytest.mark.parametrize(
+    "bs, cap, budget, threshold, seed",
+    [
+        (64, 8192, 8064, 8064, 0),  # production (A = 128, budget = threshold = 8064)
+        (64, 8192, 8064, 8064, 1),
+        (64, 1024, 3000, 700, 2),  # small span cap: internal chunks, packed tails of split rows, odd-block hits
+        (32, 1024, 4000, 0, 3),  # block 32 (A = 128 > bs)
+    ],
+)
+def test_cpu_packed_emulated_schedule(monkeypatch, bs, cap, budget, threshold, seed):
+    """P5 under a vLLM-like schedule of bursts (``test_prefill_plan.FakeVllmScheduler``: prefix hits on admission, full
+    blocks cached at allocation so later-admitted rows hit blocks an earlier row computes in the same step, chunk
+    budgets, shuffled rows, new lanes per call): short prompts, shared system prompts (incl. 200 / 1100 / 2112 tokens:
+    odd-block same-step hits whose writer's chunk boundary sits at the readers' c0, review edit R-E1), multi-turn
+    extensions, duplicates and long prompts. Every call on a packing-on and a packing-off generator: the same logits,
+    the same cache contents after every call, the emulation's read checks (prefix, SWA tail, the unfilled rows
+    ``[c0, w0)`` the global layers read, no read of a write of the same pass) and the MTP entries."""
+    from models.demos.motif3.tests.unit.test_prefill_plan import FakeVllmScheduler
+
+    cfg = host_cfg(prefill_span_cap=cap)
+    cfg.set_kv_geometry(24000 if bs == 32 else 12000, bs)
+    (gp, mp, pool_p, _), (gs, ms, pool_s, _) = (
+        fake_generator(cfg, monkeypatch, packed=True, num_blocks=cfg.kv_num_blocks),
+        fake_generator(cfg, monkeypatch, packed=False, num_blocks=cfg.kv_num_blocks),
+    )
+    rng = random.Random(seed)
+    width = 32768 // bs
+    sched = FakeVllmScheduler(bs=bs, num_blocks=cfg.kv_num_blocks, budget=budget, threshold=threshold, width=width)
+    systems = [[rng.randrange(5000) for _ in range(n)] for n in (64, 130, 200, 1100, 2112)]
+    history: List[List[int]] = []
+    st = dict(calls=0, rows=0, odd_hits=0, packed_odd_hits=0)
+    for wave in range(16):
+        for _ in range(rng.randint(4, 20)):
+            k = rng.random()
+            if k < 0.35:
+                toks = [rng.randrange(5000) for _ in range(rng.randint(1, 300))]
+            elif k < 0.65:
+                toks = rng.choice(systems) + [rng.randrange(5000) for _ in range(rng.randint(1, 200))]
+            elif k < 0.75 and history:
+                toks = list(rng.choice(history)) + [rng.randrange(5000) for _ in range(rng.randint(1, 300))]
+            elif k < 0.85 and history:
+                toks = list(rng.choice(history))
+            else:
+                toks = [rng.randrange(5000) for _ in range(rng.randint(300, 2600))]
+            history.append(toks)
+            sched.add(toks)
+        while sched.running or sched.waiting:
+            rows = sched.schedule()
+            perm = list(range(len(rows)))
+            rng.shuffle(perm)
+            lanes = rng.sample(range(32), len(rows))
+            reqs = [_rows_of(rows[k][0].tokens, rows[k][0].computed, rows[k][1], rows[k][0].blocks, width=width,
+                             lane=lane) for k, lane in zip(perm, lanes)]  # fmt: skip
+            lp = gp.prefill_forward_batch(reqs, kv_cache=pool_p)
+            ls = gs.prefill_forward_batch(reqs, kv_cache=pool_s)
+            assert torch.equal(lp, ls), f"call {st['calls']}: packed logits != per-row"
+            assert pool_p.kv == pool_s.kv and pool_p.mtp_kv == pool_s.mtp_kv, f"call {st['calls']}: caches differ"
+            _p5_check_call(gp, pool_p, reqs, lp)
+            batch = gp.last_prefill
+            odd = {i for i, j in enumerate(batch.jobs) if j.plan.has_sp1 and j.plan.c0 < j.plan.w0}
+            st["odd_hits"] += len(odd)
+            st["packed_odd_hits"] += sum(g.row in odd for p in batch.packed_passes for g in p.segments)
+            st["calls"] += 1
+            st["rows"] += len(reqs)
+            sched.commit(rows)
+            assert st["calls"] < 3000
+    s = gp.stats
+    assert all(c.freed == 1 for c in mp.chunks) and len(mp.chunks) == s["solo_passes"] + s["packed_passes"]
+    assert s["prefill_chunks"] == gs.stats["prefill_chunks"] and s["packed_passes"] > 0 and s["packed_pk1_passes"] > 0
+    assert st["packed_odd_hits"] > 0, st  # R-E1: odd-block hit rows ran in packed passes (after their writers)
+    assert s["solo_passes"] + s["packed_passes"] < s["prefill_chunks"], "packing saved no device pass"
+    assert s["packed_plan_errors"] == 0, "a packed plan failed its own checks (the call ran per row)"
+    log(f"P5 emulated schedule bs={bs} cap={cap} budget={budget} threshold={threshold} seed={seed}: {st}; "
+        f"{ {k: v for k, v in s.items() if k.startswith(('packed', 'solo', 'prefill'))} }")  # fmt: skip
+
+
+def test_cpu_packed_shape_filter_after_capture(monkeypatch):
+    """After the decode capture (a fake captured path): a packed pass whose shape was not warmed runs as one solo pass
+    per segment (``fallback`` = the packed shape, counter ``packed_solo_fallbacks``, logged once per shape), with the
+    same results; warmed shapes pack; the pk1 key names the tail variant (review edit R-E2: ``shared`` warmed does not
+    let a ``distinct`` pass run); an unwarmed solo shape still refuses the call (nothing runs, nothing is written);
+    packing turned on after a capture without packed shapes never refuses a call."""
+    from models.demos.motif3.tt.generator import DecodePath
+
+    cfg = host_cfg()
+    logs: List[str] = []
+    gp, mp, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS, log=logs.append)
+    gp._paths[gp.serving_path] = DecodePath(*gp.serving_path, width=512, trace_id=object())  # "captured"
+    gp._warmed = set(gp.prefill_shapes())  # solo shapes only: packing was off at the warm-up
+    rng = random.Random(4)
+
+    def burst(n, L, lane0=0):
+        return [_p5_req(lane0 + i, [rng.randrange(5000) for _ in range(L)], 0, [1000 + 40 * lane0 + i])
+                for i in range(n)]  # fmt: skip
+
+    reqs = burst(32, 34)
+    lg = gp.prefill_forward_batch(reqs, kv_cache=pool)
+    _p5_check_call(gp, pool, reqs, lg)
+    b = gp.last_prefill
+    assert not b.packed_passes and len(b.fallbacks) == 32 and {p.fallback for p in b.fallbacks} == {("pk0", 2048, 64)}
+    assert gp.stats["packed_solo_fallbacks"] == 32 and sum("('pk0', 2048, 64)" in m for m in logs) == 1
+    gp.prefill_forward_batch(burst(32, 34), kv_cache=pool)
+    assert gp.stats["packed_solo_fallbacks"] == 64 and sum("('pk0', 2048, 64)" in m for m in logs) == 1, "logged once"
+    gp._warmed.add(("pk0", 2048, 64))
+    reqs = burst(32, 30)
+    lg = gp.prefill_forward_batch(reqs, kv_cache=pool)
+    _p5_check_call(gp, pool, reqs, lg)
+    assert [p.shape for p in gp.last_prefill.passes] == [("pk0", 2048, 64)] and not gp.last_prefill.fallbacks
+    # pk1: 4 rows with their own 2048-token histories, resumed at 2048: distinct tails (R-E2)
+    hist = []
+    for i in range(4):
+        t = [rng.randrange(5000) for _ in range(2048 + 50)]
+        blk = list(range(3000 + 40 * i, 3000 + 40 * i + 33))
+        hist.append((t, blk))
+        gp.prefill_forward_batch([_rows_of(t, 0, 2048, blk, width=512, lane=i)], kv_cache=pool)  # solo sp0 2048
+    resumed = [_rows_of(t, 2048, len(t), blk, width=512, lane=8 + i) for i, (t, blk) in enumerate(hist)]
+    gp._warmed |= {("pk1", 512, 128, "shared")}
+    n0 = gp.stats["packed_solo_fallbacks"]
+    lg = gp.prefill_forward_batch(resumed, kv_cache=pool)
+    _p5_check_call(gp, pool, resumed, lg)
+    assert {p.fallback for p in gp.last_prefill.fallbacks} == {("pk1", 512, 128, "distinct")}
+    assert gp.stats["packed_solo_fallbacks"] == n0 + 4
+    # an unwarmed SOLO shape refuses the call before any device op
+    gp._warmed.discard((PP.SP0, 128))
+    n_ops, snap, mtp_snap = len(mp.ops), dict(pool.kv), dict(pool.mtp_kv)
+    with pytest.raises(RuntimeError, match=r"\('sp0', 128\)"):
+        gp.prefill_forward_batch([_p5_req(0, [1, 2, 3], 0, [9000])], kv_cache=pool)
+    assert len(mp.ops) == n_ops and pool.kv == snap and pool.mtp_kv == mtp_snap, "a refused call ran something"
+
+
+def test_cpu_packed_plan_error_runs_per_row(monkeypatch):
+    """Packing never refuses a call (design §3.3 step 5; P5 review finding 6): when the packed plan fails its own checks
+    -- the planner's invariants (``prefill_plan._check_passes``: ``AssertionError``) or a packed table check
+    (``attention.packed_host_tables``: ``ValueError``) -- the call runs with the packing-off passes (writer-first rows):
+    the same logits and caches as a packing-off generator, ``plan_error`` names the failure, the call counts
+    ``packed_plan_errors`` and logs it; the next call packs again. Bad rows still refuse the call before any planning
+    (two rows writing one block), and after the capture an unwarmed solo shape still refuses it (nothing runs)."""
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tt.generator import DecodePath
+
+    cfg = host_cfg()
+    scen = _p5_scenarios(5)
+    for what in ("planner", "tables"):
+        logs: List[str] = []
+        (gp, mp, pool_p, _), (gs, ms, pool_s, _) = _p5_pair(cfg, monkeypatch)
+        gp.log = logs.append
+        reqs = scen["mixed"]
+        ls = gs.prefill_forward_batch(reqs, kv_cache=pool_s)
+        with monkeypatch.context() as m:
+            if what == "planner":
+                m.setattr(PP, "_check_passes", lambda *a, **k: (_ for _ in ()).throw(AssertionError("injected bug")))
+            else:
+                m.setattr(G, "packed_host_tables", lambda *a, **k: (_ for _ in ()).throw(ValueError("injected bug")))
+            lp = gp.prefill_forward_batch(reqs, kv_cache=pool_p)
+        b = gp.last_prefill
+        err = "AssertionError: injected bug" if what == "planner" else "ValueError: injected bug"
+        assert b.packed and not b.packed_passes and b.plan_error == err, (what, b.plan_error, b.describe())
+        assert [p.describe() for p in b.passes] == [p.describe() for p in gs.last_prefill.passes]
+        assert torch.equal(lp, ls) and pool_p.kv == pool_s.kv and pool_p.mtp_kv == pool_s.mtp_kv
+        _p5_check_call(gp, pool_p, reqs, lp)
+        assert gp.stats["packed_plan_errors"] == 1 and gp.stats["packed_passes"] == 0
+        assert sum("packed prefill plan" in x and err in x for x in logs) == 1, logs
+        burst = scen["burst"]  # the next call packs again
+        lb = gp.prefill_forward_batch(burst, kv_cache=pool_p)
+        _p5_check_call(gp, pool_p, burst, lb)
+        assert gp.last_prefill.plan_error is None and gp.last_prefill.packed_passes
+        assert gp.stats["packed_plan_errors"] == 1
+    # bad rows still refuse the call before any planning: two rows writing one block
+    gp, mp, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS)
+    n_ops = len(mp.ops)
+    with pytest.raises(ValueError, match="both write block 77"):
+        gp.prefill_forward_batch([_p5_req(0, list(range(40)), 0, [77]), _p5_req(1, list(range(50)), 0, [77])],
+                                 kv_cache=pool)  # fmt: skip
+    assert len(mp.ops) == n_ops and gp.stats["packed_plan_errors"] == 0
+    # after the capture, a failed packed plan whose solo shapes were not warmed refuses the call (nothing runs)
+    gp._paths[gp.serving_path] = DecodePath(*gp.serving_path, width=512, trace_id=object())  # "captured"
+    gp._warmed = set(gp.prefill_shapes()) - {(PP.SP0, 2048)}
+    with monkeypatch.context() as m:
+        m.setattr(PP, "_check_passes", lambda *a, **k: (_ for _ in ()).throw(AssertionError("injected bug")))
+        with pytest.raises(RuntimeError, match=r"\('sp0', 2048\)"):
+            gp.prefill_forward_batch(scen["mixed"], kv_cache=pool)
+    assert len(mp.ops) == n_ops and pool.kv == {} and gp.stats["packed_plan_errors"] == 0
+
+
+def test_cpu_packed_warmup(monkeypatch):
+    """``warmup_prefill`` with packing on (span cap 1024: 22 packed shapes): the solo shapes first (unchanged), then one
+    warm call per packed shape in ``cfg.packed_prefill_shapes()`` order, both pk1 tail variants (R-E2), the MTP
+    layer's packed fill once per pass size T; nothing is written; the capture is refused until the packed shapes are
+    warmed too; a second warm-up is a no-op; ``packed_warmup="full"`` runs one full warm-up pass per shape (head and
+    MTP fill included); packing off warms no packed shape and the capture needs only the solo shapes."""
+    cfg = host_cfg(prefill_span_cap=1024)
+
+    def patched(gen, model):
+        orig = model.prefill_chunk
+
+        def prefill_chunk(tok, *, chunk, kv_caches):  # warm-up inputs (fill all -1): shapes only
+            h = chunk.host
+            if int(h.fill.max()) < 0 and (h.is_packed or h.path == PP.SP1):
+                model.ops.append(("layers", h.path, int(h.bucket), int(h.start)))
+                return FakeT(h=[0] * h.bucket, start=h.start, end=h.end, tokens=tok.tokens, bucket=h.bucket)
+            return orig(tok, chunk=chunk, kv_caches=kv_caches)
+
+        model.prefill_chunk = prefill_chunk
+        model.mtp.fill_kv_prefill = lambda hn, nxt, *, kv_cache, chunk: model.ops.append(("mtp", chunk.bucket))
+
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True)
+    patched(gen, model)
+    solo, packed = gen.prefill_shapes(), gen.packed_shapes()
+    assert packed == list(cfg.packed_prefill_shapes()) and (len(solo), len(packed)) == (8, 22)  # pk0 10, pk1 6 x 2
+    assert {s[3] for s in packed if s[0] == "pk1"} == set(api.PK1_TAIL_VARIANTS)
+    with pytest.raises(RuntimeError, match="before the prefill warmup: 30 shapes"):
+        gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=512)
+    gen.warmup_prefill(kv_cache=pool, enable_trace=False)
+    assert gen.warmed_shapes == set(solo) | set(packed)
+    assert [o[1:3] for o in model.ops if o[0] == "layers"] == solo, "solo warm-ups unchanged"
+    assert [c[0] for c in model.warm_calls] == packed
+    first_t = {}
+    for s in packed:
+        first_t.setdefault(int(s[1]), s)
+    assert [c[2] for c in model.warm_calls] == [first_t[int(s[1])] == s for s in packed], "the MTP fill once per T"
+    assert pool.kv == {} and not pool.mtp_kv, "warm-ups write nothing"
+    assert gen.required_prefill_shapes() == solo + packed
+    n = len(model.ops)
+    gen.warmup_prefill(kv_cache=pool, enable_trace=False)
+    assert len(model.ops) == n
+    # full warm-up passes
+    g2, m2, p2, _ = fake_generator(cfg, monkeypatch, packed=True)
+    patched(g2, m2)
+    g2.packed_warmup = "full"
+    g2.warmup_prefill(kv_cache=p2, enable_trace=False)
+    full = [o for o in m2.ops if o[0] == "layers"][len(solo) :]
+    assert [(o[1], o[2]) for o in full] == [(s[0], s[1]) for s in packed] and not m2.warm_calls
+    assert sum(o[0] == "head" for o in m2.ops) == len(solo) + len(packed)
+    assert sum(o[0] == "mtp" for o in m2.ops) == len(solo) + len(packed)
+    # packing off: solo shapes only
+    g3, m3, p3, _ = fake_generator(cfg, monkeypatch, packed=False)
+    patched(g3, m3)
+    g3.warmup_prefill(kv_cache=p3, enable_trace=False)
+    assert g3.warmed_shapes == set(solo) and not m3.warm_calls and g3.required_prefill_shapes() == solo
+
+
+def test_cpu_cp_p_harness(monkeypatch):
+    """The device tests' harness on the host: ``Blocks`` hands out fresh ascending ids, then released ones; a scope
+    (nested too) releases what it took on exit; ``_RebucketLast`` re-plans exactly the given rows with their last
+    chunk at the pass's bucket (chunk starts / ends kept; tables still valid) and restores ``plan_row``; the bucket
+    floor then runs per row (no packed pass) at those buckets on the emulated cache with the right logits."""
+    b = Blocks(10)
+    with b.scope():
+        assert b.take(3) == [1, 2, 3]
+        with b.scope():
+            assert b.take(2) == [4, 5]
+        assert b.free == [4, 5]
+        assert b.take(4) == [6, 7, 8, 9]
+        assert b.take(2) == [4, 5]  # fresh ids exhausted: released ones
+        with pytest.raises(RuntimeError, match="KV pool exhausted"):
+            b.take(1)
+    assert sorted(b.free) == list(range(1, 10))
+    cfg = host_cfg()
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, num_blocks=P5_NUM_BLOCKS)
+    sc = _p5_scenarios()
+    m, sh = sc["mixed"], sc["shared_2k"]
+    reqs = [dataclasses.replace(r, lane=i) for i, r in enumerate([m[0], m[24], m[25], m[30], sh[0], sh[1]])]
+    keys = [(r.start, r.end) for r in reqs]
+    assert len(set(keys)) == len(keys)
+    base = [gen.plan_row(*k) for k in keys]
+    pick = {keys[0]: 2048, keys[-2]: 4096, keys[-1]: 4096}  # a 40-token sp0 row, the writer's tail, a reader
+    with _RebucketLast(gen, pick):
+        got = [gen.plan_row(*k) for k in keys]
+        logits = gen.prefill_forward_batch(reqs, kv_cache=pool)
+        assert not gen.last_prefill.packed_passes
+        # the 40-token row at 2048 (rebucketed), the 1500-token row and the writer's head chunk (2048 natively), and
+        # the writer's tail and the reader at 4096 (rebucketed)
+        assert (
+            sorted(p.shape for p in gen.last_prefill.passes if p.shape[1] > 1024)
+            == [("sp0", 2048)] * 3 + [("sp1", 4096)] * 2
+        )
+    assert [gen.plan_row(*k) for k in keys] == base, "plan_row restored"
+    for k, g, p in zip(keys, got, base):
+        assert g.chunks[:-1] == p.chunks[:-1] and (g.chunks[-1].start, g.chunks[-1].end) == (
+            p.chunks[-1].start,
+            p.chunks[-1].end,
+        )
+        assert g.chunks[-1].bucket == pick.get(k, p.chunks[-1].bucket), (k, g, p)
+    _p5_check_call(gen, pool, reqs, logits)
+
+
+class _SynTF:
+    """A teacher-forced collector stand-in for :func:`_cpp_row_bars` on the host: ``rows[i][p]`` = logits of position
+    ``p`` of request ``i``."""
+
+    def __init__(self, rows: List[torch.Tensor]):
+        self.rows = rows
+
+    def take(self, index: int, lo: int, hi: int) -> torch.Tensor:
+        return self.rows[index][lo:hi].clone()
+
+
+def test_cpu_cp_p_row_bars():
+    """The per-segment bars of CP-P (``_cpp_row_bars``, P5 review finding 2) on synthetic runs: 8 requests, per-row
+    reference A, floor F and packed B on their own blocks, logits with a clear argmax per position, caches L0-L2
+    (exact layers: B bitwise, F 1 % noise as the sp1 floor), L52 / MTP (floor-level noise). Clean runs pass. Each defect
+    confined to ONE segment fails the new bars while the median / pooled / count bars of the test (as before the review)
+    pass: (b) the head row of a segment off by one position, (c) a segment's last position computed wrong (its returned
+    and teacher-forced logits agree), (d) a segment's L2 rows (layer 1's SWA attention) off by 3 %, (e) a 40-row
+    segment's MTP rows on shifted next tokens in a call of 12,040 rows. An MTP stand-in row whose argmax token differs
+    is excused (f)."""
+    n, V, D = 8, 96, 32
+    names = ("L0", "L1", "L2", "L52", "MTP")
+    exact = ["L0", "L1", "L2"]
+
+    def build(lens, *, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        truth_lg = []
+        for L in lens:  # a clear winner per position: noise at the floor's level never flips it
+            lg = torch.randn(L, V, generator=g) * 3
+            lg[torch.arange(L), torch.randint(V, (L,), generator=g)] += 8.0
+            truth_lg.append(lg)
+        truth_kv = {k: [torch.randn(L, D, generator=g) for L in lens] for k in names}
+        caches = {k: torch.zeros(3 * sum(api.cdiv(L, BS) for L in lens) + 1, 1, BS, D) for k in names}
+        runs = {}
+        nxt = 1
+        for tag, lg_noise, kv_noise in (("A", 0.0, {}), ("F", 0.15, {"L0": 0.01, "L1": 0.01, "L2": 0.01,
+                                                                      "L52": 0.1, "MTP": 0.1}),
+                                        ("B", 0.15, {"L52": 0.1, "MTP": 0.1})):  # fmt: skip
+            blocks, rows = [], []
+            for i, L in enumerate(lens):
+                blocks.append(list(range(nxt, nxt + api.cdiv(L, BS))))
+                nxt += api.cdiv(L, BS)
+                rows.append(truth_lg[i] + lg_noise * torch.randn(L, V, generator=g))
+                pos = torch.arange(L)
+                blk = torch.tensor(blocks[-1])[pos // BS]
+                for k in names:
+                    caches[k][blk, 0, pos % BS] = truth_kv[k][i] + kv_noise.get(k, 0.0) * torch.randn(L, D, generator=g)
+            reqs = [SimpleNamespace(start=0, end=L) for L in lens]
+            runs[tag] = CppRun(reqs=reqs, blocks=blocks, logits=torch.stack([r[-1] for r in rows]), passes=[],
+                               kinds=set(), fallbacks=0, seconds=0.0, tf=_SynTF(rows), writes=set())  # fmt: skip
+        return runs, caches
+
+    def old_bars(A, B, F, caches) -> List[str]:  # CP-P's median / pooled / count bars (unchanged by the review)
+        out = []
+        lb, lf = _cpp_last(A, B), _cpp_last(A, F)
+        if 1 - lb["median"] > max(1 - CPP_LOGIT_PCC, CPP_FLOOR_RATIO * (1 - lf["median"])):
+            out.append("median")
+        if len(lb["flips"]) > len(lf["flips"]) + CPP_FLIP_SLACK:
+            out.append("flips")
+        for k, t in caches.items():
+            ra, rb, rf = _cpp_rows(t, A), _cpp_rows(t, B), _cpp_rows(t, F)
+            if 1 - _pcc(rb, ra) > max(1 - CPP_CACHE_PCC, CPP_FLOOR_RATIO * (1 - _pcc(rf, ra))):
+                out.append(f"pooled {k}")
+        return out
+
+    lens = [40 + 10 * i for i in range(n)]
+    # (a) clean
+    runs, caches = build(lens)
+    fails, notes = _cpp_row_bars(runs["A"], runs["B"], runs["F"], caches, exact)
+    assert not fails and not old_bars(runs["A"], runs["B"], runs["F"], caches), (fails, notes)
+    assert all(f"{k} rows per request: bitwise {n}/{n}" in "; ".join(notes) for k in exact), notes
+    # (b) the head row of segment 3 off by one position (its teacher-forced rows are right)
+    runs, caches = build(lens)
+    B = runs["B"]
+    B.logits[3] = B.tf.rows[3][-2]
+    fails, _ = _cpp_row_bars(runs["A"], B, runs["F"], caches, exact)
+    assert not old_bars(runs["A"], B, runs["F"], caches)
+    assert any("packed run: the returned logits of rows [3]" in m for m in fails), fails
+    # (c) segment 5's last position computed wrong (a RoPE / attention defect at that row: both reads agree)
+    runs, caches = build(lens)
+    B = runs["B"]
+    B.tf.rows[5][-1] = B.tf.rows[5][-5].clone()
+    B.logits[5] = B.tf.rows[5][-1]
+    fails, _ = _cpp_row_bars(runs["A"], B, runs["F"], caches, exact)
+    assert not old_bars(runs["A"], B, runs["F"], caches)
+    assert len(fails) == 1 and "last-token logits of rows [5]" in fails[0], fails
+    # (d) segment 2's L2 rows 3 % off (layer 1's SWA attention of one segment); the floor is 1 % off everywhere
+    runs, caches = build(lens)
+    B, g = runs["B"], torch.Generator().manual_seed(7)
+    for p in range(lens[2]):
+        blk = B.blocks[2][p // BS]
+        caches["L2"][blk, 0, p % BS] += 0.03 * torch.randn(D, generator=g)
+    fails, _ = _cpp_row_bars(runs["A"], B, runs["F"], caches, exact)
+    assert not old_bars(runs["A"], B, runs["F"], caches)
+    assert len(fails) == 1 and "L2 cache rows of requests [2]" in fails[0], fails
+    # (e) a 40-row segment's MTP rows from shifted next tokens, beside a 12,000-row request (a 0.3 % share of the rows)
+    big = [40, 12000]
+    runs, caches = build(big, seed=1)
+    B = runs["B"]
+    rows = torch.stack([caches["MTP"][B.blocks[0][p // BS], 0, p % BS] for p in range(40)])
+    for p in range(40):
+        caches["MTP"][B.blocks[0][p // BS], 0, p % BS] = rows[(p + 1) % 40]
+    fails, _ = _cpp_row_bars(runs["A"], B, runs["F"], caches, exact)
+    assert not old_bars(runs["A"], B, runs["F"], caches)
+    assert len(fails) == 1 and "MTP cache rows of requests [0]" in fails[0], fails
+    # (f) segment 6's argmax flips (near tie: top-2 swapped in both reads): its MTP stand-in row is another token's
+    runs, caches = build(lens)
+    B = runs["B"]
+    last = B.tf.rows[6][-1]
+    top2 = torch.topk(last, 2).indices
+    last[top2[0]], last[top2[1]] = last[top2[1]].clone(), last[top2[0]].clone()
+    B.logits[6] = last.clone()
+    p = lens[6] - 1
+    caches["MTP"][B.blocks[6][p // BS], 0, p % BS] = torch.randn(D, generator=torch.Generator().manual_seed(3))
+    fails, notes = _cpp_row_bars(runs["A"], B, runs["F"], caches, exact)
+    assert not fails, (fails, notes)
+
+
+def test_cpu_packed_negative_controls(monkeypatch):
+    """The emulation catches what P5 must never do: (1) the pre-R-E1 schedule of CP-P (vi) (the odd-block readers in
+    the writer's level, packed with an unrelated tail chunk: ``test_prefill_plan``'s hand-made plan) reads the
+    unwritten block ``[c0, w0)``; (2) a dummy segment that writes; (3) segment tokens shifted by one row; (4) a wrong
+    MTP stand-in in a packed pass; (5) the logits of another segment's row (head rows off by one segment)."""
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tests.unit.test_prefill_plan import _Ids, _odd_hit_call
+
+    cfg = host_cfg()
+    # (1) R-E1
+    reqs = _odd_hit_call(_Ids(3))[0]
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS)
+    good = gen.plan_prefill_batch(reqs).passes
+    segs = {g.key: g for p in good for g in p.segments}
+    old = good[:2] + [
+        PP.PrefillPass("pk1", (segs[(0, 1)], segs[(2, 0)], segs[(3, 0)]), 128, 4, 2048, tails="distinct"), good[3]
+    ]  # fmt: skip
+    monkeypatch.setattr(G.PP, "plan_prefill_passes", lambda *a, **k: list(old))
+    with pytest.raises(AssertionError, match="global read of unfilled row 2048"):
+        gen.prefill_forward_batch(reqs, kv_cache=pool)
+    monkeypatch.undo()
+    scen = _p5_scenarios(1)
+    # (2) a dummy segment that writes (the attention's table checks bypassed)
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS)
+    real_tables = G.packed_host_tables
+
+    def leaky(cfg_, p, reqs_, plans):
+        h = real_tables(cfg_, p, reqs_, plans)
+        fill = h.fill.clone()
+        fill[0, -1] = 4321
+        return _unchecked(h, fill=fill)
+
+    monkeypatch.setattr(G, "packed_host_tables", leaky)
+    with pytest.raises(AssertionError, match="dummy segment 31"):
+        gen.prefill_forward_batch(scen["mixed"][:24] + scen["mixed"][30:], kv_cache=pool)
+    monkeypatch.undo()
+    # (3) tokens shifted by one row
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS)
+    real_tok = G.PP.pass_tokens
+    monkeypatch.setattr(G.PP, "pass_tokens", lambda p, r, pad: torch.roll(real_tok(p, r, pad), 1))
+    with pytest.raises(AssertionError, match="segment 0: not row 0's tokens"):
+        gen.prefill_forward_batch(scen["burst"], kv_cache=pool)
+    monkeypatch.undo()
+    # (4) a wrong MTP stand-in
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS)
+    real = G.mtp_next_tokens
+    monkeypatch.setattr(G, "mtp_next_tokens", lambda t, s, e, nxt: real(t, s, e, None if nxt is None else nxt + 1))
+    with pytest.raises(AssertionError, match="MTP next token of row 0 position 33"):
+        gen.prefill_forward_batch(scen["burst"], kv_cache=pool)
+    monkeypatch.undo()
+    # (5) head rows of the next segment: row k gets row k + 1's logits (no MTP layer: its stand-in check would fire)
+    gen, model, pool, _ = fake_generator(cfg, monkeypatch, packed=True, num_blocks=P5_NUM_BLOCKS, mtp=False)
+    real_rows = PP.PrefillPass.head_rows
+    monkeypatch.setattr(PP.PrefillPass, "head_rows", lambda self: [(k, r + self.seg_rows if k < len(self.segments) - 1
+                                                                    else r) for k, r in real_rows(self)])  # fmt: skip
+    lg = gen.prefill_forward_batch(scen["burst"], kv_cache=pool)
+    with pytest.raises(AssertionError, match="row 0: logits of another prefix"):
+        _p5_check_call(gen, pool, scen["burst"], lg)
+
+
+# ======================================================================================================================
 # device tests: the real model from the TT cache (design §5.3)
 # ======================================================================================================================
 CP_LAYERS = int(os.environ.get("MOTIF3_CP_LAYERS", "53"))  # < 53: a quick plumbing run (the bars assume 53 layers)
+# P5: the session warms the packed shapes before the capture (default; MOTIF3_CP_PACKED=0 boots without them and
+# skips the CP-P tests), then keeps packing off except inside the CP-P tests
+CP_PACKED = os.environ.get("MOTIF3_CP_PACKED", "1").strip() not in ("0", "", "false", "off", "no")
 MAX_LEN = 32768
 BS = 64
 NUM_BLOCKS = api.expected_num_blocks()  # 4129: the serving pool (262,144 tokens, block 64, 32 seqs)
@@ -940,9 +1743,17 @@ MULTI_TRACE_NOTE = (
     "2026-10-03 (logs/dev/20261003_0112..0141_wp45_diag_*.log): a session that captured TWO decode traces (spec "
     "all_split + plain all) and then, with the traces released, compiled a new prefill bucket (a 12K or 32K single "
     "shot: 66-72 new programs) and re-captured, returned garbage 32-row tiles (finite, |logit| 1e18-1e20) in 1-4 of "
-    "every 6 later bucket-1024 prefills while a trace was alive; clean with no trace alive, with one captured trace "
-    "(0 of 30), without the compile (0 of 30) or with one small new program (0 of 30). The tracker "
-    "(TT_METAL_TRACE_ALLOC_TRACKING=1) found no live unsafe buffer. Serving captures one trace and never re-captures."
+    "every 6 later bucket-1024 prefills while a trace was alive; no garbage with no trace alive, with one captured "
+    "trace (0 of 30), without the compile (0 of 30) or with one small new program (0 of 30). The tracker "
+    "(TT_METAL_TRACE_ALLOC_TRACKING=1) found no live unsafe buffer. Root cause (docs/p5_t64/f3.md §0-§4, verified): "
+    "not the traces but the TP-ring all-gather completion race (docs/determinism/INVESTIGATION.md), which corrupted "
+    "prefills in every phase of those runs, with one trace, two traces or none; the trace history only moved which "
+    "stale bytes the racing gather read, and so whether they looked like garbage. ring_gather='safe' (the default) "
+    "closes it: on the same sequence 0 garbage prefills, one residual stream per prompt, and two traces replayed "
+    "alternately bitwise equal to each path alone. Several decode traces are safe under F3N rules R1-R5 (f3.md §6; "
+    "tt/generator.py): serving with MOTIF3_SPEC_VERIFY=auto captures TWO decode traces (T32-spec, then T64), each once "
+    "at warmup, and never re-captures; packed, wide and non-speculating launches capture one. This module still "
+    "captures only the serving spec trace of a packed launch and runs CP-X's plain all decode eagerly."
 )
 SAMPLE_EVERY = 4  # full-vocab PCC rows (the fp32 reference logits are recomputed on the host for these)
 CP_TIMEOUT = 3600
@@ -1021,17 +1832,43 @@ class RefuseReads:
 
 
 class Blocks:
-    """KV block ids 1 .. NUM_BLOCKS - 1 (0 = vLLM's null block), never reused within the session."""
+    """KV block ids 1 .. NUM_BLOCKS - 1 (0 = vLLM's null block). ``take`` hands out fresh ascending ids while there
+    are any (a test may rely on contiguous ids), then ids released by earlier tests: every device test runs inside
+    :meth:`scope` (the autouse fixture ``_recycled_blocks``), which returns the ids it took when the test ends (no
+    later test reads a finished test's KV)."""
 
     def __init__(self, n: int):
         self.n, self.next = int(n), 1
+        self.free: List[int] = []
+        self._scope: Optional[List[int]] = None
 
     def take(self, k: int) -> List[int]:
-        if self.next + k > self.n:
-            raise RuntimeError(f"KV pool exhausted: {k} blocks at {self.next} of {self.n}")
-        out = list(range(self.next, self.next + k))
-        self.next += k
+        if self.next + k <= self.n:
+            out = list(range(self.next, self.next + k))
+            self.next += k
+        elif len(self.free) >= k:
+            out, self.free = self.free[:k], self.free[k:]
+        else:
+            raise RuntimeError(f"KV pool exhausted: {k} blocks at {self.next} of {self.n}, {len(self.free)} released")
+        if self._scope is not None:
+            self._scope.extend(out)
         return out
+
+    def scope(self):
+        """Context manager: the ids taken inside return to the free list on exit (also when nested: the caller is
+        done with their KV)."""
+        blocks = self
+
+        class _Scope:
+            def __enter__(self_):
+                self_.outer, blocks._scope = blocks._scope, []
+                return self_
+
+            def __exit__(self_, *exc):
+                taken, blocks._scope = blocks._scope, self_.outer
+                blocks.free.extend(taken)
+
+        return _Scope()
 
 
 def page_row(blocks: Sequence[int], upto: int) -> torch.Tensor:
@@ -1053,9 +1890,10 @@ def prefill_request(lane: int, ids: Sequence[int], end: int, blocks: Sequence[in
 
 
 class RowCollector:
-    """``gen.chunk_observer`` that collects teacher-forced logits: ``want = {row index in the call: (lo, hi)}`` ->
-    ``rows[(row index, position)] = logits [V]`` for positions ``[lo, hi)`` computed by the call's chunks (the LM head
-    on every 32-row tile through the tensor-args slice: no new program; FULL_MODEL_VALIDATION §2.1)."""
+    """``gen.chunk_observer`` (and, for packed passes, ``gen.pass_observer = collector.on_pass``) that collects
+    teacher-forced logits: ``want = {row index in the call: (lo, hi)}`` -> ``rows[(row index, position)] = logits [V]``
+    for positions ``[lo, hi)`` computed by the call's chunks or packed segments (the LM head on every 32-row tile
+    through the tensor-args slice: no new program; FULL_MODEL_VALIDATION §2.1)."""
 
     def __init__(self, gen, want: Dict[int, Tuple[int, int]], streams_at: Optional[Dict[int, Sequence[int]]] = None):
         self.gen, self.want = gen, dict(want)
@@ -1064,23 +1902,32 @@ class RowCollector:
         self.streams: Dict[Tuple[int, int], torch.Tensor] = {}  # (row index, position) -> X row [4, 4096] fp32
 
     def __call__(self, job, ch, X):
+        self._collect(job.index, int(ch.start), int(ch.end), X, 0)
+
+    def on_pass(self, batch, p, X):
+        """A packed pass: segment ``k`` holds positions ``[start, end)`` of row ``segments[k].row`` at packed rows
+        ``p.offset(k) ...`` (an offset that is a multiple of the 32-row tile)."""
+        for k, g in enumerate(p.segments):
+            self._collect(int(g.row), int(g.start), int(g.end), X, p.offset(k))
+
+    def _collect(self, index: int, a: int, e: int, X, off: int) -> None:
         import ttnn
 
-        lo, hi = self.want.get(job.index, (0, 0))
-        a, e = int(ch.start), int(ch.end)
-        sp = sorted(p for p in self.streams_at.get(job.index, ()) if a <= p < e)
+        lo, hi = self.want.get(index, (0, 0))
+        sp = sorted(p for p in self.streams_at.get(index, ()) if a <= p < e)
         if sp:  # residual streams of those positions (chip 0; prefill outputs are replicated)
             xt = ttnn.to_torch(ttnn.get_device_tensors(X)[0])  # [1, 4, C, 4096]
             for p in sp:
-                self.streams[(job.index, p)] = xt[0, :, p - a].float().clone()
+                self.streams[(index, p)] = xt[0, :, off + p - a].float().clone()
             del xt
         s0, s1 = max(lo, a), min(hi, e)
         if s0 >= s1:
             return
+        assert off % 32 == 0, off
         head = self.gen.model.head
         for r0 in range((s0 - a) // 32 * 32, s1 - a, 32):
             li = min(r0 + 31, e - a - 1)
-            tile = head.forward_prefill(X, li)
+            tile = head.forward_prefill(X, off + li)
             try:
                 reader = head._reader(tile)
                 views = reader.read(tile)
@@ -1089,7 +1936,7 @@ class RowCollector:
                 ttnn.deallocate(tile)
             for r in range(r0, min(r0 + 32, e - a)):
                 if s0 <= a + r < s1:
-                    self.rows[(job.index, a + r)] = rows[r - r0].clone()
+                    self.rows[(index, a + r)] = rows[r - r0].clone()
 
     def take(self, index: int, lo: int, hi: int) -> torch.Tensor:
         missing = [p for p in range(lo, hi) if (index, p) not in self.rows]
@@ -1258,23 +2105,71 @@ class Session:
         """One ``prefill_forward_batch`` call; ``want`` = teacher-forced positions per row (RowCollector)."""
         col = RowCollector(self.gen, want or {}) if want else None
         self.gen.chunk_observer = col
+        self.gen.pass_observer = col.on_pass if col is not None else None
         try:
             t0 = time.time()
             out = self.gen.prefill_forward_batch(list(rows), kv_cache=self.pool)
             dt = time.time() - t0
         finally:
-            self.gen.chunk_observer = None
+            self.gen.chunk_observer = self.gen.pass_observer = None
         assert_sane(out, "prefill logits")
         return out, col, dt
 
     def prefill_observed(self, rows: Sequence[api.PrefillRequest], collector: RowCollector):
-        self.gen.chunk_observer = collector
+        self.gen.chunk_observer, self.gen.pass_observer = collector, collector.on_pass
         try:
             out = self.gen.prefill_forward_batch(list(rows), kv_cache=self.pool)
         finally:
-            self.gen.chunk_observer = None
+            self.gen.chunk_observer = self.gen.pass_observer = None
         assert_sane(out, "prefill logits")
         return out
+
+    def packing(self, on: bool):
+        """Context manager: the generator's packed-prefill switch (P5) for the block, restored after."""
+        gen = self.gen
+
+        class _Packing:
+            def __enter__(self_):
+                self_.old = gen.packed_prefill
+                gen.packed_prefill = bool(on)
+
+            def __exit__(self_, *exc):
+                gen.packed_prefill = self_.old
+
+        return _Packing()
+
+    def cache_host(self, cache) -> torch.Tensor:
+        """Chip 0's copy of a paged cache ``[num_blocks, 1, block, 576]`` on the host (a buffer read: no device
+        program, safe while a trace is alive; prefill and KV-R write every chip alike)."""
+        import ttnn
+
+        return ttnn.to_torch(ttnn.get_device_tensors(cache)[0])
+
+    def greedy_spec(self, lanes: Sequence[Lane], steps: int) -> Dict[int, List[bool]]:
+        """:meth:`greedy` through ``decode_forward_spec`` (ordinary steps of the serving spec trace): also returns, per
+        lane, whether the MTP layer's prediction of each step (``m0``: the token after the step's argmax) equals the
+        next step's argmax (the draft acceptance a speculating server would see)."""
+        acc: Dict[int, List[bool]] = {ln.lane: [] for ln in lanes}
+        prev: Dict[int, int] = {}
+        for _ in range(steps):
+            tokens = torch.zeros(api.NUM_LANES, dtype=torch.int32)
+            pos = torch.full((api.NUM_LANES,), -1, dtype=torch.int32)
+            pt = torch.zeros(api.NUM_LANES, WIDTH, dtype=torch.int32)
+            for ln in lanes:
+                p = len(ln.seq) - 1
+                tokens[ln.lane], pos[ln.lane], pt[ln.lane] = ln.seq[-1], p, page_row(ln.blocks, p + 1)
+            batch = api.SpecDecodeBatch.from_decode_batch(api.DecodeBatch(tokens=tokens, positions=pos, page_table=pt))
+            res = self.gen.decode_forward_spec(batch, kv_cache=self.pool, enable_trace=True, want_logits=True)
+            assert_sane(res.logits[[ln.lane for ln in lanes]], "decode logits", [ln.lane for ln in lanes])
+            for ln in lanes:
+                row = res.logits[ln.lane].float()
+                tok = int(row.argmax())
+                if ln.lane in prev:
+                    acc[ln.lane].append(prev[ln.lane] == tok)
+                prev[ln.lane] = int(res.mtp_argmax[ln.lane, 0])
+                ln.seq.append(tok)
+                ln.margins.append(_margin(row))
+        return acc
 
     # ---- decode ----------------------------------------------------------------------------------------------
     def greedy(self, lanes: Sequence[Lane], steps: int, *, trace: bool = True, path=None) -> None:
@@ -1372,7 +2267,7 @@ def session():
             max_batch_size=api.NUM_LANES, max_seq_len=MAX_LEN, num_layers=CP_LAYERS, kv_cache_dtype="bfp8",
             weights_path=str(DEFAULT_WEIGHTS_DIR), block_size=BS, weights_source="TT cache only (test)",
             chunked_prefill=True, prefix_caching=True, max_num_batched_tokens=budget,
-            long_prefill_token_threshold=budget, spec_tokens=1,
+            long_prefill_token_threshold=budget, spec_tokens=1, packed_prefill=CP_PACKED,
         )  # fmt: skip
         guard = RefuseReads(DEFAULT_WEIGHTS_DIR)
         t0 = time.time()
@@ -1384,18 +2279,25 @@ def session():
         assert not gen.model.cache_misses and not guard.refused, "not a TT-cache-only boot"
         assert gen.decode_kv_mode == "all" and gen.mtp_enabled
         assert gen.serving_path == ("spec", "all_split")
-        # ONE captured decode trace, as in serving: with a second one (the plain all trace) captured next to it, the
-        # prefills after a release / new-program compile / re-capture (CP-L's 32K single shot) returned garbage tiles
-        # (MULTI_TRACE_NOTE). CP-X runs the plain all decode eagerly, with no trace alive, instead.
+        # ONE captured decode trace, as in a packed launch. With a second one (the plain all trace) captured next to
+        # it, the prefills after a release / new-program compile / re-capture (CP-L's 32K single shot) once returned
+        # garbage tiles: the TP-ring all-gather race, closed by ring_gather="safe" (MULTI_TRACE_NOTE). CP-X still runs
+        # the plain all decode eagerly, with no trace alive.
         pool = gen.allocate_kv_cache(num_blocks=NUM_BLOCKS, block_size=BS, num_layers=CP_LAYERS)
         assert gen.prefill_alignment == A, "update the test's budget: A moved (gate G9 per-bucket chunks?)"
         t0 = time.time()
-        gen.warmup_prefill(kv_cache=pool, enable_trace=False)
+        gen.warmup_prefill(kv_cache=pool, enable_trace=False)  # with CP_PACKED: the packed shapes too (P5)
         t_wp = time.time() - t0
+        assert gen.packed_prefill == CP_PACKED
+        if CP_PACKED:
+            assert set(gen.packed_shapes()) <= gen.warmed_shapes
+        # the module's tests run the per-row path unless they turn packing on (CP-P: ``session.packing(True)``)
+        gen.packed_prefill = False
         gen.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=WIDTH)
         gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=WIDTH)
         log(
-            f"warmup: prefill {t_wp:.1f} s ({len(gen.warmed_shapes)} shapes, MTP fill included), decode eager "
+            f"warmup: prefill {t_wp:.1f} s ({len(gen.warmed_shapes)} shapes, MTP fill included; packed "
+            f"{gen.timings.get('warmup_packed_s', 0):.1f} s), decode eager "
             f"{gen.timings.get('warmup_decode_eager_s', 0):.1f} s, capture "
             f"{gen.timings.get('capture_decode_s', 0):.1f} s;"
             f" program cache {mesh.num_program_cache_entries()}"
@@ -1407,12 +2309,25 @@ def session():
         close_motif_mesh(mesh)
 
 
+@pytest.fixture(autouse=True)
+def _recycled_blocks(request):
+    """Device tests (those that use ``session``): the KV blocks a test takes return to the session's free list when it
+    ends, so the module's tests together never exhaust the 4129-block serving pool. Host tests: nothing (no boot)."""
+    if "session" not in request.fixturenames:
+        yield
+        return
+    with request.getfixturevalue("session").blocks.scope():
+        yield
+
+
 def _needle_prompt(tok, target_tokens: int) -> Tuple[List[int], str]:
     """A ~``target_tokens`` chat prompt: tt-metal technical reports as the haystack, one needle sentence at 40 % depth,
     a question at the end (thinking off). Returns ``(ids, needle answer)``."""
     from models.demos.motif3.reference.tokenizer import encode_chat
 
-    root = Path(__file__).resolve().parents[4]
+    # the tt-metal checkout's docs: TT_METAL_HOME (scripts/devrun.sh sets it), else this file's checkout (a run from a
+    # copy of models/demos/motif3 alone would otherwise build a haystack of blank lines)
+    root = Path(os.environ.get("TT_METAL_HOME") or Path(__file__).resolve().parents[4])
     files = [
         "METALIUM_GUIDE.md",
         "tech_reports/LLMs/llms.md",
@@ -1425,7 +2340,9 @@ def _needle_prompt(tok, target_tokens: int) -> Tuple[List[int], str]:
         "tech_reports/LLMs/vLLM_integration.md",
         "README.md",
     ]
-    text = "\n\n".join((root / f).read_text(errors="ignore") for f in files if (root / f).is_file())
+    found = [f for f in files if (root / f).is_file()]
+    assert len(found) >= len(files) // 2, f"needle haystack: only {found} under {root}"
+    text = "\n\n".join((root / f).read_text(errors="ignore") for f in found)
     while len(text) < 8 * target_tokens:
         text = text + "\n\n" + text
     answer = "7319-4426"
@@ -1737,9 +2654,12 @@ def test_cp_l_truncated_vs_reference(session):
     """CP-L (ii) (``MOTIF3_CP_LAYERS=4`` only): the truncated TT model (layers 0-3) on the 32K needle prompt and on its
     first 16384 tokens, single shot (draft-1 buckets 32768 / 16384) and vLLM-chunked (recommended budget; 4096 steps),
     vs the CPU reference prefix model: residual-stream PCC after layer 3 >= 0.99 at every sampled position (the
-    truncated-state bar, design §5.3), and every chunked path no further from the reference than the single shot (within
-    0.001 at the worst position and in the median). Reported: the design's chunked vs single-shot TT streams >= 0.999
-    (2026-10-02: min 0.9981-0.9987, median 0.99975-0.99995; the worst positions are the single shot's worst too)."""
+    truncated-state bar, design §5.3), and every chunked path no further from the reference than the single shot,
+    within 0.001 in the median and in the mean error over the sampled positions (lead decision 2026-10-03, re-signed
+    under F5: the worst single position is reported, F5's chunked paths sit 0.0015 under the single shot's worst at one
+    position while their median and mean error improve). Reported: the design's chunked vs single-shot TT streams >=
+    0.999 (2026-10-02: min 0.9981-0.9987, median 0.99975-0.99995; the worst positions are the single shot's worst too).
+    """
     if CP_LAYERS != len(LONG_REF_LAYERS):
         pytest.skip(f"needs MOTIF3_CP_LAYERS={len(LONG_REF_LAYERS)} (the reference prefix model)")
     s, gen = session, session.gen
@@ -1792,22 +2712,26 @@ def test_cp_l_truncated_vs_reference(session):
             for name in ("budget", "t4096"):
                 col, st_p = cols[name], vs_ref[name]
                 tt = torch.tensor([_pcc(col.streams[(0, p)], cols["single"].streams[(0, p)]) for p in pos])
-                # asserted: the chunked path no further from the reference than the single shot (within 0.001, at the
-                # worst position and in the median); reported: the design's chunked vs single-shot TT >= 0.999
-                closer = (
-                    float(st_p.min()) >= float(one.min()) - 0.001
-                    and float(st_p.median()) >= float(one.median()) - 0.001
-                )
+                # asserted (lead decision 2026-10-03, re-signed under F5's per-bucket q / k): the chunked path no
+                # further from the reference than the single shot, within 0.001, in the MEDIAN and in the MEAN ERROR
+                # (1 - PCC averaged over the sampled positions); the worst single position is reported (F5: 0.99678
+                # at 31961 vs the single shot's worst 0.99829, a chaotic single position; the >= 0.99 bar above still
+                # holds at every position); reported: the design's chunked vs single-shot TT >= 0.999
+                err, err_one = float((1 - st_p).mean()), float((1 - one).mean())
+                closer = float(st_p.median()) >= float(one.median()) - 0.001 and err <= err_one + 0.001
+                worst_ok = float(st_p.min()) >= float(one.min()) - 0.001
                 log(
                     f"CP-L (ii) S={S} {name} vs single shot TT: stream PCC min {float(tt.min()):.6f} median "
                     f"{float(tt.median()):.6f} (design bar 0.999 {'met' if float(tt.min()) >= 0.999 else 'NOT met'}); "
-                    f"vs the reference within 0.001 of the single shot: {closer}"
+                    f"vs the reference: median {float(st_p.median()):.5f} (single {float(one.median()):.5f}), mean "
+                    f"error {err:.6f} (single {err_one:.6f}) -> within 0.001 of the single shot: {closer}; worst "
+                    f"position within 0.001 of the single shot's: {worst_ok} (reported)"
                 )
                 if not closer:
                     fails.append(
-                        f"CP-L (ii) S={S} {name}: further from the reference than the single shot (min "
-                        f"{float(st_p.min()):.5f} vs {float(one.min()):.5f}, median {float(st_p.median()):.5f} vs "
-                        f"{float(one.median()):.5f})"
+                        f"CP-L (ii) S={S} {name}: further from the reference than the single shot (median "
+                        f"{float(st_p.median()):.5f} vs {float(one.median()):.5f}, mean error {err:.6f} vs "
+                        f"{err_one:.6f})"
                     )
     finally:
         s.recapture()
@@ -1847,8 +2771,10 @@ def _cold_runs(s: Session) -> Dict[str, Dict[str, Any]]:
 @pytest.mark.timeout(CP_TIMEOUT)
 def test_cp_h_prefix_reuse(session):
     """CP-H: (i) cold prefill + 32 greedy tokens; (ii) the same prompt with ``start = floor((S - 1) / 64) * 64`` on the
-    first run's blocks (another DP row): the same argmax unless margin < 0.5, greedy tokens identical except a
-    near-tie divergence; (iii) ``P + X`` cold, then ``P + Y`` (= the C2 prompt, ``P`` its first ``floor(S / 2 / 64)``
+    first run's blocks (another DP row): the hit row's last-token argmax is the fp32 golden's unless the golden's margin
+    is below 0.5 (lead decision 2026-10-03: re-signed against the golden under F5's A = 128, whose hit at 192 resumes
+    at 128; the pre-F5 rule against the cold TT row is reported), greedy tokens identical except a near-tie
+    divergence; (iii) ``P + X`` cold, then ``P + Y`` (= the C2 prompt, ``P`` its first ``floor(S / 2 / 64)``
     blocks) hitting ``P``: the teacher-forced suffix rows vs the fp32 golden within 0.3 pt top-1 and +-0.5 % NLL of the
     cold TT rows (pooled over the 6 prompts).
 
@@ -1882,22 +2808,30 @@ def test_cp_h_prefix_reuse(session):
         k_c, k_h, k_r = _kl(ref, lc), _kl(ref, lh), _kl(ref, lr)
         same = int(lh.argmax()) == int(lc.argmax())
         mg = _margin(c["last"])
-        # hard bar: the design's argmax rule (+ the greedy streams below, + the pooled rows of (iii) and CP-C). The
-        # design's single-row PCC >= 0.999 is reported: no TT path meets it reliably at full depth (module docstring,
-        # "single rows"): MoE top-8 near ties flip under any perturbation (the cold repeat misses it too)
-        ok = same or mg < NEAR_TIE
+        # hard bar (lead decision 2026-10-03, re-signed under F5's A = 128): the hit row's argmax is the fp32 golden's
+        # (tie-aware, row_metrics) unless the GOLDEN's margin is below 0.5 -- not the cold TT row's argmax and margin,
+        # a noisy reference (multi_turn_chat: the hit picks the golden's token at golden margin 0.24 while the cold
+        # row picks another at its own margin 0.531). Plus the greedy streams below and the pooled rows of (iii) and
+        # CP-C. Reported: the pre-F5 rule (hit vs cold argmax unless the cold margin < 0.5) and the design's single-row
+        # PCC >= 0.999, which no TT path meets reliably at full depth (module docstring, "single rows": MoE top-8 near
+        # ties flip under any perturbation; the cold repeat misses it too)
+        gm = row_metrics(g, torch.tensor([g.S - 1]), lh[None])
+        g_agree, g_margin = bool(gm["agree"][0]), float(gm["margin"][0])
+        ok = g_agree or g_margin < NEAR_TIE
+        old_ok = same or mg < NEAR_TIE
         design_bar.append(p >= 0.999)
         log(
             f"CP-H (ii) {name}: hit {k * BS} ({[(ch.start, ch.bucket, ch.path) for ch in plan.chunks]}, {dt:.2f} s): "
             f"last-token PCC hit/cold {p:.5f} (repeat/cold {p_rep:.5f}; design bar 0.999 "
             f"{'met' if p >= 0.999 else 'NOT met'}); vs fp32 PCC cold {r_c:.5f} hit {r_h:.5f} repeat {r_r:.5f}, KL "
-            f"cold "
-            f"{k_c:.4f} hit {k_h:.4f} repeat {k_r:.4f}; argmax {'same' if same else 'DIFF'} (margin {mg:.3f}) -> "
-            f"{'ok' if ok else 'FAIL'}"
+            f"cold {k_c:.4f} hit {k_h:.4f} repeat {k_r:.4f}; hit argmax {'=' if g_agree else '!='} fp32 golden's "
+            f"(golden margin {g_margin:.3f}) -> {'ok' if ok else 'FAIL'}; pre-F5 rule (vs cold: argmax "
+            f"{'same' if same else 'DIFF'}, cold margin {mg:.3f}) {'met' if old_ok else 'NOT met'} (reported)"
         )
         if not ok:
             fails.append(
-                f"CP-H (ii) {name}: argmax differs at margin {mg:.3f} (PCC vs fp32 hit {r_h:.5f}, cold " f"{r_c:.5f})"
+                f"CP-H (ii) {name}: the hit row's argmax {int(lh.argmax())} is not the fp32 golden's "
+                f"{int(g.argmax[g.S - 1])} at golden margin {g_margin:.3f} (PCC vs fp32 hit {r_h:.5f}, cold {r_c:.5f})"
             )
         lanes.append(
             (
@@ -2475,3 +3409,570 @@ def test_prefill_ttft_report(session):
     for name, sec, chunks in rows:
         log(f"TTFT {name}: {sec:.2f} s  chunks {chunks}")
     assert s.programs() == pc0, f"program cache grew after the capture: {pc0} -> {s.programs()}"
+
+
+# ---- CP-P: packed prefill (P5) vs per-row ---------------------------------------------------------------------------
+CPP_CASES = (
+    "i_s64",
+    "i_s128",
+    "ii_shared2k",
+    "iii_mixed",
+    "iv_template",
+    "v_split_writer",
+    "vi_odd_hit",
+    "vii_resumed",
+)
+CPP_WALL_BARS = {"i_s64": 2.0, "i_s128": 3.3, "ii_shared2k": 5.0}  # design §6.2: the packed call's wall time (s)
+# the packed passes each case must contain: (kind, tail variant) of its last call
+CPP_KINDS = {
+    "i_s64": {("pk0", None)},
+    "i_s128": {("pk0", None)},
+    "ii_shared2k": {("pk1", "shared")},
+    "iii_mixed": {("pk0", None)},
+    "iv_template": {("pk0", None)},
+    "v_split_writer": {("pk1", "shared")},
+    "vi_odd_hit": {("pk1", "shared")},
+    "vii_resumed": {("pk1", "distinct")},
+}
+CPP_LOGIT_PCC = 0.999  # design §6.2: last-token logits, packed vs per-row (reported; the floor rule is asserted)
+CPP_CACHE_PCC = 0.99999  # design §6.2: KV and MTP cache rows, packed vs per-row (reported; the floor rule is asserted)
+CPP_TOP1_PT = 0.003  # teacher-forced top-1 within 0.3 pt of per-row
+CPP_NLL_REL = 0.005  # ... NLL within +-0.5 %
+CPP_ACCEPT = 0.02  # MTP draft acceptance over the greedy tokens within 2 points (design §7.3)
+# The bucket floor (test_cp_p_packed_vs_per_row): packed's error vs per-row (1 - PCC: the median last-token logits
+# row, the aggregate of the written cache rows) at most this multiple of the floor's own error, or within the design
+# bar. 2026-10-03 at 53 layers the ratio measured 0.8-1.4 (one draw of a chaotic quantity: a few rows dominate); a wrong
+# table, RoPE row or token gives errors orders of magnitude above the floor
+CPP_FLOOR_RATIO = 2.0
+# Count bars (argmax flips at a per-row margin >= 0.5, greedy divergences beyond a near tie): packed may exceed the
+# floor's count by this much. The floor is ONE draw of a chaotic count, so an exact comparison fails at random; the
+# slack is logged whenever it is used (2026-10-03: CP-P (iv) row 8, (v) row 7). A single bad segment cannot hide in it:
+# the per-segment bars below are exact or floor-relative per row (P5 review, finding 2)
+CPP_FLIP_SLACK = 1
+# Per-segment (per-row) bars (P5 review, finding 2; :func:`_cpp_row_bars`). Every row's last-token logits, and every
+# row's written cache rows at the last layer and the MTP layer, within ``1 - CPP_ROW_PCC`` (PCC 0.95) or
+# ``CPP_FLOOR_RATIO`` x the floor's worst row; the cache rows of the layers whose inputs only layers 0-1 compute (dense
+# MLPs, row-invariant: ``CPP_EXACT_LAYERS``) per row within the design bar or ``CPP_FLOOR_RATIO`` x the floor's error
+# of the same row (expected bitwise: 2026-10-03 every L0 / L1 row was); the returned logits of every row equal the
+# teacher-forced logits of its last position (the same pass output), bitwise.
+CPP_ROW_PCC = 0.95
+CPP_EXACT_LAYERS = (0, 1, 2)  # L0 global attention -> L1's cache; L1 SWA attention -> L2's cache
+CppRow = Tuple[List[int], int, Optional[Tuple[int, int, int]]]  # (ids, start, (call, row, k): first k blocks shared)
+
+
+def _cpp_calls(s: Session, case: str) -> List[List[CppRow]]:
+    """The prefill calls of a CP-P case (module docstring), rows as ``(ids, start, share)``: ``share = (call, row,
+    k)`` = the row's first ``k`` blocks are row ``row`` of call ``call``'s (a prefix hit; a same-step hit when it is
+    the same call). Real tokens: C2 prompt prefixes and windows of the C2 token stream."""
+    rng = random.Random(1000 + CPP_CASES.index(case))
+    gold = list(s.gold.values())
+    src = [t for g in gold for t in g.ids]
+
+    def text(n: int) -> List[int]:
+        i = rng.randrange(len(src))
+        return [src[(i + j) % len(src)] for j in range(n)]
+
+    if case in ("i_s64", "i_s128"):
+        lo, hi = (20, 64) if case == "i_s64" else (65, 128)
+        lens = [rng.randint(lo, hi) for _ in range(32)]
+        return [[(list(gold[i].ids[: lens[i]]) if i < len(gold) else text(lens[i]), 0, None) for i in range(32)]]
+    if case == "ii_shared2k":  # one call: the writer's sp0 2048 chunk, then its tail and 31 hits at 2048 (pk1)
+        P = text(2048)
+        return [[(P + text(60), 0, None)] + [(P + text(rng.randint(20, 100)), 2048, (0, 0, 32)) for _ in range(31)]]
+    if case == "iii_mixed":
+        return [[(text(n), 0, None) for n in [40] * 24 + [300, 350, 400, 420, 480, 500] + [1500, 1500]]]
+    if case == "iv_template":  # hits of 64 tokens < the SWA tail: c0 = 0, they pack (pk0) with their writer
+        Tm = list(gold[0].ids[:64])
+        return [[(Tm + text(26), 0, None)] + [(Tm + text(rng.randint(20, 40)), 64, (0, 0, 1)) for _ in range(31)]]
+    if case == "v_split_writer":  # the writer's (0, 2048) + (2048, 256) chunks; 8 hits on its first 32 blocks
+        W = text(2300)
+        return [[(W, 0, None)] + [(W[:2048] + text(rng.randint(30, 120)), 2048, (0, 0, 32)) for _ in range(8)]]
+    if case == "vi_odd_hit":  # R-E1: readers hit 33 blocks (c0 2048 < w0 2112) of X, whose chunk boundary is 2048
+        U, X = text(2148), text(2200)
+        return [[(U, 0, None), (X, 0, None)] + [(X[:2112] + text(50), 2112, (0, 1, 33)) for _ in range(2)]]
+    if case == "vii_resumed":  # 8 sessions with their own 1024-token histories, resumed at 1024 (pk1, distinct)
+        H = [text(1024) for _ in range(8)]
+        return [
+            [(h, 0, None) for h in H],
+            [(h + text(rng.randint(30, 120)), 1024, (0, i, 16)) for i, h in enumerate(H)],
+        ]
+    raise ValueError(case)
+
+
+@dataclasses.dataclass
+class CppRun:
+    """One run of a CP-P case on its own blocks: the last call's rows."""
+
+    reqs: List[api.PrefillRequest]
+    blocks: List[List[int]]
+    logits: torch.Tensor
+    passes: List[str]
+    kinds: set
+    fallbacks: int
+    seconds: float
+    tf: Optional[RowCollector]
+    writes: set  # every block id the run's calls write
+    calls: List[List[api.PrefillRequest]] = dataclasses.field(default_factory=list)  # every call's requests
+
+
+class _RebucketLast:
+    """Context manager for the bucket floor: ``gen.plan_row`` re-plans every row ``(start, end)`` of ``buckets`` with
+    its LAST chunk at bucket ``buckets[(start, end)]`` (the packed pass's ``T``: the row-local programs at the pass's
+    rows, the per-row attention), the other chunks as planned."""
+
+    def __init__(self, gen, buckets: Dict[Tuple[int, int], int]):
+        self.gen, self.buckets = gen, dict(buckets)
+
+    def __enter__(self):
+        orig = self.orig = self.gen.plan_row
+
+        def plan_row(start, end):
+            plan = orig(start, end)
+            T = self.buckets.get((int(start), int(end)))
+            last = plan.chunks[-1]
+            if T is None or T <= last.bucket:
+                return plan
+            return dataclasses.replace(plan, chunks=plan.chunks[:-1] + (dataclasses.replace(last, bucket=int(T)),))
+
+        self.gen.plan_row = plan_row
+        return self
+
+    def __exit__(self, *exc):
+        del self.gen.plan_row  # the instance override: back to the class method
+
+
+def _cpp_run(
+    s: Session, calls: List[List[CppRow]], *, packed: bool, observe: bool, rebucket: Optional[List[Dict]] = None
+) -> CppRun:
+    """Run ``calls`` on fresh blocks (capacity for the greedy tokens) with packing ``packed``; teacher-forced logits of
+    every real row of the last call when ``observe``; ``rebucket[c]``: call ``c``'s rows at the bucket of the packed
+    pass that would hold them (:class:`_RebucketLast`, per row: the bucket floor)."""
+    blocks: List[List[List[int]]] = []
+    writes: set = set()
+    out = col = None
+    all_reqs: List[List[api.PrefillRequest]] = []
+    with s.packing(packed):
+        for c, rows in enumerate(calls):
+            reqs, blks = [], []
+            for i, (ids, start, share) in enumerate(rows):
+                need = api.cdiv(len(ids) + DECODE_STEPS + 1, BS)
+                if share is None:
+                    b = s.blocks.take(need)
+                else:
+                    sc, sr, k = share
+                    src_blk = blocks[sc][sr] if sc < c else blks[sr]
+                    b = list(src_blk[:k]) + s.blocks.take(need - k)
+                blks.append(b)
+                reqs.append(prefill_request(i, ids, len(ids), b, start=start))
+                writes |= set(b[start // BS : api.cdiv(len(ids), BS)])
+            blocks.append(blks)
+            all_reqs.append(reqs)
+            last = c == len(calls) - 1
+            want = {i: (r.start, r.end) for i, r in enumerate(reqs)} if (observe and last) else None
+            if rebucket and rebucket[c]:
+                with _RebucketLast(s.gen, rebucket[c]):
+                    out, col, _ = s.prefill(reqs, want)
+            else:
+                out, col, _ = s.prefill(reqs, want)
+    b = s.gen.last_prefill
+    return CppRun(
+        reqs=reqs, blocks=blocks[-1], logits=out.clone(), passes=[p.describe() for p in b.passes],
+        kinds={(p.kind, p.tails) for p in b.packed_passes}, fallbacks=len(b.fallbacks),
+        seconds=s.gen.timings["last_prefill_s"] + s.gen.timings["last_prefill_plan_s"], tf=col, writes=writes,
+        calls=all_reqs,
+    )  # fmt: skip
+
+
+def _cpp_tf(run: CppRun) -> Dict[str, float]:
+    """Teacher-forced top-1 accuracy (argmax = the actual next token) and NLL over every real row of the last call
+    that has a next token."""
+    hit, nll = [], []
+    for i, r in enumerate(run.reqs):
+        lo, hi = r.start, r.end - 1  # rows with a known next token
+        if hi <= lo:
+            continue
+        lg = run.tf.take(i, lo, hi).float()
+        tgt = r.tokens[lo + 1 : hi + 1].to(torch.int64)
+        hit.append(lg.argmax(-1) == tgt)
+        nll.append(torch.logsumexp(lg.double(), -1) - lg.double().gather(1, tgt[:, None])[:, 0])
+    return {"rows": int(sum(h.numel() for h in hit)), "top1": float(torch.cat(hit).float().mean()),
+            "nll": float(torch.cat(nll).mean())}  # fmt: skip
+
+
+def _cpp_rows(cache: torch.Tensor, run: CppRun) -> torch.Tensor:
+    """The cache rows ``[n, 576]`` of every position a run's last call wrote (``[w0, end)`` of each row)."""
+    out = []
+    for r, blk in zip(run.reqs, run.blocks):
+        for p in range(r.start // BS * BS, r.end):
+            out.append(cache[blk[p // BS], 0, p % BS])
+    return torch.stack(out).float()
+
+
+def _cpp_last(A: CppRun, X: CppRun) -> Dict[str, Any]:
+    """Last-token logits of ``X`` vs the per-row run ``A``: per-row PCC, bitwise rows, and the rows whose argmax
+    differs from A's where A's margin is >= 0.5 (not a near tie)."""
+    pcc = torch.tensor([_pcc(a.float(), x.float()) for a, x in zip(A.logits, X.logits)])
+    flips = [i for i, (a, x) in enumerate(zip(A.logits, X.logits))
+             if int(a.float().argmax()) != int(x.float().argmax()) and _margin(a) >= NEAR_TIE]  # fmt: skip
+    return {"pcc": pcc, "median": float(pcc.median()), "min": float(pcc.min()),
+            "below": int((pcc < CPP_LOGIT_PCC).sum()), "bitwise": sum(torch.equal(a, x) for a, x in zip(A.logits,
+                                                                                                         X.logits)),
+            "flips": flips}  # fmt: skip
+
+
+def _cpp_req_rows(cache: torch.Tensor, run: CppRun) -> List[torch.Tensor]:
+    """Per request of a run's last call: its written cache rows ``[w0, end)`` (``[n, 576]`` fp32, position order)."""
+    out = []
+    for r, blk in zip(run.reqs, run.blocks):
+        rows = [cache[blk[p // BS], 0, p % BS] for p in range(r.start // BS * BS, r.end)]
+        out.append(torch.stack(rows).float())
+    return out
+
+
+def _cpp_row_bars(
+    A: CppRun, B: CppRun, F: CppRun, caches: Dict[str, torch.Tensor], exact: Sequence[str]
+) -> Tuple[List[str], List[str]]:
+    """The per-segment bars of CP-P (P5 review, finding 2): a defect confined to ONE packed segment (a wrong head row,
+    RoPE row, token, fill, SDPA table, SWA tail or MTP next token of one row) must fail, although the median and
+    pooled bars of :func:`test_cp_p_packed_vs_per_row` average it away and the count bars allow ``CPP_FLIP_SLACK``.
+    ``A`` per row (the reference), ``B`` packed, ``F`` the bucket floor; ``caches``: host copies of the paged caches
+    after the runs (``"L<i>"`` / ``"MTP"``), ``exact``: the names among them whose rows only layers 0-1 compute.
+    Returns ``(fails, notes)``:
+
+    * head rows (exact): every run's returned logits row equals the teacher-forced logits of the row's last position
+      (the LM head on the same pass output, through the tile the generator read): a head row or logits-to-row mapping
+      off by any row fails bitwise;
+    * last-token logits: every packed row's error (1 - PCC vs per-row) within ``1 - CPP_ROW_PCC`` or
+      ``CPP_FLOOR_RATIO`` x the floor's worst row;
+    * the cache rows each request wrote, per request: ``exact`` layers within the design bar (1 - ``CPP_CACHE_PCC``) or
+      ``CPP_FLOOR_RATIO`` x the floor's error on the same request (packed is bitwise there: every L0 / L1 row on
+      2026-10-03); the other layers within ``1 - CPP_ROW_PCC`` or ``CPP_FLOOR_RATIO`` x the floor's worst request. The
+      MTP row of a request's last position is left out where a run's last-token argmax (its MTP stand-in token)
+      differs from per-row's: its input token differs by design."""
+    fails: List[str] = []
+    notes: List[str] = []
+    for tag, run in (("per-row", A), ("floor", F), ("packed", B)):
+        bad = []
+        for i, r in enumerate(run.reqs):
+            tf = run.tf.take(i, r.end - 1, r.end)[0]
+            if not torch.equal(run.logits[i].float(), tf.float()):
+                bad.append(i)
+        if bad:
+            fails.append(f"{tag} run: the returned logits of rows {bad} are not the teacher-forced logits of their "
+                         f"last position (a head row or logits-to-row mapping is off)")  # fmt: skip
+    pb = _row_pccs(B.logits.float(), A.logits.float())
+    pf = _row_pccs(F.logits.float(), A.logits.float())
+    eb, ef = 1 - pb, 1 - pf
+    bar = max(1 - CPP_ROW_PCC, CPP_FLOOR_RATIO * float(ef.max()))
+    worst = int(eb.argmax())
+    notes.append(f"last-token per row: packed worst row {worst} PCC {float(pb[worst]):.5f}, floor worst "
+                 f"{float(pf.min()):.5f}, bar {1 - bar:.5f}")  # fmt: skip
+    if float(eb.max()) > bar:
+        fails.append(f"last-token logits of rows {[i for i in range(len(eb)) if float(eb[i]) > bar]} vs per-row: PCC "
+                     f"{[round(float(pb[i]), 5) for i in range(len(eb)) if float(eb[i]) > bar]} below {1 - bar:.5f} "
+                     f"(the floor's worst row {float(pf.min()):.5f})")  # fmt: skip
+    am = {tag: [int(lg.float().argmax()) for lg in run.logits] for tag, run in (("A", A), ("B", B), ("F", F))}
+    for name, t in caches.items():
+        ra, rb, rf = _cpp_req_rows(t, A), _cpp_req_rows(t, B), _cpp_req_rows(t, F)
+        e_b, e_f = [], []
+        for i in range(len(ra)):
+            for tag, rx, acc in (("B", rb, e_b), ("F", rf, e_f)):
+                keep = ra[i].shape[0]
+                if name == "MTP" and am[tag][i] != am["A"][i]:
+                    keep -= 1  # the stand-in row: another input token (the run's own argmax)
+                same = keep <= 0 or torch.equal(rx[i][:keep], ra[i][:keep])
+                acc.append(0.0 if same else 1 - _pcc(rx[i][:keep], ra[i][:keep]))
+        if name in exact:
+            bad = [i for i in range(len(ra)) if e_b[i] > max(1 - CPP_CACHE_PCC, CPP_FLOOR_RATIO * e_f[i])]
+            nbit = sum(torch.equal(rb[i], ra[i]) for i in range(len(ra)))
+            notes.append(f"{name} rows per request: bitwise {nbit}/{len(ra)}, worst error {max(e_b):.3g} (floor "
+                         f"{max(e_f):.3g})")  # fmt: skip
+            if bad:
+                fails.append(f"{name} cache rows of requests {bad} vs per-row: errors "
+                             f"{[float(f'{e_b[i]:.3g}') for i in bad]} above {1 - CPP_CACHE_PCC:g} and "
+                             f"{CPP_FLOOR_RATIO} x the floor's on the same request "
+                             f"{[float(f'{e_f[i]:.3g}') for i in bad]}")  # fmt: skip
+        else:
+            bar = max(1 - CPP_ROW_PCC, CPP_FLOOR_RATIO * max(e_f))
+            bad = [i for i in range(len(ra)) if e_b[i] > bar]
+            notes.append(f"{name} rows per request: worst PCC {1 - max(e_b):.5f} (request {e_b.index(max(e_b))}), "
+                         f"floor worst {1 - max(e_f):.5f}, bar {1 - bar:.5f}")  # fmt: skip
+            if bad:
+                fails.append(f"{name} cache rows of requests {bad} vs per-row: PCC "
+                             f"{[round(1 - e_b[i], 5) for i in bad]} below {1 - bar:.5f} (the floor's worst request "
+                             f"{1 - max(e_f):.5f})")  # fmt: skip
+    return fails, notes
+
+
+@pytest.mark.timeout(CP_TIMEOUT)
+@pytest.mark.parametrize("case", CPP_CASES)
+def test_cp_p_packed_vs_per_row(session, case):
+    """CP-P (design §6.2; P5): the case's prefill call(s) four ways, each on its own blocks, in the session that warmed
+    the packed shapes before its capture: A per row (packing off: the reference); F the **bucket floor** -- per row
+    with, in every call, each packed row's chunk at the bucket ``T`` of the pass that packs it (the row-local programs
+    at the pass's rows: "the tolerance prefill already has between buckets", P5N §5.8); B packed; C packed again.
+
+    At full depth single rows are chaotic (module docstring; CP-H: hit vs cold last-token PCC down to 0.85): the MoE
+    layers at M = T and at M = the row's bucket are not bitwise (layers 0-1, dense, are), and MoE top-8 near ties
+    amplify that. So the single-row design bars (last-token PCC >= 0.999 per row; cache rows >= 0.99999) are reported
+    and asserted relative to F, as CP-X asserts against its sp1 floor. 2026-10-03 (53 layers) F missed them as much as
+    B (i_s64: last-token median 0.9972 vs 0.9966, 30 vs 29 of 32 rows below 0.999; 32 greedy tokens identical to A on
+    11 of 32 rows): greedy outputs depend on the rows a burst packs together through M = T, not through packing. The
+    lead accepted this floor rule and the batch-dependence contract on 2026-10-04 (docs/P5_T64_REVIEW.md I-1: P5 on in
+    both TIS specs; MOTIF3_PACKED_PREFILL=0 restores per-row prefill). Asserted:
+
+    * the packed call runs the expected packed passes (``CPP_KINDS``; pk1 tail variants included), no solo fallback,
+      and the program cache does not grow (nothing compiles after the capture: F3N rule R2);
+    * last-token logits vs A: B's median error (1 - PCC) at most 2 x F's, or the design's 0.999; B's argmax differs
+      from A's at an A margin >= 0.5 on no more rows than F's does, plus ``CPP_FLIP_SLACK`` (logged when used);
+    * per segment (:func:`_cpp_row_bars`, P5 review finding 2; a defect in ONE segment must fail): every run's
+      returned logits equal the teacher-forced logits of the row's last position, bitwise (head rows); every row's
+      last-token error within 0.05 or 2 x F's worst row; per request, the written cache rows of L0, L1 and L2 (whose
+      inputs only the dense layers 0-1 compute: packed is bitwise there) within the design's 0.99999 or 2 x F's error
+      on the same request, and those of the last layer and the MTP layer within 0.05 or 2 x F's worst request (an MTP
+      stand-in row whose argmax token differs is left out);
+    * teacher-forced (the LM head on every tile of every segment): top-1 no more than 0.3 pt below A's and NLL within
+      +-0.5 % of A's (the design's pooled bars, as CP-H (iii) and CP-C), or within 2 x F's own deviation from A;
+    * the packed call repeated (C): logits and written cache rows bitwise identical to B;
+    * the cache rows the call writes (layers 0, 1, 2, the last, and the MTP layer: chip 0) vs A: aggregate error (1 -
+      PCC) at most 2 x F's, or the design's 0.99999; every block outside B's and C's fill sets bitwise untouched by
+      them (layer 0 and the MTP cache);
+    * 32 greedy tokens per row, B vs A: identical except a near-tie divergence (margin < 0.5 on either side), on all
+      but as many rows as F's streams diverge from A's otherwise, plus ``CPP_FLIP_SLACK`` (logged when used); the MTP
+      layer's draft acceptance over them within 2 points (rows whose streams agree);
+    * the packed call's wall time within ``CPP_WALL_BARS`` (i: 2.0 s, i at <= 128 tokens: 3.3 s, ii: 5.0 s).
+
+    Reported: the design bars as such, bitwise rows, F's identical greedy rows, the per-row and floor call times, the
+    fp32-golden top-1 of the C2-prefix rows of (i)."""
+    s = session
+    if not CP_PACKED:
+        pytest.skip("MOTIF3_CP_PACKED=0: the session did not warm the packed shapes")
+    gen = s.gen
+    pc0 = s.programs()
+    calls = _cpp_calls(s, case)
+    fails: List[str] = []
+    A = _cpp_run(s, calls, packed=False, observe=True)
+    rebucket: List[Dict[Tuple[int, int], int]] = []
+    for reqs in A.calls:  # the packed plan of each call (host only): each packed row's pass size T
+        with s.packing(True):
+            plan = gen.plan_prefill_batch(reqs)
+        m: Dict[Tuple[int, int], int] = {}
+        for p in plan.packed_passes:
+            for g in p.segments:
+                if g.last:
+                    key = (reqs[g.row].start, reqs[g.row].end)
+                    m[key] = max(m.get(key, 0), p.tokens)
+        rebucket.append(m)
+    F = _cpp_run(s, calls, packed=False, observe=True, rebucket=rebucket)
+    snap = {k: s.cache_host(c) for k, c in (("L0", s.pool[0]), ("MTP", s.pool.mtp))}
+    B = _cpp_run(s, calls, packed=True, observe=True)
+    C = _cpp_run(s, calls, packed=True, observe=False)
+    log(
+        f"CP-P {case}: per-row {A.seconds:.2f} s ({len(A.passes)} passes); floor {F.seconds:.2f} s "
+        f"({'; '.join(F.passes)}); packed {B.seconds:.2f} s / repeat {C.seconds:.2f} s: {'; '.join(B.passes)}"
+    )
+    if not CPP_KINDS[case] <= B.kinds or B.fallbacks or C.passes != B.passes:
+        fails.append(
+            f"{case}: packed passes {B.passes} (kinds {B.kinds}, fallbacks {B.fallbacks}), want {CPP_KINDS[case]}"
+        )
+    # ---- last-token logits vs per-row: packed, and the bucket floor; the repeat ------------------------------------
+    lb, lf = _cpp_last(A, B), _cpp_last(A, F)
+    slack_used: List[str] = []
+    if 1 - lb["median"] > max(1 - CPP_LOGIT_PCC, CPP_FLOOR_RATIO * (1 - lf["median"])):
+        fails.append(f"{case}: last-token PCC median vs per-row {lb['median']:.6f}: error above {CPP_FLOOR_RATIO} x "
+                     f"the floor's (median {lf['median']:.6f})")  # fmt: skip
+    if len(lb["flips"]) > len(lf["flips"]) + CPP_FLIP_SLACK:
+        fails.append(f"{case}: argmax differs from per-row at margin >= {NEAR_TIE} on rows {lb['flips']} (the floor: "
+                     f"{lf['flips']})")  # fmt: skip
+    elif len(lb["flips"]) > len(lf["flips"]):
+        slack_used.append(f"argmax flips at margin >= {NEAR_TIE}: packed {lb['flips']}, floor {lf['flips']}")
+    if not torch.equal(B.logits, C.logits):
+        fails.append(f"{case}: the packed call repeated is not bitwise identical (logits)")
+    # ---- teacher-forced rows ----------------------------------------------------------------------------------------
+    ta, tb, tf = _cpp_tf(A), _cpp_tf(B), _cpp_tf(F)
+    d_top1, d_nll = tb["top1"] - ta["top1"], tb["nll"] / ta["nll"] - 1
+    f_top1, f_nll = tf["top1"] - ta["top1"], tf["nll"] / ta["nll"] - 1
+    top1_bad = -d_top1 > max(CPP_TOP1_PT, CPP_FLOOR_RATIO * abs(f_top1))
+    if top1_bad or abs(d_nll) > max(CPP_NLL_REL, CPP_FLOOR_RATIO * abs(f_nll)):
+        fails.append(f"{case}: teacher-forced top-1 {100 * d_top1:+.2f} pt, NLL {100 * d_nll:+.3f} % vs per-row (the "
+                     f"floor: {100 * f_top1:+.2f} pt, {100 * f_nll:+.3f} %)")  # fmt: skip
+    gold_note = ""
+    if case.startswith("i_"):  # C2-prefix rows: vs the fp32 golden
+        gm: Dict[str, List[Dict[str, torch.Tensor]]] = {"A": [], "B": []}
+        for i, g in enumerate(list(s.gold.values())[: len(A.reqs)]):
+            e = A.reqs[i].end
+            if e > g.S:
+                continue
+            for tag, run in (("A", A), ("B", B)):
+                gm[tag].append(row_metrics(g, torch.arange(e), run.tf.take(i, 0, e)))
+        if gm["A"]:
+            ga, gb = pooled(gm["A"]), pooled(gm["B"])
+            gold_note = f"; C2 rows vs fp32 golden top-1 per-row {ga['agree']:.4f} packed {gb['agree']:.4f}"
+    # ---- caches: written rows vs per-row (and the floor's); the repeat; blocks outside the fill sets -----------------
+    names = {f"L{i}": i for i in (*CPP_EXACT_LAYERS, gen.num_layers - 1) if i < gen.num_layers}
+    after = {k: s.cache_host(s.pool[i]) for k, i in names.items()}
+    after["MTP"] = s.cache_host(s.pool.mtp)
+    exact = [f"L{i}" for i in CPP_EXACT_LAYERS if i < gen.num_layers]  # their inputs: layers 0-1 only (dense)
+    row_fails, row_notes = _cpp_row_bars(A, B, F, after, exact)
+    fails += [f"{case}: per segment: {m}" for m in row_fails]
+    cache_note = []
+    for k, t in after.items():
+        ra, rb, rc, rf = _cpp_rows(t, A), _cpp_rows(t, B), _cpp_rows(t, C), _cpp_rows(t, F)
+        p_b, p_f = _pcc(rb, ra), _pcc(rf, ra)
+        n_bit = int((rb == ra).all(-1).sum())
+        cache_note.append(f"{k} pcc {p_b:.7f} (row min {float(_row_pccs(rb, ra).min()):.6f}; floor {p_f:.7f}) "
+                          f"bitwise {n_bit}/{ra.shape[0]}")  # fmt: skip
+        if 1 - p_b > max(1 - CPP_CACHE_PCC, CPP_FLOOR_RATIO * (1 - p_f)):
+            fails.append(f"{case}: {k} cache rows packed vs per-row PCC {p_b:.7f}: error above {CPP_FLOOR_RATIO} x the "
+                         f"floor's ({p_f:.7f})")  # fmt: skip
+        if not torch.equal(rb, rc):
+            fails.append(f"{case}: {k} cache rows of the packed repeat not bitwise identical")
+    allowed = B.writes | C.writes
+    for k in ("L0", "MTP"):
+        changed = set(torch.nonzero((snap[k] != after[k]).flatten(1).any(-1)).flatten().tolist())
+        stray = sorted(changed - allowed)
+        if stray:
+            fails.append(f"{case}: {k} blocks outside the packed fill sets changed: {stray[:8]}")
+    del snap, after
+    # ---- greedy continuations + MTP acceptance -----------------------------------------------------------------------
+    lanes, acc = {}, {}
+    for tag, run in (("B", B), ("A", A), ("F", F)):
+        ls = [Lane(i, list(r.tokens.tolist()) + [int(lg.float().argmax())], blk, [_margin(lg)])
+              for i, (r, lg, blk) in enumerate(zip(run.reqs, run.logits, run.blocks))]  # fmt: skip
+        acc[tag] = s.greedy_spec(ls, DECODE_STEPS - 1)
+        lanes[tag] = ls
+    same_rows, div, same_f = [], [], 0
+    hard: Dict[str, List[str]] = {"B": [], "F": []}
+    for i in range(len(A.reqs)):
+        n0 = A.reqs[i].end
+        la = lanes["A"][i]
+        for tag in ("B", "F"):
+            lx = lanes[tag][i]
+            ok, why = compare_streams(la.seq[n0:], la.margins, lx.seq[n0:], lx.margins)
+            if la.seq[n0:] == lx.seq[n0:]:
+                if tag == "B":
+                    same_rows.append(i)
+                else:
+                    same_f += 1
+            elif not ok:
+                hard[tag].append(f"row {i}: {why}")
+            elif tag == "B":
+                div.append(f"row {i}: {why}")
+    if len(hard["B"]) > len(hard["F"]) + CPP_FLIP_SLACK:
+        fails.append(f"{case}: greedy tokens diverge from per-row beyond a near tie on {hard['B']} (the floor: "
+                     f"{hard['F']})")  # fmt: skip
+    elif len(hard["B"]) > len(hard["F"]):
+        slack_used.append(f"greedy divergences beyond a near tie: packed {hard['B']}, floor {hard['F']}")
+    acc_a = [x for i in same_rows for x in acc["A"][i]]
+    acc_b = [x for i in same_rows for x in acc["B"][i]]
+    rate_a = sum(acc_a) / max(1, len(acc_a))
+    rate_b = sum(acc_b) / max(1, len(acc_b))
+    if acc_a and abs(rate_a - rate_b) > CPP_ACCEPT:
+        fails.append(f"{case}: MTP acceptance packed {rate_b:.3f} vs per-row {rate_a:.3f} on the identical streams")
+    bar = CPP_WALL_BARS.get(case)
+    if bar is not None and C.seconds > bar:
+        fails.append(f"{case}: packed call {C.seconds:.2f} s > {bar} s (per-row {A.seconds:.2f} s)")
+    log(
+        f"CP-P {case}: last-token PCC vs per-row: packed median {lb['median']:.6f} min {lb['min']:.6f} (< "
+        f"{CPP_LOGIT_PCC}: {lb['below']}/{len(lb['pcc'])}), bitwise {lb['bitwise']}, argmax flips at margin >= 0.5 "
+        f"{lb['flips']}; floor median {lf['median']:.6f} min {lf['min']:.6f} (< {CPP_LOGIT_PCC}: {lf['below']}), "
+        f"bitwise {lf['bitwise']}, flips {lf['flips']}; teacher-forced ({tb['rows']} rows) top-1 {tb['top1']:.4f} vs "
+        f"{ta['top1']:.4f} (floor {tf['top1']:.4f}), NLL {tb['nll']:.4f} vs {ta['nll']:.4f} (floor {tf['nll']:.4f})"
+        f"{gold_note}; caches: {'; '.join(cache_note)}; greedy {len(same_rows)}/{len(A.reqs)} identical (floor "
+        f"{same_f}/{len(A.reqs)}), near-tie divergences {div}, beyond a near tie {hard['B']} (floor {hard['F']}); MTP "
+        f"acceptance packed {rate_b:.3f} per-row {rate_a:.3f} ({len(acc_a)} drafts); wall packed {C.seconds:.2f} s "
+        f"(bar {bar}) vs per-row {A.seconds:.2f} s (x{A.seconds / max(C.seconds, 1e-9):.1f}); programs {pc0} -> "
+        f"{s.programs()}"
+    )
+    log(f"CP-P {case} per segment: {'; '.join(row_notes)}; count slack ({CPP_FLIP_SLACK}) used: {slack_used or 'no'}")
+    if s.programs() != pc0:
+        fails.append(f"{case}: program cache grew after the capture: {pc0} -> {s.programs()}")
+    assert not fails, "\n".join(fails)
+
+
+@pytest.mark.timeout(CP_TIMEOUT)
+def test_cp_p_burst_ttft_report(session):
+    """P5 burst TTFT at generator level (design §1, §10; report, plus two bars): ``prefill_forward_batch`` wall time
+    (host tokens to host logits, MTP fill included, no observer) per row and packed for bursts of 32 prompts of ~34,
+    ~100, ~300 and ~600 tokens, of 32 rows behind a shared 2K prefix (one call), and of 16 short prompts; then the
+    decode stall (design §1, §7.3): 16 lanes decode through the traced spec step and a packed 16-row burst of short
+    prompts (the most a 32-lane server admits beside them) runs between two steps: the decode gap (one step + the
+    call) within the design's 2.5 s stall bar of burst (a) (expected ~1.1 s + a step, design §10; per row ~10 s).
+    Asserted: the 32 x ~34 packed call within 2.0 s, the decode gap within 2.5 s, the program cache constant."""
+    s = session
+    if not CP_PACKED:
+        pytest.skip("MOTIF3_CP_PACKED=0: the session did not warm the packed shapes")
+    rng = random.Random(77)
+    src = [t for g in s.gold.values() for t in g.ids]
+    pc0 = s.programs()
+
+    def text(n):
+        i = rng.randrange(len(src))
+        return [src[(i + j) % len(src)] for j in range(n)]
+
+    def burst(n_rows, lo, hi, shared=0):
+        P = text(shared)
+        rows, blk0 = [], s.blocks.take(api.cdiv(shared, BS)) if shared else []
+        for i in range(n_rows):
+            ids = P + text(rng.randint(lo, hi))
+            b = blk0 + s.blocks.take(api.cdiv(len(ids) + DECODE_STEPS + 1, BS) - len(blk0))
+            rows.append(prefill_request(i, ids, len(ids), b, start=shared if (shared and i) else 0))
+        return rows
+
+    report, fails = [], []
+    per_row_16: Optional[float] = None
+    for name, args in (("32 x ~34", (32, 30, 38)), ("32 x ~100", (32, 90, 110)), ("32 x ~300", (32, 280, 320)),
+                       ("32 x ~600", (32, 560, 640)), ("16 x ~34", (16, 30, 38)),
+                       ("32 behind a shared 2K (1 call)", (32, 30, 90, 2048))):  # fmt: skip
+        t = {}
+        for packed in (False, True):
+            with s.packing(packed):
+                for rep in range(2 if packed else 1):
+                    with s.blocks.scope():  # the burst's KV is not needed afterwards
+                        rows = burst(*args)
+                        t0 = time.time()
+                        s.gen.prefill_forward_batch(rows, kv_cache=s.pool)
+                        t[(packed, rep)] = time.time() - t0
+            if packed:
+                desc = s.gen.last_prefill.describe()
+        tp = min(t[(True, 0)], t[(True, 1)])
+        report.append(f"{name}: per row {t[(False, 0)]:.2f} s, packed {t[(True, 0)]:.2f} / {t[(True, 1)]:.2f} s "
+                      f"(x{t[(False, 0)] / tp:.1f}): {desc}")  # fmt: skip
+        if name == "32 x ~34" and t[(True, 1)] > 2.0:
+            fails.append(f"32 x ~34 packed call {t[(True, 1)]:.2f} s > 2.0 s")
+        if name == "16 x ~34":
+            per_row_16 = t[(False, 0)]
+    # decode stall: 16 lanes decode; a packed 16-row burst between two traced steps
+    lanes = []
+    for i in range(16):
+        ids = text(rng.randint(100, 300))
+        b = s.blocks.take(api.cdiv(len(ids) + 64, BS))
+        out, _, _ = s.prefill([prefill_request(16 + i, ids, len(ids), b)])
+        lanes.append(Lane(16 + i, list(ids) + [int(out[0].float().argmax())], b))
+    step_t = []
+    for _ in range(4):
+        t0 = time.time()
+        s.greedy(lanes, 1)
+        step_t.append(time.time() - t0)
+    step = sorted(step_t)[len(step_t) // 2]
+    with s.packing(True):
+        rows = burst(16, 30, 38)
+        t0 = time.time()
+        s.greedy(lanes, 1)
+        t1 = time.time()
+        s.gen.prefill_forward_batch(rows, kv_cache=s.pool)
+        t2 = time.time()
+        s.greedy(lanes, 1)
+        t3 = time.time()
+    gap, call = t3 - t1, t2 - t1
+    per_row = per_row_16 if per_row_16 is not None else float("nan")
+    report.append(f"decode stall: 16 decoding lanes, a packed 16 x ~34 burst between two steps: step {step:.3f} s, "
+                  f"burst call {call:.2f} s, decode gap {gap:.2f} s (bar 2.5 s; the same burst per row: a call of "
+                  f"{per_row:.2f} s)")  # fmt: skip
+    if gap > 2.5:
+        fails.append(f"decode stall {gap:.2f} s > 2.5 s (burst call {call:.2f} s, one step {step:.3f} s)")
+    for line in report:
+        log(f"P5 burst TTFT: {line}")
+    if s.programs() != pc0:
+        fails.append(f"program cache grew after the capture: {pc0} -> {s.programs()}")
+    assert not fails, "\n".join(fails)

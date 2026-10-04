@@ -34,7 +34,12 @@ Built from the HF ``config.json`` (or a transformers config object, or ``Generat
   ``A`` (``prefill_resume_alignment``) and the sp1 program configs it comes from (``resumed_prefill_pc``,
   :data:`SP1_GLOBAL_CHUNKS`), the sp1 SDPA page-table width, the chunk cost table, ``plan_prefill_row`` with this
   config's geometry, the KV-R / decode KV-write mode (``kv_replicated_decode``, ``kv_write_mode``) and the MTP layer
-  (``spec_tokens``, ``mtp_layer_spec()``, ``kv_pool_layers``).
+  (``spec_tokens``, ``mtp_layer_spec()``, ``kv_pool_layers``);
+* packed prefill (P5) and the T64 verify modes (docs/p5_t64/P5_T64_DESIGN.md §3, §4, §8.3): the packed segment sizes and
+  pass cap (``pack_seg_buckets``, ``pack_sp1_seg_buckets``, ``pack_max_tokens``) and every packed shape the generator
+  warms (``packed_prefill_shapes()``); ``spec_verify``, ``wide_rows_per_dp`` and ``wide_step_ratio``; the per-M
+  (``m_tiles``) decode matmul configs of the 64-row step (``mcast1d_matmul_pc(per_core_m=)``, MoE router and experts,
+  LM head); and the refusals ``validate`` enforces for it (F3N rule R1: ``ring_gather="safe"``; review edit R-E7).
 
 Import rule (design §2.1): this module imports only the standard library, ``ttnn``, ``generator_api`` (stdlib +
 torch; the KV-pool and weights-location helpers shared with the vLLM bridge) and ``prefill_plan`` (stdlib + torch +
@@ -50,7 +55,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import ttnn
 
@@ -62,6 +67,12 @@ from .generator_api import kv_cache_bytes_per_chip as _api_kv_cache_bytes_per_ch
 from .generator_api import kv_pool_tokens_from_env, resolve_tt_cache_path, resolve_weights_location
 from .generator_api import DEFAULT_PREFILL_SPAN_CAP, SUPPORTED_SPEC_TOKENS, check_prefill_span_cap, kv_write_mode
 from .generator_api import prefill_span_cap_from_env
+from .generator_api import DEFAULT_PACKED_PREFILL_MAX_SEG, DEFAULT_PACKED_PREFILL_MAX_TOKENS, PACK_BATCHES
+from .generator_api import PACK_SEG_BUCKETS, PACK_SP1_SEG_BUCKETS, PACKED_PASS_KINDS, PK1_TAIL_VARIANTS
+from .generator_api import SPEC_VERIFY_MODES, WIDE_SPEC_VERIFY_MODES, check_packed_prefill_max_seg
+from .generator_api import check_packed_prefill_max_tokens
+from .generator_api import packed_prefill_max_seg_from_env, packed_prefill_max_tokens_from_env
+from .generator_api import packed_prefill_pk1_from_env
 from . import prefill_plan as _plan
 
 # ------------------------------------------------------------------------------------------------------------
@@ -106,6 +117,18 @@ ROUTER_LOGITS_IMPLS = ("composite", "exact_fp32")  # MotifMoE(router_logits=...)
 # reroutes every such gather (+0.26-0.45 ms per decode step); "native" = the plain ttnn.all_gather (the pre-fix
 # behaviour, prefill not run-to-run reproducible). Validation and cost: docs/determinism/FIX.md.
 RING_GATHER_MODES = ("safe", "lean", "native")
+# T64 step / T32-spec step device-time ratio r (docs/p5_t64/P5_T64_DESIGN.md §4.9, option A'': 1.118 at 1K, 1.126 at
+# 4K, 1.173 at 32K context): the input of the T64 drafting crossover c* (verify_plan.crossover_lanes). Gate G16
+# re-measures it on the full model.
+DEFAULT_WIDE_STEP_RATIO = 1.13
+# Gathered decode row counts at which tt/moe.py's MotifRouter runs the exact-fp32 router kernel (RouterLogitsFP32) when
+# router_logits="exact_fp32" (MotifRouter._use_logits_fn; moe.EXACT_ROUTER_DECODE_ROWS must list the same counts,
+# test_infra_config checks it): 32 (T32 steps) and the 64 rows of a T64 step (review edit R-E7: WP-D D1, rows bitwise
+# equal to M = 32 in test_moe_device_t64_rows[exact_fp32]; G-S5w passed under exact_fp32). validate() refuses
+# spec_verify="auto" with router_logits="exact_fp32" at a T64 row count missing here: those rows would take the
+# composite router, differ from the T32 rows, and "auto" (which switches between the two traces per step) would not be
+# lossless.
+ROUTER_EXACT_FP32_DECODE_ROWS: Tuple[int, ...] = (TILE, 2 * TILE)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -603,6 +626,10 @@ EXPERTS_GATE_UP_GRID = (10, 8)  # 80 cores x per_core_N 1 = the 80 tiles of N = 
 EXPERTS_GATE_UP_IN0_BLOCK_W = 8
 EXPERTS_DOWN_GRID = (8, 4)  # 32 cores x per_core_N 4 = the 128 tiles of N = 4096
 EXPERTS_DOWN_IN0_BLOCK_W = 4
+# T64 (docs/p5_t64/t64.md §2.5, §5.1; real layer-2 weights, L1 intermediates): at M = 64 (per_core_M 2) gate_up keeps
+# 10 x 8 (weight bound, +11 us) and down moves to 8 x 8 cores (per_core_N 2): 1204.1 us per MoE layer against 1283.7 us
+# with down on 8 x 4 (M = 32: 1038.6 us); the M = 64 rows are bitwise equal to the M = 32 module's on both down grids.
+EXPERTS_DOWN_GRID_WIDE = (8, 8)
 
 
 def _grid_xy(grid) -> Tuple[int, int]:
@@ -741,22 +768,31 @@ def mcast1d_matmul_pc(
     k_tiles: Optional[int] = None,
     *,
     per_core_n: Optional[int] = None,
+    per_core_m: int = 1,
     fuse_batch: bool = False,
     fused_activation=None,
     fp32_acc: bool = True,
 ):
-    """``MatmulMultiCoreReuseMultiCast1DProgramConfig`` with in0 multicast over ``grid = (x, y)`` cores and M = one
-    tile row (the defaults are verbatim ``tests/unit/gates/test_g6_experts.py:mcast1d_cfg``).
+    """``MatmulMultiCoreReuseMultiCast1DProgramConfig`` with in0 multicast over ``grid = (x, y)`` cores (the defaults
+    are verbatim ``tests/unit/gates/test_g6_experts.py:mcast1d_cfg``).
 
+    * M: ``per_core_m`` tile rows (in0 is multicast, so every core computes all M rows of its N block):
+      ``per_core_M = out_block_h = per_core_m``. 1 (default) = one 32-row tile, every decode matmul of the 32-lane
+      step; 2 = the 64 gathered rows of a T64 step (MoE router / experts, LM head; docs/p5_t64/P5_T64_DESIGN.md T4).
     * N split: without ``per_core_n`` N must split evenly over the cores (G6). With ``per_core_n`` the output has
       ``ceil(N / per_core_n)`` blocks, which must fit the grid; the last one may be partial (the 215 / 860 vocab tiles
       of the LM head: the 1D factory handles the tail, verified identical to the auto config; embed_head wave B1).
-    * Out subblock: the widest of 1..4 dividing ``per_core_N`` (fp32 dest acc; 1..8 with ``fp32_acc=False``).
+    * Out subblock: ``h = 1`` at every ``per_core_m`` (docs/p5_t64/t64.md §5.1: ``(2, 1)`` on the M = 64 gate_up ran
+      slower than ``(1, 1)``) and ``w`` the widest of 1..4 dividing ``per_core_N`` (fp32 dest acc: ``h x w <= 4``;
+      1..8 with ``fp32_acc=False``).
     * ``fuse_batch``: G6 / the router use False, the dense / shared MLP and the LM head True.
     * ``fused_activation``: e.g. ``ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID)`` (router decode linear).
     """
     ncores = int(grid[0]) * int(grid[1])
     n_tiles = int(n_tiles)
+    pcm = int(per_core_m)
+    if pcm < 1:
+        raise ValueError(f"per_core_m must be >= 1 tile row, got {per_core_m}")
     if per_core_n is None:
         if n_tiles % ncores:
             raise ValueError(f"N = {n_tiles} tiles does not split over {ncores} cores (pass per_core_n for a tail)")
@@ -772,9 +808,9 @@ def mcast1d_matmul_pc(
         in0_block_w=int(in0_block_w),
         out_subblock_h=1,
         out_subblock_w=_subblock_w(pcn, fp32_acc),
-        out_block_h=1,
+        out_block_h=pcm,
         out_block_w=pcn,
-        per_core_M=1,
+        per_core_M=pcm,
         per_core_N=pcn,
         fuse_batch=bool(fuse_batch),
         fused_activation=fused_activation,
@@ -797,17 +833,22 @@ def reuse_matmul_pc(grid, in0_block_w: int, per_core_n: int, *, per_core_m: int 
     )
 
 
-def experts_gate_up_pc(n_out: int = 2 * 1280, k_in: int = 4096):
+def experts_gate_up_pc(n_out: int = 2 * 1280, k_in: int = 4096, *, m_tiles: int = 1, grid=None):
     """G6 gate_up config: ``[1,12,32,4096] bf16 @ [1,12,4096,2560] bfp8`` -> 1D mcast on 10 x 8 = 80 cores,
     ``in0_block_w`` 8, ``per_core_M`` 1, ``per_core_N`` 1, ``out_subblock_w`` 1 (426 us HiFi2 / 433 us HiFi4 traced,
-    314 GB/s). Use with the ``experts`` role."""
-    return mcast1d_matmul_pc(EXPERTS_GATE_UP_GRID, n_out // TILE, EXPERTS_GATE_UP_IN0_BLOCK_W, k_in // TILE)
+    314 GB/s). Use with the ``experts`` role. ``m_tiles=2``: the 64 rows of a T64 step, same grid with ``per_core_M``
+    2 (docs/p5_t64/t64.md §5.1). ``grid`` overrides the core grid."""
+    g = EXPERTS_GATE_UP_GRID if grid is None else grid
+    return mcast1d_matmul_pc(g, n_out // TILE, EXPERTS_GATE_UP_IN0_BLOCK_W, k_in // TILE, per_core_m=m_tiles)
 
 
-def experts_down_pc(n_out: int = 4096, k_in: int = 1280):
+def experts_down_pc(n_out: int = 4096, k_in: int = 1280, *, m_tiles: int = 1, grid=None):
     """G6 down config: ``[1,12,32,1280] bf16 @ [1,12,1280,4096] bfp8`` -> 1D mcast on 8 x 4 = 32 cores,
-    ``in0_block_w`` 4, ``per_core_N`` 4, ``out_subblock_w`` 4 (222 us HiFi2 / 226 us HiFi4 traced, 301 GB/s)."""
-    return mcast1d_matmul_pc(EXPERTS_DOWN_GRID, n_out // TILE, EXPERTS_DOWN_IN0_BLOCK_W, k_in // TILE)
+    ``in0_block_w`` 4, ``per_core_N`` 4, ``out_subblock_w`` 4 (222 us HiFi2 / 226 us HiFi4 traced, 301 GB/s).
+    ``m_tiles=2`` (a T64 step's 64 rows): ``per_core_M`` 2 on :data:`EXPERTS_DOWN_GRID_WIDE` = 8 x 8 cores, so
+    ``per_core_N`` 2 (the measured best, docs/p5_t64/t64.md §5.1). ``grid`` overrides the core grid."""
+    g = grid if grid is not None else (EXPERTS_DOWN_GRID if int(m_tiles) == 1 else EXPERTS_DOWN_GRID_WIDE)
+    return mcast1d_matmul_pc(g, n_out // TILE, EXPERTS_DOWN_IN0_BLOCK_W, k_in // TILE, per_core_m=m_tiles)
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -935,13 +976,19 @@ ROUTER_DECODE_GRID = (12, 1)  # 12 cores x per_core_N 1 = the 12 output tiles of
 ROUTER_DECODE_IN0_BLOCK_W = 32
 
 
-def router_decode_pc(n_tiles: int = 12, k_tiles: int = 128, *, sigmoid: bool = False):
+def router_decode_pc(n_tiles: int = 12, k_tiles: int = 128, *, sigmoid: bool = False, m_tiles: int = 1):
     """Router decode linear ``[1, 1, 32, 4096] @ [4096, 384]`` (tt/moe.py ``MotifRouter._decode_pc``): 1D multicast on
     12 x 1 cores, ``in0_block_w`` 32: 13.6 us instead of 52.5 us with the auto config, identical results. ``sigmoid``:
-    the SFPU sigmoid as the config's ``fused_activation`` (bitwise-identical scores, one op fewer)."""
+    the SFPU sigmoid as the config's ``fused_activation`` (bitwise-identical scores, one op fewer). ``m_tiles=2``: the
+    64 gathered rows of a T64 step (``per_core_M`` 2, fused sigmoid included; docs/p5_t64/t64.md §2.5, §5.1)."""
     act = ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID) if sigmoid else None
     return mcast1d_matmul_pc(
-        ROUTER_DECODE_GRID, int(n_tiles), ROUTER_DECODE_IN0_BLOCK_W, int(k_tiles), fused_activation=act
+        ROUTER_DECODE_GRID,
+        int(n_tiles),
+        ROUTER_DECODE_IN0_BLOCK_W,
+        int(k_tiles),
+        per_core_m=m_tiles,
+        fused_activation=act,
     )
 
 
@@ -1016,13 +1063,22 @@ LM_HEAD_PC: Dict[str, Tuple[Tuple[int, int], int, int]] = {
 }
 
 
-def lm_head_pc(vocab_tiles: int, spec, compute_grid=(12, 10)):
+def lm_head_pc(vocab_tiles: int, spec, compute_grid=(12, 10), *, m_tiles: int = 1):
     """LM-head program config for ``vocab_tiles`` output tiles per chip from ``spec = (grid, per_core_N,
-    in0_block_w)`` (``LM_HEAD_PC[split]``); equals tt/lm_head.py ``lm_head_program_config``."""
+    in0_block_w)`` (``LM_HEAD_PC[split]``); equals tt/lm_head.py ``lm_head_program_config``. ``m_tiles``: tile rows of
+    the gathered input, 1 for the 32-lane step, 2 for the 64 rows of a T64 step (``per_core_M`` 2 on the same grid:
+    149.2 vs 143.8 us, rows bitwise equal to M = 32; docs/p5_t64/t64.md §5.1)."""
     grid, pcn, ibw = spec
     if not _fits(grid, compute_grid):
         raise ValueError(f"grid {tuple(grid)} exceeds the chip compute grid {tuple(compute_grid)}")
-    return mcast1d_matmul_pc(tuple(int(v) for v in grid), int(vocab_tiles), int(ibw), per_core_n=int(pcn), fuse_batch=True)
+    return mcast1d_matmul_pc(
+        tuple(int(v) for v in grid),
+        int(vocab_tiles),
+        int(ibw),
+        per_core_n=int(pcn),
+        per_core_m=m_tiles,
+        fuse_batch=True,
+    )
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -1087,6 +1143,16 @@ class ChipHeads:
     @property
     def n_signal(self) -> int:
         return len(self.signal_heads)
+
+
+def _pack_bucket_fields(max_seg: int, pk1: bool) -> Dict[str, Tuple[int, ...]]:
+    """``pack_seg_buckets`` / ``pack_sp1_seg_buckets`` for the settings knobs ``packed_prefill_max_seg`` /
+    ``packed_prefill_pk1``: the segment sizes up to ``max_seg``; no pk1 sizes when pk1 is off."""
+    s = check_packed_prefill_max_seg(max_seg)
+    return {
+        "pack_seg_buckets": tuple(b for b in PACK_SEG_BUCKETS if b <= s),
+        "pack_sp1_seg_buckets": tuple(b for b in PACK_SP1_SEG_BUCKETS if b <= s) if pk1 else (),
+    }
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -1180,6 +1246,18 @@ class MotifTTConfig:
     kv_replicated_decode: bool = False  # KV-R: every decode KV write on all 32 chips (on with prefix caching)
     spec_tokens: int = 0  # MTP self-speculation drafts per step: 0 | 1
     num_nextn_predict_layers: int = 1  # config.json: MTP layers in the checkpoint (model.mtp_layers.0)
+    # Packed prefill shapes (P5; docs/p5_t64/P5_T64_DESIGN.md §3): from GeneratorSettings.packed_prefill_max_seg /
+    # _max_tokens / _pk1 (from_settings), else MOTIF3_PACKED_PREFILL_MAX_SEG / _MAX_TOKENS / _PK1. Packing itself is
+    # switched by the settings (MOTIF3_PACKED_PREFILL); packed_prefill_shapes() lists every shape these allow.
+    pack_seg_buckets: Tuple[int, ...] = PACK_SEG_BUCKETS  # pk0 segment rows S (ascending, from PACK_SEG_BUCKETS)
+    pack_sp1_seg_buckets: Tuple[int, ...] = PACK_SP1_SEG_BUCKETS  # pk1 S (from PACK_SP1_SEG_BUCKETS); () = pk1 off
+    pack_max_tokens: int = DEFAULT_PACKED_PREFILL_MAX_TOKENS  # the largest packed pass T = B * S (also <= span cap)
+    # Speculative verify mode (T64; docs/p5_t64/P5_T64_DESIGN.md §2.2, §4): GeneratorSettings.spec_verify via
+    # from_settings. "wide" / "auto" stage the 64-row trace when spec_tokens > 0 (wide_rows_per_dp); validate() then
+    # requires ring_gather "safe" (F3N R1) and refuses "auto" with the exact-fp32 router at a T64 row count missing
+    # from ROUTER_EXACT_FP32_DECODE_ROWS (R-E7).
+    spec_verify: str = "packed"  # "packed" | "wide" | "auto" (generator_api.SPEC_VERIFY_MODES)
+    wide_step_ratio: float = DEFAULT_WIDE_STEP_RATIO  # r = T64 step / T32-spec step: the input of c* (G16 updates it)
 
     # ---- module defaults the decoder passes (README §4, §10; wave-B1 decisions) ------------------------------------
     # mHC coefficients: "motif" = tt/kernels/sinkhorn_motif (Option B, exact fp32 SFPU, ~3 us/site); "stock" = the
@@ -1188,7 +1266,8 @@ class MotifTTConfig:
     # Router decode logits (decision D1, decided on model-level metrics): "composite" (FPU fp32 composite, 99.81 % top-8
     # agreement on real tokens) | "exact_fp32" (tt/kernels/router_fp32, 99.997 %, +24 us per MoE layer).
     router_logits: str = "composite"  # MOTIF3_ROUTER_LOGITS
-    # Ring all-gathers of the TP axis (tt/ccl.py MotifCCL, P1 determinism fix): "lean" (default) | "safe" | "native".
+    # Ring all-gathers of the TP axis (tt/ccl.py MotifCCL, P1 determinism fix): "safe" (default) | "lean" | "native".
+    # spec_verify "wide" / "auto" (T64) require "safe" (validate(); F3N rule R1, review edit R-E5).
     ring_gather: str = "safe"  # MOTIF3_RING_GATHER
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
@@ -1206,6 +1285,9 @@ class MotifTTConfig:
         self.compute_grid = tuple(int(s) for s in self.compute_grid)
         self.eos_token_ids = tuple(int(e) for e in self.eos_token_ids)
         self.polynorm_output_scale_per_layer = _per_layer_scales(self.polynorm_output_scale_per_layer)
+        self.pack_seg_buckets = tuple(int(s) for s in self.pack_seg_buckets)
+        self.pack_sp1_seg_buckets = tuple(int(s) for s in self.pack_sp1_seg_buckets)
+        self.wide_step_ratio = float(self.wide_step_ratio)
         self.weights_dir = Path(self.weights_dir)
         self.tt_cache_root = Path(self.tt_cache_root)
         self.axes = MeshAxes.detect(self.mesh_shape)
@@ -1237,7 +1319,8 @@ class MotifTTConfig:
           INFRA-6) come from the device.
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
-          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_WEIGHTS_DIR`` /
+          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_PREFILL_MAX_BUCKET``,
+          ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
         * Explicit ``overrides`` win (any field, plus ``kv_cache_dtype="bfp8"|"bf16"`` mapped onto ``dtypes``).
         """
@@ -1297,6 +1380,8 @@ class MotifTTConfig:
             polynorm_bias_clamp=d.get("polynorm_bias_clamp", 0.5),
             num_nextn_predict_layers=int(d.get("num_nextn_predict_layers", 1)),
             prefill_span_cap=prefill_span_cap_from_env() or DEFAULT_PREFILL_SPAN_CAP,
+            **_pack_bucket_fields(packed_prefill_max_seg_from_env(), packed_prefill_pk1_from_env()),
+            pack_max_tokens=packed_prefill_max_tokens_from_env(),
             hidden_clamp=d.get("hidden_clamp", 1e6),
             n_streams=int(d.get("mhc_expansion_rate", 4)),
             sinkhorn_iters=int(d.get("mhc_sinkhorn_iters", 20)),
@@ -1380,7 +1465,10 @@ class MotifTTConfig:
         ``kv_block_size`` from ``block_size`` when known (``allocate_kv_cache`` stays authoritative: call
         ``set_kv_geometry`` there), ``weights_dir``, ``tt_cache_root`` (``cache_path``), ``weights_revision``; the
         fabric from the device. Features: ``kv_replicated_decode = settings.kv_replicated`` (KV-R resolved),
-        ``spec_tokens``, ``prefill_span_cap`` when the settings carry one (else ``MOTIF3_PREFILL_MAX_BUCKET`` / 8192).
+        ``spec_tokens``, ``prefill_span_cap`` when the settings carry one (else ``MOTIF3_PREFILL_MAX_BUCKET`` / 8192);
+        P5 / T64 (docs/p5_t64/P5_T64_DESIGN.md §8.3): ``pack_seg_buckets`` / ``pack_sp1_seg_buckets`` from
+        ``packed_prefill_max_seg`` and ``packed_prefill_pk1``, ``pack_max_tokens = packed_prefill_max_tokens``,
+        ``spec_verify`` (settings objects without these fields keep the environment's / the defaults).
         ``overrides`` win."""
         weights = getattr(settings, "weights_path", None)
         local = bool(weights) and Path(weights).is_dir()
@@ -1408,6 +1496,16 @@ class MotifTTConfig:
         kw["spec_tokens"] = int(getattr(settings, "spec_tokens", 0) or 0)
         if getattr(settings, "prefill_span_cap", None) is not None:
             kw["prefill_span_cap"] = int(settings.prefill_span_cap)
+        if hasattr(settings, "packed_prefill_max_seg") or hasattr(settings, "packed_prefill_pk1"):
+            kw.update(
+                _pack_bucket_fields(
+                    getattr(settings, "packed_prefill_max_seg", DEFAULT_PACKED_PREFILL_MAX_SEG),
+                    bool(getattr(settings, "packed_prefill_pk1", True)),
+                )
+            )
+        if getattr(settings, "packed_prefill_max_tokens", None) is not None:
+            kw["pack_max_tokens"] = int(settings.packed_prefill_max_tokens)
+        kw["spec_verify"] = str(getattr(settings, "spec_verify", None) or "packed")
         kw.update(overrides)
         return cls.from_hf_config(src, mesh_device=mesh_device, mesh_shape=mesh_shape, **kw)
 
@@ -1480,6 +1578,54 @@ class MotifTTConfig:
         tail = self.prefill_swa_tail
         if tail % self.kv_block_size:
             raise ValueError(f"SWA tail {tail} is not a whole number of {self.kv_block_size}-token blocks")
+        # ---- packed prefill (P5) ----
+        for name, got, allowed in (
+            ("pack_seg_buckets", self.pack_seg_buckets, PACK_SEG_BUCKETS),
+            ("pack_sp1_seg_buckets", self.pack_sp1_seg_buckets, PACK_SP1_SEG_BUCKETS),
+        ):
+            if list(got) != sorted(set(got)) or not set(got) <= set(allowed):
+                raise ValueError(f"{name} must hold ascending, distinct values of {allowed}, got {got}")
+            unaligned = [s for s in got if s % self.kv_block_size]
+            if unaligned:
+                raise ValueError(
+                    f"{name} {unaligned}: a packed segment must be whole {self.kv_block_size}-token blocks (the pass's "
+                    f"fill table concatenates the segments' block entries)"
+                )
+        check_packed_prefill_max_tokens(self.pack_max_tokens)
+        # ---- speculative verify mode (T64) and F3N rule R1 ----
+        if self.spec_verify not in SPEC_VERIFY_MODES:
+            raise ValueError(f"spec_verify must be one of {SPEC_VERIFY_MODES}, got {self.spec_verify!r}")
+        if not (math.isfinite(self.wide_step_ratio) and self.wide_step_ratio >= 1.0):
+            raise ValueError(
+                f"wide_step_ratio (T64 step / T32 step) must be finite and >= 1, got {self.wide_step_ratio}"
+            )
+        rows = self.wide_rows_per_dp
+        if rows:
+            if rows > TILE:
+                raise ValueError(
+                    f"spec_verify={self.spec_verify!r} puts 2 x {self.lanes_per_row} rows on each DP row, more than "
+                    f"one {TILE}-row tile row: the 64-row verify step needs >= 2 DP rows (mesh {self.mesh_shape})"
+                )
+            if self.ring_gather != "safe":
+                raise ValueError(
+                    f"spec_verify={self.spec_verify!r} needs ring_gather='safe', got {self.ring_gather!r} "
+                    f"(MOTIF3_RING_GATHER): the 64-row trace and the second decode trace rely on every TP-ring "
+                    f"all-gather being rerouted (F3N rule R1, docs/p5_t64/f3.md §6; P5_T64_DESIGN.md X3, R-E5: 'lean' "
+                    f"keeps the decode-sized gathers native and needs its own G-X run first)"
+                )
+            wide_m = self.dp * rows
+            if (
+                self.spec_verify == "auto"
+                and self.router_logits == "exact_fp32"
+                and wide_m not in ROUTER_EXACT_FP32_DECODE_ROWS
+            ):
+                raise ValueError(
+                    f"spec_verify='auto' with router_logits='exact_fp32' is refused: ROUTER_EXACT_FP32_DECODE_ROWS "
+                    f"{ROUTER_EXACT_FP32_DECODE_ROWS} (the gathered decode row counts at which tt/moe.py runs the "
+                    f"exact-fp32 router) lacks the {wide_m}-row T64 step, whose rows would then take the composite "
+                    f"router and differ from the T32 rows (P5_T64_DESIGN.md R-E7: 'auto' would not be lossless). Use "
+                    f"MOTIF3_ROUTER_LOGITS=composite, or MOTIF3_SPEC_VERIFY=packed / wide"
+                )
 
     # ======================================================================================================
     # derived model quantities
@@ -1836,6 +1982,44 @@ class MotifTTConfig:
         )
 
     # ======================================================================================================
+    # packed prefill (P5; docs/p5_t64/P5_T64_DESIGN.md §3)
+    # ======================================================================================================
+    @property
+    def pack_max_seg(self) -> int:
+        """The largest packed segment S of either kind (0 when neither has one): the planner's ``max_seg``."""
+        return max(self.pack_seg_buckets + self.pack_sp1_seg_buckets, default=0)
+
+    @property
+    def pack_pk1(self) -> bool:
+        """pk1 passes (resumed chunks at one common start) are configured: ``pack_sp1_seg_buckets`` is not empty."""
+        return bool(self.pack_sp1_seg_buckets)
+
+    @property
+    def pack_tokens_cap(self) -> int:
+        """The largest packed pass T: ``min(pack_max_tokens, max_prefill_span)`` (8192). A pass of T rows runs the
+        bucket-T programs the solo warmup already compiled, so T must be a span bucket."""
+        return min(int(self.pack_max_tokens), self.max_prefill_span)
+
+    def packed_prefill_shapes(self) -> Tuple[Tuple[Any, ...], ...]:
+        """Every packed pass shape the generator warms before the decode capture (§3.5), in a fixed order:
+        ``("pk0", T, S)`` for S in ``pack_seg_buckets``, then ``("pk1", T, S, tails)`` for S in
+        ``pack_sp1_seg_buckets`` and ``tails`` in ``generator_api.PK1_TAIL_VARIANTS`` (review edit R-E2: the shared /
+        distinct SWA tail gathers are different programs), with ``T = B * S`` for B in ``generator_api.PACK_BATCHES``,
+        ``T <= pack_tokens_cap`` and T a span bucket. Each key is the ``PrefillPass.shape`` of a packed pass
+        (``prefill_plan``; solo chunks keep ``(path, bucket)``): after the capture a pass whose key was not warmed runs
+        as solo chunks. Defaults: 22 pk0 keys and 17 x 2 pk1 keys."""
+        cap, buckets = self.pack_tokens_cap, set(self.prefill_span_buckets)
+
+        def totals(S: int) -> List[int]:
+            return [B * S for B in PACK_BATCHES if B * S <= cap and B * S in buckets]
+
+        pk0, pk1 = PACKED_PASS_KINDS
+        shapes: List[Tuple[Any, ...]] = [(pk0, T, S) for S in self.pack_seg_buckets for T in totals(S)]
+        for S in self.pack_sp1_seg_buckets:
+            shapes += [(pk1, T, S, tails) for T in totals(S) for tails in PK1_TAIL_VARIANTS]
+        return tuple(shapes)
+
+    # ======================================================================================================
     # decode KV writes (KV-R) and the MTP layer (docs/features/FEATURES_DESIGN.md §3.4-§3.6)
     # ======================================================================================================
     @property
@@ -1843,6 +2027,17 @@ class MotifTTConfig:
         """``row`` | ``row_split`` | ``all`` | ``all_split`` (``generator_api.kv_write_mode``): KV-R x speculation.
         Fixed per server (the decode trace is captured with it); one mode shared by all 53 layers + the MTP layer."""
         return kv_write_mode(self.kv_replicated_decode, self.spec_tokens > 0)
+
+    @property
+    def wide_rows_per_dp(self) -> int:
+        """Rows per DP row of the T64 verify step (docs/p5_t64/P5_T64_DESIGN.md §4.1) when this launch stages it
+        (``spec_tokens > 0`` and ``spec_verify`` "wide" / "auto"), else 0: ``2 * lanes_per_row`` = 16 (``[8 anchors |
+        8 drafts]``, still one 32-row tile row; ``generator_api.WIDE_ROWS_PER_GROUP``). The gathered T64 step has
+        ``dp * wide_rows_per_dp`` = 64 rows. Modules allocate their 64-row constants in their constructors when it is
+        set (F3N rule R3: the LM head's 64-row argmax constants, the MoE's 64-row top-k pads), never after a capture."""
+        if int(self.spec_tokens) > 0 and self.spec_verify in WIDE_SPEC_VERIFY_MODES:
+            return 2 * self.lanes_per_row
+        return 0
 
     @property
     def mtp_layer_idx(self) -> int:
@@ -1914,13 +2109,15 @@ class MotifTTConfig:
             kind = self.layer(kind)
         return sdpa_prefill_pc(kind, self.compute_grid, seq_len)
 
-    def experts_gate_up_pc(self):
-        """G6 routed-expert gate_up config (``[.,12,32,4096] @ [.,12,4096,2 * moe_intermediate]``)."""
-        return experts_gate_up_pc(2 * self.moe_intermediate_size, self.hidden_size)
+    def experts_gate_up_pc(self, m_tiles: int = 1, grid=None):
+        """G6 routed-expert gate_up config (``[.,12,32,4096] @ [.,12,4096,2 * moe_intermediate]``); ``m_tiles=2`` for
+        the 64 rows of a T64 step (:func:`experts_gate_up_pc`)."""
+        return experts_gate_up_pc(2 * self.moe_intermediate_size, self.hidden_size, m_tiles=m_tiles, grid=grid)
 
-    def experts_down_pc(self):
-        """G6 routed-expert down config (``[.,12,32,moe_intermediate] @ [.,12,moe_intermediate,4096]``)."""
-        return experts_down_pc(self.hidden_size, self.moe_intermediate_size)
+    def experts_down_pc(self, m_tiles: int = 1, grid=None):
+        """G6 routed-expert down config (``[.,12,32,moe_intermediate] @ [.,12,moe_intermediate,4096]``); ``m_tiles=2``
+        for the 64 rows of a T64 step, on 8 x 8 cores unless ``grid`` says otherwise (:func:`experts_down_pc`)."""
+        return experts_down_pc(self.hidden_size, self.moe_intermediate_size, m_tiles=m_tiles, grid=grid)
 
     # ---- wave-B1 module builders (README §5; each equals the module's measured local config) ----------------------
     def attn_decode_matmul_pcs(self) -> Dict[str, Any]:
@@ -1968,11 +2165,12 @@ class MotifTTConfig:
             raise ValueError(f"decode_split {decode_split} does not give whole-tile K chunks")
         return mhc_decode_proj_pc(self.compute_grid, k // TILE)
 
-    def router_decode_pc(self, sigmoid: bool = False):
-        """Router decode linear config (:func:`router_decode_pc`), or None when the grid has fewer than 12 columns."""
+    def router_decode_pc(self, sigmoid: bool = False, m_tiles: int = 1):
+        """Router decode linear config (:func:`router_decode_pc`; ``m_tiles=2`` for the 64 rows of a T64 step), or None
+        when the grid has fewer than 12 columns."""
         if self.compute_grid[0] < ROUTER_DECODE_GRID[0]:
             return None
-        return router_decode_pc(self.num_experts // TILE, self.hidden_size // TILE, sigmoid=sigmoid)
+        return router_decode_pc(self.num_experts // TILE, self.hidden_size // TILE, sigmoid=sigmoid, m_tiles=m_tiles)
 
     def experts_prefill_pc(self, m_rows: int, n_out: int, out_block_w: int):
         """Batched prefill expert matmul config for ``m_rows`` rows and ``n_out`` output columns
@@ -2000,12 +2198,13 @@ class MotifTTConfig:
             raise ValueError(f"vocab {self.vocab_size} does not split into {n} tile-aligned blocks")
         return self.vocab_size // n
 
-    def lm_head_pc(self, vocab_split: str = "mesh", spec=None):
-        """LM-head GEMM config (:data:`LM_HEAD_PC`; ``spec`` overrides, ``"auto"`` = None)."""
+    def lm_head_pc(self, vocab_split: str = "mesh", spec=None, m_tiles: int = 1):
+        """LM-head GEMM config (:data:`LM_HEAD_PC`; ``spec`` overrides, ``"auto"`` = None); ``m_tiles=2`` for the 64
+        rows of a T64 step (:func:`lm_head_pc`)."""
         if spec == "auto":
             return None
         spec = spec if spec is not None else LM_HEAD_PC[vocab_split]
-        return lm_head_pc(self.vocab_per_shard(vocab_split) // TILE, spec, self.compute_grid)
+        return lm_head_pc(self.vocab_per_shard(vocab_split) // TILE, spec, self.compute_grid, m_tiles=m_tiles)
 
     def compute_config_descriptor(self, role: str, **kw):
         """generic_op ``ComputeConfigDescriptor`` from a role (:func:`compute_config_descriptor`)."""
@@ -2067,6 +2266,13 @@ class MotifTTConfig:
     def describe(self) -> str:
         a = self.axes
         kv_src = "allocated" if self.kv_num_blocks_actual is not None else "expected"
+        wide = ""
+        if self.wide_rows_per_dp:
+            wide = f" (T64 {self.wide_rows_per_dp} rows/DP row, r {self.wide_step_ratio:g})"
+
+        def segs(sizes: Tuple[int, ...]) -> str:
+            return "/".join(str(s) for s in sizes) or "off"
+
         return (
             f"MotifTTConfig(mesh={a.mesh_shape} tp_axis={a.tp_axis} dp_axis={a.dp_axis} tp={a.tp_size} dp={a.dp_size}; "
             f"fabric={self.fabric}; layers={self.num_layers}/{self.num_hidden_layers} global={len(self.global_layers)} "
@@ -2077,9 +2283,11 @@ class MotifTTConfig:
             f"kv blocks={self.kv_num_blocks}x{self.kv_block_size} ({kv_src}, {self.dtypes.kv_cache_name}) "
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
-            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits}; "
+            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} ring_gather={self.ring_gather}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
-            f"spec={self.spec_tokens}; cache={self.cache_dir})"
+            f"spec={self.spec_tokens} spec_verify={self.spec_verify}{wide}; "
+            f"pack S={segs(self.pack_seg_buckets)} pk1 S={segs(self.pack_sp1_seg_buckets)} T<={self.pack_tokens_cap}; "
+            f"cache={self.cache_dir})"
         )
 
 
@@ -2093,8 +2301,10 @@ __all__ = [
     "DEFAULT_FABRIC",
     "DEFAULT_KV_POOL_TOKENS",
     "DEFAULT_L1_SMALL_SIZE",
+    "DEFAULT_WIDE_STEP_RATIO",
     "DtypePolicy",
     "EXPERTS_DOWN_GRID",
+    "EXPERTS_DOWN_GRID_WIDE",
     "EXPERTS_GATE_UP_GRID",
     "EXPERTS_PREFILL_OUT_BLOCK_W",
     "FLASH_MLA_DECODE_K_CHUNK",
@@ -2109,6 +2319,7 @@ __all__ = [
     "NUM_CB_SLOTS",
     "ROUTER_DECODE_GRID",
     "RING_GATHER_MODES",
+    "ROUTER_EXACT_FP32_DECODE_ROWS",
     "ROUTER_LOGITS_IMPLS",
     "SDPA_PREFILL_CHUNKS",
     "SP1_GLOBAL_CHUNKS",

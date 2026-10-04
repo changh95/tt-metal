@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Resumed / chunked prefill planning: pure host, torch only (features design §2.2, §3.1, §3.7.2).
+"""Resumed / chunked / packed prefill planning: pure host, torch only (features design §2.2, §3.1, §3.7.2;
+packed prefill: docs/p5_t64/P5_T64_DESIGN.md §3).
 
 A prefill *row* is one :class:`~models.demos.motif3.tt.generator_api.PrefillRequest`: tokens at positions
 ``0 .. e-1``, of which ``[0, s)`` are already in the paged latent cache (``s = request.start`` = vLLM
@@ -48,6 +49,18 @@ Rules (features design §3.1):
    it allocates them, so a later-admitted request can hit blocks an earlier row computes in the same step.
    :func:`order_prefill_requests` runs writers first (stable topological order; raises on a cycle or on two rows
    writing one block).
+6. **Packed passes** (P5, design §3.1-§3.3; :func:`plan_prefill_passes`, ``MOTIF3_PACKED_PREFILL``). Every chunk of a
+   call is a *segment* (:class:`PackSegment`). A chunk of ``r = end - start`` real rows packs at ``S`` = the smallest
+   segment size ``>= r`` (sp0: 64 ... 1024; sp1: 128 ... 1024; review edit R-E4: the chunk's rows, not the row's
+   span), else it runs solo. A :class:`PrefillPass` is ``solo`` (one chunk at its own bucket: the paths above,
+   bitwise unchanged), ``pk0`` (``B`` sp0 segments) or ``pk1`` (``B`` sp1 segments at one common start ``a``):
+   ``B`` a power of two (dummy segments fill it), ``T = B * S`` rows, segment ``k`` at packed rows ``[k S, k S + S)``.
+   A segment depends on its row's previous chunk and, when sp1, on every segment of the call that writes a block of
+   its row's read-only prefix ``[0, w0)`` (review edit R-E1: when ``c0 < w0`` the global layers read rows
+   ``[c0, w0)`` from the cache; the range of rule 5). Passes run level by level, so a pass never holds a segment
+   together with one of its dependencies. A segment's tables are the rule-4 tables of its chunk re-bucketed to ``S``
+   (R-E12); a pk1 pass gathers its SWA tails once when every segment has the same tail blocks (``shared``), else per
+   segment (``distinct``), and the variant is part of the pass shape (R-E2).
 
 No per-lane or per-slot state appears anywhere: a request may change lane between chunks, the paged cache is the
 only cross-chunk state.
@@ -60,12 +73,23 @@ from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .generator_api import MIN_PREFILL_BUCKET, cdiv, check_block_size
+from .generator_api import (
+    DEFAULT_PACKED_PREFILL_MAX_SEG,
+    DEFAULT_PACKED_PREFILL_MAX_TOKENS,
+    MIN_PREFILL_BUCKET,
+    PACK_BATCHES,
+    PACK_SEG_BUCKETS,
+    PACK_SP1_SEG_BUCKETS,
+    PACKED_PASS_KINDS,
+    PK1_TAIL_VARIANTS,
+    cdiv,
+    check_block_size,
+)
 
 SP0 = "sp0"  # chunk at start 0: draft-1 prefill path (no cache reads)
 SP1 = "sp1"  # chunk at start > 0: reads the paged cache (resumed prefill)
@@ -674,6 +698,832 @@ def plan_prefill_batch(
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Packed multi-row prefill (P5; docs/p5_t64/P5_T64_DESIGN.md §3.1-§3.5; module docstring rule 6)
+# ----------------------------------------------------------------------------------------------------------------
+SOLO = "solo"  # one chunk alone at its own bucket: the single-chunk paths, bitwise unchanged
+PK0, PK1 = PACKED_PASS_KINDS  # "pk0": B sp0 segments; "pk1": B sp1 segments at one common start
+PASS_KINDS = (SOLO, PK0, PK1)
+SHARED_TAILS, DISTINCT_TAILS = PK1_TAIL_VARIANTS  # pk1 SWA tails gathered once / per segment (review edit R-E2)
+# A level holds at most one segment per row (a row's chunks form a chain) and a call at most NUM_LANES = 32 rows.
+DEFAULT_PACK_MAX_BATCH = max(PACK_BATCHES)
+
+PassShape = Tuple[Any, ...]  # solo ("sp0" | "sp1", bucket); ("pk0", T, S); ("pk1", T, S, "shared" | "distinct")
+
+
+@dataclass(frozen=True)
+class PackSegment:
+    """One chunk of one row of a call, as the packed planner sees it (design §3.3 step 1; :func:`segment_dag`).
+
+    Attributes:
+        row: the row's index in the call (``requests[row]``, ``plans[row]``).
+        chunk_index: ``k``: the chunk is ``plans[row].chunks[k]``.
+        path: the chunk's path, ``"sp0"`` (start 0) or ``"sp1"``.
+        start: ``a``, the chunk's first position.
+        end: one past the chunk's last real row.
+        rows: ``S``, the segment rows the chunk packs at (:func:`segment_rows`), or None when it cannot pack (it then
+            runs solo at its own bucket).
+        last: the row's last chunk; its segment runs the LM head.
+    """
+
+    row: int
+    chunk_index: int
+    path: str
+    start: int
+    end: int
+    rows: Optional[int]
+    last: bool
+
+    def __post_init__(self):
+        if self.path not in PATHS:
+            raise ValueError(f"segment path must be one of {PATHS}, got {self.path!r}")
+        if int(self.row) < 0 or int(self.chunk_index) < 0:
+            raise ValueError(f"segment row {self.row} and chunk index {self.chunk_index} must be >= 0")
+        if not 0 <= int(self.start) < int(self.end):
+            raise ValueError(f"a segment needs 0 <= start < end, got start={self.start} end={self.end}")
+        if (int(self.start) == 0) != (self.path == SP0):
+            raise ValueError(f"an sp0 segment starts at 0 and an sp1 segment later, got {self.path} at {self.start}")
+        if self.rows is not None and int(self.rows) < self.real_rows:
+            raise ValueError(f"segment rows {self.rows} < the chunk's {self.real_rows} real rows")
+
+    @property
+    def key(self) -> Tuple[int, int]:
+        """``(row, chunk_index)``, unique within a call."""
+        return (int(self.row), int(self.chunk_index))
+
+    @property
+    def real_rows(self) -> int:
+        """The chunk's real rows ``end - start``."""
+        return int(self.end) - int(self.start)
+
+    @property
+    def head_row_local(self) -> int:
+        """Segment-local row of the last real token (the LM head reads it on the row's last chunk)."""
+        return int(self.end) - 1 - int(self.start)
+
+    @property
+    def is_sp1(self) -> bool:
+        return self.path == SP1
+
+
+@dataclass(frozen=True)
+class PrefillPass:
+    """One eager run of the prefill layers inside a ``prefill_forward_batch`` call (design §3.2;
+    :func:`plan_prefill_passes`).
+
+    Attributes:
+        kind: ``"solo"`` (one chunk at its own bucket), ``"pk0"`` (sp0 segments) or ``"pk1"`` (sp1 segments at one
+            common start).
+        segments: the real segments in packed order: segment ``k`` occupies packed rows ``[k S, k S + S)``, its real
+            rows ``[k S, k S + end - start)``.
+        seg_rows: ``S`` (packed); the chunk's bucket (solo).
+        batch: ``B``, one of ``generator_api.PACK_BATCHES`` (packed; dummy segments fill ``[len(segments), B)``); 1
+            (solo).
+        start: the pk1 common start ``a``; 0 (pk0); the chunk's start (solo).
+        tails: pk1 only: the SWA tail variant (review edit R-E2), ``"shared"`` (every segment has the same tail blocks:
+            one gather + repeat) or ``"distinct"`` (a gather per segment). The variant selects programs, so it is part
+            of :attr:`shape`.
+        fallback: on a solo pass the shape filter made from a packed pass whose shape was not warmed: that packed
+            shape (the generator counts it as ``packed_solo_fallbacks`` and logs it once per shape); else None.
+
+    A dummy segment writes nothing (fill entries -1) and its outputs are dropped. It holds pad tokens and copies
+    segment 0's RoPE rows and, in a pk1 pass, segment 0's SDPA row and tail blocks (R-E2), so it reads only what
+    segment 0 reads and keeps a pass whose real segments share their tails on the ``shared`` variant.
+    """
+
+    kind: str
+    segments: Tuple[PackSegment, ...]
+    seg_rows: int
+    batch: int
+    start: int
+    tails: Optional[str] = None
+    fallback: Optional[PassShape] = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "segments", tuple(self.segments))
+        segs, S, B, a = self.segments, int(self.seg_rows), int(self.batch), int(self.start)
+        if self.kind not in PASS_KINDS:
+            raise ValueError(f"pass kind must be one of {PASS_KINDS}, got {self.kind!r}")
+        if not segs or not all(isinstance(g, PackSegment) for g in segs):
+            raise ValueError("a pass holds one or more PackSegment")
+        if len({g.key for g in segs}) != len(segs):
+            raise ValueError(f"a pass holds a segment twice: {[g.key for g in segs]}")
+        if S < 1 or any(g.real_rows > S for g in segs):
+            raise ValueError(f"segment rows {S} must hold every segment's real rows {[g.real_rows for g in segs]}")
+        if self.kind == SOLO:
+            if B != 1 or len(segs) != 1 or a != segs[0].start or self.tails is not None:
+                raise ValueError("a solo pass holds one segment at batch 1, starts at its chunk, has no tail variant")
+            if self.fallback is not None and (len(self.fallback) < 3 or self.fallback[0] not in PACKED_PASS_KINDS):
+                raise ValueError(f"a fallback is the packed shape the solo pass came from, got {self.fallback!r}")
+            return
+        if self.fallback is not None:
+            raise ValueError("only a solo pass has a fallback shape")
+        if B not in PACK_BATCHES or len(segs) > B:
+            raise ValueError(f"a packed pass has a batch in {PACK_BATCHES} >= its {len(segs)} segments, got {B}")
+        path = SP0 if self.kind == PK0 else SP1
+        if any(g.path != path for g in segs):
+            raise ValueError(f"a {self.kind} pass holds {path} segments only, got {[g.path for g in segs]}")
+        if self.kind == PK0:
+            if a != 0 or self.tails is not None:
+                raise ValueError("a pk0 pass starts at 0 and has no tail variant")
+            return
+        if any(g.start != a for g in segs):  # the batched chunked SDPA takes ONE start (design R-P4)
+            raise ValueError(f"a pk1 pass shares one start {a}, got segment starts {[g.start for g in segs]}")
+        if self.tails not in PK1_TAIL_VARIANTS:
+            raise ValueError(f"a pk1 pass needs its tail variant, one of {PK1_TAIL_VARIANTS}, got {self.tails!r}")
+
+    @property
+    def tokens(self) -> int:
+        """``T = B * S``: the pass's rows (the bucket its row-local programs run at)."""
+        return int(self.batch) * int(self.seg_rows)
+
+    @property
+    def path(self) -> str:
+        """The segments' path: ``"sp0"`` (pk0 / solo sp0) or ``"sp1"`` (pk1 / solo sp1)."""
+        return self.segments[0].path
+
+    @property
+    def is_packed(self) -> bool:
+        return self.kind != SOLO
+
+    @property
+    def shape(self) -> PassShape:
+        """The key that selects the pass's programs: solo ``(path, bucket)`` (the generator's prefill shape), pk0
+        ``("pk0", T, S)``, pk1 ``("pk1", T, S, tails)`` (R-E2). Packed keys are those of
+        ``MotifTTConfig.packed_prefill_shapes()`` (:func:`packed_pass_shapes`)."""
+        if self.kind == SOLO:
+            return (self.path, int(self.seg_rows))
+        if self.kind == PK0:
+            return (PK0, self.tokens, int(self.seg_rows))
+        return (PK1, self.tokens, int(self.seg_rows), self.tails)
+
+    @property
+    def dummies(self) -> int:
+        """Dummy segments ``B - len(segments)``."""
+        return int(self.batch) - len(self.segments)
+
+    @property
+    def real_rows(self) -> int:
+        return sum(g.real_rows for g in self.segments)
+
+    @property
+    def padding_rows(self) -> int:
+        """Rows of the pass that hold no real token: segment padding and dummy segments."""
+        return self.tokens - self.real_rows
+
+    def offset(self, k: int) -> int:
+        """First packed row of segment ``k`` (``0 <= k < B``, dummies included): ``k * S``."""
+        k = int(k)
+        if not 0 <= k < int(self.batch):
+            raise IndexError(f"segment {k} outside the pass's {self.batch} segments")
+        return k * int(self.seg_rows)
+
+    def head_rows(self) -> List[Tuple[int, int]]:
+        """``[(k, packed row)]``, ascending ``k``, for every segment that is its row's last chunk: the LM head reads
+        packed row ``k S + end - 1 - start``, and the logits are those of row ``segments[k].row``."""
+        S = int(self.seg_rows)
+        return [(k, k * S + g.head_row_local) for k, g in enumerate(self.segments) if g.last]
+
+    def describe(self) -> str:
+        """A one-line summary for logs."""
+        if self.kind == SOLO:
+            g = self.segments[0]
+            why = f", fallback from {self.fallback}" if self.fallback is not None else ""
+            return f"solo {g.path} C={self.seg_rows} a={g.start} (row {g.row} chunk {g.chunk_index}{why})"
+        tails = f" tails={self.tails}" if self.kind == PK1 else ""
+        return (
+            f"{self.kind} T={self.tokens} S={self.seg_rows} B={self.batch} ({len(self.segments)} real) "
+            f"a={self.start}{tails}"
+        )
+
+
+@dataclass(frozen=True)
+class PackedCostModel:
+    """What :func:`packed_pass_cost` adds to the row cost model's ``cost(bucket, start)`` (design §3.3 step 4;
+    calibrated on GATES_RESULTS §13.3 (gate G15a-rest), P5N §14, GATES_RESULTS §12.4 (G10) and the P5 review's
+    every-packed-shape probe, ``logs/dev/20261003_193703_p5rev_all_shapes.log``). A pass of ``T`` rows at start ``a`` (0
+    for pk0) costs ``cost(T, a)``: the bucket-T chunk, whose sp1 prefix term prices pk1's batched global attention
+    (51 ms measured at B = 32, S = 128, a = 2048 against 54 ms modelled), plus
+
+    * ``head_s`` per segment that is its row's last chunk (one LM-head call and host read; solo chunks pay it too);
+    * :meth:`extras_s`: the CN transposes around the batched SDPA, ``layers * transpose_s_per_layer * max(1, T /
+      transpose_ref_tokens)``, and one MTP KV-only fill ``mtp_fill_s``. The 4 transposes of a layer cost ~0.4 ms of
+      eager host dispatch (G15a-rest (a): 0.32-0.42 ms at T 1024-8192) and 115 / 397 us of device time at T 2048 /
+      8192 (G15a-rest (d), traced). An eager pass overlaps the two, so it pays about the larger: ~0.4 ms per layer at
+      ``1024 <= T <= 8192`` (0.5-0.7 ms of host dispatch at T <= 256: at most ~18 ms more per pass, which decides
+      nothing). ``transpose_ref_tokens = 8192`` keeps the term flat at ~21 ms up to the 8192-row pass cap (P5 review,
+      finding 6: the earlier reference of 2048 priced 42 / 85 ms at T 4096 / 8192 against 21 ms; over 3093 host-planned
+      calls the recalibration changed no pass shape, only equal-cost tie-breaks);
+    * pk1, :meth:`tails_s`: the SWA tail gathers. ``shared``: ``swa_layers * tail_gather_s`` (one 2-block gather per
+      layer: 4 dispatches, 0.61-0.72 ms measured). ``distinct``: ``swa_layers * (tail_gather_s + 2 B * tail_op_s)``, a
+      gather's work plus the ``2 B`` tensor-args slices (and the concat that replaces the ``repeat``): G15a-rest (c),
+      eager per SWA layer, distinct minus shared = +3.92 / +0.74 / +0.04 ms at B = 32 / 8 / 2, ~0.06 ms per slice, so
+      ~0.18 s per pass at B = 32 (the earlier ``(2 B + 2) * 0.15 ms`` priced 0.39 s). A solo sp1 chunk pays one
+      shared-size gather. In the full model that premium is host dispatch, which a device-bound pass (``T >= 1024``)
+      hides: the review probe ran every pk1 shape at the same wall time with either variant (within 0.1 s). So the term
+      is an upper bound; it keeps ``shared`` cheaper than ``distinct`` and decides no pack-vs-solo choice.
+
+    The default reproduces today's serial burst: 32 rows of 34 tokens cost 32 x (0.642 + 0.0014) = 20.59 s (20.56 s
+    measured); packed, one pk0 pass of T = 2048 costs ~1.62 s (1.63 s measured in the review probe)."""
+
+    head_s: float = 1.4e-3
+    layers: int = 53
+    transpose_s_per_layer: float = 0.4e-3
+    transpose_ref_tokens: int = 8192
+    mtp_fill_s: float = 5.0e-3
+    swa_layers: int = 39
+    tail_gather_s: float = 0.65e-3
+    tail_op_s: float = 0.06e-3
+
+    def __post_init__(self):
+        terms = (self.head_s, self.layers, self.transpose_s_per_layer, self.mtp_fill_s, self.swa_layers)
+        if min(terms + (self.tail_gather_s, self.tail_op_s)) < 0 or int(self.transpose_ref_tokens) < 1:
+            raise ValueError(f"packed-pass cost terms must be >= 0 (transpose_ref_tokens >= 1), got {self}")
+
+    def extras_s(self, tokens: int) -> float:
+        """Transposes and the MTP fill of a packed pass of ``tokens`` rows."""
+        scale = max(1.0, int(tokens) / int(self.transpose_ref_tokens))
+        return self.layers * self.transpose_s_per_layer * scale + self.mtp_fill_s
+
+    def tails_s(self, tails: str, batch: int) -> float:
+        """SWA tail gathers of a pass of ``batch`` segments with tail variant ``tails`` (``distinct`` always costs more
+        than ``shared``)."""
+        if tails == SHARED_TAILS:
+            return self.swa_layers * self.tail_gather_s
+        if tails == DISTINCT_TAILS:
+            return self.swa_layers * (self.tail_gather_s + 2 * int(batch) * self.tail_op_s)
+        raise ValueError(f"tail variant must be one of {PK1_TAIL_VARIANTS}, got {tails!r}")
+
+
+DEFAULT_PACKED_COST = PackedCostModel()
+
+
+def _pass_cost(
+    fn: CostFn, model: PackedCostModel, kind: str, seg_rows: int, batch: int, start: int, heads: int, sp1: bool, tails
+) -> float:
+    if kind == SOLO:
+        return float(fn(seg_rows, start)) + model.head_s * heads + (model.tails_s(SHARED_TAILS, 1) if sp1 else 0.0)
+    T = int(batch) * int(seg_rows)
+    c = float(fn(T, start if kind == PK1 else 0)) + model.head_s * heads + model.extras_s(T)
+    return c + (model.tails_s(tails, batch) if kind == PK1 else 0.0)
+
+
+def packed_pass_cost(
+    p: PrefillPass,
+    cost: Union[None, Mapping[int, float], CostFn] = None,
+    *,
+    model: Optional[PackedCostModel] = None,
+) -> float:
+    """Estimated seconds of pass ``p`` (any kind) under the row cost model ``cost`` (as for :func:`plan_prefill_row`)
+    and the packed terms ``model`` (default :data:`DEFAULT_PACKED_COST`). A solo pass costs ``cost(bucket, start)``
+    plus its head (and an sp1 chunk's tail gather); a packed pass costs ``cost(T, a)`` plus the
+    :class:`PackedCostModel` terms. :func:`plan_prefill_passes` minimizes the sum over a call's passes."""
+    fn = _cost_fn(cost)
+    m = DEFAULT_PACKED_COST if model is None else model
+    heads = sum(1 for g in p.segments if g.last)
+    return _pass_cost(fn, m, p.kind, p.seg_rows, p.batch, p.start, heads, p.path == SP1, p.tails)
+
+
+def _check_seg_buckets(buckets: Sequence[int], block_size: int, name: str) -> Tuple[int, ...]:
+    bl, bs = tuple(int(b) for b in buckets), int(block_size)
+    if any(b2 <= b1 for b1, b2 in zip(bl, bl[1:])) or (bl and bl[0] < 1):
+        raise ValueError(f"{name} must be strictly increasing positive segment sizes, got {bl}")
+    bad = [b for b in bl if b % bs]
+    if bad:
+        raise ValueError(
+            f"{name} {bad} are not multiples of the block size {bs}: a packed segment is whole blocks (the fill "
+            "kernel maps packed row i to table entry i // bs)"
+        )
+    return bl
+
+
+def _max_pass_batch(seg_rows: int, max_tokens: int, max_batch: int) -> int:
+    """The largest ``B`` of ``PACK_BATCHES`` with ``B <= max_batch`` and ``B * S <= max_tokens`` (0: none)."""
+    return max((B for B in PACK_BATCHES if B <= max_batch and B * int(seg_rows) <= max_tokens), default=0)
+
+
+def _pass_batch(segments: int) -> int:
+    """``B`` of a pass of ``segments >= 2`` real segments: the smallest power of two ``>= segments``."""
+    return 1 << (int(segments) - 1).bit_length()
+
+
+def _pack_buckets(
+    block_size: int,
+    max_seg: int,
+    max_tokens: int,
+    max_batch: int,
+    pk1: bool,
+    seg_buckets: Optional[Sequence[int]],
+    sp1_seg_buckets: Optional[Sequence[int]],
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """The sp0 / sp1 segment sizes a pass can use: the given sizes (default ``PACK_SEG_BUCKETS`` /
+    ``PACK_SP1_SEG_BUCKETS``; no sp1 sizes when ``pk1`` is off) up to ``max_seg`` for which a pass of two segments
+    fits ``max_tokens`` and ``max_batch``."""
+    bs = int(block_size)
+    if bs < 1:
+        raise ValueError(f"block_size must be positive, got {bs}")
+    ms, mt, mb = int(max_seg), int(max_tokens), int(max_batch)
+    if ms < 0 or mt < 1 or mb < 1:
+        raise ValueError(f"need max_seg >= 0, max_tokens >= 1 and max_batch >= 1, got {ms}, {mt}, {mb}")
+    if not isinstance(pk1, bool):
+        raise TypeError(f"pk1 must be a bool, got {pk1!r}")
+    seg = _check_seg_buckets(PACK_SEG_BUCKETS if seg_buckets is None else seg_buckets, bs, "seg_buckets")
+    sp1 = PACK_SP1_SEG_BUCKETS if sp1_seg_buckets is None else sp1_seg_buckets
+    sp1 = _check_seg_buckets(sp1, bs, "sp1_seg_buckets") if pk1 else ()
+
+    def fits(S: int) -> bool:
+        return S <= ms and _max_pass_batch(S, mt, mb) >= 2
+
+    return tuple(S for S in seg if fits(S)), tuple(S for S in sp1 if fits(S))
+
+
+def _seg_rows(chunk: Any, seg_buckets: Tuple[int, ...], sp1_seg_buckets: Tuple[int, ...]) -> Optional[int]:
+    buckets = sp1_seg_buckets if chunk.path == SP1 else seg_buckets
+    r = int(chunk.end) - int(chunk.start)
+    return next((S for S in buckets if S >= r), None)
+
+
+def segment_rows(
+    chunk: ChunkPlan,
+    *,
+    block_size: int,
+    seg_buckets: Sequence[int] = PACK_SEG_BUCKETS,
+    sp1_seg_buckets: Sequence[int] = PACK_SP1_SEG_BUCKETS,
+) -> Optional[int]:
+    """``S`` of a chunk: the smallest of ``seg_buckets`` (sp0 chunk) or ``sp1_seg_buckets`` (sp1 chunk) that is
+    ``>=`` the chunk's real rows ``end - start`` (review edit R-E4: a 2108-token row's 60-row tail chunk packs at 128),
+    or None when none is (the chunk runs solo). Sizes must be increasing multiples of ``block_size``."""
+    bs = int(block_size)
+    return _seg_rows(
+        chunk,
+        _check_seg_buckets(seg_buckets, bs, "seg_buckets"),
+        _check_seg_buckets(sp1_seg_buckets, bs, "sp1_seg_buckets"),
+    )
+
+
+def segment_dag(
+    requests: Sequence[Any],
+    plans: Sequence[RowPlan],
+    block_size: int,
+    *,
+    seg_buckets: Sequence[int] = PACK_SEG_BUCKETS,
+    sp1_seg_buckets: Sequence[int] = PACK_SP1_SEG_BUCKETS,
+) -> Tuple[List[PackSegment], List[Tuple[int, ...]]]:
+    """The segments of one call and their dependencies (design §3.3 steps 1-2): writer-first at segment granularity.
+
+    Returns ``(segments, deps)``: one :class:`PackSegment` per chunk of every row, in (row, chunk) order, with
+    ``rows`` from :func:`segment_rows`; ``deps[s]`` = the indices (ascending) of the segments segment ``s`` must run
+    after:
+
+    * the row's previous chunk (chunk ``k`` reads rows ``[w0, a)`` its row's earlier chunks write);
+    * for an sp1 segment, every segment of another row that writes a block of its row's read-only prefix
+      ``page_table[: w0 / bs]`` (review edit R-E1). Global layers fill first and then read keys ``[0, a + i]`` from
+      the cache, and the fill skips the blocks below ``w0``: with ``c0 < w0`` (a hit of an odd number of 64-row blocks
+      at A = 128) the chunk reads rows ``[c0, w0)`` from the cache, so ``[0, a)`` is not enough. The SWA tail
+      ``[a - tail, a)`` lies inside ``[0, w0)`` or the row's own earlier chunks.
+
+    A segment writes the blocks of ``[max(w0, a), end)`` (:func:`fill_table`). Every check of
+    :func:`order_prefill_requests` runs first, with its messages (plan / request mismatch, a real position on a block
+    id < 1, a block id twice in a row, two rows writing one block, a dependency cycle between rows); an acyclic row
+    order makes the segment DAG acyclic, since a segment cycle would project onto a row cycle."""
+    bs = int(block_size)
+    order_prefill_requests(requests, plans, bs)
+    seg_b = _check_seg_buckets(seg_buckets, bs, "seg_buckets")
+    sp1_b = _check_seg_buckets(sp1_seg_buckets, bs, "sp1_seg_buckets")
+    segments = [
+        PackSegment(i, k, c.path, c.start, c.end, _seg_rows(c, seg_b, sp1_b), c.last)
+        for i, plan in enumerate(plans)
+        for k, c in enumerate(plan.chunks)
+    ]
+    tables = [_row(r.page_table).tolist() for r in requests]
+    writer: Dict[int, int] = {}
+    for s, g in enumerate(segments):
+        for b in tables[g.row][max(plans[g.row].w0, g.start) // bs : cdiv(g.end, bs)]:
+            writer[b] = s
+    deps: List[Tuple[int, ...]] = []
+    for s, g in enumerate(segments):
+        d = {s - 1} if g.chunk_index > 0 else set()  # segments are in (row, chunk) order
+        if g.is_sp1:
+            for b in tables[g.row][: plans[g.row].read_only_blocks]:
+                w = writer.get(b)
+                if w is not None and segments[w].row != g.row:
+                    d.add(w)
+        deps.append(tuple(sorted(d)))
+    return segments, deps
+
+
+def _segment_chunk(g: PackSegment, bucket: int) -> ChunkPlan:
+    return ChunkPlan(start=int(g.start), bucket=int(bucket), end=int(g.end), path=g.path, last=bool(g.last))
+
+
+def _page_table(requests: Sequence[Any], row: int) -> torch.Tensor:
+    if not 0 <= int(row) < len(requests):
+        raise ValueError(f"segment row {row} outside the call's {len(requests)} rows")
+    return _row(requests[int(row)].page_table)
+
+
+def _solo_pass(g: PackSegment, plans: Sequence[RowPlan], fallback: Optional[PassShape] = None) -> PrefillPass:
+    bucket = plans[g.row].chunks[g.chunk_index].bucket
+    return PrefillPass(SOLO, (g,), int(bucket), 1, int(g.start), fallback=fallback)
+
+
+def _cheapest_partition(
+    n: int, max_b: int, solo: Callable[[int], float], packed: Callable[[int, int], float]
+) -> List[Tuple[int, int]]:
+    """The cheapest cut of ``n`` ordered items into consecutive runs ``[(i, j), ...]``: ``j - i == 1`` runs solo,
+    ``2 <= j - i <= max_b`` runs as one packed pass. Dynamic programming over prefixes; ties keep the longer run."""
+    best = [0.0] + [math.inf] * n
+    run = [0] * (n + 1)
+    for j in range(1, n + 1):
+        for b in range(min(j, max_b), 0, -1):
+            c = best[j - b] + (solo(j - 1) if b == 1 else packed(j - b, j))
+            if c < best[j]:
+                best[j], run[j] = c, b
+    out: List[Tuple[int, int]] = []
+    j = n
+    while j:
+        out.append((j - run[j], j))
+        j -= run[j]
+    return out[::-1]
+
+
+def _plan_group(
+    kind: str,
+    S: int,
+    a: int,
+    members: List[int],
+    segments: List[PackSegment],
+    plans: Sequence[RowPlan],
+    tails_of: Mapping[int, Tuple[int, ...]],
+    *,
+    max_b: int,
+    fn: CostFn,
+    model: PackedCostModel,
+) -> List[PrefillPass]:
+    """The passes of one level's group of packable segments (all ``kind`` at ``S``, pk1 also at start ``a``)."""
+    if kind == PK1:  # segments that share a prefix (equal tail blocks) become neighbours: shared-tail passes
+        members = sorted(members, key=lambda s: (tails_of[s], segments[s].key))
+    heads = [0]
+    for s in members:
+        heads.append(heads[-1] + int(segments[s].last))
+
+    def variant(i: int, j: int) -> Optional[str]:
+        if kind == PK0:
+            return None
+        return SHARED_TAILS if tails_of[members[i]] == tails_of[members[j - 1]] else DISTINCT_TAILS
+
+    def solo(i: int) -> float:
+        g = segments[members[i]]
+        bucket = plans[g.row].chunks[g.chunk_index].bucket
+        return _pass_cost(fn, model, SOLO, bucket, 1, g.start, int(g.last), g.is_sp1, None)
+
+    def packed(i: int, j: int) -> float:
+        return _pass_cost(fn, model, kind, S, _pass_batch(j - i), a, heads[j] - heads[i], kind == PK1, variant(i, j))
+
+    out: List[PrefillPass] = []
+    for i, j in _cheapest_partition(len(members), max_b, solo, packed):
+        if j - i == 1:
+            out.append(_solo_pass(segments[members[i]], plans))
+        else:
+            part = tuple(sorted((segments[s] for s in members[i:j]), key=lambda g: g.key))
+            out.append(PrefillPass(kind, part, S, _pass_batch(j - i), a, variant(i, j)))
+    return out
+
+
+def _check_passes(
+    passes: Sequence[PrefillPass],
+    segments: Sequence[PackSegment],
+    deps: Sequence[Tuple[int, ...]],
+    *,
+    max_tokens: int,
+    max_batch: int,
+) -> None:
+    """The planner's own invariants (design R-P3, R-P4); a failure is a planner bug: every segment in exactly one
+    pass, every dependency in a strictly earlier pass, every packed pass of >= 2 segments at ``B`` = the next power of
+    two within the caps. Raises ``AssertionError`` (explicitly, so ``python -O`` keeps the check) before any device
+    work; the generator then runs the call per row in writer-first order (``MotifGenerator.plan_prefill_batch``,
+    counter ``packed_plan_errors``), so packing never refuses a call."""
+    index = {g.key: s for s, g in enumerate(segments)}
+    pass_of = [-1] * len(segments)
+    for n, p in enumerate(passes):
+        for g in p.segments:
+            s = index.get(g.key)
+            if s is None or segments[s] != g or pass_of[s] >= 0:
+                raise AssertionError(f"pass {n} ({p.describe()}): segment {g.key} is unknown or planned twice")
+            pass_of[s] = n
+        if p.is_packed and not (
+            len(p.segments) >= 2
+            and p.batch == _pass_batch(len(p.segments))
+            and p.batch <= max_batch
+            and p.tokens <= max_tokens
+        ):
+            raise AssertionError(f"pass {n} ({p.describe()}) breaks the batch / token caps")
+    if any(n < 0 for n in pass_of):
+        raise AssertionError(f"segments {[segments[s].key for s, n in enumerate(pass_of) if n < 0]} are in no pass")
+    for s, d in enumerate(deps):
+        for t in d:
+            if pass_of[t] >= pass_of[s]:
+                raise AssertionError(
+                    f"segment {segments[s].key} (pass {pass_of[s]}) depends on segment {segments[t].key}, planned in "
+                    f"pass {pass_of[t]}: not strictly earlier"
+                )
+
+
+def plan_prefill_passes(
+    requests: Sequence[Any],
+    plans: Sequence[RowPlan],
+    *,
+    block_size: int,
+    max_seg: int = DEFAULT_PACKED_PREFILL_MAX_SEG,
+    max_tokens: int = DEFAULT_PACKED_PREFILL_MAX_TOKENS,
+    max_batch: int = DEFAULT_PACK_MAX_BATCH,
+    pk1: bool = True,
+    allowed: Optional[Collection[PassShape]] = None,
+    cost: Union[None, Mapping[int, float], CostFn] = None,
+    seg_buckets: Optional[Sequence[int]] = None,
+    sp1_seg_buckets: Optional[Sequence[int]] = None,
+    swa_tail: int = DEFAULT_SWA_TAIL,
+    pack_cost: Optional[PackedCostModel] = None,
+) -> List[PrefillPass]:
+    """The passes of one ``prefill_forward_batch`` call with packed prefill on, in execution order (design §3.3;
+    module docstring rule 6). Pure host; raises ``ValueError`` (bad rows: :func:`segment_dag`) before any device work.
+
+    1. Segments and dependencies: :func:`segment_dag` (it runs every check of :func:`order_prefill_requests`).
+    2. Level scheduling: the segments whose dependencies have all run form the next level. Its packable segments are
+       grouped by ``("pk0", S)`` and ``("pk1", S, a)``; the others run solo. Each group is cut into packed passes of
+       ``b >= 2`` segments (``B`` = the next power of two, ``B <= max_batch``, ``B * S <= max_tokens``) and solo
+       chunks, choosing the cut of least :func:`packed_pass_cost` (a lone segment always runs solo). pk1 groups are
+       ordered by tail blocks first, so segments that share a prefix share a pass (the ``shared`` variant). A level's
+       passes run in the order of their first segment ``(row, chunk)``. No pass holds a segment together with one of
+       its dependencies.
+    3. Shape filter: with ``allowed`` (the generator's warmed shapes once the decode trace is captured), a packed pass
+       whose :attr:`PrefillPass.shape` is not in it runs as one solo pass per segment, each with ``fallback`` = that
+       shape: packing never refuses a call and never compiles a program. Solo shapes are not filtered here (the
+       generator refuses an unwarmed solo shape, as it does without packing).
+
+    Args:
+        requests / plans: the call's rows (``PrefillRequest``-like: ``start``, ``seq_len``, ``page_table``) and their
+            row plans (``plan_prefill_row``), as for :func:`order_prefill_requests`.
+        block_size: KV block size.
+        max_seg: the largest segment ``S`` (``cfg.pack_max_seg``; 0 = nothing packs).
+        max_tokens: the largest pass ``T`` (``cfg.pack_tokens_cap``; at most the span cap, so every ``T = B * S``, a
+            power of two, is a compiled bucket).
+        max_batch: the largest ``B``.
+        pk1: pack sp1 chunks at a common start (``cfg.pack_pk1``); False: they run solo.
+        allowed: the shapes a packed pass may have; None = any (before the decode capture).
+        cost: the row cost model, as for :func:`plan_prefill_row` (the generator's ``cfg.prefill_cost_table`` model).
+        seg_buckets / sp1_seg_buckets: the sp0 / sp1 segment sizes (``cfg.pack_seg_buckets`` /
+            ``cfg.pack_sp1_seg_buckets``; default ``generator_api.PACK_SEG_BUCKETS`` / ``PACK_SP1_SEG_BUCKETS``),
+            narrowed to ``max_seg`` and to the sizes for which a pass of two segments fits the caps.
+        swa_tail: SWA tail rows (``cfg.prefill_swa_tail``): a pk1 pass is ``shared`` iff all its segments have the same
+            blocks at ``[a - tail, a)``.
+        pack_cost: the packed-pass cost terms (default :data:`DEFAULT_PACKED_COST`).
+    """
+    bs = int(block_size)
+    seg_b, sp1_b = _pack_buckets(bs, max_seg, max_tokens, max_batch, pk1, seg_buckets, sp1_seg_buckets)
+    tail = int(swa_tail)
+    if tail < 0 or tail % bs:
+        raise ValueError(f"swa_tail {tail} must be a non-negative multiple of the block size {bs}")
+    fn = _cost_fn(cost)
+    model = DEFAULT_PACKED_COST if pack_cost is None else pack_cost
+    segments, deps = segment_dag(requests, plans, bs, seg_buckets=seg_b, sp1_seg_buckets=sp1_b)
+    tails_of: Dict[int, Tuple[int, ...]] = {}
+    for s, g in enumerate(segments):
+        if g.is_sp1 and g.rows is not None:
+            ids = tail_blocks(_page_table(requests, g.row), _segment_chunk(g, g.rows), bs, tail) if tail else None
+            tails_of[s] = () if ids is None else tuple(ids.tolist())
+    passes: List[PrefillPass] = []
+    done = [False] * len(segments)
+    pending = list(range(len(segments)))
+    while pending:
+        ready = [s for s in pending if all(done[t] for t in deps[s])]
+        if not ready:  # unreachable: segment_dag refuses row cycles, and an acyclic row order makes the DAG acyclic
+            raise ValueError(f"prefill segments {[segments[s].key for s in pending]} depend on each other (cycle)")
+        level: List[PrefillPass] = []
+        groups: Dict[Tuple[str, int, int], List[int]] = {}
+        for s in ready:
+            g = segments[s]
+            if g.rows is None:
+                level.append(_solo_pass(g, plans))
+            else:
+                groups.setdefault((PK1, g.rows, g.start) if g.is_sp1 else (PK0, g.rows, 0), []).append(s)
+        for (kind, S, a), members in groups.items():
+            max_b = _max_pass_batch(S, int(max_tokens), int(max_batch))
+            level += _plan_group(kind, S, a, members, segments, plans, tails_of, max_b=max_b, fn=fn, model=model)
+        level.sort(key=lambda p: min(g.key for g in p.segments))
+        for p in level:
+            if p.is_packed and allowed is not None and p.shape not in allowed:
+                passes += [_solo_pass(g, plans, fallback=p.shape) for g in p.segments]
+            else:
+                passes.append(p)
+        for s in ready:
+            done[s] = True
+        pending = [s for s in pending if not done[s]]
+    _check_passes(passes, segments, deps, max_tokens=int(max_tokens), max_batch=int(max_batch))
+    return passes
+
+
+def solo_prefill_passes(plans: Sequence[RowPlan], order: Optional[Sequence[int]] = None) -> List[PrefillPass]:
+    """One solo pass per chunk: the rows in ``order`` (default input order; with packing off the generator passes
+    :func:`order_prefill_requests`), each row's chunks in sequence. That is the row-by-row execution of a call
+    without packing, as passes."""
+    idx = list(range(len(plans))) if order is None else [int(i) for i in order]
+    if sorted(idx) != list(range(len(plans))):
+        raise ValueError(f"order {idx} is not a permutation of the {len(plans)} rows")
+    return [
+        PrefillPass(SOLO, (PackSegment(i, k, c.path, c.start, c.end, None, c.last),), c.bucket, 1, c.start)
+        for i in idx
+        for k, c in enumerate(plans[i].chunks)
+    ]
+
+
+def packed_pass_shapes(
+    *,
+    block_size: int,
+    max_seg: int = DEFAULT_PACKED_PREFILL_MAX_SEG,
+    max_tokens: int = DEFAULT_PACKED_PREFILL_MAX_TOKENS,
+    max_batch: int = DEFAULT_PACK_MAX_BATCH,
+    pk1: bool = True,
+    seg_buckets: Optional[Sequence[int]] = None,
+    sp1_seg_buckets: Optional[Sequence[int]] = None,
+) -> Tuple[PassShape, ...]:
+    """Every shape a packed pass of :func:`plan_prefill_passes` can have with these knobs, in the order of
+    ``MotifTTConfig.packed_prefill_shapes()`` (the list the generator warms; a host test checks they agree): pk0
+    ``("pk0", T, S)`` per sp0 segment size ``S`` and ``T = B * S`` ascending, then pk1 ``("pk1", T, S, tails)`` for
+    both tail variants. Defaults: 22 pk0 and 17 x 2 pk1 shapes."""
+    seg_b, sp1_b = _pack_buckets(block_size, max_seg, max_tokens, max_batch, pk1, seg_buckets, sp1_seg_buckets)
+
+    def batches(S: int) -> List[int]:
+        top = _max_pass_batch(S, int(max_tokens), int(max_batch))
+        return [B for B in PACK_BATCHES if B <= top]
+
+    out: List[PassShape] = [(PK0, B * S, S) for S in seg_b for B in batches(S)]
+    out += [(PK1, B * S, S, v) for S in sp1_b for B in batches(S) for v in PK1_TAIL_VARIANTS]
+    return tuple(out)
+
+
+# ---- per-pass host tables (each segment's slice is the per-chunk table of its chunk re-bucketed to S) ------------
+def pass_chunks(p: PrefillPass, plans: Sequence[RowPlan]) -> List[ChunkPlan]:
+    """The chunk of every real segment of ``p``, re-bucketed to the pass's segment rows (review edit R-E12:
+    ``dataclasses.replace(chunk, bucket=S)`` with ``S >=`` the chunk's rows, so the per-chunk table builders give
+    ``S / bs`` fill entries and ``S`` RoPE rows; a solo pass keeps its chunk). ``ValueError`` when a segment does not
+    match its row plan."""
+    out = []
+    for g in p.segments:
+        if not 0 <= g.row < len(plans) or not 0 <= g.chunk_index < len(plans[g.row].chunks):
+            raise ValueError(f"segment {g.key} has no chunk in the {len(plans)} row plans")
+        c = plans[g.row].chunks[g.chunk_index]
+        if (c.start, c.end, c.path, c.last) != (g.start, g.end, g.path, g.last):
+            raise ValueError(f"segment {g} does not match chunk {c} of row {g.row}'s plan")
+        out.append(c if c.bucket == p.seg_rows else replace(c, bucket=int(p.seg_rows)))
+    return out
+
+
+def pass_fill_table(p: PrefillPass, requests: Sequence[Any], plans: Sequence[RowPlan], block_size: int) -> torch.Tensor:
+    """``paged_fill_cache`` table of pass ``p``: ``int32 [1, T / bs]``. Entries ``[k S / bs, (k + 1) S / bs)`` are
+    segment ``k``'s :func:`fill_table` (its chunk re-bucketed to ``S``: blocks below the row's ``w0`` and pure-padding
+    blocks -1); a dummy segment's entries are -1 (it writes nothing). The fill kernel maps packed row ``i`` to entry
+    ``i // bs``, so ``S`` must be a multiple of ``bs``."""
+    bs, S = int(block_size), int(p.seg_rows)
+    if bs < 1 or S % bs:
+        raise ValueError(f"segment rows {S} must be a positive multiple of the block size {bs}")
+    n = S // bs
+    out = torch.full((1, int(p.batch) * n), -1, dtype=torch.int32)
+    for k, (g, c) in enumerate(zip(p.segments, pass_chunks(p, plans))):
+        plan = plans[g.row]
+        if int(plan.block_size) != bs:
+            raise ValueError(f"row {g.row}'s plan has block size {plan.block_size}, the pass {bs}")
+        out[0, k * n : (k + 1) * n] = fill_table(_page_table(requests, g.row), c, plan.w0, bs)
+    return out
+
+
+def pass_rope_positions(p: PrefillPass, max_positions: int) -> torch.Tensor:
+    """RoPE table rows of pass ``p``: ``int32 [T]``, segment ``k``'s :func:`rope_positions` at ``[k S, k S + S)``
+    (``min(a_k + i, max_positions - 1)``; real rows never clamp); dummy segments copy segment 0's rows."""
+    rows = [rope_positions(_segment_chunk(g, p.seg_rows), max_positions) for g in p.segments]
+    return torch.cat(rows + [rows[0]] * p.dummies)
+
+
+def pass_sdpa_tables(p: PrefillPass, requests: Sequence[Any], block_size: int, width: int) -> torch.Tensor:
+    """sp1 SDPA page tables of a pk1 (or solo sp1) pass: ``int32 [B, width]``, row ``k`` = segment ``k``'s
+    :func:`sdpa_table` (the real ids of blocks ``[0, cdiv(end, bs))``, then 0; never -1); dummy segments copy segment
+    0's row. ``width * bs`` must cover ``a + S`` (padded query rows read up to there)."""
+    if p.path != SP1:
+        raise ValueError(f"SDPA page tables exist for sp1 passes only, got a {p.kind} {p.path} pass")
+    bs, W = int(block_size), int(width)
+    if W * bs < int(p.start) + int(p.seg_rows):
+        raise ValueError(f"SDPA width {W} x {bs} does not cover the pass's {int(p.start) + int(p.seg_rows)} positions")
+    rows = [sdpa_table(_page_table(requests, g.row), g.end, bs, W) for g in p.segments]
+    return torch.stack(rows + [rows[0]] * p.dummies)
+
+
+def pass_tail_blocks(
+    p: PrefillPass, requests: Sequence[Any], block_size: int, tail: int = DEFAULT_SWA_TAIL
+) -> torch.Tensor:
+    """SWA tail block ids of a pk1 (or solo sp1) pass: ``int32 [B, tail / bs]``, row ``k`` = segment ``k``'s
+    :func:`tail_blocks` (positions ``[a - tail, a)``); dummy segments copy segment 0's row."""
+    if p.path != SP1:
+        raise ValueError(f"SWA tails exist for sp1 passes only, got a {p.kind} {p.path} pass")
+    rows = [
+        tail_blocks(_page_table(requests, g.row), _segment_chunk(g, p.seg_rows), block_size, tail) for g in p.segments
+    ]
+    return torch.stack(rows + [rows[0]] * p.dummies)
+
+
+def tail_variant(tail: torch.Tensor) -> str:
+    """The pk1 tail variant of a ``[B, nt]`` tail table (review edit R-E2): ``"shared"`` when every row equals row 0,
+    else ``"distinct"`` (no partial dedupe: the program set must not depend on the data)."""
+    t = torch.as_tensor(tail)
+    if t.ndim != 2 or t.shape[0] < 1:
+        raise ValueError(f"tail table must be [B, nt] with B >= 1, got {tuple(t.shape)}")
+    return SHARED_TAILS if bool((t == t[:1]).all()) else DISTINCT_TAILS
+
+
+def pass_rows(p: PrefillPass, values: Sequence[Any], fill: int) -> torch.Tensor:
+    """A per-row host input in the pass's packed layout: ``int32 [T]`` holding ``values[k]`` (segment ``k``'s
+    ``end - start`` real-row values) at ``[k S, k S + end - start)`` and ``fill`` elsewhere (segment padding, dummy
+    segments). E.g. the MTP layer's next tokens (``mtp.mtp_next_tokens`` per segment)."""
+    if len(values) != len(p.segments):
+        raise ValueError(f"{len(values)} value rows for the pass's {len(p.segments)} segments")
+    S = int(p.seg_rows)
+    out = torch.full((p.tokens,), int(fill), dtype=torch.int32)
+    for k, (g, v) in enumerate(zip(p.segments, values)):
+        v = torch.as_tensor(v).reshape(-1)
+        if v.numel() != g.real_rows or v.dtype.is_floating_point:
+            raise ValueError(f"segment {k} takes {g.real_rows} integer values, got {v.dtype} [{v.numel()}]")
+        out[k * S : k * S + g.real_rows] = v.to(torch.int32)
+    return out
+
+
+def pass_tokens(p: PrefillPass, requests: Sequence[Any], pad_id: int) -> torch.Tensor:
+    """Token ids of pass ``p``: ``int32 [T]``, segment ``k``'s ``tokens[start:end]`` at ``[k S, ...)``, ``pad_id``
+    in padding rows and dummy segments."""
+    rows = []
+    for g in p.segments:
+        if not 0 <= g.row < len(requests):
+            raise ValueError(f"segment row {g.row} outside the call's {len(requests)} rows")
+        rows.append(torch.as_tensor(requests[g.row].tokens)[g.start : g.end])
+    return pass_rows(p, rows, pad_id)
+
+
+@dataclass(frozen=True)
+class PassTables:
+    """Every host table of one pass except its tokens (:func:`pass_tables`); the attention owner's
+    ``PackedHostTables`` holds the same data for packed passes.
+
+    Attributes:
+        fill: ``int32 [1, T / bs]`` (:func:`pass_fill_table`).
+        rope: ``int32 [T]`` (:func:`pass_rope_positions`; packed passes always gather their RoPE rows, review edit
+            R-E11).
+        ends: ``int32 [B]``: one past each segment's last real row (absolute position); dummies copy segment 0's.
+        sdpa: sp1: ``int32 [B, W']`` (:func:`pass_sdpa_tables`); else None.
+        start_idx: sp1: ``int32 [1]`` = ``[a]``; else None.
+        tail: sp1 with an SWA tail: ``int32 [B, tail / bs]`` (:func:`pass_tail_blocks`); else None.
+        tails: the pass's tail variant (pk1), else None.
+    """
+
+    fill: torch.Tensor
+    rope: torch.Tensor
+    ends: torch.Tensor
+    sdpa: Optional[torch.Tensor] = None
+    start_idx: Optional[torch.Tensor] = None
+    tail: Optional[torch.Tensor] = None
+    tails: Optional[str] = None
+
+
+def pass_tables(
+    p: PrefillPass,
+    requests: Sequence[Any],
+    plans: Sequence[RowPlan],
+    *,
+    block_size: int,
+    sdpa_width: int,
+    max_positions: int,
+    swa_tail: int = DEFAULT_SWA_TAIL,
+) -> PassTables:
+    """Every host table of pass ``p`` (any kind; a solo pass gets its chunk's tables of rule 4, with ``[1, ...]``
+    leading dims). Raises ``ValueError`` when a ``shared`` pk1 pass has segments whose tail blocks differ: the
+    shared program gathers segment 0's tail only."""
+    ends = [int(g.end) for g in p.segments]
+    out = dict(
+        fill=pass_fill_table(p, requests, plans, block_size),
+        rope=pass_rope_positions(p, max_positions),
+        ends=torch.tensor(ends + ends[:1] * p.dummies, dtype=torch.int32),
+        tails=p.tails,
+    )
+    if p.path == SP1:
+        out["sdpa"] = pass_sdpa_tables(p, requests, block_size, sdpa_width)
+        out["start_idx"] = torch.tensor([int(p.start)], dtype=torch.int32)
+        if int(swa_tail) > 0:
+            out["tail"] = pass_tail_blocks(p, requests, block_size, swa_tail)
+            if p.tails == SHARED_TAILS and tail_variant(out["tail"]) != SHARED_TAILS:
+                raise ValueError(
+                    f"{p.describe()}: planned with shared tails, but its segments' tail blocks differ "
+                    f"{out['tail'].tolist()}"
+                )
+    return PassTables(**out)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # vLLM scheduler configuration (bridge fail-fast checks, features design §1.5)
 # ----------------------------------------------------------------------------------------------------------------
 SMALL_BUDGET_TOKENS = 4096
@@ -787,15 +1637,28 @@ __all__ = [
     "ChunkPlan",
     "ChunkTables",
     "CostFn",
+    "DEFAULT_PACKED_COST",
+    "DEFAULT_PACK_MAX_BATCH",
     "DEFAULT_PREFILL_COST_TABLE",
     "DEFAULT_SP1_ATTN_S_PER_ROW_KEY",
     "DEFAULT_SP1_GLOBAL_CHUNKS",
     "DEFAULT_SP1_GLOBAL_COST",
     "DEFAULT_SWA_TAIL",
+    "DISTINCT_TAILS",
+    "PASS_KINDS",
     "PATHS",
+    "PK0",
+    "PK1",
+    "PackSegment",
+    "PackedCostModel",
+    "PassShape",
+    "PassTables",
+    "PrefillPass",
     "RowPlan",
     "SDPA_TABLE_WIDTH_MULTIPLE",
+    "SHARED_TAILS",
     "SMALL_BUDGET_TOKENS",
+    "SOLO",
     "SP0",
     "SP1",
     "SP1_GLOBAL_CHUNKS_BF16_KV",
@@ -805,8 +1668,19 @@ __all__ = [
     "chunk_tables",
     "fill_table",
     "order_prefill_requests",
+    "packed_pass_cost",
+    "packed_pass_shapes",
+    "pass_chunks",
+    "pass_fill_table",
+    "pass_rope_positions",
+    "pass_rows",
+    "pass_sdpa_tables",
+    "pass_tables",
+    "pass_tail_blocks",
+    "pass_tokens",
     "plan_cost",
     "plan_prefill_batch",
+    "plan_prefill_passes",
     "plan_prefill_row",
     "prefill_cost_model",
     "recommended_budget",
@@ -814,10 +1688,14 @@ __all__ = [
     "rope_positions",
     "sdpa_table",
     "sdpa_table_width",
+    "segment_dag",
+    "segment_rows",
+    "solo_prefill_passes",
     "sp1_global_chunk_table",
     "sp1_global_qk",
     "sp1_prefix_cost",
     "span_buckets",
     "table_cost",
     "tail_blocks",
+    "tail_variant",
 ]

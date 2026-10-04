@@ -119,7 +119,10 @@ Motif payloads (per chip, decode): AR(tp) of ``[1,1,8,4096]`` after ``wo`` / MoE
 PolyNorm moments (``ar_exact``); AG(dp) of ``[1,1,8,4096]`` -> ``[1,1,32,4096]`` (MoE token gather, lane order
 ``l = 8 dp + local``, via ``ag_dp_rows``); AR(dp) of ``[1,1,32,4096]`` (MoE combine) followed by
 ``partition(dim=2, "dp")`` to keep this row's 8 lanes. Prefill: RS(dp) ``[1,1,S,4096]`` -> ``[1,1,S/4,4096]``, AR(tp),
-AG(dp) back to ``[1,1,S,4096]``.
+AG(dp) back to ``[1,1,S,4096]``. The T64 verify step (16 rows per DP row, docs/p5_t64/P5_T64_DESIGN.md §4) runs the
+same collectives on 16 rows: ``ag_dp_rows`` -> ``[1,1,64,W]`` in natural order (MoE) or split order (``halves=2``:
+anchors then drafts; LM heads, KV-R write), AR(dp) of ``[1,1,64,4096]``, ``partition`` back to 16 rows, AR(tp) of
+``[1,1,16,4096]``.
 """
 
 from __future__ import annotations
@@ -843,9 +846,11 @@ class MotifCCL:
         """All-gather across DP groups (prefill MoE output; the decode token gather uses :meth:`ag_dp_rows`)."""
         return self.all_gather(x, dim, "dp", **kw)
 
-    def ag_dp_rows(self, x, *, memory_config=None, intermediate_memory_config=None, out_layout=ttnn.TILE_LAYOUT):
-        """Decode MoE token gather (INFRA-5, MOE-1): this row's lanes ``[1, 1, L, 4096]`` (L = 8) ->
-        ``[1, 1, 4 L, 4096]`` in lane order ``8 dp + l`` on every chip.
+    def ag_dp_rows(
+        self, x, *, memory_config=None, intermediate_memory_config=None, out_layout=ttnn.TILE_LAYOUT, halves: int = 1
+    ):
+        """Decode token gather over DP (INFRA-5, MOE-1): this row's rows ``[1, 1, L, W]`` -> ``[1, 1, 4 L, W]`` on
+        every chip (L = 8 lanes in the 32-lane step; L = 16 in the 64-row T64 verify step).
 
         ``to_layout(ROW_MAJOR)`` -> ``all_gather(dim=2, "dp")`` in ROW_MAJOR -> ``to_layout(out_layout)`` (TILE by
         default). Gate G4: the 8-row gather costs 12 us traced in ROW_MAJOR against 62 us in TILE (whose padded tiles
@@ -853,19 +858,47 @@ class MotifCCL:
         26.5-28 us in all with the default L1 intermediates (RM all_gather 11-12 + tilize L1->DRAM 11 + untilize 2.5),
         30-31 us with DRAM intermediates, vs 59-62 us for the TILE gather.
 
-        The untilized input and the gathered ROW_MAJOR tensor live in ``intermediate_memory_config`` (default L1
-        interleaved: 64 KB / 256 KB per chip) and are freed before returning, so no L1 buffer outlives the call. A
-        ROW_MAJOR input skips the untilize; the input is not consumed. Output in ``memory_config`` (DRAM interleaved
-        by default, the module-boundary convention). Replicas of the result are bitwise identical. A size-1 DP axis
-        returns a new tensor (a copy, or the layout conversion)."""
+        Row order (``halves``; docs/p5_t64/P5_T64_DESIGN.md §4.1):
+
+        * ``halves=1`` (natural, default): output row ``L dp + j`` = DP row ``dp``'s row ``j``. L = 8: lane order
+          ``8 dp + l``. L = 16 (T64): the MoE token gather, whose inverse is ``partition(dim=2, "dp")``.
+        * ``halves=2`` (split): each DP row's rows are two halves of ``L / 2`` (T64: ``[8 anchors | 8 drafts]``); the
+          output holds every DP row's first half, then every DP row's second half: row ``(L/2) dp + j`` = DP row
+          ``dp``'s row ``j`` and row ``2 L + (L/2) dp + j`` = its row ``L/2 + j``. At L = 16 rows 0..31 are the anchors
+          in T32 lane order (the 32-lane layout: a tile-aligned slice) and rows 32..63 the drafts, for the LM heads
+          and the KV-R write. The ROW_MAJOR input is viewed as ``[1, 2, L/2, W]`` and gathered on dim 2 (``[1, 2, 2 L,
+          W]``), then viewed as ``[1, 1, 4 L, W]``: both reshapes keep the last dim, so they are metadata-only views;
+          the same gather, the same cost (G16-lite at L = 16: 42.6 vs 42.7 us traced at W = 4096, 27.3 vs 27.3 us at
+          576; order verified on device, T64N §5.1).
+
+        Every gather goes through :meth:`all_gather` (the ring-gather race guard covers it; F3N rule R1). The untilized
+        input and the gathered ROW_MAJOR tensor live in ``intermediate_memory_config`` (default L1 interleaved: 64 KB /
+        256 KB per chip at L = 8) and are freed before returning, so no L1 buffer outlives the call. A ROW_MAJOR input
+        skips the untilize; the input is not consumed. Output in ``memory_config`` (DRAM interleaved by default, the
+        module-boundary convention). Replicas of the result are bitwise identical. A size-1 DP axis returns a new
+        tensor (a copy, or the layout conversion; with one DP row the split order is the natural one)."""
+        h = int(halves)
+        if h != 1:  # (ttnn.Shape has no slicing: a list first)
+            dims = [int(d) for d in x.shape]
+            if h < 1 or dims[-2] % h or math.prod(dims[:-2]) != 1:
+                raise ValueError(
+                    f"ag_dp_rows: halves={halves} must be >= 1 and divide the rows of x [1, 1, L, W], got {dims}"
+                )
         mc = self._mc(memory_config)
         imc = intermediate_memory_config if intermediate_memory_config is not None else ttnn.L1_MEMORY_CONFIG
         if self.axis_size("dp") == 1:
             return self._fresh(x, mc) if x.layout == out_layout else ttnn.to_layout(x, out_layout, memory_config=mc)
         rm = x if x.layout == ttnn.ROW_MAJOR_LAYOUT else ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=imc)
-        g = self.all_gather(rm, 2, "dp", memory_config=imc)
+        if h == 1:
+            g = self.all_gather(rm, 2, "dp", memory_config=imc)
+        else:  # split order: [1, h, L/h, W] views (same last dim: metadata only), gathered on dim 2
+            shape = [int(d) for d in rm.shape]
+            rows, w = shape[-2], shape[-1]
+            parts = ttnn.reshape(rm, (1, h, rows // h, w))
+            gh = self.all_gather(parts, 2, "dp", memory_config=imc)  # [1, h, 4 L / h, W]: half-major
+            g = ttnn.reshape(gh, (1, 1, rows * self.axis_size("dp"), w))  # a view of gh's buffer
         if rm is not x:
-            ttnn.deallocate(rm)
+            ttnn.deallocate(rm)  # (frees the buffer the input view of the split order shares)
         if out_layout == ttnn.ROW_MAJOR_LAYOUT:
             if imc == mc:
                 return g

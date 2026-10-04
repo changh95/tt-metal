@@ -18,12 +18,26 @@ Dataflow (README CONVENTIONS §2-3)::
             offset RoPE / SWA tail, shared by every layer); X = prefill_chunk(tokens [1|4, C], chunk=inp, kv) (sp0 =
             the draft-1 path through the fill table; sp1 reads the cached prefix). The generator plans the chunks
             (``cfg.plan_prefill_row``), runs the head on the last one and the MTP layer's KV-only fill on each.
+    packed  (P5, docs/p5_t64/P5_T64_DESIGN.md §3.4) one packed pass: B segments of S rows, T = B * S rows, the same
+            calls as a chunk: inp = chunk_inputs(attention.PackedHostTables) (``inp.is_packed``; pk1 reads the cache:
+            ``inp.reads_cache``), X = prefill_chunk(tokens [1|4, T], chunk=inp, kv). Only the attention treats the
+            segments apart (batched SDPA, per-segment RoPE rows and fill); every other module runs its bucket-T
+            programs. The generator runs the head once per segment that ends its row and one MTP fill per pass.
+            ``warm_attention`` compiles the packed attention programs of a shape before the decode capture.
     decode with KV-R (README §16): the same as decode, with ``kv_write=`` (``tt/kv_write.DecodeKVWrite``) shared by
             every layer and its ``cur_pos`` / ``page_table`` as FlashMLA's.
     spec    (MTP self-speculation, the "T32-spec" step; features design §3.8.1, README §17): decode_spec = decode with
             the step's split ``kv_write`` -> hn = head.stream_mean_norm(X) -> logits (TILE) -> host logits (ROW_MAJOR)
             + a = head.argmax_decode -> m = mtp.forward_decode(hn, a) (the MTP layer on every lane, its own cache
             ``pool.mtp`` through the same ``kv_write``). The generator packs drafts into idle lanes (packed verify).
+    wide    (the "T64" full-batch verify step; docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4): decode_wide = the spec step on
+            16 rows per DP row ``[8 anchors at n | the same lanes' 8 drafts at n + 1]`` (still one tile row): tokens
+            [4, 16] -> X [1, 4, 16, 4096] -> 53 layers with ``kv_write = DecodeKVWrite(rows=64)`` (call A anchors, call
+            B drafts; FlashMLA option A'' inside the attention) -> hn [1, 1, 16, 4096] -> the split-order logits
+            [1, 1, 64, 6880] (rows 0..31 = the anchors in lane order) -> a [1, 1, 1, 64] = (a0 x 32, a1 x 32) -> the
+            MTP layer on all 64 rows -> m = (m0 x 32, m1 x 32). Every row equals the spec step's row of the same
+            token, position and cache bitwise, so the generator may switch between the two steps (``spec_verify``
+            "auto").
 
 MTP layer (features design §3.6; README §17): ``mtp=True`` (default when ``cfg.spec_tokens``) also builds
 :class:`~models.demos.motif3.tt.mtp.MotifMTP` (part ``L53``, sharing the embedding and the LM head); the pool then
@@ -82,12 +96,14 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+import torch
 
 import ttnn
 
 from . import weights as W
-from .attention import MotifAttention, PrefillChunkInputs
+from .attention import ChunkHostTables, MotifAttention, PackedHostTables, PrefillChunkInputs
 from .ccl import MotifCCL
 from .decoder import MotifDecoderLayer, free_tensors
 from .embedding import MotifEmbedding
@@ -427,7 +443,7 @@ class MotifModel:
             part ``L53``, sharing this model's embedding and LM head; features design §3.6). ``None`` (default) =
             ``cfg.spec_tokens > 0`` (MTP self-speculation). :meth:`allocate_kv_caches` then adds its latent cache
             (``pool.mtp``), the generator fills it during prefill (KV-only, D9) and :meth:`decode_spec` runs the
-            layer on every decode lane.
+            layer on every decode lane (:meth:`decode_wide`: on the T64 step's 64 rows).
         mtp_kwargs: extra kwargs for :class:`MotifMTP` (A/B knobs).
     """
 
@@ -685,33 +701,205 @@ class MotifModel:
         _free(hn)
         return rm, a, m
 
-    def chunk_inputs(self, host) -> PrefillChunkInputs:
+    def decode_wide(
+        self,
+        tokens,
+        *,
+        rot_idxs,
+        kv_write,
+        kv_caches,
+        want_rm: bool = False,
+        stop_after: Optional[int] = None,
+        keep_hidden: bool = False,
+    ):
+        """One **T64** step: the full-batch speculative verify step (trace-safe; docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4,
+        decisions T1-T5). Each DP row decodes 16 rows, still one 32-row tile row: rows 0..7 = the anchors of its 8
+        lanes (the last committed token at ``n``; idle lane: ``cur_pos = -1``), rows 8..15 = the same lanes' drafts
+        at ``n + 1`` with the owner's page-table row (no draft: ``-1``)::
+
+            X  = embed(tokens)                          [1, 4, 16, 4096] per DP row
+            X  = 53 layers (kv_write: call A anchors, call B drafts, both before FlashMLA; option A'' inside the
+                 attention: one B = 16 FlashMLA call on the SWA layers, two B = 8 calls on the global layers)
+            hn = head.stream_mean_norm(X)               [1, 1, 16, 4096]
+            lg = head.decode_logits(hn, halves=2)       [1, 1, 64, 6880] TILE: rows 0..31 = the anchors in lane order
+                                                        (the 32-lane layout), rows 32..63 = the drafts
+            rm = head.logits_rm(lg, rows=32)            only with ``want_rm``: the anchors' ROW_MAJOR logits
+            a  = head.argmax_decode(lg)                 [1, 1, 1, 64] uint32 = (a0 of lanes 0..31, a1 of lanes 0..31)
+            m  = mtp.forward_decode(hn, a, ...)         [1, 1, 1, 64] = (m0 x 32, m1 x 32); the MTP layer writes its
+                                                        cache at the same rows and positions (call A / call B)
+
+        Every row equals the T32 spec step's (:meth:`decode_spec`) row of the same token, position and cache bit for
+        bit (A'', the M = 64 MoE / LM-head configs; gate G-S5w), which keeps ``spec_verify="auto"`` lossless when the
+        steps alternate between the two traces. No overflow pass: every lane owns a draft row. A rejected draft's KV
+        at ``n + 1`` is rewritten by the next step's anchor (call A) before any FlashMLA read, as in packed verify.
+
+        Args (persistent device inputs; README §3): ``tokens [4, 16]`` uint32 per DP row (``embed.decode_tokens_host(
+        tokens [64], rows_per_dp=16)``, physical row order ``16 r + j``), ``rot_idxs [1, 32]`` uint32 per DP row
+        (``rope.rot_idxs_host(positions [64], rows_per_dp=16)``: 16 rows used), ``kv_write`` (required:
+        ``tt.kv_write.DecodeKVWrite(rows=64)``; its ``cur_pos [16]`` / ``page_table [16, W]`` are the SWA layers'
+        FlashMLA inputs and the ``active`` mask's, its ``flash_groups()`` the global layers'), ``kv_caches``
+        (:class:`MotifKVPool` with its MTP cache). The model must be built with a T64 config
+        (``cfg.wide_rows_per_dp`` = 16: ``spec_tokens > 0`` and ``spec_verify`` "wide" / "auto"), so that the 64-row
+        MoE pads and argmax constants exist (allocated by the module constructors, before any capture: F3N rule R3),
+        and with the "mesh" vocab split. ``want_rm``: also untilize the anchors' logits (``spec_verify="wide"``: its
+        ordinary steps read host logits or run the device sampler on them); without it ``rm`` is None (the
+        ``auto`` mode's T64 trace is argmax-only). ``stop_after``: the first k decoder layers only (plumbing runs).
+        ``keep_hidden`` (eager diagnostics only): also return ``hn`` (the caller frees it).
+
+        Returns ``(rm or None, a, m)`` (``+ (hn,)`` with ``keep_hidden``): read ``a`` / ``m`` with
+        ``head.tokens_to_host`` (int64 ``[64]``, split order), ``rm`` with ``head.logits_to_host`` (the 32 anchors).
+        Host checks run before any device op."""
+        if self.mtp is None:
+            raise ValueError("decode_wide needs the MTP layer (MotifModel(..., mtp=True))")
+        if kv_write is None:
+            raise ValueError("decode_wide needs the step's kv_write (tt.kv_write.DecodeKVWrite(rows=64))")
+        cfg = self.cfg
+        rows = 2 * int(cfg.lanes_per_row)
+        if int(getattr(cfg, "wide_rows_per_dp", 0) or 0) != rows:
+            raise ValueError(
+                f"decode_wide needs a model built with a T64 config (cfg.wide_rows_per_dp = {rows}: spec_tokens > 0 "
+                f"and spec_verify 'wide' / 'auto'), got wide_rows_per_dp {getattr(cfg, 'wide_rows_per_dp', None)}: the "
+                f"MoE's 64-row top-k pads and the LM head's 64-row argmax constants are allocated by the constructors"
+            )
+        per = getattr(kv_write, "lanes_per_row", None)
+        if per is None or int(per) != rows:
+            raise ValueError(
+                f"decode_wide needs a kv_write built for {rows} rows per DP row (DecodeKVWrite(rows=64)), got "
+                f"lanes_per_row {per}"
+            )
+        if int(tokens.shape[-1]) != rows:
+            raise ValueError(
+                f"decode_wide: tokens have {int(tokens.shape[-1])} rows per DP row, the T64 step has {rows} "
+                f"(embed.decode_tokens_host(tokens [64], rows_per_dp={rows}))"
+            )
+        if getattr(self.head, "vocab_split", "mesh") != "mesh":
+            raise ValueError(f"decode_wide needs the LM head's 'mesh' vocab split, got {self.head.vocab_split!r}")
+        mtp_cache = getattr(kv_caches, "mtp", None)
+        if mtp_cache is None:
+            raise ValueError("decode_wide needs the pool's MTP cache (allocate_kv_caches with the MTP layer)")
+        n = self._stop(stop_after)
+        kvs = self._check_kv(kv_caches, n)
+        cur_pos, page_table = kv_write.cur_pos, kv_write.page_table
+        X = self.embed.forward_decode(tokens)  # [1, 4, 16, 4096]: rows from the token shape
+        rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
+        act = MotifAttention.active_mask_from_cur_pos(cur_pos, rows)
+        rm = None
+        try:
+            for layer, kv in zip(self.layers[:n], kvs):
+                Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
+                                          kv_write=kv_write)  # fmt: skip
+                _free(X)
+                X = Xn
+            hn = self.head.stream_mean_norm(X)  # [1, 1, 16, 4096]
+            _free(X)
+            X = None
+            lg = self.head.decode_logits(hn, halves=2)  # [1, 1, 64, 6880] TILE; hn kept for the MTP layer
+            if want_rm:
+                rm = self.head.logits_rm(lg, rows=int(cfg.max_batch))  # the anchors: [1, 1, 32, 6880] ROW_MAJOR
+            a = self.head.argmax_decode(lg)  # [1, 1, 1, 64]
+            _free(lg)
+            m = self.mtp.forward_decode(hn, a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=mtp_cache,
+                                        active=act, kv_write=kv_write)  # fmt: skip
+            kv_write.end_step()
+        finally:
+            _free(act, *[t for cs in rot.values() for t in cs])
+        if keep_hidden:
+            return rm, a, m, hn
+        _free(hn)
+        return rm, a, m
+
+    def chunk_inputs(self, host: Union[ChunkHostTables, PackedHostTables]) -> PrefillChunkInputs:
         """Upload one prefill chunk's host tables (``attention.ChunkHostTables``: ``chunk_host_tables`` /
-        ``warmup_chunk_host_tables``) as the :class:`~models.demos.motif3.tt.attention.PrefillChunkInputs` every layer
-        of the chunk shares (eager: a few small copies; sp1 adds the offset-RoPE gathers). Free with ``inp.free()``."""
+        ``warmup_chunk_host_tables``) or one packed pass's (``attention.PackedHostTables``: ``packed_host_tables`` /
+        ``warmup_packed_host_tables``; P5) as the :class:`~models.demos.motif3.tt.attention.PrefillChunkInputs` every
+        layer of the chunk / pass shares (eager: a few small copies; sp1 chunks and every packed pass add the RoPE-row
+        gathers). Free with ``inp.free()``."""
         return PrefillChunkInputs.upload(self.mesh_device, self.cfg, self.rope, host)
 
     def prefill_chunk(self, tokens, *, chunk: PrefillChunkInputs, kv_caches=None, stop_after: Optional[int] = None):
         """One chunk of a resumed / chunked prefill (eager; features design §3.7.1, README §15): ``tokens`` = device
         ``[1, C]`` / ``[4, C]`` uint32 (``embed.prefill_tokens_device`` of the chunk's real tokens, padded to the bucket
         ``C = chunk.bucket``), ``chunk`` = its :class:`PrefillChunkInputs` (:meth:`chunk_inputs`), shared by every
-        layer. Every layer fills its cache through ``chunk.fill_pt`` (``-1`` = skip); sp1 chunks (start > 0) read the
-        cached prefix, so they need ``kv_caches``. Returns the residual streams ``[1, 4, C, 4096]`` after the last layer
-        run (``head.forward_prefill(X, chunk.head_row)`` for the logits; ``head.stream_mean_norm(X)`` for the MTP
-        layer's KV-only fill). Not consumed: ``tokens``, ``chunk``."""
+        layer. Every layer fills its cache through ``chunk.fill_pt`` (``-1`` = skip); a chunk that reads the cached
+        prefix (``chunk.reads_cache``: sp1, or a pk1 packed pass; review edit R-E11) needs ``kv_caches``. Returns the
+        residual streams ``[1, 4, C, 4096]`` after the last layer run (``head.forward_prefill(X, chunk.head_row)`` for
+        the logits; ``head.stream_mean_norm(X)`` for the MTP layer's KV-only fill). Not consumed: ``tokens``,
+        ``chunk``.
+
+        A packed pass (P5; ``chunk.is_packed``) is the same call with ``C = T = B * S`` (``tokens`` = the segments'
+        tokens, each padded to ``S``, then the dummy segments): every layer is row-local except the attention, which
+        reads the segments apart from ``chunk``; segment ``k``'s last real row is ``chunk.segment_head_row(k)``."""
         n = self._stop(stop_after)
         kvs = self._check_kv(kv_caches, n)
         C = int(tokens.shape[-1])
         if C != int(chunk.bucket):
             raise ValueError(f"prefill_chunk: {C} token rows, the chunk's bucket is {chunk.bucket}")
-        if chunk.is_sp1 and any(kv is None for kv in kvs):
-            raise ValueError("an sp1 chunk reads the cached prefix: prefill_chunk needs kv_caches")
+        if chunk.reads_cache and any(kv is None for kv in kvs):
+            what = "an sp1 chunk" if chunk.is_sp1 else f"a {chunk.path} pass"
+            raise ValueError(f"{what} reads the cached prefix: prefill_chunk needs kv_caches")
         X = self.embed.forward_prefill(tokens)
         for layer, kv in zip(self.layers[:n], kvs):
             Xn = layer.forward_prefill(X, chunk=chunk, kv_cache=kv)
             _free(X)
             X = Xn
         return X
+
+    def attention_warm_layers(self) -> Tuple[int, ...]:
+        """The decoder layers :meth:`warm_attention` runs by default: the first built layer of each attention kind
+        (global, then SWA; ascending ``layer_ids``). Every layer of a kind runs the same attention programs (the
+        weights differ, the shapes and configs do not), so one per kind compiles them all."""
+        out: Dict[bool, int] = {}
+        for l in self.layer_ids:
+            out.setdefault(bool(self.cfg.layer(l).is_global), int(l))
+        return tuple(out[k] for k in (True, False) if k in out)
+
+    def warm_attention(
+        self,
+        chunk: PrefillChunkInputs,
+        kv_caches,
+        *,
+        layers: Optional[Sequence[int]] = None,
+        mtp: bool = False,
+    ) -> Tuple[int, ...]:
+        """Warm-up only (P5, docs/p5_t64/P5_T64_DESIGN.md §3.5; before the decode capture): compile the attention
+        programs of one prefill input shape without running the model. ``layer.attn.forward_prefill(x0, chunk=chunk,
+        kv_cache=kv)`` on a zero input ``x0 [1, 1, T, hidden]`` (bf16 TILE DRAM, the layer norm's output layout) for
+        each layer of ``layers`` (default :meth:`attention_warm_layers`: one global and one SWA layer) and, with
+        ``mtp`` (and the MTP layer built), the MTP layer's KV-only fill ``mtp.fill_kv_prefill(x0, pad tokens,
+        chunk=chunk)`` into ``kv_caches.mtp`` (the packed pass's MTP fill: the gathered RoPE rows at ``T``).
+
+        ``chunk`` is a warm-up input (``attention.warmup_packed_host_tables`` / ``warmup_chunk_host_tables`` through
+        :meth:`chunk_inputs`): its fill table is all ``-1`` and a pk1 pass reads only the null block, so nothing is
+        written. The row-local programs of a pass of ``T`` rows (embedding, mHC, norms, MLP / MoE, LM head, the MTP
+        block input) are the solo bucket-``T`` chunk's, compiled by its warm-up. Not consumed: ``chunk``. Returns the
+        decoder layer indices run."""
+        T = int(chunk.bucket)
+        ids = self.attention_warm_layers() if layers is None else tuple(int(l) for l in layers)
+        idx = {int(l): i for i, l in enumerate(self.layer_ids)}
+        missing = [l for l in ids if l not in idx]
+        if missing:
+            raise ValueError(f"warm_attention: layers {missing} are not built (built: {self.layer_ids})")
+        kvs = self._check_kv(kv_caches, len(self.layers))
+        if chunk.reads_cache and any(kvs[idx[l]] is None for l in ids):
+            raise ValueError(f"warm_attention: a {chunk.path} input reads the paged cache: pass kv_caches")
+        want_mtp = bool(mtp) and self.mtp is not None
+        mtp_cache = getattr(kv_caches, "mtp", None) if want_mtp else None
+        if want_mtp and mtp_cache is None:
+            raise ValueError("warm_attention(mtp=True) needs the pool's MTP cache (kv_caches.mtp)")
+        shape = [1, 1, T, int(self.cfg.hidden_size)]
+        e = ttnn.empty(shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, self.mesh_device, ttnn.DRAM_MEMORY_CONFIG)
+        x0 = nxt = None
+        try:
+            x0 = ttnn.fill(e, 0.0)
+            for l in ids:
+                _free(self.layers[idx[l]].attn.forward_prefill(x0, chunk=chunk, kv_cache=kvs[idx[l]]))
+            if want_mtp:
+                pad = torch.full((T,), int(self.cfg.pad_token_id), dtype=torch.int32)
+                nxt = self.embed.rows_tokens_device(pad, T)
+                self.mtp.fill_kv_prefill(x0, nxt, kv_cache=mtp_cache, chunk=chunk)
+        finally:
+            _free(e, x0, nxt)
+        return ids
 
     def prefill(self, tokens, *, page_table=None, kv_caches=None, last_index: Optional[int] = None,
                 return_streams: bool = False, stop_after: Optional[int] = None):

@@ -8,10 +8,15 @@ Run device-hidden (the root conftest opens the UMD cluster even for collection),
         models/demos/motif3/tests/unit/test_infra_config.py
 """
 
+import ast
 import dataclasses
 import importlib
+import inspect
 import json
 import math
+import re
+from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +31,10 @@ from models.demos.motif3.tt.model_config import (
     DEFAULT_HF_META_DIR,
     DEFAULT_L1_SMALL_SIZE,
     DEFAULT_WEIGHTS_DIR,
+    DEFAULT_WIDE_STEP_RATIO,
+    EXPERTS_DOWN_GRID_WIDE,
     FP32_ACC_OFF_ROLES,
+    ROUTER_EXACT_FP32_DECODE_ROWS,
     SP1_GLOBAL_CHUNKS,
     LayerSpec,
     MeshAxes,
@@ -36,6 +44,7 @@ from models.demos.motif3.tt.model_config import (
     experts_down_pc,
     experts_gate_up_pc,
     flash_mla_decode_pc,
+    lm_head_pc,
     make_compute_kernel_config,
     mcast1d_matmul_pc,
     mesh_l1_small_bytes,
@@ -44,6 +53,7 @@ from models.demos.motif3.tt.model_config import (
     resolve_weights_dir,
     resumed_prefill_pc,
     rope_scaling_of,
+    router_decode_pc,
     sdpa_prefill_chunks,
     sdpa_prefill_pc,
     sp1_global_chunks,
@@ -73,6 +83,13 @@ _ENV = (
     "MOTIF3_PREFILL_MAX_BUCKET",
     "MOTIF3_PACKED_PREFILL",
     "MOTIF3_SPEC_VERIFY",
+    "MOTIF3_RING_GATHER",
+    # P5 / T64 (docs/p5_t64/P5_T64_DESIGN.md §3.9, §4.7)
+    "MOTIF3_PACKED_PREFILL_MAX_SEG",
+    "MOTIF3_PACKED_PREFILL_MAX_TOKENS",
+    "MOTIF3_PACKED_PREFILL_PK1",
+    "MOTIF3_PACKED_WARMUP",
+    "MOTIF3_WIDE_MIN_LANES",
 )
 
 
@@ -1289,3 +1306,470 @@ def test_check_generator_features():
 
     with pytest.raises(ValueError, match="no resumed prefill"):
         api.check_generator_features(SplitsWithoutResume(), plain)
+
+
+# ======================================================================================================
+# P5 (packed prefill) and T64 (full-batch speculative verify): the settings / config fields of step C1a
+# (docs/p5_t64/P5_T64_DESIGN.md §8.3, §8.5; host tests of §7.1)
+# ======================================================================================================
+def test_p5_t64_contract_constants():
+    """The frozen vocabulary of both features: verify modes, the T64 row counts, the packed segment sizes / batches /
+    pass kinds / pk1 tail variants, the drafting-policy constants."""
+    assert api.SPEC_VERIFY_MODES == ("packed", "wide", "auto") and api.WIDE_SPEC_VERIFY_MODES == ("wide", "auto")
+    assert api.WIDE_ROWS == 2 * api.NUM_LANES == 64 == api.NUM_DP_GROUPS * api.WIDE_ROWS_PER_GROUP
+    assert api.WIDE_ROWS_PER_GROUP == 2 * api.LANES_PER_GROUP == 16 <= 32  # [8 anchors | 8 drafts]: one tile row
+    assert api.WIDE_MIN_LANES_NEVER == api.NUM_LANES + 1 == 33
+    assert (api.DEFAULT_SPEC_ALPHA_PRIOR, api.SPEC_ALPHA_PRIOR_WEIGHT) == (0.85, 64)
+    assert api.PACKED_PASS_KINDS == ("pk0", "pk1") and api.PK1_TAIL_VARIANTS == ("shared", "distinct")
+    assert api.PACK_SEG_BUCKETS == (64, 128, 256, 512, 1024) and api.PACK_SP1_SEG_BUCKETS == (128, 256, 512, 1024)
+    assert set(api.PACK_SP1_SEG_BUCKETS) <= set(api.PACK_SEG_BUCKETS)
+    assert api.PACK_BATCHES == (2, 4, 8, 16, 32) and max(api.PACK_BATCHES) == api.NUM_LANES  # rows of one call
+    for s in api.PACK_SEG_BUCKETS + api.PACK_BATCHES:
+        assert s & (s - 1) == 0, s  # powers of two: T = B * S is a prefill bucket
+    assert api.DEFAULT_PACKED_PREFILL_MAX_SEG == max(api.PACK_SEG_BUCKETS) == 1024
+    assert api.DEFAULT_PACKED_PREFILL_MAX_TOKENS == api.DEFAULT_PREFILL_SPAN_CAP == 8192
+    assert api.PACKED_WARMUP_MODES == ("attention", "full") and api.DEFAULT_PACKED_WARMUP == "attention"
+
+
+def test_p5_t64_settings_defaults_and_validation():
+    s = api.GeneratorSettings()
+    assert (s.packed_prefill, s.packed_prefill_max_seg, s.packed_prefill_max_tokens, s.packed_prefill_pk1) == (
+        False,
+        1024,
+        8192,
+        True,
+    )
+    assert (s.packed_warmup, s.spec_verify, s.wide_min_lanes, s.spec_alpha_prior) == ("attention", "packed", None, 0.85)
+    for ok in (
+        dict(spec_verify="auto", spec_tokens=1),
+        dict(spec_verify="wide"),  # no effect without speculation, but not an error
+        dict(packed_prefill=True, packed_prefill_max_seg=64, packed_prefill_max_tokens=128, packed_prefill_pk1=False),
+        dict(packed_prefill_max_tokens=32768, packed_warmup="full"),
+        dict(wide_min_lanes=1),
+        dict(wide_min_lanes=33),  # never
+        dict(spec_alpha_prior=0.0),
+        dict(spec_alpha_prior=1),
+    ):
+        api.GeneratorSettings(**ok)
+    for bad, exc in (
+        (dict(spec_verify="Auto"), ValueError),  # the settings take the parsed (lower-case) mode
+        (dict(spec_verify="both"), ValueError),
+        (dict(packed_prefill_max_seg=2048), ValueError),  # beyond the segment sizes gate G15 validates
+        (dict(packed_prefill_max_seg=100), ValueError),
+        (dict(packed_prefill_max_tokens=3000), ValueError),
+        (dict(packed_prefill_max_tokens=64), ValueError),
+        (dict(packed_prefill_max_tokens=65536), ValueError),
+        (dict(packed_prefill_pk1="yes"), TypeError),
+        (dict(packed_warmup="none"), ValueError),
+        (dict(wide_min_lanes=0), ValueError),
+        (dict(wide_min_lanes=34), ValueError),
+        (dict(spec_alpha_prior=1.5), ValueError),
+        (dict(spec_alpha_prior=-0.1), ValueError),
+        (dict(spec_alpha_prior=float("nan")), ValueError),
+        (dict(spec_alpha_prior=True), TypeError),
+    ):
+        with pytest.raises(exc):
+            api.GeneratorSettings(**bad)
+
+
+def test_p5_t64_env_parsing():
+    """MOTIF3_PACKED_PREFILL_* / MOTIF3_PACKED_WARMUP / MOTIF3_SPEC_VERIFY=auto / MOTIF3_WIDE_MIN_LANES: parsed by
+    GeneratorSettings.from_env (API server and EngineCore alike); a typo raises instead of silently changing a knob."""
+    hf = SimpleNamespace(num_hidden_layers=53)
+    kw = dict(max_batch_size=32, max_seq_len=32768)
+    d = api.GeneratorSettings.from_env(hf, environ={}, **kw)
+    assert (d.packed_prefill, d.packed_prefill_max_seg, d.packed_prefill_max_tokens, d.packed_prefill_pk1) == (
+        False,
+        1024,
+        8192,
+        True,
+    )
+    assert (d.packed_warmup, d.spec_verify, d.wide_min_lanes, d.spec_alpha_prior) == ("attention", "packed", None, 0.85)
+    env = {
+        "MOTIF3_PACKED_PREFILL": "1",
+        "MOTIF3_PACKED_PREFILL_MAX_SEG": "512",
+        "MOTIF3_PACKED_PREFILL_MAX_TOKENS": "4096",
+        "MOTIF3_PACKED_PREFILL_PK1": "off",
+        "MOTIF3_PACKED_WARMUP": " FULL ",
+        "MOTIF3_SPEC_VERIFY": " Auto ",
+        "MOTIF3_WIDE_MIN_LANES": "20",
+    }
+    s = api.GeneratorSettings.from_env(hf, environ=env, serving=dict(spec_tokens=1), **kw)
+    assert (s.packed_prefill, s.packed_prefill_max_seg, s.packed_prefill_max_tokens, s.packed_prefill_pk1) == (
+        True,
+        512,
+        4096,
+        False,
+    )
+    assert (s.packed_warmup, s.spec_verify, s.wide_min_lanes, s.spec_alpha_prior) == ("full", "auto", 20, 0.85)
+    # the parsers one by one: unset / blank = the default
+    assert api.packed_prefill_max_seg_from_env({}) == 1024 and api.packed_prefill_max_tokens_from_env({}) == 8192
+    assert api.packed_prefill_pk1_from_env({}) is True and api.packed_warmup_from_env({}) == "attention"
+    assert api.wide_min_lanes_from_env({}) is None and api.spec_verify_from_env({"MOTIF3_SPEC_VERIFY": " "}) == "packed"
+    assert api.packed_warmup_from_env({"MOTIF3_PACKED_WARMUP": " "}) == "attention"
+    assert api.spec_verify_from_env({"MOTIF3_SPEC_VERIFY": "WIDE"}) == "wide"
+    assert [api.packed_prefill_max_seg_from_env({"MOTIF3_PACKED_PREFILL_MAX_SEG": str(v)}) for v in (64, 1024)] == [
+        64,
+        1024,
+    ]
+    assert api.packed_prefill_pk1_from_env({"MOTIF3_PACKED_PREFILL_PK1": "0"}) is False
+    assert api.wide_min_lanes_from_env({"MOTIF3_WIDE_MIN_LANES": "33"}) == 33
+    for name, parser, bads in (
+        ("MOTIF3_PACKED_PREFILL_MAX_SEG", api.packed_prefill_max_seg_from_env, ("2048", "96", "-1", "x", "1e3")),
+        ("MOTIF3_PACKED_PREFILL_MAX_TOKENS", api.packed_prefill_max_tokens_from_env, ("5000", "64", "65536", "x")),
+        ("MOTIF3_PACKED_PREFILL_PK1", api.packed_prefill_pk1_from_env, ("ture", "2")),
+        ("MOTIF3_PACKED_WARMUP", api.packed_warmup_from_env, ("none", "attn")),
+        ("MOTIF3_SPEC_VERIFY", api.spec_verify_from_env, ("both", "t64")),
+        ("MOTIF3_WIDE_MIN_LANES", api.wide_min_lanes_from_env, ("0", "34", "x", "-5")),
+    ):
+        for bad in bads:
+            with pytest.raises(ValueError, match=name):
+                parser({name: bad})
+        with pytest.raises(ValueError, match=name):
+            api.GeneratorSettings.from_env(hf, environ={name: bads[0]}, **kw)
+
+
+def test_smoothed_acceptance_prior():
+    """Review edit R-E3: alpha-hat = (accepted + n0 a0) / (verified + n0). A fresh server (nothing verified) assumes
+    a0 = 0.85, far above the T64 break-even r - 1 ~ 0.13, so a c = 32 burst drafts from its first verify step."""
+    sa = api.smoothed_acceptance
+    assert sa(0, 0) == api.DEFAULT_SPEC_ALPHA_PRIOR == 0.85
+    assert sa(0, 0) > DEFAULT_WIDE_STEP_RATIO - 1.0
+    assert sa(0, 0, prior=0.5) == 0.5 and sa(0, 0, weight=0) == 0.85  # nothing to average: the prior
+    assert sa(30, 32) == pytest.approx((30 + 64 * 0.85) / 96)
+    assert sa(30, 32, weight=0) == pytest.approx(30 / 32)
+    assert sa(88_000, 100_000) == pytest.approx(0.88, abs=1e-4)  # many verifies: the measured rate
+    assert 0.0 <= sa(0, 10_000) < 0.01 and 0.99 < sa(10_000, 10_000) <= 1.0
+    lo, mid, hi = sa(0, 64), sa(32, 64), sa(64, 64)
+    assert lo < mid < hi and lo == pytest.approx(0.425)  # 64 rejects halve the prior
+    for bad in (dict(accepted=5, verified=4), dict(accepted=-1, verified=4), dict(accepted=0, verified=0, weight=-1)):
+        with pytest.raises(ValueError):
+            sa(**bad)
+    with pytest.raises(ValueError):
+        sa(1, 2, prior=1.2)
+
+
+def test_drafts_all_lanes_contract():
+    """Review edit R-E9: the bridge asks a yes / no, ``drafts_all_lanes(live_lanes, acceptance=None)``; the ABC default
+    (and every generator without the 64-row trace) answers False, which keeps the bridge's idle-lane budget."""
+    sig = inspect.signature(api.MotifGenerator.drafts_all_lanes)
+    assert list(sig.parameters) == ["self", "live_lanes", "acceptance"]
+    assert sig.parameters["acceptance"].default is None
+    for g in (_TinyGenerator(), _ResumedGenerator()):
+        assert g.drafts_all_lanes([0, 1, 2]) is False
+        assert g.drafts_all_lanes(list(range(32)), acceptance=0.99) is False
+        assert g.drafts_all_lanes([], acceptance=None) is False
+
+    class Wide(_ResumedGenerator):
+        def drafts_all_lanes(self, live_lanes, acceptance=None):
+            return len(set(live_lanes)) >= 19
+
+    assert Wide().drafts_all_lanes(list(range(19))) and not Wide().drafts_all_lanes(list(range(18)))
+
+
+def test_packed_prefill_config_and_shapes(monkeypatch):
+    """P5 shapes (design §3.5): 22 pk0 (T, S) and 17 pk1 (T, S), each pk1 shape with both SWA tail variants (R-E2);
+    every T = B * S a span bucket <= 8192; every segment size has its SDPA programs; the settings / env knobs narrow
+    the list."""
+    cfg = _cfg()
+    assert cfg.pack_seg_buckets == api.PACK_SEG_BUCKETS and cfg.pack_sp1_seg_buckets == api.PACK_SP1_SEG_BUCKETS
+    assert (cfg.pack_max_tokens, cfg.pack_tokens_cap, cfg.pack_max_seg, cfg.pack_pk1) == (8192, 8192, 1024, True)
+    shapes = cfg.packed_prefill_shapes()
+    assert len(shapes) == len(set(shapes)) == 22 + 2 * 17
+    pk0 = [k for k in shapes if k[0] == "pk0"]
+    pk1 = [k for k in shapes if k[0] == "pk1"]
+    assert shapes == tuple(pk0 + pk1)  # pk0 first, then pk1: a fixed warmup order
+    assert Counter(S for _, _, S in pk0) == {64: 5, 128: 5, 256: 5, 512: 4, 1024: 3}
+    assert Counter(k[2] for k in pk1) == {128: 10, 256: 10, 512: 8, 1024: 6}
+    for k in shapes:
+        kind, T, S = k[:3]
+        assert len(k) == (3 if kind == "pk0" else 4), k
+        assert T // S in api.PACK_BATCHES and T == S * (T // S), k
+        assert T in cfg.prefill_span_buckets and T <= cfg.pack_tokens_cap, k
+    for T, S in {(k[1], k[2]) for k in pk1}:  # both tail variants of every pk1 shape (R-E2)
+        assert {k[3] for k in pk1 if k[1:3] == (T, S)} == set(api.PK1_TAIL_VARIANTS)
+    # the design's scenarios (§3.3): 32 short prompts; a shared 2K prefix; the mixed step; S = 1024 at the cap
+    for key in (("pk0", 2048, 64), ("pk1", 4096, 128, "shared"), ("pk1", 4096, 128, "distinct"), ("pk0", 4096, 512)):
+        assert key in shapes, key
+    assert ("pk0", 8192, 1024) in shapes and ("pk0", 16384, 512) not in shapes  # T <= the 8192 cap
+    assert ("pk1", 128, 64, "shared") not in shapes  # no pk1 segments of 64 rows
+    # every packed segment has its per-segment SDPA programs: pk0 the G2 config at S, pk1 the sp1 configs at S
+    for S in cfg.pack_seg_buckets:
+        for kind in ("global", "swa"):
+            cfg.sdpa_prefill_pc(kind, seq_len=S)
+    for S in cfg.pack_sp1_seg_buckets:
+        for kind in ("global", "swa"):
+            cfg.resumed_prefill_pc(kind, S)
+    assert "pack S=64/128/256/512/1024 pk1 S=128/256/512/1024 T<=8192" in cfg.describe()
+
+    # settings -> config (GEN-1 mapping)
+    raw = json.load(open(f"{HF_META}/config.json"))
+    s = api.GeneratorSettings(packed_prefill_max_seg=256, packed_prefill_pk1=False, packed_prefill_max_tokens=4096)
+    c2 = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+    assert (c2.pack_seg_buckets, c2.pack_sp1_seg_buckets, c2.pack_max_tokens) == ((64, 128, 256), (), 4096)
+    assert (c2.pack_max_seg, c2.pack_pk1, c2.pack_tokens_cap) == (256, False, 4096)
+    assert len(c2.packed_prefill_shapes()) == 5 + 5 + 4 and "pk1 S=off" in c2.describe()
+    assert all(k[0] == "pk0" and k[1] <= 4096 for k in c2.packed_prefill_shapes())
+    c3 = MotifTTConfig.from_settings(api.GeneratorSettings(packed_prefill_max_seg=64), mesh_shape=(4, 8), hf_config=raw)
+    assert (c3.pack_seg_buckets, c3.pack_sp1_seg_buckets, c3.pack_pk1) == ((64,), (), False)  # no pk1 size <= 64
+
+    # the span cap bounds T as well: max_model_len 4096, or 6144 (a non-power-of-two last bucket)
+    assert max(k[1] for k in _cfg(max_model_len=4096).packed_prefill_shapes()) == 4096
+    c6 = _cfg(max_model_len=6144)
+    assert c6.pack_tokens_cap == 6144 and max(k[1] for k in c6.packed_prefill_shapes()) == 4096
+
+    # environment (configs built without settings, e.g. module tests)
+    monkeypatch.setenv("MOTIF3_PACKED_PREFILL_MAX_SEG", "512")
+    monkeypatch.setenv("MOTIF3_PACKED_PREFILL_MAX_TOKENS", "4096")
+    monkeypatch.setenv("MOTIF3_PACKED_PREFILL_PK1", "0")
+    ce = _cfg()
+    assert (ce.pack_seg_buckets, ce.pack_sp1_seg_buckets, ce.pack_max_tokens) == ((64, 128, 256, 512), (), 4096)
+    duck = SimpleNamespace(num_layers=2, max_seq_len=4096, max_batch_size=4, kv_cache_dtype="bfp8")  # pre-P5 object
+    assert MotifTTConfig.from_settings(duck, mesh_shape=(4, 8), hf_config=raw).pack_max_tokens == 4096  # env kept
+    plain = MotifTTConfig.from_settings(api.GeneratorSettings(), mesh_shape=(4, 8), hf_config=raw)
+    assert plain.pack_pk1 and plain.pack_max_tokens == 8192  # the settings win over the environment
+    monkeypatch.setenv("MOTIF3_PACKED_PREFILL_MAX_SEG", "2048")
+    with pytest.raises(ValueError, match="MOTIF3_PACKED_PREFILL_MAX_SEG"):
+        _cfg()
+    for v in ("MOTIF3_PACKED_PREFILL_MAX_SEG", "MOTIF3_PACKED_PREFILL_MAX_TOKENS", "MOTIF3_PACKED_PREFILL_PK1"):
+        monkeypatch.delenv(v)
+
+    # validation
+    for bad in (
+        dict(pack_seg_buckets=(128, 64)),
+        dict(pack_seg_buckets=(64, 64)),
+        dict(pack_seg_buckets=(32,)),
+        dict(pack_seg_buckets=(2048,)),
+        dict(pack_sp1_seg_buckets=(64, 128)),  # pk1 S = 64 needs its own SWA square config (later)
+        dict(pack_max_tokens=3000),
+        dict(pack_max_tokens=64),
+        dict(pack_max_tokens=65536),
+    ):
+        with pytest.raises(ValueError):
+            _cfg(**bad)
+    with pytest.raises(ValueError, match="whole 128-token blocks"):  # S = 64 would split a block of the fill table
+        _cfg(kv_block_size=128)
+    assert _cfg(kv_block_size=128, pack_seg_buckets=[128, 256]).pack_seg_buckets == (128, 256)  # lists normalized
+    assert _cfg(pack_seg_buckets=(), pack_sp1_seg_buckets=()).packed_prefill_shapes() == ()
+    small = _cfg()
+    small.set_kv_geometry(8225, 32)  # block 32: every segment still whole blocks
+    assert small.packed_prefill_shapes() == shapes
+
+
+def test_per_core_m_matmul_builders():
+    """``per_core_m`` (T64's 64 gathered rows = 2 tile rows): ``per_core_M = out_block_h = per_core_m``, out subblock
+    ``h = 1`` and ``h x w <= 4`` with fp32 dest acc (8 without); ``per_core_m = 1`` is the unchanged draft-1 config."""
+    for pcn in range(1, 9):
+        for pcm in (1, 2, 3, 4):
+            for fp32 in (True, False):
+                pc = mcast1d_matmul_pc((8, 1), 8 * pcn, 1, per_core_n=pcn, per_core_m=pcm, fp32_acc=fp32)
+                assert (pc.per_core_M, pc.out_block_h, pc.per_core_N, pc.out_block_w) == (pcm, pcm, pcn, pcn)
+                assert pc.out_subblock_h == 1 and pcn % pc.out_subblock_w == 0
+                assert pc.out_subblock_h * pc.out_subblock_w <= (4 if fp32 else 8)
+    default = mcast1d_matmul_pc((12, 1), 12, 32, 128)
+    assert repr(default) == repr(mcast1d_matmul_pc((12, 1), 12, 32, 128, per_core_m=1))
+    assert (default.per_core_M, default.out_block_h) == (1, 1)
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="per_core_m"):
+            mcast1d_matmul_pc((12, 1), 12, 32, 128, per_core_m=bad)
+
+
+def _g16_lite_mm1d(grid, in0_block_w, per_core_m, per_core_n, sub_h, sub_w, fuse_batch=False, act=None):
+    """Verbatim ``mm1d`` of docs/p5_t64/scripts/t64_bench.py: the configs the G16-lite probe measured (T64N §5.1)."""
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(int(grid[0]), int(grid[1])),
+        in0_block_w=int(in0_block_w),
+        out_subblock_h=int(sub_h),
+        out_subblock_w=int(sub_w),
+        out_block_h=int(per_core_m),
+        out_block_w=int(per_core_n),
+        per_core_M=int(per_core_m),
+        per_core_N=int(per_core_n),
+        fuse_batch=bool(fuse_batch),
+        fused_activation=act,
+        mcast_in0=True,
+    )
+
+
+def test_t64_m64_decode_configs_match_the_g16_lite_probe():
+    """The M = 64 decode configs (design T4, §4.2) are exactly the ones G16-lite measured: router per_core_M 2 + fused
+    sigmoid on 12 x 1; gate_up per_core_M 2 on 10 x 8; down per_core_M 2 on 8 x 8 (8 x 4 by grid override); LM head
+    per_core_M 2 on 12 x 9. M = 32 (``m_tiles=1``) is unchanged."""
+    mm, cfg = _g16_lite_mm1d, _cfg()
+    sig = ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID)
+    want64 = {
+        "router": (mm((12, 1), 32, 2, 1, 1, 1), cfg.router_decode_pc(m_tiles=2), router_decode_pc(m_tiles=2)),
+        "router_sigmoid": (
+            mm((12, 1), 32, 2, 1, 1, 1, act=sig),
+            cfg.router_decode_pc(sigmoid=True, m_tiles=2),
+            router_decode_pc(12, 128, sigmoid=True, m_tiles=2),
+        ),
+        "gate_up": (mm((10, 8), 8, 2, 1, 1, 1), cfg.experts_gate_up_pc(m_tiles=2), experts_gate_up_pc(m_tiles=2)),
+        "down_8x8": (mm((8, 8), 4, 2, 2, 1, 2), cfg.experts_down_pc(m_tiles=2), experts_down_pc(m_tiles=2)),
+        "down_8x4": (
+            mm((8, 4), 4, 2, 4, 1, 4),
+            cfg.experts_down_pc(2, (8, 4)),
+            experts_down_pc(m_tiles=2, grid=(8, 4)),
+        ),
+        "lm_head": (
+            mm((12, 9), 16, 2, 2, 1, 2, fuse_batch=True),
+            cfg.lm_head_pc("mesh", m_tiles=2),
+            lm_head_pc(215, ((12, 9), 2, 16), m_tiles=2),
+        ),
+    }
+    for name, (want, *got) in want64.items():
+        for g in got:
+            assert repr(g) == repr(want), name
+    want32 = {
+        "router_sigmoid": (mm((12, 1), 32, 1, 1, 1, 1, act=sig), cfg.router_decode_pc(sigmoid=True)),
+        "gate_up": (mm((10, 8), 8, 1, 1, 1, 1), cfg.experts_gate_up_pc()),
+        "down": (mm((8, 4), 4, 1, 4, 1, 4), cfg.experts_down_pc()),
+        "lm_head": (mm((12, 9), 16, 1, 2, 1, 2, fuse_batch=True), cfg.lm_head_pc("mesh")),
+    }
+    for name, (want, got) in want32.items():
+        assert repr(got) == repr(want), name
+    assert repr(cfg.experts_down_pc(m_tiles=1)) == repr(cfg.experts_down_pc())  # m_tiles=1 keeps the G6 8 x 4 grid
+    assert repr(cfg.lm_head_pc("mesh", m_tiles=1)) == repr(cfg.lm_head_pc("mesh"))
+    tp64 = cfg.lm_head_pc("tp", m_tiles=2)  # the 'tp' vocab split at M = 64: per_core_N 8, subblock 1 x 4
+    assert (tp64.per_core_M, tp64.per_core_N, tp64.out_subblock_h, tp64.out_subblock_w) == (2, 8, 1, 4)
+    assert EXPERTS_DOWN_GRID_WIDE == (8, 8) and all(a <= b for a, b in zip(EXPERTS_DOWN_GRID_WIDE, cfg.compute_grid))
+    assert cfg.lm_head_pc("mesh", "auto", m_tiles=2) is None
+
+
+def test_spec_verify_config_and_f3_refusals(monkeypatch):
+    """``spec_verify`` / ``wide_rows_per_dp`` / ``wide_step_ratio`` and the refusals the generator's ``create`` gets
+    through ``MotifTTConfig.from_settings``: "wide" / "auto" need ring_gather "safe" (F3N R1; R-E5: "native" and
+    "lean" refused), and "auto" with the exact-fp32 router only at a T64 row count the MoE runs it at (R-E7)."""
+    cfg = _cfg()
+    assert (cfg.spec_verify, cfg.wide_rows_per_dp, cfg.wide_step_ratio) == ("packed", 0, DEFAULT_WIDE_STEP_RATIO)
+    assert DEFAULT_WIDE_STEP_RATIO == 1.13 and cfg.ring_gather == "safe"
+    for shape in ((4, 8), (8, 4)):
+        for mode in api.WIDE_SPEC_VERIFY_MODES:
+            c = _cfg(mesh_shape=shape, spec_tokens=1, spec_verify=mode)
+            assert c.wide_rows_per_dp == api.WIDE_ROWS_PER_GROUP == 16, (shape, mode)
+            assert c.dp * c.wide_rows_per_dp == api.WIDE_ROWS
+    assert _cfg(spec_tokens=1, spec_verify="packed").wide_rows_per_dp == 0
+    assert _cfg(spec_verify="auto").wide_rows_per_dp == 0  # no speculation: no 64-row trace
+    raw = json.load(open(f"{HF_META}/config.json"))
+    s = api.GeneratorSettings(prefix_caching=True, chunked_prefill=True, spec_tokens=1, spec_verify="auto")
+    c = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+    assert (c.spec_verify, c.wide_rows_per_dp, c.kv_write_mode) == ("auto", 16, "all_split")
+    assert "spec=1 spec_verify=auto (T64 16 rows/DP row, r 1.13)" in c.describe() and "ring_gather=safe" in c.describe()
+    plain = MotifTTConfig.from_settings(api.GeneratorSettings(), mesh_shape=(4, 8), hf_config=raw)
+    assert (plain.spec_verify, plain.wide_rows_per_dp) == ("packed", 0)
+
+    # R1 / R-E5: only "safe" with a 64-row trace
+    for mode in api.WIDE_SPEC_VERIFY_MODES:
+        for ring in ("native", "lean"):
+            with pytest.raises(ValueError, match="ring_gather='safe'"):
+                _cfg(spec_tokens=1, spec_verify=mode, ring_gather=ring)
+    for ring in ("native", "lean"):  # unaffected: today's packed verify, and "auto" without speculation
+        _cfg(spec_tokens=1, spec_verify="packed", ring_gather=ring)
+        _cfg(spec_verify="auto", ring_gather=ring)
+    monkeypatch.setenv("MOTIF3_RING_GATHER", "native")  # the path create() takes
+    with pytest.raises(ValueError, match="ring_gather='safe'"):
+        MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+    monkeypatch.delenv("MOTIF3_RING_GATHER")
+
+    # R-E7: "auto" + the exact-fp32 router is accepted since tt/moe.py runs it at the T64 step's M = 64 (D1); a T64 row
+    # count missing from ROUTER_EXACT_FP32_DECODE_ROWS is still refused
+    assert ROUTER_EXACT_FP32_DECODE_ROWS == (32, 64)
+    c = _cfg(spec_tokens=1, spec_verify="auto", router_logits="exact_fp32")
+    assert (c.spec_verify, c.router_logits, c.wide_rows_per_dp) == ("auto", "exact_fp32", 16)
+    monkeypatch.setenv("MOTIF3_ROUTER_LOGITS", "exact_fp32")
+    c = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
+    assert (c.spec_verify, c.router_logits, c.wide_rows_per_dp) == ("auto", "exact_fp32", 16)
+    monkeypatch.delenv("MOTIF3_ROUTER_LOGITS")
+    mc = importlib.import_module("models.demos.motif3.tt.model_config")
+    monkeypatch.setattr(mc, "ROUTER_EXACT_FP32_DECODE_ROWS", (32,))
+    with pytest.raises(ValueError, match="lacks the 64-row T64 step"):
+        _cfg(spec_tokens=1, spec_verify="auto", router_logits="exact_fp32")
+    monkeypatch.setattr(mc, "ROUTER_EXACT_FP32_DECODE_ROWS", ROUTER_EXACT_FP32_DECODE_ROWS)
+    _cfg(spec_tokens=1, spec_verify="wide", router_logits="exact_fp32")  # one trace: T64 rows only meet T64 rows
+    _cfg(spec_tokens=1, spec_verify="packed", router_logits="exact_fp32")
+    moe = importlib.import_module("models.demos.motif3.tt.moe")
+    use = getattr(getattr(moe, "MotifRouter", None), "_use_logits_fn", None)
+    if use is not None:  # the constant must say what tt/moe.py does (D1 changes both together)
+        stub = SimpleNamespace(logits_fn=object())
+        try:
+            got = {M: bool(use(stub, SimpleNamespace(shape=[1, 1, M, 4096]))) for M in (32, 64)}
+        except (AttributeError, TypeError) as e:  # MotifRouter's predicate changed shape: D1 re-checks the constant
+            print(f"[config] MotifRouter._use_logits_fn not probed with a stub: {e!r}")
+        else:
+            assert got == {M: M in ROUTER_EXACT_FP32_DECODE_ROWS for M in (32, 64)}, got
+
+    # geometry and value checks
+    with pytest.raises(ValueError, match="tile row"):
+        _cfg(mesh_shape=(1, 8), spec_tokens=1, spec_verify="auto")  # 2 x 32 lanes on one DP row
+    assert _cfg(mesh_shape=(1, 8), spec_tokens=1).wide_rows_per_dp == 0
+    for bad in (dict(spec_verify="tall"), dict(wide_step_ratio=0.99), dict(wide_step_ratio=float("nan"))):
+        with pytest.raises(ValueError):
+            _cfg(**bad)
+    with pytest.raises(ValueError):
+        _cfg(wide_step_ratio=float("inf"))
+    assert _cfg(wide_step_ratio=1).wide_step_ratio == 1.0 and _cfg(wide_step_ratio=1.3).wide_step_ratio == 1.3
+
+
+# ---- F3N rule R1 (P5_T64_DESIGN.md §2.3, review edit R-E5): every TP-ring collective goes through MotifCCL ----------
+_TTNN_COLLECTIVE = re.compile(
+    r"(?:^|_)(?:all_gather|all_reduce|reduce_scatter|all_broadcast|all_to_all|point_to_point)(?:_|$)"
+)
+_TTNN_NORM_STATS = re.compile(r"_(?:pre|post)_all_gather$")  # rms_norm_pre_all_gather & co: norm statistics, not CCLs
+
+
+def _raw_ttnn_collectives(path: Path):
+    """``file:line expr`` of every reference to a ttnn collective op in ``path`` (calls, aliases, ``from ttnn import``,
+    ``getattr(ttnn, "...")``), whatever name ``ttnn`` is imported under."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    roots = {"ttnn"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots |= {(a.asname or a.name).split(".")[0] for a in node.names if a.name.split(".")[0] == "ttnn"}
+
+    def collective(name: str) -> bool:
+        return bool(_TTNN_COLLECTIVE.search(name)) and not _TTNN_NORM_STATS.search(name)
+
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "ttnn":
+            names = [a.name for a in node.names if collective(a.name)]
+            hits += [f"{path.name}:{node.lineno} from {node.module} import {n}" for n in names]
+        elif isinstance(node, ast.Attribute) and collective(node.attr):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in roots:
+                hits.append(f"{path.name}:{node.lineno} {ast.unparse(node)}")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and node.args:
+            obj = node.args[0]
+            while isinstance(obj, ast.Attribute):
+                obj = obj.value
+            name = node.args[1] if len(node.args) > 1 else None
+            if isinstance(obj, ast.Name) and obj.id in roots and isinstance(name, ast.Constant):
+                if isinstance(name.value, str) and collective(name.value):
+                    hits.append(f"{path.name}:{node.lineno} {ast.unparse(node)}")
+    return hits
+
+
+def test_r1_no_raw_ttnn_collectives_outside_ccl(tmp_path):
+    """F3N R1: the ring-gather race guard (``MotifCCL``, ``ring_gather="safe"``) only covers collectives that go
+    through ``tt/ccl.py``. No module under ``tt/`` other than ``ccl.py`` may reference a ttnn collective op directly:
+    every new P5 / T64 payload (packed moments up to ``[1,3,2048,32]``, T64's 16-row decode gathers) must reach the
+    predicate. ``ccl.py``'s own native calls sit behind ``_ag_race_prone`` (R-E5)."""
+    tt_dir = Path(importlib.import_module("models.demos.motif3.tt.model_config").__file__).resolve().parent
+    files = sorted(tt_dir.rglob("*.py"))
+    assert len(files) > 10 and (tt_dir / "ccl.py") in files
+    own = _raw_ttnn_collectives(tt_dir / "ccl.py")
+    assert any("ttnn.all_gather" in h for h in own), own  # the scan sees real call sites (no vacuous pass)
+    raw = [h for f in files if f.name != "ccl.py" for h in _raw_ttnn_collectives(f)]
+    assert not raw, f"raw ttnn collectives outside tt/ccl.py (route them through MotifCCL, F3N rule R1): {raw}"
+    # the scan itself: aliases, from-imports, getattr and nested namespaces are caught; norm statistics and strings not
+    src = (
+        "import ttnn as tn\nimport ttnn\nfrom ttnn import all_gather as ag\nx = tn.experimental.all_gather_async\n"
+        "y = getattr(ttnn, 'reduce_scatter')\nz = ttnn.rms_norm_pre_all_gather\ns = 'ttnn.all_gather'\n"
+        "w = self_ccl.all_gather\n"
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(src)
+    hits = _raw_ttnn_collectives(probe)
+    assert len(hits) == 3 and all(h.startswith("probe.py:") for h in hits), hits

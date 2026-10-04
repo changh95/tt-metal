@@ -14,7 +14,9 @@ TT layout (README CONVENTIONS §3): streams are **stream-major** ``[1, 4, T, 409
   lanes ``8 dp + l``), bitwise identical on the 8 TP chips of the row. The 4 streams come out of the gather itself:
   the per-chip token input is ``[4, 8]`` uint32 (the row's 8 lane tokens once per stream, ROW_MAJOR), so one
   ``ttnn.embedding`` call (row gather + tilize) yields ``[4, 8, 4096]``, and the reshape to ``[1, 4, 8, 4096]`` is a
-  view. No repeat / concat op on the decode path.
+  view. No repeat / concat op on the decode path. The T64 verify step (docs/p5_t64/P5_T64_DESIGN.md §4.1) runs the same
+  ops on 16 rows per DP row (``[8 anchors | 8 drafts]``): tokens ``[4, 16]`` from ``decode_tokens_host(...,
+  rows_per_dp=16)``, ``X [1, 4, 16, 4096]`` (``forward_decode`` takes the row count from the token shape).
 * **Prefill**: one user, ``S`` = bucket (a multiple of 32), replicated on all 32 chips: tokens ``[1, S]`` uint32 ->
   fused tilized ``ttnn.embedding`` -> ``[1, 1, S, 4096]`` -> ``ttnn.repeat`` -> ``[1, 4, S, 4096]`` ("repeat"), or
   tokens ``[4, S]`` -> one gather -> ``[1, 4, S, 4096]`` ("gather4"). ``prefill_mode="auto"`` (default) uses
@@ -43,8 +45,9 @@ Single-stream rows (the MTP layer's ``embed(t_{p+1})``, features design §3.6; R
 :meth:`MotifEmbedding.embed_rows` gathers ``[1, T]`` token ids into ``[1, 1, T, 4096]`` (one stream, no expand; ``T`` =
 the prefill rows of a chunk, or a DP row's 8 lanes), and :meth:`MotifEmbedding.embed_rows_from_device` does it for the
 decode step's lane-ordered device argmax ``[1, 1, 1, 32]`` (``MotifLMHead.argmax_decode``): ``partition`` over DP (no
-fabric traffic) + one gather, trace-safe. The prefill rows' ids come from :meth:`MotifEmbedding.rows_tokens_host` /
-``rows_tokens_device`` (``[T]`` padded to the bucket with ``pad_token_id``).
+fabric traffic) + one gather, trace-safe; for the T64 step's split-order argmax ``[1, 1, 1, 64]`` it yields the row's
+16 rows ``[a0 of its 8 lanes | a1 of its 8 lanes]``. The prefill rows' ids come from
+:meth:`MotifEmbedding.rows_tokens_host` / ``rows_tokens_device`` (``[T]`` padded to the bucket with ``pad_token_id``).
 
 Import rule: ttnn, torch and the shared motif3 infra only; no other ``models/demos/**`` package.
 """
@@ -66,21 +69,36 @@ PREFILL_MODES = ("auto", "repeat", "gather4")
 GATHER4_MIN_TOKENS = 1024  # measured crossover (device profiler): repeat 48.6 vs gather4 55.4 us at 128, 794 vs 682 at 4K
 
 
-def decode_token_rows(tokens: torch.Tensor, cfg: MotifTTConfig, *, n_streams: Optional[int] = None) -> torch.Tensor:
-    """Lane-ordered decode tokens ``[max_batch]`` (32) -> ``[dp * n_streams, lanes_per_row]`` int32 host tensor whose
-    DP shard ``r`` (rows ``[n_streams r, n_streams (r + 1))``) is row ``r``'s 8 lane tokens repeated once per stream.
+def decode_rows_per_dp(cfg: MotifTTConfig, rows_per_dp: Optional[int] = None) -> int:
+    """Decode rows per DP row: ``cfg.lanes_per_row`` (8) by default, or ``rows_per_dp`` (the T64 verify step's 16 =
+    ``[8 anchors | 8 drafts]``, docs/p5_t64/P5_T64_DESIGN.md §4.1), at most one 32-row tile row."""
+    r = int(cfg.lanes_per_row) if rows_per_dp is None else int(rows_per_dp)
+    if not 1 <= r <= 32:
+        raise ValueError(f"rows_per_dp must be in [1, 32] (one tile row of tokens per DP row), got {rows_per_dp}")
+    return r
+
+
+def decode_token_rows(
+    tokens: torch.Tensor, cfg: MotifTTConfig, *, n_streams: Optional[int] = None, rows_per_dp: Optional[int] = None
+) -> torch.Tensor:
+    """Decode tokens ``[dp * rows_per_dp]`` in physical row order -> ``[dp * n_streams, rows_per_dp]`` int32 host tensor
+    whose DP shard ``r`` (rows ``[n_streams r, n_streams (r + 1))``) is DP row ``r``'s tokens repeated once per stream.
+    Default ``rows_per_dp = lanes_per_row``: the 32 lane-ordered tokens (DP row ``r`` = lanes ``8r .. 8r+7``). The T64
+    verify step passes ``rows_per_dp=16`` and its 64 tokens in row order ``16 r + j`` (row ``r``'s ``[8 anchors | 8
+    drafts]``).
 
     Inactive lanes may hold any valid id (their rows are ignored downstream; the bridge sends 0); a negative id (an
     "inactive" marker) is replaced by ``pad_token_id``. Ids ``>= vocab_size`` raise (``ttnn.embedding`` would read past
     the table)."""
     n_streams = cfg.n_streams if n_streams is None else int(n_streams)
+    per = decode_rows_per_dp(cfg, rows_per_dp)
     t = torch.as_tensor(tokens).reshape(-1).to(torch.int64)
-    if t.numel() != cfg.max_batch:
-        raise ValueError(f"expected {cfg.max_batch} lane tokens, got {t.numel()}")
+    if t.numel() != cfg.dp * per:
+        raise ValueError(f"expected {cfg.dp * per} decode tokens ({cfg.dp} DP rows x {per}), got {t.numel()}")
     t = torch.where(t < 0, torch.full_like(t, int(cfg.pad_token_id)), t)
     check_token_ids(t, cfg)
-    rows = t.to(torch.int32).reshape(cfg.dp, 1, cfg.lanes_per_row)  # lanes_to_rows
-    return rows.expand(cfg.dp, n_streams, cfg.lanes_per_row).reshape(cfg.dp * n_streams, cfg.lanes_per_row).contiguous()
+    rows = t.to(torch.int32).reshape(cfg.dp, 1, per)  # lanes_to_rows
+    return rows.expand(cfg.dp, n_streams, per).reshape(cfg.dp * n_streams, per).contiguous()
 
 
 def prefill_token_row(tokens: torch.Tensor, bucket: int, cfg: MotifTTConfig, *, n_copies: int = 1) -> torch.Tensor:
@@ -96,6 +114,19 @@ def prefill_token_row(tokens: torch.Tensor, bucket: int, cfg: MotifTTConfig, *, 
     row = torch.full((int(bucket),), int(cfg.pad_token_id), dtype=torch.int32)
     row[:S] = t.to(torch.int32)
     return row.reshape(1, -1).expand(int(n_copies), -1).contiguous()
+
+
+def _free_unless_view(t, other) -> None:
+    """Free ``t`` unless it is ``other`` or shares its buffer (a metadata-only reshape view of it): ``ttnn.reshape``
+    returns a view when the last dim is kept and a new tensor otherwise."""
+    if t is other:
+        return
+    try:
+        alias = t.buffer_address() == other.buffer_address()
+    except Exception:  # (host stand-ins in tests)
+        alias = False
+    if not alias:
+        ttnn.deallocate(t)
 
 
 def check_token_ids(t: torch.Tensor, cfg: MotifTTConfig) -> None:
@@ -176,20 +207,22 @@ class MotifEmbedding:
             )
         return self._row_mapper_cached
 
-    def decode_tokens_host(self, tokens: torch.Tensor):
+    def decode_tokens_host(self, tokens: torch.Tensor, *, rows_per_dp: Optional[int] = None):
         """Lane-ordered ``tokens [32]`` -> **host** mesh tensor (chip of DP row ``r``: ``[4, 8]`` uint32 ROW_MAJOR =
-        lanes ``8r .. 8r+7`` once per stream) for ``ttnn.copy_host_to_device_tensor(host, persistent_input)``."""
+        lanes ``8r .. 8r+7`` once per stream) for ``ttnn.copy_host_to_device_tensor(host, persistent_input)``.
+        ``rows_per_dp=16`` (the T64 step): ``tokens [64]`` in row order ``16 r + j`` -> ``[4, 16]`` per DP row
+        (:func:`decode_token_rows`)."""
         return ttnn.from_torch(
-            decode_token_rows(tokens, self.cfg, n_streams=self.n_streams),
+            decode_token_rows(tokens, self.cfg, n_streams=self.n_streams, rows_per_dp=rows_per_dp),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             mesh_mapper=self._row_mapper(),
         )
 
-    def decode_tokens_device(self, tokens: torch.Tensor, *, memory_config=None):
+    def decode_tokens_device(self, tokens: torch.Tensor, *, memory_config=None, rows_per_dp: Optional[int] = None):
         """As :meth:`decode_tokens_host`, uploaded (allocate the persistent decode input once with this)."""
         return ttnn.from_torch(
-            decode_token_rows(tokens, self.cfg, n_streams=self.n_streams),
+            decode_token_rows(tokens, self.cfg, n_streams=self.n_streams, rows_per_dp=rows_per_dp),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=self.mesh_device,
@@ -255,11 +288,13 @@ class MotifEmbedding:
         return e
 
     def forward_decode(self, tokens) -> ttnn.Tensor:
-        """``tokens``: device ``[4, 8]`` uint32 ROW_MAJOR per chip (:meth:`decode_tokens_device`, persistent).
-        Returns ``X [1, 4, 8, 4096]`` bf16 TILE DRAM: this DP row's 8 lanes, 4 identical streams, replicated over TP.
-        Trace-safe: one ``ttnn.embedding`` (+ one TP all-gather with ``shard_hidden``) and a view reshape."""
-        e = self._gather(tokens)  # [4, 8, D] TILE
-        return ttnn.reshape(e, (1, self.n_streams, self.lanes, self.hidden))
+        """``tokens``: device ``[4, R]`` uint32 ROW_MAJOR per chip (:meth:`decode_tokens_device`, persistent; R = 8
+        lanes, or the T64 verify step's 16 rows). Returns ``X [1, 4, R, 4096]`` bf16 TILE DRAM: this DP row's rows, 4
+        identical streams, replicated over TP; R comes from the token shape. Trace-safe: one ``ttnn.embedding`` (+ one
+        TP all-gather with ``shard_hidden``) and a view reshape."""
+        rows = int(tokens.shape[-1])
+        e = self._gather(tokens)  # [4, R, D] TILE
+        return ttnn.reshape(e, (1, self.n_streams, rows, self.hidden))
 
     def forward_prefill(self, tokens) -> ttnn.Tensor:
         """``tokens``: device ``[1, S]`` or ``[4, S]`` uint32 replicated (:meth:`prefill_tokens_device`; S = bucket, a
@@ -292,19 +327,42 @@ class MotifEmbedding:
         layer's decode input ``embed(a)``; one stream). ``token_ids``: ``[1, 1, 1, 32]`` uint32 ROW_MAJOR replicated on
         every chip (``MotifLMHead.argmax_decode`` with the default "mesh" vocab split: this row keeps lanes ``8 dp ..
         8 dp + 7`` with ``partition`` over DP, no fabric traffic) or ``[1, 1, 1, 8]`` per DP row (the "tp" split).
-        Trace-safe (a mesh partition, a view reshape, one gather); the input is not consumed."""
+        Trace-safe (a mesh partition, a view reshape, one gather); the input is not consumed.
+
+        T64 verify step ("mesh"; docs/p5_t64/P5_T64_DESIGN.md §4.4): the split-order argmax ``[1, 1, 1, 64]`` = ``(a0
+        of lanes 0..31, a1 of lanes 0..31)`` -> ``[1, 1, 16, 4096]`` per DP row = ``[a0 of its 8 lanes | a1 of its 8
+        lanes]``, the T64 rows' layout ``[anchors | drafts]``: a ``[1, 1, 2, 32]`` reshape, ``partition`` of dim 3 over
+        DP (``[1, 1, 2, 8]``), a ``[1, 16]`` reshape (both reshapes change the last dim of a ROW_MAJOR tensor: small
+        device copies, freed here), then the same gather; every row is bitwise the row the 32-id call embeds."""
         n = int(token_ids.shape[-1])
+        if n == 2 * self.cfg.max_batch and 2 * self.lanes <= 32:  # T64 split order
+            return self._embed_split_ids(token_ids)
         if n == self.cfg.max_batch and n != self.lanes:
             part = self.ccl.partition(token_ids, len(token_ids.shape) - 1, "dp")  # [1, 1, 1, 8]
         elif n == self.lanes:
             part = token_ids
         else:
             raise ValueError(
-                f"expected {self.cfg.max_batch} (or {self.lanes}) lane token ids, got {list(token_ids.shape)}"
+                f"expected {self.cfg.max_batch} (or {self.lanes}) lane token ids, or the T64 step's "
+                f"{2 * self.cfg.max_batch} split-order ids, got {list(token_ids.shape)}"
             )
         e = self.embed_rows(ttnn.reshape(part, (1, self.lanes)))
         if part is not token_ids:
             ttnn.deallocate(part)
+        return e
+
+    def _embed_split_ids(self, token_ids) -> ttnn.Tensor:
+        """:meth:`embed_rows_from_device` of the T64 step's 64 split-order ids (``[a0 x 32 | a1 x 32]``, every chip)
+        -> ``[1, 1, 16, 4096]`` per DP row (``[a0 of its 8 lanes | a1 of its 8 lanes]``). Frees what it allocates;
+        never the input (a reshape that returned a view of its input is not freed separately)."""
+        B = int(self.cfg.max_batch)
+        halves = ttnn.reshape(token_ids, (1, 1, 2, B))  # row 0 = a0 of the 32 lanes, row 1 = a1
+        part = self.ccl.partition(halves, 3, "dp")  # [1, 1, 2, 8]: this DP row's lanes, a0 then a1
+        _free_unless_view(halves, token_ids)
+        flat = ttnn.reshape(part, (1, 2 * self.lanes))  # [1, 16] = [a0 x 8 | a1 x 8]
+        _free_unless_view(part, flat)
+        e = self.embed_rows(flat)
+        ttnn.deallocate(flat)
         return e
 
     # ---- device-side greedy feedback (optional, v1 device sampling) ---------------------------------------------
@@ -332,6 +390,7 @@ __all__ = [
     "PREFILL_MODES",
     "MotifEmbedding",
     "check_token_ids",
+    "decode_rows_per_dp",
     "decode_token_rows",
     "prefill_token_row",
 ]

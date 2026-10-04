@@ -27,6 +27,9 @@ TT dataflow per chip (TP index ``tp``; ``k = 4096 / 8 = 512``)::
          m  = head.argmax_decode(head.decode_logits(out))           [1, 1, 1, 32] uint32, lane order
     prefill, KV-only (serving; D9): attn.fill_kv(a, chunk=, kv_cache=)       no SDPA, no MLP, no head
     prefill, full (tests, acceptance estimates): attn.forward_prefill(a) -> ... -> out [1, 1, S, 4096]
+    T64 verify step (docs/p5_t64/P5_T64_DESIGN.md §4.4; T = 16 per DP row = [8 anchors | 8 drafts]): the same decode
+         on 16 rows, tokens = the split-order main argmax [1, 1, 1, 64] (embed_rows_from_device -> [a0 x 8 | a1 x 8]),
+         the head's split-order logits decode_logits(out, halves=2) -> m [1, 1, 1, 64] = (m0 of the 32 lanes, m1)
 
 * ``input_proj`` is K-sharded over TP ("interleaved" split, ``weights.mtp_input_proj_rows``): chip ``tp`` holds the
   1024 rows of ``W^T`` for hidden columns ``[512 tp, +512)`` and the same embedding columns, so its input is two
@@ -493,35 +496,61 @@ class MotifMTP:
         return_hidden: bool = False,
         taps: Optional[Dict[str, Any]] = None,
     ):
-        """One MTP decode step on the 8 lanes of each DP row (trace-safe; features design §3.8.1).
+        """One MTP decode step on the 8 lanes of each DP row, or on the T64 verify step's 16 rows (trace-safe; features
+        design §3.8.1; docs/p5_t64/P5_T64_DESIGN.md §4.4).
 
         Args:
-            hn: ``head.stream_mean_norm(X)`` of the main model ``[1, 1, 8, 4096]`` bf16 (this DP row's lanes; not
-                consumed).
+            hn: ``head.stream_mean_norm(X)`` of the main model ``[1, 1, R, 4096]`` bf16 (this DP row's rows; not
+                consumed): R = 8 lanes, or R = 16 = ``[8 anchors | 8 drafts]`` in the T64 step.
             tokens: the main model's argmax ``head.argmax_decode(logits)`` ``[1, 1, 1, 32]`` uint32 ROW_MAJOR, lane
                 order, on every chip (``[1, 1, 1, 8]`` per row with the "tp" vocab split); not consumed. The MTP input
-                ``t_{p+1}`` of lane ``l`` at position ``cur_pos[l]``.
+                ``t_{p+1}`` of lane ``l`` at position ``cur_pos[l]``. With R = 16: the T64 step's split-order
+                ``[1, 1, 1, 64]`` = ``(a0 of lanes 0..31, a1 of lanes 0..31)`` ("mesh" only), the inputs of the anchor
+                rows (at ``n``) and of the draft rows (at ``n + 1``).
             rot / cur_pos / page_table / active / kv_write: the step's tensors shared with the main layers
                 (``MotifAttention.forward_decode``; ``rot`` must hold the ``"plain"`` tables); ``kv_write`` is passed to
-                the attention only when given. ``kv_cache``: the MTP cache (updated at ``cur_pos``).
-            return_hidden: also return ``out`` (the ``final_layernorm`` output ``[1, 1, 8, 4096]``, the LM-head input;
+                the attention only when given (required with R = 16: the draft-1 write takes 8 lanes).
+                ``kv_cache``: the MTP cache (updated at ``cur_pos``).
+            return_hidden: also return ``out`` (the ``final_layernorm`` output ``[1, 1, R, 4096]``, the LM-head input;
                 the caller frees it): acceptance diagnostics and trace tests.
             taps: eager debugging only (never inside a trace); receives :data:`TAP_NAMES` (not freed).
 
         Returns the MTP argmax ``m`` ``[1, 1, 1, 32]`` uint32 ROW_MAJOR, lane order, identical on every chip
         (``head.argmax_decode``; read with ``head.tokens_to_host``): the draft for position ``cur_pos[l] + 2``
-        (``(m, out)`` with ``return_hidden``)."""
+        (``(m, out)`` with ``return_hidden``). With R = 16: ``[1, 1, 1, 64]`` = ``(m0 of lanes 0..31, m1 of lanes
+        0..31)`` (the split-order head, ``decode_logits(out, halves=2)``); every row equals the 8-row step's row of the
+        same inputs bitwise (the MTP layer is an SWA layer: one FlashMLA call over all 16 rows, measured bitwise)."""
         embed, head = self._need("embed"), self._need("head")
-        if int(hn.shape[-2]) != self.lanes or int(hn.shape[-1]) != self.hidden:
-            raise ValueError(f"MTP decode expects hn [1, 1, {self.lanes}, {self.hidden}], got {list(hn.shape)}")
-        e = embed.embed_rows_from_device(tokens)  # [1, 1, 8, 4096]
+        rows = int(hn.shape[-2])
+        if rows not in (self.lanes, 2 * self.lanes) or int(hn.shape[-1]) != self.hidden:
+            raise ValueError(
+                f"MTP decode expects hn [1, 1, {self.lanes} (or the T64 step's {2 * self.lanes}), {self.hidden}], got "
+                f"{list(hn.shape)}"
+            )
+        wide = rows == 2 * self.lanes
+        if wide:  # T64: split-order ids, the split-order head, and a KV write that takes 16 rows per DP row
+            if int(tokens.shape[-1]) != 2 * self.cfg.max_batch or head.vocab_split != "mesh":
+                raise ValueError(
+                    f"MTP decode at {rows} rows per DP row (T64) needs the split-order argmax [1, 1, 1, "
+                    f"{2 * self.cfg.max_batch}] of a 'mesh' head, got {list(tokens.shape)} ({head.vocab_split!r})"
+                )
+            if kv_write is None:
+                raise ValueError(
+                    "MTP decode at 16 rows per DP row (T64) needs the step's kv_write (anchors at n in call A, drafts "
+                    "at n + 1 in call B); the draft-1 write takes the 8 lanes of a DP row"
+                )
+        e = embed.embed_rows_from_device(tokens)  # [1, 1, R, 4096]
         h, a = self._block_input_rows(hn, e, decode=True, want_h=True, taps=taps)
         kw = {} if kv_write is None else {"kv_write": kv_write}
         o = self.attn.forward_decode(
             a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv_cache, active=active, **kw
         )
         out = self._block_tail(h, a, o, decode=True, taps=taps)
-        logits = head.decode_logits(out, consume=taps is None and not return_hidden)  # [1, 1, 32, 6880] ("mesh")
+        consume = taps is None and not return_hidden
+        if wide:  # [1, 1, 64, 6880]: rows 0..31 the anchors' MTP logits, 32..63 the drafts'
+            logits = head.decode_logits(out, consume=consume, halves=2)
+        else:
+            logits = head.decode_logits(out, consume=consume)  # [1, 1, 32, 6880] ("mesh")
         m = head.argmax_decode(logits)
         if taps is not None:
             taps["logits"] = logits

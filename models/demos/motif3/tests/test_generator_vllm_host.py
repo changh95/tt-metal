@@ -31,9 +31,15 @@ Coverage:
   the per-chip MTP bytes), the scheduler-config capture and fail-fast checks, the cross-DP-row prefix-hit hazard
   (wrong without KV-R whichever lane hits, right with it), same-step hits (writer-first), a chunked prompt changing
   lane between chunks, internal span splits, the verify / propose bookkeeping, the idle-lane budget, PS-1 hold-back;
+* packed prefill and full-batch verify (``docs/p5_t64/P5_T64_DESIGN.md`` §7.1): packed prefill is invisible to the
+  bridge (the fake packs the rows of a call into passes, same outputs); the fake's 64-row verify path (T64: drafts on
+  their owners' DP rows, no overflow pass) and the drafting policy (``packed`` / ``wide`` / ``auto`` around ``c*``, the
+  prior-smoothed running acceptance, a fresh server's 32-request burst drafting from its first verify, the per-DP-row
+  budget of ``row_split`` below ``c*``); the ``Motif-3 features:`` line;
 * the real engine end to end: ``vllm.LLM`` -> TTPlatform -> TTWorker -> TTScheduler / TTModelRunner -> bridge -> fake
   generator, with only the mesh open/close patched (this is what found the stale block-table ids), with every feature
-  off (draft 1) and with chunked prefill + prefix caching + MTP speculation on (small budget, every token checked);
+  switch off (the draft-1 capabilities), with chunked prefill + prefix caching + MTP speculation on (small budget,
+  every token checked) and with packed prefill + ``MOTIF3_SPEC_VERIFY=auto`` at 32 concurrent requests;
 * the Motif reasoning and tool parser plugin files, loaded the way ``--*-parser-plugin`` loads them, and the
   documented ``vllm serve`` flags parsed by vLLM's own CLI parser.
 
@@ -48,6 +54,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import math
 import os
 import random
 import subprocess
@@ -120,7 +127,12 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_KV_REPLICATED_DECODE",
         "MOTIF3_PREFILL_MAX_BUCKET",
         "MOTIF3_PACKED_PREFILL",
+        "MOTIF3_PACKED_PREFILL_MAX_SEG",
+        "MOTIF3_PACKED_PREFILL_MAX_TOKENS",
+        "MOTIF3_PACKED_PREFILL_PK1",
+        "MOTIF3_PACKED_WARMUP",
         "MOTIF3_SPEC_VERIFY",
+        "MOTIF3_WIDE_MIN_LANES",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -199,6 +211,19 @@ def fake_lane_logprob(lane: int) -> float:
     return -(0.25 + 0.01 * int(lane))
 
 
+FAKE_WIDE_STEP_RATIO = 1.13  # r = T64 step / T32 step (model_config.DEFAULT_WIDE_STEP_RATIO; G16 updates the real one)
+
+
+def crossover_lanes(alpha: float, ratio: float = FAKE_WIDE_STEP_RATIO) -> int:
+    """``c*`` of docs/p5_t64/P5_T64_DESIGN.md §4.5 with review edit R-E3's guard (the fake generator's rule; the real
+    one is ``tt/verify_plan.crossover_lanes``): 33 ("never") unless ``alpha > r - 1``, else ``ceil(32 alpha r / ((1 +
+    alpha) - (1 - alpha) r))`` clamped to ``[17, 33]``."""
+    if not alpha > ratio - 1:
+        return api.WIDE_MIN_LANES_NEVER
+    c = math.ceil(32 * alpha * ratio / ((1 + alpha) - (1 - alpha) * ratio))
+    return min(api.WIDE_MIN_LANES_NEVER, max(17, c))
+
+
 @dataclasses.dataclass
 class FakeSample:
     """What ``MotifGenerator.decode_forward_sampled`` returns (the fields the bridge reads): lane order."""
@@ -232,6 +257,16 @@ class FakeMotifGenerator(api.MotifGenerator):
       (``a0``); a draft runs on an IDLE partner lane (any group with KV-R, the owner's group without), writes at
       ``n + 1`` through the owner's page-table row and reads ``0 .. n + 1`` from the partner's group copy (``a1``);
       drafts without a partner run in an overflow pass on their own lane. ``m = mtp_token(...)``;
+    * the 64-row verify (T64, ``settings.spec_verify`` "wide" / "auto"; docs/p5_t64/P5_T64_DESIGN.md §2.2, §4): every
+      draft runs on its OWNER's DP row (the draft row), writes at ``n + 1`` through the owner's page-table row into the
+      owner's group copy (every copy with KV-R) in the same pass as the anchors, and reads ``0 .. n + 1`` from it; no
+      idle lane, no overflow pass. "wide" runs every step so; "auto" runs a verify step so unless it wants logits or
+      sampling (review edit R-E6) or all its drafts fit idle lanes (``choose_verify_kind``). ``drafts_all_lanes``
+      answers like the real generator: "packed" never, "wide" always, "auto" from ``wide_min_lanes`` or
+      :func:`crossover_lanes` live lanes on;
+    * packed prefill (``settings.packed_prefill``, P5 §3.3): the rows of one call run in passes, by level (a row reading
+      the cache runs one pass after the last writer of its read-only prefix); inside a pass every row reads before any
+      row writes, so a reader packed with its writer would read stale KV;
     * inactive-lane rows are NaN logits and ``NO_TOKEN`` ids, so the bridge must never hand them to vLLM.
     """
 
@@ -252,6 +287,7 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.prefill_calls = []  # one record per prefill_forward_batch call
         self.decode_steps = []  # (active lanes, enable_trace) of every decode step (plain and spec)
         self.spec_steps = []  # one record per decode_forward_spec call
+        self.policy_calls = []  # (live lanes, acceptance, answer) of every drafts_all_lanes call
         self.warmups = []  # ("prefill"|"decode", enable_trace, page_table_width)
         self.released_lanes = []
         self.traces_released = 0
@@ -289,6 +325,25 @@ class FakeMotifGenerator(api.MotifGenerator):
     @property
     def supports_spec_decode(self) -> bool:
         return True
+
+    def drafts_all_lanes(self, live_lanes, acceptance=None):
+        """``MotifGenerator.drafts_all_lanes`` as a generator with the 64-row trace answers it (review edits R-E3,
+        R-E9): "packed" never, "wide" always, "auto" iff the live lanes reach ``settings.wide_min_lanes`` when set, else
+        ``crossover_lanes(acceptance)`` (``None`` = ``settings.spec_alpha_prior``)."""
+        live = [int(lane) for lane in live_lanes]
+        assert live and all(0 <= lane < api.NUM_LANES for lane in live), live
+        assert acceptance is None or 0.0 <= float(acceptance) <= 1.0, acceptance
+        s = self.settings
+        if not s.spec_decode or s.spec_verify == "packed":
+            answer = False
+        elif s.spec_verify == "wide":
+            answer = True
+        else:
+            alpha = s.spec_alpha_prior if acceptance is None else float(acceptance)
+            c_star = s.wide_min_lanes if s.wide_min_lanes is not None else crossover_lanes(alpha)
+            answer = len(set(live)) >= c_star
+        self.policy_calls.append((tuple(live), acceptance, answer))
+        return answer
 
     supports_device_sampling = True
 
@@ -367,22 +422,52 @@ class FakeMotifGenerator(api.MotifGenerator):
         if not self.writer_first:
             order = list(range(len(reqs)))
         written, rows, out = set(), [], [None] * len(reqs)
-        for i in order:
-            out[i], rec = self._prefill_row(reqs[i], plans[i], enable_trace, written)
-            rows.append(rec)
-        self.prefill_calls.append(dict(rows=rows, order=list(order)))
+        passes = self._packed_passes(reqs, plans) if self.settings.packed_prefill and self.writer_first else None
+        for group in passes or [[i] for i in order]:
+            reads = {i: self._prefill_read(reqs[i], plans[i], written) for i in group}  # a pass reads, then writes
+            for i in group:
+                self._prefill_write(reqs[i], plans[i], written)
+            for i in group:
+                out[i], rec = self._prefill_finish(reqs[i], plans[i], enable_trace, *reads[i])
+                rows.append(rec)
+        if passes is not None:
+            order = [i for group in passes for i in group]
+        self.prefill_calls.append(dict(rows=rows, order=list(order), passes=passes))
         return torch.stack(out)
 
-    def _prefill_row(self, req, plan, enable_trace, written):
-        s, e, bs, pt = int(req.start), req.seq_len, self.block_size, req.page_table
+    def _packed_passes(self, reqs, plans):
+        """P5's level scheduling at the fake's row granularity (docs/p5_t64/P5_T64_DESIGN.md §3.3): a row with an sp1
+        chunk runs one pass after the last writer of a block of its read-only prefix ``page_table[: w0 / bs]`` (review
+        edit R-E1's read set), every other row in the first pass. Computed here, apart from
+        ``prefill_plan.order_prefill_requests``, so a wrong read set there does not hide in the fake."""
+        bs = self.block_size
+        writer = {}
+        for i, (req, plan) in enumerate(zip(reqs, plans)):
+            for b in req.page_table[plan.read_only_blocks : api.cdiv(plan.end, bs)].tolist():
+                writer[int(b)] = i
+        deps = []
+        for j, (req, plan) in enumerate(zip(reqs, plans)):
+            prefix = req.page_table[: plan.read_only_blocks].tolist() if plan.has_sp1 else []
+            deps.append({writer[int(b)] for b in prefix if int(b) in writer} - {j})
+        passes, done = [], set()
+        while len(done) < len(reqs):
+            ready = [i for i in range(len(reqs)) if i not in done and deps[i] <= done]
+            assert ready, f"prefill rows read each other's blocks: {deps}"
+            passes.append(ready)
+            done.update(ready)
+        return passes
+
+    def _prefill_read(self, req, plan, written):
+        """What a row reads (before any row of its pass writes): the prediction, whether every chip's copy of its
+        cached prefix agreed, and whether that prefix holds blocks written earlier in this call."""
+        e, bs, pt = req.seq_len, self.block_size, req.page_table
         need = api.cdiv(e, bs)
         assert bool((pt[:need] >= 1).all()), "prompt positions on the null block"
         # Contract: the tail is zero. vLLM's rows can carry stale ids of OTHER requests' blocks there, and the
-        # bucket-padding writes below would land in them.
+        # bucket-padding writes would land in them.
         assert bool((pt[need:] == 0).all()), f"prefill page-table tail not zeroed: {pt.tolist()}"
         tokens = req.tokens.long()
-        c0, w0 = plan.c0, plan.w0
-        cached = w0 if c0 > 0 else 0  # sp1 reads the blocks below the write floor from the cache; sp0 reads nothing
+        cached = plan.w0 if plan.c0 > 0 else 0  # sp1 reads the blocks below the write floor from the cache
         seq, consistent, reads_same_call = tokens, True, False
         if cached:
             pos = torch.arange(cached)
@@ -391,26 +476,35 @@ class FakeMotifGenerator(api.MotifGenerator):
             consistent = bool((copies == copies[:1]).all())
             seq = torch.cat([copies[0], tokens[cached:]])
             reads_same_call = bool(set(blocks.tolist()) & written)
+        pred = next_token(seq, self._vocab) if consistent else wrong_token(next_token(tokens, self._vocab), self._vocab)
+        return pred, consistent, reads_same_call
+
+    def _prefill_write(self, req, plan, written):
+        """The row's KV writes: ``[w0, end)`` on every chip (never a block below ``w0``), bucket padding only inside
+        its own last block."""
+        e, bs, pt, w0 = req.seq_len, self.block_size, req.page_table, plan.w0
+        need = api.cdiv(e, bs)
         pos = torch.arange(w0, e)
-        self.kv[:, pt[pos // bs].long(), pos % bs] = tokens[w0:e]  # every chip; never a block below w0
+        self.kv[:, pt[pos // bs].long(), pos % bs] = req.tokens.long()[w0:e]
         last = plan.chunks[-1]
         pad = torch.arange(e, min(last.start + last.bucket, need * bs))
         if pad.numel():  # bucket padding: only inside the own last block (fill table -1 past it)
             self.kv[:, pt[pad // bs].long(), pad % bs] = PAD_GARBAGE
         written.update(int(b) for b in pt[w0 // bs : need].tolist())
-        pred = next_token(seq, self._vocab) if consistent else wrong_token(next_token(tokens, self._vocab), self._vocab)
-        self.prefills.append((req.lane, e, enable_trace))
+
+    def _prefill_finish(self, req, plan, enable_trace, pred, consistent, reads_same_call):
+        self.prefills.append((req.lane, req.seq_len, enable_trace))
         rec = dict(
             lane=req.lane,
-            start=s,
-            end=e,
-            c0=c0,
-            w0=w0,
+            start=int(req.start),
+            end=req.seq_len,
+            c0=plan.c0,
+            w0=plan.w0,
             paths=plan.paths,
             buckets=plan.buckets,
             consistent=consistent,
             reads_same_call=reads_same_call,
-            tokens=tokens.tolist(),
+            tokens=req.tokens.long().tolist(),
         )
         self.prefill_rows.append(rec)
         return one_hot(pred, self._vocab, torch.bfloat16), rec
@@ -444,6 +538,30 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.host_steps += 1
         return out
 
+    def _partner_lanes(self, idle_lanes, draft_lanes):
+        """Packed verify's partners (features design §3.8.2): each draft takes an idle lane (any DP row with KV-R, the
+        owner's row without); the drafts left over overflow."""
+        G, idle, partner, overflow = api.LANES_PER_GROUP, list(idle_lanes), {}, []
+        for lane in draft_lanes:
+            cands = idle if self.settings.kv_replicated else [x for x in idle if x // G == lane // G]
+            if cands:
+                partner[lane] = cands[0]
+                idle.remove(cands[0])
+            else:
+                overflow.append(lane)
+        return partner, overflow
+
+    def _verify_kind(self, overflows: bool, want_logits: bool, sampling) -> str:
+        """``choose_verify_kind`` (docs/p5_t64/P5_T64_DESIGN.md §4.5): "wide" runs every step as the 64-row step;
+        "auto" runs a verify step there iff its drafts overflow the idle lanes and it wants neither logits nor sampling
+        (review edit R-E6: such a step stays on the 32-lane trace, overflow pass included); "packed" never."""
+        mode = self.settings.spec_verify
+        if mode == "wide":
+            return "wide"
+        if mode == "auto" and overflows and not want_logits and sampling is None:
+            return "wide"
+        return "spec"
+
     def decode_forward_spec(self, batch, *, kv_cache, enable_trace, want_logits, sampling=None):
         assert kv_cache is self.handle
         assert isinstance(batch, api.SpecDecodeBatch)
@@ -459,32 +577,32 @@ class FakeMotifGenerator(api.MotifGenerator):
         V, G = self._vocab, api.LANES_PER_GROUP
         owners = torch.nonzero(batch.active).reshape(-1).tolist()
         n = {lane: int(batch.positions[lane]) for lane in owners}
-        idle = list(batch.idle_lanes)
-        partner, overflow = {}, []
-        for lane in torch.nonzero(drafted).reshape(-1).tolist():  # packed verify (features design §3.8.2)
-            cands = idle if self.settings.kv_replicated else [x for x in idle if x // G == lane // G]
-            if cands:
-                partner[lane] = cands[0]
-                idle.remove(cands[0])
-            else:
-                overflow.append(lane)
+        draft_lanes = torch.nonzero(drafted).reshape(-1).tolist()
+        partner, overflow = self._partner_lanes(batch.idle_lanes, draft_lanes)
+        kind = self._verify_kind(bool(overflow), want_logits, sampling)
+        wide = []  # T64: drafts on their owners' draft rows
+        if kind == "wide":
+            partner, overflow, wide = {}, [], draft_lanes
         argmax = torch.full((api.NUM_LANES, 2), NO_TOKEN, dtype=torch.int32)
         mtp = torch.full((api.NUM_LANES, 2), NO_TOKEN, dtype=torch.int32)
         logits = torch.full((api.NUM_LANES, V), float("nan")) if want_logits else None
         pt = batch.page_table
-        # Pass 1: call A writes the anchors, call B the packed drafts, then every row reads.
+        # Pass 1: call A writes the anchors, call B the drafts (packed: on idle partner lanes; T64: on the owners' DP
+        # rows, into the owner's group copy), then every row reads.
         for lane in owners:
             self._write(lane, pt[lane], n[lane], int(batch.tokens[lane]))
         for lane, p in partner.items():
             self._write(p, pt[lane], n[lane] + 1, int(batch.draft_tokens[lane]))
+        for lane in wide:
+            self._write(lane, pt[lane], n[lane] + 1, int(batch.draft_tokens[lane]))
         for lane in owners:
             seq = self._read(lane // G, pt[lane], n[lane]).tolist()
             a0 = next_token(seq, V)
             argmax[lane, 0], mtp[lane, 0] = a0, mtp_token(seq + [a0], V)
             if logits is not None:
                 logits[lane] = one_hot(a0, V)
-        for lane, p in partner.items():
-            seq = self._read(p // G, pt[lane], n[lane] + 1).tolist()
+        for lane, row in [*partner.items(), *((lane, lane) for lane in wide)]:
+            seq = self._read(row // G, pt[lane], n[lane] + 1).tolist()
             a1 = next_token(seq, V)
             argmax[lane, 1], mtp[lane, 1] = a1, mtp_token(seq + [a1], V)
         # Pass 2 (overflow): the remaining drafts on their own lanes at n + 1.
@@ -498,9 +616,11 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.spec_steps.append(
             dict(
                 owners=owners,
-                drafted=torch.nonzero(drafted).reshape(-1).tolist(),
+                drafted=draft_lanes,
                 partners=dict(partner),
                 overflow=list(overflow),
+                kind=kind,  # "spec" (the 32-lane trace) | "wide" (the 64-row trace)
+                idle=len(batch.idle_lanes),
                 want_logits=want_logits,
                 trace=enable_trace,
                 sampled=sampling is not None,
@@ -1141,7 +1261,7 @@ def test_class_capabilities_follow_the_import_time_environment(value):
 @pytest.fixture(scope="module")
 def motif_vllm_config(tmp_path_factory):
     """``VllmConfig`` for the real Motif-3 config, built the way ``vllm serve`` builds it on the TT platform, with
-    every feature switch OFF (draft 1).
+    every feature switch OFF (the draft-1 capabilities).
 
     ``ModelConfig`` inspects the registered class in vLLM's registry subprocess, which imports the bridge in a fresh
     interpreter (it inherits this device-hidden namespace and ``PYTHONPATH``)."""
@@ -1348,7 +1468,9 @@ def _engine_config(monkeypatch, tmp_path, caps, **engine_kwargs):
     return EngineArgs(**args).create_engine_config()
 
 
-PRODUCTION_ENGINE_ARGS = dict(  # gv.FEATURE_VLLM_ARGS: budget = threshold = 8192 - A (128, G9 per-bucket q / k)
+# gv.FEATURE_VLLM_ARGS: the opt-in MTP launch (the production default launch is the same without speculative_config);
+# budget = threshold = 8192 - A (128, G9 per-bucket q / k).
+MTP_LAUNCH_ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
     max_num_batched_tokens=8064,
     long_prefill_token_threshold=8064,
@@ -1366,7 +1488,7 @@ def test_vllm_config_keeps_the_features_the_capabilities_allow(monkeypatch, tmp_
 
     from vllm_tt_plugin.config import get_tt_spec_plan
 
-    vc = _engine_config(monkeypatch, tmp_path, CAPS_ON, **PRODUCTION_ENGINE_ARGS)
+    vc = _engine_config(monkeypatch, tmp_path, CAPS_ON, **MTP_LAUNCH_ENGINE_ARGS)
     sched, cache = vc.scheduler_config, vc.cache_config
     assert sched.enable_chunked_prefill is True and cache.enable_prefix_caching is True
     assert (sched.max_num_batched_tokens, sched.long_prefill_token_threshold) == (8064, 8064)
@@ -1404,7 +1526,8 @@ def test_vllm_config_keeps_the_features_the_capabilities_allow(monkeypatch, tmp_
 
 
 def test_vllm_config_refuses_what_the_switches_do_not_allow(monkeypatch, tmp_path):
-    """MOTIF3_*=0 is draft 1: the platform turns chunked prefill and prefix caching off and refuses speculation."""
+    """MOTIF3_*=0 declares the draft-1 capabilities: the platform turns chunked prefill and prefix caching off and
+    refuses speculation."""
     off = _engine_config(
         monkeypatch, tmp_path, CAPS_OFF, enable_chunked_prefill=True, enable_prefix_caching=True,
         max_num_batched_tokens=8128,
@@ -1873,6 +1996,7 @@ def test_default_generator_class_serves_the_default_capabilities():
         "prefill_forward_batch": ["requests", "kv_cache", "enable_trace"],
         "decode_forward": ["batch", "kv_cache", "enable_trace"],
         "decode_forward_spec": ["batch", "kv_cache", "enable_trace", "want_logits"],
+        "drafts_all_lanes": ["live_lanes", "acceptance"],  # the T64 drafting answer (generator_api default: False)
         "warmup_prefill": ["kv_cache", "enable_trace"],
         "warmup_decode": ["kv_cache", "enable_trace", "page_table_width"],
         "release_lane": ["lane"],
@@ -2951,6 +3075,469 @@ def test_real_generator_device_sampling_interface():
 
 
 # ================================================================================================================
+# 7c. Packed prefill (P5) and the 64-row verify (T64): docs/p5_t64/P5_T64_DESIGN.md §3, §4.5-§4.7, §7.1 (WP-B)
+# ================================================================================================================
+def test_fake_c_star_rule_matches_the_design_table():
+    """The fake generator's c* rule (:func:`crossover_lanes`) on the design's table (§7.1 ``test_verify_plan``, review
+    edit R-E3): 33 ("never") wherever alpha <= r - 1, where the unguarded formula gives 0, -91 or +565; 25 at alpha 0.2,
+    19 at 0.88 and 1.0 (r 1.126), 17 at r 1.0 (clamped from 16); always within [17, 33]."""
+    r = 1.126
+    for alpha in (0.0, 0.05, 0.061, r - 1 - 1e-6):
+        assert crossover_lanes(alpha, r) == api.WIDE_MIN_LANES_NEVER == 33, alpha
+    assert [crossover_lanes(a, r) for a in (0.2, 0.88, 1.0)] == [25, 19, 19]
+    assert crossover_lanes(1.0, 1.0) == 17
+    assert crossover_lanes(api.DEFAULT_SPEC_ALPHA_PRIOR) == 19  # the prior, r 1.13: what a fresh server starts from
+    for ratio in (1.0, 1.05, 1.13, 1.173, 1.3):
+        assert all(17 <= crossover_lanes(i / 200, ratio) <= 33 for i in range(201)), ratio
+
+
+def test_fake_t64_rules_match_verify_plan():
+    """The fake generator serves the bridge by the real T64 rules of ``tt/verify_plan.py`` (WP-K), once that module
+    exists: its c* is ``crossover_lanes(alpha, ratio)`` (frozen interface, §8.5) over a grid of alpha and r; its
+    ``drafts_all_lanes`` answers as ``verify_plan.drafts_all_lanes`` for every mode, live-lane count, acceptance and
+    ``wide_min_lanes``; its verify routing is ``choose_verify_kind`` on random steps (ordinary / verify, logits,
+    sampling) under ``all_split`` and ``row_split``. The bridge tests above run against these rules."""
+    if not (METAL_ROOT / "models" / "demos" / "motif3" / "tt" / "verify_plan.py").is_file():
+        pytest.skip("tt/verify_plan.py (WP-K) does not exist yet")
+    from models.demos.motif3.tt import verify_plan
+
+    for ratio in (1.0, 1.05, 1.118, 1.126, 1.13, 1.173, 1.3):
+        for i in range(201):
+            alpha = i / 200
+            assert verify_plan.crossover_lanes(alpha, ratio) == crossover_lanes(alpha, ratio), (alpha, ratio)
+    lanes = gv.LaneMap(32).slot_to_lane
+    for mode in api.SPEC_VERIFY_MODES:
+        for min_lanes in (None, 1, 8, 24, 33):
+            settings = api.GeneratorSettings(num_layers=3, spec_tokens=1, spec_verify=mode, wide_min_lanes=min_lanes)
+            gen = FakeMotifGenerator(settings, 4096)
+            for live in range(1, 33):
+                for acceptance in (None, 0.0, 0.1, 0.13, 0.2, 0.5, 0.85, 0.97, 1.0):
+                    real = verify_plan.drafts_all_lanes(
+                        lanes[:live], spec_verify=mode, ratio=FAKE_WIDE_STEP_RATIO, acceptance=acceptance,
+                        min_lanes=min_lanes, prior=settings.spec_alpha_prior,
+                    )  # fmt: skip
+                    assert gen.drafts_all_lanes(lanes[:live], acceptance) == real, (mode, min_lanes, live, acceptance)
+    rng = random.Random(5)
+    for trial in range(400):
+        kvr = trial % 2 == 0
+        active = set(rng.sample(range(32), rng.randrange(0, 33)))
+        p_draft = rng.choice((0.0, 0.3, 0.7, 1.0))
+        drafts = [rng.randrange(100, 4000) if lane in active and rng.random() < p_draft else -1 for lane in range(32)]
+        batch = api.SpecDecodeBatch(
+            tokens=torch.tensor([100 if lane in active else 0 for lane in range(32)], dtype=torch.int32),
+            positions=torch.tensor([rng.randrange(0, 900) if lane in active else -1 for lane in range(32)],
+                                   dtype=torch.int32),
+            draft_tokens=torch.tensor(drafts, dtype=torch.int32),
+            page_table=torch.zeros(32, 4, dtype=torch.int32),
+        )  # fmt: skip
+        draft_lanes = [lane for lane in range(32) if drafts[lane] >= 0]
+        for mode in api.SPEC_VERIFY_MODES:
+            settings = api.GeneratorSettings(num_layers=3, spec_tokens=1, prefix_caching=kvr, spec_verify=mode)
+            gen = FakeMotifGenerator(settings, 4096)
+            _, overflow = gen._partner_lanes(batch.idle_lanes, draft_lanes)
+            for want_logits in (False, True):
+                for sampling in (None, ([0.0] * 32, [1.0] * 32, [1] * 32, [None] * 32)):
+                    real = verify_plan.choose_verify_kind(
+                        batch, mode, want_logits, sampling, kv_mode=settings.kv_write_mode
+                    )
+                    fake = gen._verify_kind(bool(overflow), want_logits, sampling)
+                    assert fake == real, (trial, mode, kvr, want_logits, sampling is None, draft_lanes)
+
+
+def test_spec_acceptance_is_prior_smoothed():
+    """Review edit R-E3: the bridge asks the generator with alpha_hat = (accepted + 64 * prior) / (accepted + rejected +
+    64), the prior ``settings.spec_alpha_prior`` (0.85) itself before any verdict."""
+    bridge, gen = _bridge(spec_tokens=1)
+    s = bridge.spec_stats
+    assert s.verdicts == 0 and bridge.spec_acceptance() == api.DEFAULT_SPEC_ALPHA_PRIOR == 0.85
+    s.accepted, s.rejected = 30, 10
+    assert s.verdicts == 40 and s.acceptance() == api.smoothed_acceptance(30, 40)
+    assert bridge.spec_acceptance() == pytest.approx((30 + 64 * 0.85) / (40 + 64))
+    s.accepted, s.rejected = 6000, 2000  # the prior fades: about the measured 0.75
+    assert bridge.spec_acceptance() == pytest.approx(0.75, abs=0.002)
+    assert s.as_dict()["accepted"] == 6000 and "all_lane_proposals" in s.as_dict()
+    low, _ = _bridge(spec_tokens=1, spec_alpha_prior=0.5)
+    assert low.spec_acceptance() == 0.5
+
+
+ROW0_SLOTS = (0, 4, 8, 12, 16, 20, 24, 28)  # LaneMap deals slot s -> lane (s % 4) * 8 + s // 4: these fill DP row 0
+
+
+def _burst(n_live, *, kvr=True, slots=None, accepted=0, rejected=0, **features):
+    """A 32-slot speculating bridge whose ``n_live`` greedy requests were prefilled in one step (into ``slots`` when
+    given), after the ordinary first decode step. The propose call that ends that step saw ``n_live`` live rows, every
+    one a candidate (its retained step is the one just run); ``accepted`` / ``rejected`` preset the bridge's verdicts
+    (its running acceptance) before that call."""
+    bridge, gen, kv, d = _allocated_bridge(32, spec_tokens=1, prefix_caching=kvr, chunked_prefill=kvr, **features)
+    rng = random.Random(1000 + n_live)
+    rids = [f"q{i}" for i in range(n_live)]
+    for rid in rids:
+        d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(3, 24))])
+    d.prefill(rids, slots=None if slots is None else list(slots)[:n_live])
+    bridge.spec_stats.accepted, bridge.spec_stats.rejected = accepted, rejected
+    d.spec_decode()  # ordinary: nothing to verify after a prefill
+    assert gen.spec_steps[-1]["drafted"] == [] and len(d.order) == n_live
+    return bridge, gen, d
+
+
+def _idle_lane_budget(d, kvr):
+    """Drafts the idle-lane budget allows when every live row is a candidate: KV-R min(live, 32 - live); without it, per
+    DP row min(active, 8 - active)."""
+    per_row = collections.Counter(d.lane_of[r] // 8 for r in d.order)
+    n = sum(per_row.values())
+    return min(n, 32 - n) if kvr else sum(min(c, 8 - c) for c in per_row.values())
+
+
+@pytest.mark.parametrize("kvr", [True, False])
+def test_drafting_policy_follows_spec_verify_and_c_star(kvr):
+    """docs/p5_t64/P5_T64_DESIGN.md §4.7 (review edits R-E3, R-E9), one propose call per case: ``packed`` keeps the
+    idle-lane budget (KV-R: 32 - live in all; without it 8 - active per DP row); ``wide`` drafts every live lane at any
+    count; ``auto`` drafts every live lane from c* live lanes on (19 at the prior 0.85, r 1.13) and keeps the budget
+    below; a low running acceptance moves c* up (alpha_hat 0.206 -> 25) or to never (alpha_hat 0.026 <= r - 1);
+    ``MOTIF3_WIDE_MIN_LANES`` replaces c* (33 = never). The bridge asks once per proposal, with every live lane and
+    alpha_hat = smoothed_acceptance(accepted, accepted + rejected); drafts past the budget are counted."""
+    cases = [  # (spec_verify, live lanes, slots, extra settings, (accepted, rejected), every live lane drafts)
+        ("packed", 12, None, {}, (0, 0), False),
+        ("packed", 32, None, {}, (0, 0), False),
+        ("packed", 8, ROW0_SLOTS, {}, (0, 0), False),
+        ("wide", 8, ROW0_SLOTS, {}, (0, 0), True),
+        ("wide", 32, None, {}, (0, 0), True),
+        ("auto", 8, ROW0_SLOTS, {}, (0, 0), False),
+        ("auto", 18, None, {}, (0, 0), False),
+        ("auto", 19, None, {}, (0, 0), True),
+        ("auto", 32, None, {}, (0, 0), True),
+        ("auto", 24, None, {}, (0, 200), False),
+        ("auto", 25, None, {}, (0, 200), True),
+        ("auto", 32, None, {}, (0, 2000), False),
+        ("auto", 8, ROW0_SLOTS, {"wide_min_lanes": 8}, (0, 0), True),
+        ("auto", 7, ROW0_SLOTS, {"wide_min_lanes": 8}, (0, 0), False),
+        ("auto", 32, None, {"wide_min_lanes": 33}, (0, 0), False),
+    ]
+    for mode, live, slots, extra, (acc, rej), every in cases:
+        case = (mode, live, slots is not None, extra, acc, rej)
+        bridge, gen, d = _burst(live, kvr=kvr, slots=slots, accepted=acc, rejected=rej, spec_verify=mode, **extra)
+        budget = _idle_lane_budget(d, kvr)
+        assert d.offers[-1] == (live if every else budget), (case, d.offers[-1], budget)
+        alpha = api.smoothed_acceptance(acc, acc + rej)
+        lanes, asked_with, answer = gen.policy_calls[-1]
+        assert len(gen.policy_calls) == 1 and answer is every, case
+        assert sorted(lanes) == sorted(d.lane_of[r] for r in d.order) and asked_with == pytest.approx(alpha), case
+        s = bridge.spec_stats
+        assert (s.all_lane_proposals, s.drafts_beyond_budget) == ((1, live - budget) if every else (0, 0)), case
+        assert s.declined_budget == (0 if every else live - budget), case
+        if every:
+            assert set(d.drafts) == set(d.order), case
+        else:
+            assert len(d.drafts) == budget, case
+    assert [crossover_lanes(api.smoothed_acceptance(0, rejected)) for rejected in (200, 2000)] == [25, 33]
+
+
+@pytest.mark.parametrize("mode", ["auto", "packed"])
+def test_a_fresh_server_burst_drafts_from_its_first_verify(mode):
+    """Review edit R-E3: a server whose first traffic is a 32-request burst. In ``auto`` the bridge asks with the prior
+    (nothing verified yet: alpha_hat 0.85, c* 19), so every lane is offered a draft right after the first decode step
+    and the first verify runs all 32 drafts as one 64-row step (no idle lane, no overflow pass); every later step
+    verifies 32 drafts that way, losslessly, and alpha_hat follows the measured acceptance. ``packed`` (today) declines
+    every draft at c = 32 (FR §3.10 ``declined_budget``): nothing is ever verified, so alpha is never measured."""
+    features = dict(spec_tokens=1, prefix_caching=True, chunked_prefill=True, spec_verify=mode)
+    bridge, gen, kv, d = _allocated_bridge(32, **features)
+    rng = random.Random(77)
+    rids = [f"b{i}" for i in range(32)]
+    for rid in rids:
+        d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(3, 40))])
+    d.prefill(rids)
+    assert len(gen.prefill_calls) == 1 and len(gen.prefill_calls[0]["rows"]) == 32
+    d.spec_decode()  # ordinary: nothing to verify after a prefill
+    assert gen.policy_calls[0][1] == api.DEFAULT_SPEC_ALPHA_PRIOR  # the bridge's alpha_hat before any verdict
+    s = bridge.spec_stats
+    if mode == "packed":
+        assert d.offers == [0] and s.declined_budget == 32 and s.all_lane_proposals == 0
+    else:
+        assert d.offers == [32] and (s.all_lane_proposals, s.drafts_beyond_budget) == (1, 32)
+    d.spec_decode()
+    if mode == "auto":  # the first verify: 32 drafts, 0 idle lanes -> one 64-row step
+        st = gen.spec_steps[-1]
+        assert st["kind"] == "wide" and len(st["drafted"]) == 32 and st["idle"] == 0
+        assert not st["overflow"] and not st["partners"] and not st["want_logits"]
+    for _ in range(24):
+        d.spec_decode()
+    if mode == "packed":
+        assert d.stats["verify_steps"] == 0 and s.verdicts == 0 and not any(st["drafted"] for st in gen.spec_steps)
+        assert bridge.spec_acceptance() == api.DEFAULT_SPEC_ALPHA_PRIOR  # never measured
+        return
+    verifies = [st for st in gen.spec_steps if st["drafted"]]
+    assert len(verifies) == d.stats["verify_steps"] == 25 and all(st["kind"] == "wide" for st in verifies)
+    assert all(len(st["drafted"]) == 32 and not st["overflow"] for st in verifies)
+    assert s.accepted > 0 and s.rejected > 0 and s.verdicts == d.stats["draft_count1"] + d.stats["draft_count2"]
+    assert s.declined_budget == 0 and s.all_lane_proposals == s.proposals
+    assert bridge.spec_acceptance() == pytest.approx(api.smoothed_acceptance(s.accepted, s.verdicts))
+    assert bridge.spec_acceptance() != api.DEFAULT_SPEC_ALPHA_PRIOR
+
+
+def test_row_split_keeps_the_per_row_budget_below_c_star():
+    """Review edit R-E9: without KV-R (``row_split``) a draft below c* needs an idle lane of its OWNER's DP row (8 -
+    active per row), which a lane count could not express, so the bridge keeps that budget. DP row 0 full and 4 lanes
+    live on row 1 (12 < c* 19): only row 1's lanes draft, packed into row 1's idle lanes on the 32-lane trace. From c*
+    live lanes on every lane drafts, row 0's included, and the generator verifies them on their own DP rows in one
+    64-row step (T64 needs no KV-R)."""
+    bridge, gen, kv, d = _allocated_bridge(32, spec_tokens=1, spec_verify="auto")
+    assert not bridge.settings.kv_replicated and bridge.settings.kv_write_mode == "row_split"
+    rng = random.Random(31)
+    first = [f"r{i}" for i in range(12)]
+    for rid in first:
+        d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(3, 30))])
+    d.prefill(first, slots=list(ROW0_SLOTS) + [1, 5, 9, 13])
+    assert sorted(d.lane_of[r] for r in first) == list(range(12))  # row 0: lanes 0..7; row 1: lanes 8..11
+    d.spec_decode()  # ordinary; the propose that follows: 12 live < c*, per-row budget (row 0: 0, row 1: 4)
+    assert d.offers[-1] == 4 and {d.lane_of[r] for r in d.drafts} == {8, 9, 10, 11}
+    d.spec_decode()  # the verify: on the 32-lane trace, partners in row 1
+    st = gen.spec_steps[-1]
+    assert st["kind"] == "spec" and sorted(st["drafted"]) == [8, 9, 10, 11] and not st["overflow"]
+    assert all(p // 8 == 1 for p in st["partners"].values())
+    assert bridge.spec_stats.all_lane_proposals == 0 and bridge.spec_stats.declined_budget == 2 * 8
+    more = [f"s{i}" for i in range(8)]
+    for rid in more:
+        d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(3, 30))])
+    d.prefill(more)
+    d.spec_decode()  # 20 live >= c* 19: every lane is offered a draft after this step
+    assert len(d.order) == 20 and d.offers[-1] == 20 and set(d.drafts) == set(d.order)
+    d.spec_decode()
+    st = gen.spec_steps[-1]
+    assert st["kind"] == "wide" and len(st["drafted"]) == 20 and not st["overflow"] and not st["partners"]
+    assert {lane // 8 for lane in st["drafted"]} >= {0, 1}  # DP row 0 had no idle lane: T64 verifies there
+    assert bridge.spec_stats.all_lane_proposals == 2 and bridge.spec_stats.drafts_beyond_budget > 0
+
+
+@pytest.mark.parametrize("kvr", [True, False])
+@pytest.mark.parametrize("mode", ["auto", "wide"])
+def test_t64_verify_is_lossless_through_the_plugin_loop(mode, kvr):
+    """Random greedy traffic swinging between ~30 and ~10 concurrent requests through the plugin's speculative loop with
+    the 64-row verify (admissions, finishes, preemption + re-prefill, row reorders): every committed token is the fake
+    model's greedy token. ``wide``: every step is a 64-row step and every live lane drafts. ``auto``: verify steps run
+    on the 32-lane trace while every draft fits an idle lane (below c*) and as one 64-row step above it; no step ever
+    needs the overflow pass, and drafts flow past the idle-lane budget."""
+    features = dict(spec_tokens=1, prefix_caching=kvr, chunked_prefill=kvr, spec_verify=mode)
+    bridge, gen, kv, d = _allocated_bridge(32, **features)
+    rng = random.Random(97 + kvr + 2 * (mode == "wide"))
+    next_id, preempted = 0, []
+
+    def new_request():
+        nonlocal next_id
+        rid = f"w{next_id}"
+        next_id += 1
+        d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(1, 50))])
+        return rid
+
+    d.prefill([new_request() for _ in range(8)])
+    for step in range(160):
+        target = 30 if (step // 40) % 2 == 0 else 10
+        running = len(d.order)
+        if preempted and running < target and rng.random() < 0.3:
+            d.prefill([preempted.pop(0)])
+        elif running < target and rng.random() < 0.6:
+            d.prefill([new_request() for _ in range(min(target - running, rng.randrange(1, 9)))])
+        rows = list(d.order)
+        if rng.random() < 0.3:
+            rng.shuffle(rows)
+        d.spec_decode(rows)
+        if len(d.order) > 3 and (len(d.order) > target or rng.random() < 0.05):
+            d.finish(rng.choice(d.order))
+        if len(d.order) > 3 and rng.random() < 0.03:
+            victim = rng.choice(d.order)
+            d.preempt(victim)
+            preempted.append(victim)
+    steps = gen.spec_steps
+    verifies = [st for st in steps if st["drafted"]]
+    assert d.stats["verify_steps"] > 60 and d.stats["draft_count2"] > 30 and d.stats["draft_count1"] > 10, d.stats
+    assert d.remaps > 5 and d.lane_checks > 500 and not any(st["overflow"] for st in steps)
+    wide = [st for st in verifies if st["kind"] == "wide"]
+    assert wide and max(len(st["drafted"]) for st in wide) >= 25, [len(st["drafted"]) for st in wide][-10:]
+    if mode == "wide":
+        assert all(st["kind"] == "wide" for st in steps) and not any(st["partners"] for st in steps)
+    else:
+        packed = [st for st in verifies if st["kind"] == "spec"]
+        assert packed and all(st["partners"] for st in packed)
+        if kvr:  # auto takes the 64-row step only for drafts that do not fit the idle lanes
+            assert all(len(st["drafted"]) > st["idle"] for st in wide)
+    s = bridge.spec_stats
+    assert s.all_lane_proposals > 0 and s.drafts_beyond_budget > 0
+    assert s.verify_steps + s.ordinary_steps == len(steps) and s.accepted == d.stats["draft_count2"]
+
+
+def test_packed_prefill_is_invisible_to_the_bridge():
+    """P5 (docs/p5_t64/P5_T64_DESIGN.md §3; ``p5.md`` §11: no functional bridge change): with
+    ``settings.packed_prefill`` the generator runs the rows of a call in packed passes by dependency level. The bridge
+    still makes ONE ``prefill_forward_batch`` call per plugin step with every row, and the same traffic (a cold burst, a
+    same-step prefix hit, chunk continuations at unaligned starts, internal span splits) gives identical logits, tokens
+    and KV with packing off and on. The packed run puts the burst in one pass and the same-step hit's readers one pass
+    after their writer."""
+
+    def run(packed):
+        bridge, gen, kv, d = _allocated_bridge(16, chunked_prefill=True, prefix_caching=True, prefill_span_cap=256,
+                                               packed_prefill=packed)  # fmt: skip
+        assert bridge.settings.packed_prefill is packed and gen.settings.packed_prefill is packed
+        outs, forward = [], bridge.prefill_forward
+
+        def recorded(**kwargs):
+            out = forward(**kwargs)
+            outs.append(out.clone())
+            return out
+
+        bridge.prefill_forward = recorded
+        rng = random.Random(4242)
+        burst = [f"c{i}" for i in range(6)]
+        for rid in burst:
+            d.add(rid, [rng.randrange(100, 4000) for _ in range(rng.randrange(5, 60))])
+        d.prefill(burst)  # step 1: six cold rows
+        d.decode()
+        d.add("W", [rng.randrange(100, 4000) for _ in range(300)])  # cold, split 256 + 44 inside the call
+        d.add("R1", d.seqs["W"][:256] + [rng.randrange(100, 4000) for _ in range(40)])
+        d.add("R2", d.seqs["W"][:256] + [rng.randrange(100, 4000) for _ in range(70)])
+        d.add("U", [rng.randrange(100, 4000) for _ in range(90)])
+        d.add("L", [rng.randrange(100, 4000) for _ in range(500)])
+        d._grow("W", 300)
+        d.share_prefix("R1", "W", 8)  # same-step hits on W's first 8 blocks (bs 32)
+        d.share_prefix("R2", "W", 8)
+        d.prefill(["R1", "W", "R2", "U", "L"], starts=[256, 0, 256, 0, 0], ends=[296, 300, 326, 90, 250])
+        for _ in range(2):
+            d.decode()
+        d.add("N", [rng.randrange(100, 4000) for _ in range(33)])
+        d.prefill(["L", "N"], starts=[250, 0])  # L's continuation at an unaligned start
+        for _ in range(3):
+            d.decode()
+        return gen, d, outs
+
+    plain, d0, outs0 = run(False)
+    packed, d1, outs1 = run(True)
+    assert len(outs0) == len(outs1) == len(plain.prefill_calls) == len(packed.prefill_calls) == 3
+    assert all(torch.equal(a, b) for a, b in zip(outs0, outs1, strict=True))
+    assert d0.seqs == d1.seqs and torch.equal(plain.kv, packed.kv)
+    assert all(r["consistent"] for r in plain.prefill_rows + packed.prefill_rows)
+    assert all(c["passes"] is None for c in plain.prefill_calls)
+    burst_call, hit_call, cont_call = packed.prefill_calls
+    assert burst_call["passes"] == [[0, 1, 2, 3, 4, 5]]  # one pass: no row reads the cache
+    assert hit_call["passes"] == [[1, 3, 4], [0, 2]]  # W, U, L's first chunk; then the readers of W's blocks
+    assert cont_call["passes"] == [[0, 1]]  # L's continuation reads only blocks of an earlier call
+    readers = [r for r in packed.prefill_rows if r["start"] == 256]
+    assert len(readers) == 2 and all(r["reads_same_call"] and r["paths"] == ("sp1",) for r in readers)
+    assert [r["paths"] for r in packed.prefill_rows if r["end"] == 300] == [("sp0", "sp1")]  # W's internal split
+
+
+def _features_line(seen):
+    lines = [m for m in seen if m.startswith("Motif-3 features: ")]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_features_line_names_spec_verify_c_star_and_packing(fake_generator_class, motif_hf_config, monkeypatch):
+    """The ``Motif-3 features:`` line (``log_features``, logged once ``create`` returned: c* is the generator's own
+    answer, probed through ``drafts_all_lanes``): the fields the server checks grep, unchanged and first; then
+    ``spec_verify``, ``c*`` (19 at the prior 0.85 in ``auto``; ``MOTIF3_WIDE_MIN_LANES`` replaces it; 1 in ``wide``;
+    never in ``packed``; n/a without speculation) and ``packed_prefill`` with its knobs. A generator class that keeps
+    ``MotifGenerator.drafts_all_lanes``' default is flagged: its 64-row verify would never engage."""
+    import re
+
+    from vllm.config import set_current_vllm_config
+
+    monkeypatch.setenv("HF_MODEL", str(_motif_dir()))
+    for var in ("MOTIF3_KV_POOL_TOKENS", "MOTIF3_KV_MAX_GB_PER_CHIP", "MOTIF3_WEIGHTS_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    mesh = SimpleNamespace(shape=(4, 8))
+    knobs = ("MOTIF3_SPEC_VERIFY", "MOTIF3_WIDE_MIN_LANES", "MOTIF3_PACKED_PREFILL", "MOTIF3_PACKED_PREFILL_MAX_SEG",
+             "MOTIF3_PACKED_PREFILL_MAX_TOKENS", "MOTIF3_PACKED_PREFILL_PK1", "MOTIF3_PACKED_WARMUP")  # fmt: skip
+    log, create = {}, FakeMotifGenerator.create.__func__
+
+    def create_after(cls, **kwargs):  # remembers how many messages were logged before create
+        log["before_create"] = len(log["seen"])
+        return create(cls, **kwargs)
+
+    monkeypatch.setattr(FakeMotifGenerator, "create", classmethod(create_after))
+
+    def boot(spec_k=1, **env):
+        for var in knobs:
+            monkeypatch.delenv(var, raising=False)
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
+        with set_current_vllm_config(_serving_vllm_config(spec_k=spec_k)):
+            gv.MotifForCausalLM.get_max_tokens_all_users(num_devices=32, max_model_len=32768, max_num_seqs=32)
+        with loguru_messages() as seen:
+            log["seen"] = seen
+            model = gv.MotifForCausalLM.initialize_vllm_model(motif_hf_config, mesh, 32, 32768)
+        line = _features_line(seen)
+        assert seen.index(line) >= log.pop("before_create")  # logged after create
+        return model, line, seen
+
+    model, line, _ = boot(
+        MOTIF3_SPEC_VERIFY="auto", MOTIF3_PACKED_PREFILL="1", MOTIF3_PACKED_PREFILL_MAX_SEG="512",
+        MOTIF3_PACKED_PREFILL_MAX_TOKENS="4096", MOTIF3_PACKED_PREFILL_PK1="0", MOTIF3_PACKED_WARMUP="full",
+    )  # fmt: skip
+    head = ("Motif-3 features: chunked_prefill=True (budget 8064, threshold 8064) prefix_caching=True "
+            "kv_replicated=True spec_tokens=1 kv_write=all_split span_cap=None ")  # fmt: skip
+    assert line == head + (
+        "spec_verify=auto c*=19 (alpha 0.850) "
+        "packed_prefill=True (max_seg 512, max_tokens 4096, pk1 False, warmup full)"
+    ), line
+    s = model.settings
+    assert (s.spec_verify, s.packed_prefill, s.packed_prefill_max_seg, s.packed_prefill_max_tokens) == (
+        "auto", True, 512, 4096
+    )  # fmt: skip
+    assert (s.packed_prefill_pk1, s.packed_warmup, s.wide_min_lanes) == (False, "full", None)
+    assert model.all_lanes_threshold() == 19 and model.generator.settings is s
+    # what the server checks grep (test_vllm_features_e2e / test_device_sampling_e2e / the TIS runbook)
+    assert re.findall(r"Motif-3 features: chunked_prefill=\w+ \(budget (\d+), threshold (\d+)\)", line) == [
+        ("8064", "8064")
+    ]
+    for key, val in (("chunked_prefill", True), ("prefix_caching", True), ("kv_replicated", True),
+                     ("spec_tokens", 1), ("kv_write", "all_split"), ("spec_verify", "auto")):  # fmt: skip
+        assert re.search(rf"\b{key}={val}\b", line), (key, line)
+    assert re.search(r"\bc\*=(\d+|never|n/a)\b", line).group(1) == "19"
+
+    _, line, _ = boot(MOTIF3_SPEC_VERIFY="auto", MOTIF3_WIDE_MIN_LANES="24")
+    assert line == head + "spec_verify=auto c*=24 (MOTIF3_WIDE_MIN_LANES=24) packed_prefill=False", line
+    _, line, _ = boot(MOTIF3_SPEC_VERIFY="wide")
+    assert line == head + "spec_verify=wide c*=1 packed_prefill=False", line
+    _, line, _ = boot()
+    assert line == head + "spec_verify=packed c*=never packed_prefill=False", line
+    _, line, _ = boot(spec_k=None, MOTIF3_PACKED_PREFILL="1")
+    assert line == (
+        "Motif-3 features: chunked_prefill=True (budget 8064, threshold 8064) prefix_caching=True kv_replicated=True "
+        "spec_tokens=0 kv_write=all span_cap=None spec_verify=packed c*=n/a "
+        "packed_prefill=True (max_seg 1024, max_tokens 8192, pk1 True, warmup attention)"
+    ), line
+
+    class FakeNoT64Generator(FakeMotifGenerator):  # accepts "auto" but keeps the "never draft every lane" default
+        drafts_all_lanes = api.MotifGenerator.drafts_all_lanes
+
+    module = sys.modules["motif3_host_test_fake_generator"]  # the fake_generator_class fixture's module
+    monkeypatch.setattr(module, "FakeNoT64Generator", FakeNoT64Generator, raising=False)
+    monkeypatch.setenv("MOTIF3_GENERATOR_CLASS", "motif3_host_test_fake_generator:FakeNoT64Generator")
+    model, line, seen = boot(MOTIF3_SPEC_VERIFY="auto")
+    assert isinstance(model.generator, FakeNoT64Generator)
+    assert line == head + "spec_verify=auto c*=never (alpha 0.850) packed_prefill=False", line
+    assert any("never engages" in m and "FakeNoT64Generator" in m for m in seen), seen
+
+
+def test_shutdown_logs_alpha_hat_and_c_star():
+    """``release_persistent_capture`` logs the speculation counters with alpha_hat and c* at alpha_hat (the T64 policy
+    state, review edit R-E3 / §12.2 D4), and a generator whose drafting answer raises cannot keep the traces alive."""
+    bridge, gen, kv, d = _allocated_bridge(8, spec_tokens=1, prefix_caching=True, spec_verify="auto")
+    bridge.spec_stats.accepted, bridge.spec_stats.rejected = 0, 2000
+    with loguru_messages() as seen:
+        bridge.release_persistent_capture()
+    line = next(m for m in seen if m.startswith("Motif-3 speculation: "))
+    assert "'all_lane_proposals': 0" in line and line.endswith("alpha_hat=0.0264 c*=never (alpha 0.026)"), line
+    assert gen.traces_released == 1
+
+    def broken(live_lanes, acceptance=None):
+        raise RuntimeError("drafting answer failed")
+
+    gen.drafts_all_lanes = broken
+    with loguru_messages() as seen:
+        bridge.release_persistent_capture()
+    assert gen.traces_released == 2 and any("c*=? (RuntimeError" in m for m in seen), seen
+
+
+# ================================================================================================================
 # 8. Motif parser plugins (loaded exactly like --reasoning-parser-plugin / --tool-parser-plugin)
 # ================================================================================================================
 @pytest.fixture(scope="module")
@@ -3028,8 +3615,9 @@ def test_vllm_serve_cli_accepts_the_motif_flags():
 
 
 def test_vllm_serve_cli_accepts_the_feature_flags():
-    """Features design §1.1 (with the lead decision threshold = budget): ``gv.FEATURE_VLLM_ARGS`` parse in ``vllm
-    serve`` and carry the values the bridge's checks call clean."""
+    """Features design §1.1 (with the lead decision threshold = budget): ``gv.FEATURE_VLLM_ARGS``, the opt-in MTP
+    launch's flags (the production default launch drops the ``--speculative-config`` pair), parse in ``vllm serve``
+    and carry the values the bridge's checks call clean."""
     from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -3184,7 +3772,7 @@ def _shutdown(llm):
 
 def test_vllm_offline_engine_end_to_end(fake_generator_class, monkeypatch, tmp_path):
     """``vllm.LLM`` -> TTPlatform -> TTWorker -> TTScheduler / TTModelRunner -> MotifForCausalLM -> fake generator,
-    every feature switch off (draft 1).
+    every feature switch off (the draft-1 capabilities).
 
     Everything is vLLM's and the plugin's real code except opening and closing the mesh (there is no device here).
     Twelve greedy requests of different lengths on ``max_num_seqs=8`` run in several waves, so state slots are reused
@@ -3478,6 +4066,89 @@ def test_vllm_offline_engine_device_sampling(fake_generator_class, monkeypatch, 
             assert any(st["drafted"] for st in gen.spec_steps[n_spec:]), "no verify step in greedy-only traffic"
             assert bridge.sampling_stats.nongreedy_verify_rows == 0
         print("MOTIF3_DEVICE_SAMPLING_ENGINE", json.dumps({"spec": spec, **bridge.sampling_stats.as_dict()}))
+    finally:
+        _shutdown(llm)
+    assert gen.traces_released == 1
+
+
+def test_vllm_offline_engine_t64_auto_and_packed_prefill(fake_generator_class, monkeypatch, tmp_path):
+    """docs/p5_t64/P5_T64_DESIGN.md §7.1 (WP-B): the real engine on the MTP launch (chunked prefill + prefix caching +
+    the model-owned drafter) with ``MOTIF3_SPEC_VERIFY=auto`` and ``MOTIF3_PACKED_PREFILL=1`` at ``max_num_seqs=32``.
+    A 32-prompt burst, 8 of them sharing a prefix (same-step hits), is prefilled in packed passes (the readers one pass
+    after their writer). At c = 32 the bridge drafts every lane from the first verify on (the acceptance prior: c* 19),
+    vLLM's scheduler and the plugin carry 32 drafts per step, and the generator verifies them as 64-row steps; as
+    requests finish the policy falls back to the idle-lane budget and the 32-lane trace. Every greedy token is checked;
+    no step needs the overflow pass."""
+    model_dir = _motif_dir(require_tokenizer=True)
+    meshes, _ = _offline_engine_env(monkeypatch, tmp_path, CAPS_ON)
+    monkeypatch.setenv("MOTIF3_TT_CACHE_PATH", str(_mtp_cache_marker(tmp_path)))  # spec_plan finds the MTP weights
+    monkeypatch.setenv("MOTIF3_SPEC_VERIFY", "auto")
+    monkeypatch.setenv("MOTIF3_PACKED_PREFILL", "1")
+
+    from vllm import LLM, SamplingParams
+
+    tt = {"trace_mode": "decode_only", "l1_small_size": api.L1_SMALL_SIZE, "decode_interleave_prefill_steps": 1,
+          "decode_interleave_decode_steps": 1}  # fmt: skip
+    with loguru_messages() as seen:
+        llm = LLM(
+            model=str(model_dir),
+            trust_remote_code=True,
+            max_model_len=4096,
+            max_num_seqs=32,
+            block_size=64,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            speculative_config=dict(gv.SPECULATIVE_CONFIG),
+            async_scheduling=False,
+            seed=0,
+            additional_config={"tt": tt},
+        )
+    V = api.VOCAB_SIZE
+    try:
+        bridge = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        gen = bridge.generator
+        s = gen.settings
+        assert isinstance(gen, fake_generator_class) and gen.mesh_device is meshes[0]
+        assert (s.spec_verify, s.packed_prefill, s.spec_tokens, s.kv_replicated) == ("auto", True, 1, True)
+        line = _features_line(seen)
+        assert "spec_verify=auto c*=19 (alpha 0.850) packed_prefill=True (max_seg 1024" in line, line
+        rng = random.Random(64)
+
+        def rand(n):
+            return [rng.randrange(100, 200000) for _ in range(n)]
+
+        head = [1, 5, 3]
+        shared = head + rand(200)  # 3 full blocks of 64: the other 7 prompts hit them in the same step
+        prompts = [shared + rand(rng.randrange(5, 40)) for _ in range(8)]
+        prompts += [head + rand(rng.randrange(5, 120)) for _ in range(24)]
+        params = [SamplingParams(temperature=0.0, max_tokens=rng.randrange(12, 48), ignore_eos=True) for _ in prompts]
+        outs = llm.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
+        for prompt, p, out in zip(prompts, params, outs, strict=True):
+            assert list(out.outputs[0].token_ids) == greedy_continuation(prompt, p.max_tokens, V)
+        rows = gen.prefill_rows
+        assert all(r["consistent"] for r in rows) and any(r["reads_same_call"] for r in rows)
+        passes = [group for call in gen.prefill_calls for group in call["passes"]]
+        assert max(len(group) for group in passes) > 8, [len(g) for g in passes]  # the burst packs
+        hits = [c for c in gen.prefill_calls if any(r["reads_same_call"] for r in c["rows"])]
+        assert hits and all(len(c["passes"]) > 1 for c in hits)  # readers one pass after their writer
+        steps = gen.spec_steps
+        wide = [st for st in steps if st["kind"] == "wide"]
+        packed = [st for st in steps if st["kind"] == "spec" and st["drafted"]]
+        assert wide and max(len(st["drafted"]) for st in wide) == 32, [len(st["drafted"]) for st in wide]
+        assert packed and not any(st["overflow"] for st in steps)  # the 32-lane trace below c*; never an overflow
+        st = bridge.spec_stats
+        assert st.all_lane_proposals > 0 and st.drafts_beyond_budget > 0 and st.accepted > 0 and st.rejected > 0
+        assert gen.policy_calls[0][1] == pytest.approx(api.DEFAULT_SPEC_ALPHA_PRIOR)
+        summary = dict(
+            prefill_calls=len(gen.prefill_calls),
+            passes=[len(g) for g in passes],
+            wide_steps=len(wide),
+            t32_verifies=len(packed),
+            max_wide_drafts=max(len(x["drafted"]) for x in wide),
+            alpha_hat=round(bridge.spec_acceptance(), 4),
+            spec=st.as_dict(),
+        )
+        print("MOTIF3_E2E_P5_T64", json.dumps(summary))
     finally:
         _shutdown(llm)
     assert gen.traces_released == 1

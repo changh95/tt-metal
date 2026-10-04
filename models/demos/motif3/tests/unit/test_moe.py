@@ -16,6 +16,10 @@ Host (CPU only; never touches the chips)::
   stand-in tensors and collectives that hand their input back (as ``MotifCCL`` does on a size-1 axis): the caller's
   ``x`` / ``add_partial`` / taps and the result are never freed, nothing is freed twice, nothing leaks.
 * ``test_moe_host_dtype_args``: ``None`` dtype arguments mean the documented bf16 default.
+* ``test_moe_host_t64_decode_configs`` (T64, docs/p5_t64/P5_T64_DESIGN.md §4.2, R-E7): the router's per-M decode
+  configs == ``model_config.router_decode_pc(m_tiles=)``, the config each decode M selects, the exact-fp32 logits at
+  M = 32 / 64 only, the experts' M = 64 configs (gate_up 10 x 8, down 8 x 8, per_core_M 2), ``wide_decode_rows``, and
+  ``forward_decode`` refusing a row count the module was not built for before any device op.
 * ``test_moe_host_import_clean``: importing ``tt.moe`` loads no other ``models/demos`` package.
 
 Real router inputs (CPU capture, ~5 min, 270 MB; the device tests skip without it)::
@@ -51,6 +55,14 @@ token below 0.999 against the reference routes must be a route flip.
   ``fold_route_scale=False`` (fp32-faithful, PCC >= 0.999); trace capture + replay with new inputs (traced == eager
   bitwise); eager / traced latency, latency variants, a traced per-stage breakdown (floor-aware) and the effective
   expert-weight bandwidth.
+* ``test_moe_device_t64_rows[composite|exact_fp32]`` (WP-D D1; T64 verify step, 16 rows per DP row = 64 gathered
+  tokens): real layer-2 weights from the serving TT cache; every output row bitwise == the 32-lane module's row of the
+  same token on all 32 chips, routes bitwise, the 32-lane path bitwise == B0's committed module, the fp32 reference,
+  traced == eager, the static-CB end below an L1 pin, traced cost M = 64 vs 32. Run::
+
+      $S/devrun.sh -t 1500 -n moe_t64 -- python -m pytest models/demos/motif3/tests/unit/test_moe.py -s \
+          -p no:cacheprovider -k t64_rows
+
 * ``test_moe_device_prefill``: real layer-2 weights, S = 128 / 2048 real tokens and S = 4096 / 32768 (real tokens
   tiled) vs the reference (and on the device's routes), replicas identical, ``add_partial`` / ``reduce_tp=False``
   contracts (S = 128), ``prefill_polynorm="fp32"`` and ``prefill_pc=False`` (bitwise equal to the default), eager latency
@@ -528,6 +540,7 @@ def test_moe_host_size1_axis_never_frees_inputs(monkeypatch, dp1, tp1, part_dtyp
     moe.hidden = H
     moe.prefill_chunk = 128
     moe.cfg = SimpleNamespace(dp=1 if dp1 else 4)
+    moe.decode_rows = M.DECODE_ROWS  # a module built with a T64 config: 32 and 64 gathered decode rows
 
     def local_partial(f, *, polynorm, decode, taps=None, memory_config=None):
         if taps is not None:
@@ -551,15 +564,16 @@ def test_moe_host_size1_axis_never_frees_inputs(monkeypatch, dp1, tp1, part_dtyp
         assert out.dtype == (ttnn.bfloat16 if ("reduce_tp=False" not in tag) else out.dtype), (tag, out.dtype)
         return out
 
-    rows = 32 if dp1 else 8
-    x = _FakeT("x", (1, 1, rows, H))
-    for ap_dt in (ttnn.bfloat16, ttnn.float32):
-        ap = _FakeT("add_partial", (1, 1, rows, H), dtype=ap_dt)
-        check(f"decode add_partial {ap_dt}", lambda: moe.forward_decode(x, add_partial=ap), [x, ap])
-    check("decode", lambda: moe.forward_decode(x), [x])
-    check("decode reduce_tp=False", lambda: moe.forward_decode(x, reduce_tp=False), [x])
-    taps = {}
-    check("decode taps", lambda: moe.forward_decode(x, taps=taps), [x], taps)
+    # 8 lanes per DP row (32 on a size-1 DP axis); with 4 DP rows also the T64 step's 16 rows per DP row (M = 64)
+    for rows in ((32,) if dp1 else (8, 16)):
+        x = _FakeT("x", (1, 1, rows, H))
+        for ap_dt in (ttnn.bfloat16, ttnn.float32):
+            ap = _FakeT("add_partial", (1, 1, rows, H), dtype=ap_dt)
+            check(f"decode {rows} add_partial {ap_dt}", lambda: moe.forward_decode(x, add_partial=ap), [x, ap])
+        check(f"decode {rows}", lambda: moe.forward_decode(x), [x])
+        check(f"decode {rows} reduce_tp=False", lambda: moe.forward_decode(x, reduce_tp=False), [x])
+        taps = {}
+        check(f"decode {rows} taps", lambda: moe.forward_decode(x, taps=taps), [x], taps)
     for S in (128, 256):  # one chunk (x itself is the chunk) and two chunks of 128
         xp = _FakeT("x_prefill", (1, 1, S, H))
         check(f"prefill S={S}", lambda: moe.forward_prefill(xp), [xp])
@@ -579,6 +593,90 @@ def test_moe_host_dtype_args():
     assert _dtype_of(ttnn.float32) == ttnn.float32 and _dtype_of(ttnn.bfloat16) == ttnn.bfloat16
     with pytest.raises(ValueError):
         _dtype_of("int8")
+
+
+def test_moe_host_t64_decode_configs(monkeypatch):
+    """T64 (docs/p5_t64/P5_T64_DESIGN.md §4.2, T4, review edit R-E7), host side of the 64-row decode: the router's
+    per-M decode configs equal ``model_config.router_decode_pc(m_tiles=)`` (M = 32 / 64, sigmoid fused or not); the
+    config each decode-shape M selects (a replaced ``decode_pc`` runs without its fused twin; other M take the auto
+    config); the exact-fp32 logits replacement applies at M = 32 and 64 only; ``experts()`` passes the M = 64 configs
+    (gate_up 10 x 8, down 8 x 8, ``per_core_M`` 2) at decode M = 64 and the G6 ones at 32; ``wide_decode_rows``; and
+    ``forward_decode`` refuses a row count the module was not built for before any device op."""
+    import models.demos.motif3.tt.moe as M
+    from models.demos.motif3.tt.model_config import EXPERTS_DOWN_GRID_WIDE, EXPERTS_GATE_UP_GRID, MotifTTConfig
+
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert M.DECODE_ROWS == (32, 64) and M.EXACT_ROUTER_DECODE_ROWS == (32, 64)
+    stub = SimpleNamespace(n_experts=cfg.num_experts, cfg=cfg)
+    pcs = {}
+    for m in (1, 2):
+        for sig in (False, True):
+            pc = pcs[m, sig] = M.MotifRouter._decode_pc(stub, sigmoid=sig, m_tiles=m)
+            assert repr(pc) == repr(cfg.router_decode_pc(sigmoid=sig, m_tiles=m)), (m, sig)
+            assert (pc.per_core_M, pc.out_block_h, pc.out_subblock_h, pc.per_core_N) == (m, m, 1, 1), (m, sig)
+    assert repr(M.MotifRouter._decode_pc(stub)) == repr(pcs[1, False])  # the M = 32 default is unchanged
+    # the decode-shape selection (the constructor's config attributes, no device)
+    r = object.__new__(M.MotifRouter)
+    r.decode_pc, r.decode_pc_sigmoid = pcs[1, False], pcs[1, True]
+    r._decode_pc_base = r.decode_pc
+    r.decode_pcs_wide = {64: (pcs[2, False], pcs[2, True])}
+    shape = lambda m: SimpleNamespace(shape=[1, 1, m, H])  # noqa: E731
+    assert r._decode_pcs(32) == (pcs[1, False], pcs[1, True]) and r._pc(shape(32)) is pcs[1, False]
+    assert r._decode_pcs(64) == (pcs[2, False], pcs[2, True]) and r._pc(shape(64)) is pcs[2, False]
+    for m in (8, 96, 128, 2976):
+        assert r._decode_pcs(m) == (None, None) and r._pc(shape(m)) is None, m
+    other = M.MotifRouter._decode_pc(stub)
+    r.decode_pc = other  # a diagnostics config at M = 32: no fused twin (separate sigmoid), M = 64 unaffected
+    assert r._decode_pcs(32) == (other, None) and r._decode_pcs(64) == (pcs[2, False], pcs[2, True])
+    r.decode_pc = None
+    assert r._decode_pcs(32) == (None, None)
+    r.logits_fn = None
+    assert not r._use_logits_fn(shape(32)) and not r._use_logits_fn(shape(64))
+    r.logits_fn = object()
+    got = {m: r._use_logits_fn(shape(m)) for m in (32, 64, 96, 128, 4096)}
+    assert got == {32: True, 64: True, 96: False, 128: False, 4096: False}, got
+    # wide_decode_rows: the T64 step's 64 gathered rows when the config stages it, else 0
+    assert M.wide_decode_rows(cfg) == 0
+    for mesh_shape in ((4, 8), (8, 4)):
+        for mode in ("wide", "auto"):
+            c = MotifTTConfig.from_hf_config(HF_META, mesh_shape=mesh_shape, spec_tokens=1, spec_verify=mode)
+            assert M.wide_decode_rows(c) == 64, (mesh_shape, mode)
+    packed = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8), spec_tokens=1, spec_verify="packed")
+    assert M.wide_decode_rows(packed) == 0
+    with pytest.raises(ValueError, match="no MoE decode configs"):
+        M.wide_decode_rows(SimpleNamespace(dp=4, wide_rows_per_dp=24))
+    # experts(): the program configs each M selects (matmuls recorded instead of run)
+    seen = []
+    monkeypatch.setattr(M.ttnn, "repeat", lambda f, reps, **kw: SimpleNamespace(shape=list(f.shape)))
+    monkeypatch.setattr(M.ttnn, "matmul", lambda a, b, **kw: seen.append((b, kw["program_config"])) or a)
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda *a, **k: None)
+    moe = object.__new__(M.MotifMoE)
+    moe.e_loc, moe.inter, moe.hidden, moe.dram = cfg.experts_per_chip, I, H, "dram"
+    moe.gate_up_dtype, moe.down_dtype, moe.ckc_experts = None, ttnn.bfloat16, "ckc"
+    moe.w_gate_up, moe.w_down, moe.prefill_pc = "W_gate_up", "W_down", True
+    moe.polynorm_impl = moe.prefill_polynorm_impl = "horner"
+    moe.polynorm = lambda gu, **kw: gu
+    moe.pc_gate_up, moe.pc_down = cfg.experts_gate_up_pc(), cfg.experts_down_pc()
+    moe.pc_wide = {64: (cfg.experts_gate_up_pc(m_tiles=2), cfg.experts_down_pc(m_tiles=2))}  # as the constructor
+    for m, decode, want in ((32, True, (moe.pc_gate_up, moe.pc_down)), (64, True, moe.pc_wide[64]),
+                            (96, True, (None, None)), (128, False, (None, None))):  # fmt: skip
+        seen.clear()
+        M.MotifMoE.experts(moe, shape(m), polynorm="fp32", decode=decode)
+        assert [s[0] for s in seen] == ["W_gate_up", "W_down"] and tuple(s[1] for s in seen) == tuple(want), m
+    gu64, dn64 = moe.pc_wide[64]
+    grid = lambda pc: (pc.compute_with_storage_grid_size.x, pc.compute_with_storage_grid_size.y)  # noqa: E731
+    assert grid(gu64) == EXPERTS_GATE_UP_GRID and grid(dn64) == EXPERTS_DOWN_GRID_WIDE
+    assert (gu64.per_core_M, gu64.per_core_N, dn64.per_core_M, dn64.per_core_N) == (2, 1, 2, 2)
+    # forward_decode: a gathered row count the module was not built for raises before any device op
+    moe.cfg, moe.layer_idx = SimpleNamespace(dp=4), 2
+    moe.ccl = SimpleNamespace(ag_dp_rows=lambda *a, **k: pytest.fail("a device op ran before the row check"))
+    moe.decode_rows = (32,)  # built without a T64 config
+    with pytest.raises(ValueError, match="wide_rows_per_dp"):
+        moe.forward_decode(SimpleNamespace(shape=[1, 1, 16, H]))
+    moe.decode_rows = (32, 64)
+    for rows in (4, 12, 24, 32):
+        with pytest.raises(ValueError, match="gathers"):
+            moe.forward_decode(SimpleNamespace(shape=[1, 1, rows, H]))
 
 
 def test_moe_host_import_clean():
@@ -1705,6 +1803,259 @@ def test_moe_device_decode_real(mesh_device, device_params, layer):
         print(f"[moe] L{layer} expert weights {moe.expert_weight_bytes_per_chip / 1e6:.1f} MB/chip in "
               f"{sum(m['us'] for m in mm):.0f} us -> {bw:.0f} GB/s effective")
     _free(x_tt)
+    moe.deallocate()
+    assert not failures, "\n".join(failures)
+
+
+# ============================================================================================================
+# T64: the 64-row verify step (docs/p5_t64/P5_T64_DESIGN.md §4.2, T4; R-E7)
+# ============================================================================================================
+class _RaisingSource:
+    """A weight source that must never be read: the T64 tests load every tensor from the serving TT cache."""
+
+    def _fail(self, *a, **k):
+        raise AssertionError(f"the BF16 source was read: {a}")
+
+    get = get_rows = shape = available = has = keys = layer_available = _fail
+
+    def __contains__(self, name):
+        self._fail(name)
+
+
+def t64_cfg(mesh_device, **kw):
+    """The mesh's config with the T64 step staged (``spec_tokens=1``, ``spec_verify="wide"``; ``ring_gather`` "safe",
+    the default): modules built with it allocate their 64-row constants in their constructors (F3N rule R3)."""
+    from models.demos.motif3.tt.model_config import MotifTTConfig
+
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_device=mesh_device, spec_tokens=1, spec_verify="wide", **kw)
+    assert cfg.wide_rows_per_dp == 16 and cfg.dp * cfg.wide_rows_per_dp == 64 and cfg.ring_gather == "safe"
+    return cfg
+
+
+def l1_pin(mesh_device):
+    """A one-page L1 tensor allocated before any new program runs. L1 buffers are allocated top-down, so it sits at the
+    top of main L1, just below L1_SMALL (the CCL semaphores), and a program whose static circular buffers reach it fails
+    with tt-metal's "clash" error: the static-CB-end check of every new T64 program (P5_T64_DESIGN.md §0.3 item 7; the
+    method of track B's ``probe_sp1_cbend.py``). Free it at the end of the test."""
+    pin = ttnn.from_torch(torch.zeros(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                          memory_config=ttnn.L1_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device))
+    try:
+        print(f"[moe] L1 pin page at {pin.buffer_address()} B (static CBs of every program below must end under it)")
+    except Exception:  # report only
+        pass
+    return pin
+
+
+def b0_module(name: str):
+    """``tt/<name>.py`` as committed at git ``HEAD`` (B0), imported under a private name with the package context of
+    the current modules (its relative imports resolve to the current shared infra): the reference of the "32-lane path
+    bitwise unchanged" checks. Skips without git."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[5]  # tt-metal (or a snapshot of it with a .git pointer)
+    rel = f"models/demos/motif3/tt/{name}.py"
+    try:
+        src = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{rel}"], capture_output=True, text=True,
+                             check=True).stdout  # fmt: skip
+    except (OSError, subprocess.CalledProcessError) as e:
+        pytest.skip(f"git show HEAD:{rel} failed: {e}")
+    spec = importlib.util.spec_from_loader(f"models.demos.motif3.tt._b0_{name}", loader=None)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = "models.demos.motif3.tt"
+    mod.__file__ = str(root / rel)
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+def moe_from_tt_cache(mesh_device, cfg, ccl, layer: int, *, module=None, **kw):
+    """``MotifMoE`` of ``layer`` (``module``'s, default ``tt.moe``) from the serving TT cache alone (a raising source,
+    nothing written); skips when the part is not converted."""
+    from models.demos.motif3.tt.model import layer_cache_complete, read_only_cache
+
+    if module is None:
+        from models.demos.motif3.tt import moe as module
+    if not layer_cache_complete(cfg, layer):
+        pytest.skip(f"TT-cache part L{layer:02d} is not converted ({cfg.cache_dir})")
+    t0 = time.time()
+    with read_only_cache() as misses:
+        moe = module.MotifMoE(mesh_device, cfg, layer, source=_RaisingSource(), ccl=ccl, cache=True, **kw)
+    assert misses == [], f"tensors missing from the TT cache: {misses}"
+    print(f"[moe] L{layer} ({module.__name__}, {kw}) loaded from the TT cache alone in {time.time() - t0:.1f} s")
+    return moe
+
+
+def upload_rows16(x64: torch.Tensor, cfg, mesh_device, device=True):
+    """T64 rows: lane-ordered anchors ``x64[:32]`` and drafts ``x64[32:]`` -> per DP row ``[1, 1, 16, 4096]`` bf16 TILE
+    = ``[the row's 8 anchors | their 8 drafts]`` (lanes ``8 dp + j``), replicated over TP."""
+    from models.demos.motif3.tt.rope import shard_lanes
+
+    L = cfg.lanes_per_row
+    a = x64[:32].reshape(cfg.dp, L, -1)
+    d = x64[32:].reshape(cfg.dp, L, -1)
+    rows = torch.cat([a, d], dim=1).reshape(cfg.dp, 1, 2 * L, -1).bfloat16()
+    return shard_lanes(rows, cfg, mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                       device=mesh_device if device else None)
+
+
+def rows16_to_halves(t16: torch.Tensor, cfg):
+    """Per-chip T64 rows ``[R, C, ..., 16, W]`` -> ``(anchors [R, C, ..., 8, W], drafts [R, C, ..., 8, W])``."""
+    L = cfg.lanes_per_row
+    return t16[..., :L, :], t16[..., L:, :]
+
+
+def natural_to_lanes(t64: torch.Tensor, cfg) -> torch.Tensor:
+    """Gathered T64 rows in natural order (row ``16 dp + j``) ``[64, ...]`` -> ``[anchors of lanes 0..31 | drafts of
+    lanes 0..31]`` ``[64, ...]``."""
+    L = cfg.lanes_per_row
+    r = t64.reshape(cfg.dp, 2, L, *t64.shape[1:])
+    return torch.cat([r[:, 0].reshape(cfg.dp * L, *t64.shape[1:]), r[:, 1].reshape(cfg.dp * L, *t64.shape[1:])])
+
+
+@pytest.mark.parametrize("router_logits", ["composite", "exact_fp32"])
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_t64_rows(mesh_device, device_params, router_logits):
+    """WP-D (D1) module test of the T64 verify step's MoE (P5_T64_DESIGN.md §4.2, T4; review edit R-E7), real layer-2
+    weights from the serving TT cache, both router settings: 64 real router inputs as 16 rows per DP row (``[8 anchors
+    | 8 drafts]``, M = 64 gathered tokens) vs the same tokens as two 32-lane steps (anchors, drafts):
+
+    * every output row on all 32 chips **bitwise** equal to the 32-lane module's row (router per_core_M 2 + fused
+      sigmoid or the exact-fp32 kernel at M = 64, gate_up / down per_core_M 2 with down on 8 x 8, 64-row top-k pad),
+      and the same with the down projection on 8 x 4 cores (G16-lite's other grid);
+    * the gathered tokens in natural order (``16 dp + j``) and the routes (indices and weights) bitwise equal to the
+      32-lane routes of the same tokens, identical on all 32 chips; replicas identical over TP;
+    * the 32-lane path bitwise equal to B0's committed module (git ``HEAD``; output on 32 chips and routes);
+    * the output vs the fp32 reference routed output of these tokens (PCC >= 0.995);
+    * a trace of the 16-row step replayed with new inputs == the eager step bitwise;
+    * every new program's static CBs end below a one-page L1 pin (no clash error), and the traced cost of M = 64 vs
+      M = 32 (G16-lite: 1204.1 vs 1038.6 us with the composite router; informational).
+    A module built without a T64 config refuses the 16-row input (host test ``test_moe_host_t64_decode_configs``)."""
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+
+    cfg = t64_cfg(mesh_device)
+    log_fabric(mesh_device, f"moe_t64_{router_logits}")
+    print(f"[moe] {cfg.describe()}")
+    ccl = MotifCCL(mesh_device, cfg)
+    pin = l1_pin(mesh_device)
+    layer = 2
+    moe = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits)
+    assert moe.decode_rows == (32, 64) and sorted(moe.router._pads) == [32, 64], (moe.decode_rows, moe.router._pads)
+    assert (moe.router.logits_fn is not None) == (router_logits == "exact_fp32")
+    data = load_real_inputs()
+    xs = data["layers"][layer]["x"]
+    n = xs.shape[0]
+    sel = spread_tokens(n, 64)
+    x64 = xs[sel]  # 64 distinct real tokens: anchors = lanes' rows 0..31, drafts = 32..63
+    failures = []
+
+    def run(x_tt):
+        taps = {}
+        out = moe.forward_decode(x_tt, taps=taps)
+        t = device_tensors_to_torch(out, mesh_device)  # [R, C, 1, 1, L, H]
+        f_all, f_same = read_replicated(taps["f_all"], mesh_device)
+        idx, i_same = read_replicated(taps["idx"], mesh_device)
+        w, w_same = read_replicated(taps["w"], mesh_device)
+        _free([taps, out])
+        return t, f_all.reshape(-1, H).float(), idx.reshape(-1, K).long(), w.reshape(-1, K).float(), (
+            f_same and i_same and w_same)
+
+    # the 32-lane module: anchors, then drafts
+    ref32 = []
+    for half in (x64[:32], x64[32:]):
+        x_tt = upload_lanes(half, cfg, mesh_device)
+        ref32.append(run(x_tt))
+        _free(x_tt)
+    # the 32-lane path is bitwise B0's: the committed module (git HEAD) on the anchors
+    moe_b0 = moe_from_tt_cache(mesh_device, cfg, ccl, layer, module=b0_module("moe"), router_logits=router_logits)
+    x_tt = upload_lanes(x64[:32], cfg, mesh_device)
+    taps = {}
+    o = moe_b0.forward_decode(x_tt, taps=taps)
+    b0_out = device_tensors_to_torch(o, mesh_device)
+    b0_idx = read_replicated(taps["idx"], mesh_device, chips=[0])[0].reshape(-1, K).long()
+    b0_w = read_replicated(taps["w"], mesh_device, chips=[0])[0].reshape(-1, K).float()
+    _free([taps, o, x_tt])
+    moe_b0.deallocate()
+    same_b0 = bool(torch.equal(b0_out, ref32[0][0])) and bool(torch.equal(b0_idx, ref32[0][2])) and bool(
+        torch.equal(b0_w, ref32[0][3]))
+    print(f"[moe] 32-lane path ({router_logits}) bitwise == B0's committed module (output on 32 chips, routes): "
+          f"{same_b0}")
+    if not same_b0:
+        failures.append(f"{router_logits}: the 32-lane path differs from B0's module")
+    # the 16-row step (eager; compiles every M = 64 program while the L1 pin is allocated)
+    x16 = upload_rows16(x64, cfg, mesh_device)
+    t16, f64, idx64, w64, same64 = run(x16)
+    anchors, drafts = rows16_to_halves(t16, cfg)
+    rows_eq = (bool(torch.equal(anchors, ref32[0][0])), bool(torch.equal(drafts, ref32[1][0])))
+    diff = max(float((anchors.float() - ref32[0][0].float()).abs().max()),
+               float((drafts.float() - ref32[1][0].float()).abs().max()))
+    gathered_ok = bool(torch.equal(natural_to_lanes(f64, cfg), x64.bfloat16().float()))
+    routes_eq = bool(torch.equal(natural_to_lanes(idx64, cfg), torch.cat([ref32[0][2], ref32[1][2]]))) and bool(
+        torch.equal(natural_to_lanes(w64, cfg), torch.cat([ref32[0][3], ref32[1][3]])))
+    rep_tp = all(bool(torch.equal(t16[r, c], t16[r, 0])) for r in range(t16.shape[0]) for c in range(t16.shape[1]))
+    finite = bool(torch.isfinite(t16.float()).all())
+    print(f"[moe] T64 {router_logits}: output rows bitwise == 32-lane (anchors, drafts) {rows_eq} (max |diff| "
+          f"{diff:.3e}) on all 32 chips; gathered tokens in natural order exact {gathered_ok}; routes (idx, w) "
+          f"bitwise == 32-lane {routes_eq}, identical on 32 chips {same64}; replicas over TP identical {rep_tp}; "
+          f"finite {finite}")
+    if not (all(rows_eq) and gathered_ok and routes_eq and same64 and rep_tp and finite):
+        failures.append(f"{router_logits}: rows {rows_eq} (max |diff| {diff:.3e}), gathered {gathered_ok}, routes "
+                        f"{routes_eq}, replicas {same64}/{rep_tp}, finite {finite}")
+    # the down projection of M = 64 on 8 x 4 cores (G16-lite's other grid, the fallback of 8 x 8): the same rows
+    from models.demos.motif3.tt.model_config import EXPERTS_DOWN_GRID
+
+    gu64, dn64 = moe.pc_wide[64]
+    moe.pc_wide[64] = (gu64, cfg.experts_down_pc(m_tiles=2, grid=EXPERTS_DOWN_GRID))
+    try:
+        t16_84 = run(x16)[0]
+    finally:
+        moe.pc_wide[64] = (gu64, dn64)
+    same84 = bool(torch.equal(t16_84, t16))
+    print(f"[moe] T64 {router_logits}: down on 8 x 4 cores (per_core_N 4) gives the same rows bitwise: {same84}")
+    if not same84:
+        failures.append(f"{router_logits}: the 8 x 4 down grid changes the M = 64 rows")
+    # accuracy vs the fp32 reference routed output of these tokens (cached golden of all L2 tokens), lane order
+    golden = GOLDEN_DIR / f"ref_routed_L{layer:02d}_v1.pt"
+    if golden.is_file():
+        g = torch.load(golden, weights_only=True)
+        if g["n"] == n and torch.equal(g["x_sum"], xs.float().sum(0)):
+            want = g["routed"][sel]
+            rows = []
+            for half in (anchors, drafts):  # chip (dp, tp=0) holds DP row dp's 8 lanes
+                rows.append(torch.cat([half[cfg.axes.coord(dp, 0)].reshape(-1, H) for dp in range(cfg.dp)]))
+            s = stats(want, torch.cat(rows).float())
+            print(f"[moe] T64 {router_logits} vs the fp32 reference routed output (64 tokens): {fmt(s)}")
+            if s["pcc"] < 0.995:
+                failures.append(f"{router_logits}: PCC vs reference {s['pcc']:.6f} < 0.995")
+        else:
+            print(f"[moe] {golden.name} does not match the captured inputs; reference check skipped")
+    else:
+        print(f"[moe] {golden.name} missing; reference check skipped")
+    # trace: capture the 16-row step once, replay with new inputs, compare with eager (bitwise)
+    with _Capture(mesh_device) as cap:
+        out_t = moe.forward_decode(x16)
+    try:
+        for it, s0 in enumerate((1, 2)):
+            x_new = xs[spread_tokens(n - s0, 64) + s0]
+            ttnn.copy_host_to_device_tensor(upload_rows16(x_new, cfg, mesh_device, device=False), x16)
+            ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+            got_t = device_tensors_to_torch(out_t, mesh_device)
+            out_e = moe.forward_decode(x16)
+            got_e = device_tensors_to_torch(out_e, mesh_device)
+            _free(out_e)
+            exact = bool(torch.equal(got_t, got_e))
+            print(f"[moe] T64 {router_logits} trace replay {it}: traced == eager bitwise {exact}")
+            if not exact:
+                failures.append(f"{router_logits}: trace replay {it} differs from eager")
+    finally:
+        ttnn.release_trace(mesh_device, cap.tid)
+        _free(out_t)
+    # traced cost (informational; slope method): M = 64 vs M = 32
+    x32 = upload_lanes(x64[:32], cfg, mesh_device)
+    st64 = traced_stats(mesh_device, lambda: moe.forward_decode(x16), n=8, reps=5, adapt_to=16)
+    st32 = traced_stats(mesh_device, lambda: moe.forward_decode(x32), n=8, reps=5, adapt_to=16)
+    print(f"[moe] T64 {router_logits} traced: M = 64 {fmt_traced(st64)} us vs M = 32 {fmt_traced(st32)} us per call "
+          f"(G16-lite composite: 1204.1 vs 1038.6 us)")
+    _free([x32, x16, pin])
     moe.deallocate()
     assert not failures, "\n".join(failures)
 

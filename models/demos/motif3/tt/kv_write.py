@@ -77,6 +77,46 @@ costs the same; gathering in ROW_MAJOR and tilizing straight into the sharded la
 §3.12.3: own-row writes per layer, one batched remote write after the last layer, +1.35 ms) is a later optimization;
 it would live in :meth:`DecodeKVWrite.write` / :meth:`DecodeKVWrite.end_step` and requires same-row partners.
 
+**T64: the 64-row verify step** (``docs/p5_t64/P5_T64_DESIGN.md`` §4.1, §4.3, T2 / T3; ``docs/p5_t64/t64.md`` §2.4).
+``DecodeKVWrite(rows=64)`` serves the T64 step: each DP row carries 16 rows ``[8 anchors | 8 drafts]``, still one
+32-row tile row. Lane ``8 r + j`` has its anchor in row ``16 r + j`` (the last committed token at ``n``) and its draft
+in row ``16 r + 8 + j`` (at ``n + 1``, with the lane's own page-table row) (:func:`wide_rows`). Build the step with
+:meth:`KVWriteStep.wide_verify`, which is :meth:`KVWriteStep.packed_verify` with ``partner_of = {16 r + j: 16 r + 8 +
+j}``. :func:`check_wide_layout` holds the layout that the split gather and the FlashMLA groups rely on. The ops per
+layer:
+
+=====================  ==================================================================  =========================
+mode (gather)          ops per layer                                                       update calls x users
+=====================  ==================================================================  =========================
+``row_split``          per DP row ``transpose`` -> ``[1, 16, 1, 576]`` on 16 cores, call   2 x 16 (each DP row)
+                       A (anchors at ``n``), then call B (drafts at ``n + 1``)
+``all_split``          ``ccl.ag_dp_rows(kv_row, halves=2)`` -> ``[1, 1, 64, 576]``: rows   2 x 32 (bfp8),
+(``split``, default)   0..31 = the anchors in T32 lane order ``8 dp + l``, rows 32..63 =   4 x 16 (bf16, R-E8)
+                       the drafts. Per half one tile-row ``slice`` + ``transpose`` to 32
+                       cores, then call A on the anchors and call B on the drafts. Both use
+                       ONE replicated ``pt [32, W]``: a draft carries its owner's row.
+``all_split``          ``ccl.ag_dp_rows(kv_row)`` -> rows ``16 dp + j``, then per 32-row     4 x 32 (bfp8),
+(``natural``)          chunk (2 DP rows): call A, then call B                              8 x 16 (bf16)
+=====================  ==================================================================  =========================
+
+The split order is the production layout. Traced per layer with this writer (``tests/unit/test_kv_write.py``
+``test_kv_write_device_wide_cost``, 2026-10-03), it costs 58.4 us against 66.2 us for natural (T32 ``all_split``:
+41.8), and ``row_split`` costs 16.8 us (T32: 11.6). A bf16 split write (4 x 16) costs 90.3 us (T32 bf16: 62.6).
+G16-lite measured 59.0 / 66.3 / 16.9 us with an injected writer of the same op sequence (T64N §5.1). ``row`` /
+``all`` have no call B, so :func:`check_kv_write_step` refuses their T64 steps with drafts, as at 32 rows. The row
+modes have no gather and ignore ``gather``.
+
+**FlashMLA groups** (option A'', design §4.3 / T3). :meth:`DecodeKVWrite.flash_groups` returns the FlashMLA inputs
+per group of rows of this chip's DP row as ``[(row slice, cur_pos, page_table)]``. At 8 rows per DP row there is one
+group, ``(0:8, cur_pos, page_table)``, which is the unchanged T32 call. At 16 rows there are two B = 8 groups:
+``(0:8, cur_pos_a, pt_a)`` for the anchors at ``n`` and ``(8:16, cur_pos_d, pt_a)`` for the drafts at ``n + 1``.
+``pt_a`` is the anchors' ``[8, W]`` rows, and the drafts share it: a draft carries its owner's row, and an idle draft
+row is skipped (``cur_pos = -1``). The global layers run one FlashMLA call per group. The SWA layers keep the single
+B = 16 call on :attr:`DecodeKVWrite.cur_pos` / :attr:`DecodeKVWrite.page_table` (``[16]`` / ``[16, W]`` per DP row).
+At B = 16 the global layers' per-user core split differs from B = 8, while the SWA layers' does not. With the groups,
+every T64 row therefore equals the T32 row bit for bit. The group inputs are persistent and :meth:`write_step` writes
+them (F3N rule R3).
+
 **Integration** (callers; this module edits nothing else):
 
 * attention (WP2b, landed): ``MotifAttention.forward_decode(..., kv_write=w)`` calls ``w.write(kv_row, kv_cache,
@@ -89,6 +129,10 @@ it would live in :meth:`DecodeKVWrite.write` / :meth:`DecodeKVWrite.end_step` an
   (before ``warmup_decode``); per step ``kv_write.write_step(step)``; pass ``cur_pos=kv_write.cur_pos,
   page_table=kv_write.page_table, kv_write=kv_write`` to every layer and to the MTP layer, and build the ``active``
   mask from ``kv_write.cur_pos``; call ``kv_write.end_step()`` after the last layer (a no-op today).
+* T64 (WP-I I2 / WP-A A2): ``DecodeKVWrite(mesh, cfg, ccl=..., page_table_width=W, rows=64, gather="split")`` staged
+  with the T64 path, before any capture. The per-step :class:`KVWriteStep` comes from ``verify_plan.plan_wide_step``.
+  The global layers' FlashMLA runs once per entry of :meth:`DecodeKVWrite.flash_groups`, on ``q[:, rows]``, and
+  concatenates the outputs on dim 1.
 
 **Host model.** :func:`kv_write_calls` lists the update calls of a step (which chips, which users, which positions),
 :func:`apply_kv_writes_host` applies them to per-DP-row torch cache copies (what every chip of that row must hold
@@ -102,13 +146,14 @@ planning functions use torch only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
 import ttnn
 
-from .generator_api import KV_LATENT_DIM, KV_WRITE_MODES, LANES_PER_GROUP, NUM_LANES
+from .generator_api import KV_LATENT_DIM, KV_WRITE_MODES, LANES_PER_GROUP, NUM_LANES, WIDE_ROWS_PER_GROUP
 from .model_config import TILE, MotifTTConfig
 from .rope import shard_lanes
 
@@ -117,7 +162,12 @@ REPLICATED_MODES = ("all", "all_split")  # KV-R: every decode KV write lands on 
 # Users per paged_update_cache call in the KV-R modes, per KV-cache dtype (gate G12, module docstring "bf16 KV caches").
 MAX_LANES_PER_CALL = {"bfp8": 32, "bf16": 16}
 CALL_KINDS = ("A", "B")  # split modes; the non-split modes have one call kind ""
-Placement = str  # "row": dim 0 sharded over the DP rows (8 lanes each), replicated over TP; "rep": replicated
+# Row order of a T64 step's KV-R gather (module docstring "T64"): "natural" = rows 16 dp + j (ccl.ag_dp_rows),
+# "split" = the anchors of every DP row, then the drafts (ccl.ag_dp_rows(x, halves=2)). Only the KV-R modes gather.
+GATHER_ORDERS = ("natural", "split")
+# "row": dim 0 sharded over the DP rows (lanes_per_row rows each: 8, or 16 at T64), replicated over TP; "rep":
+# replicated on every chip
+Placement = str
 
 
 # ======================================================================================================================
@@ -146,6 +196,28 @@ def allows_cross_row_partners(mode: str) -> bool:
     return check_mode(mode) == "all_split"
 
 
+def check_gather(gather: str) -> str:
+    """``gather`` if it is one of :data:`GATHER_ORDERS`, else ``ValueError``."""
+    if gather not in GATHER_ORDERS:
+        raise ValueError(f"the KV-R gather order must be one of {GATHER_ORDERS}, got {gather!r}")
+    return gather
+
+
+def gathers_split(mode: str, gather: str) -> bool:
+    """The step's rows reach the update calls in split order: ``gather == "split"`` in a KV-R mode. The row modes have
+    no gather (each DP row writes its own rows), so they ignore ``gather``. ``"all"`` with ``"split"`` raises
+    ``ValueError``: the split order writes the anchors (call A) and the drafts (call B) separately, and ``all`` has no
+    call B."""
+    check_gather(gather)
+    if gather != "split" or not is_replicated(mode):
+        return False
+    if not is_split(mode):
+        raise ValueError(
+            f"the split-order gather writes anchors in call A and drafts in call B: mode {mode!r} has no call B"
+        )
+    return True
+
+
 def lanes_per_call_for(
     mode: str,
     kv_dtype_name: str = "bfp8",
@@ -153,24 +225,73 @@ def lanes_per_call_for(
     lanes: int = NUM_LANES,
     lanes_per_row: int = LANES_PER_GROUP,
     requested: Optional[int] = None,
+    gather: str = "natural",
 ) -> int:
     """Users per ``paged_update_cache`` call. Row modes: ``lanes_per_row`` (each DP row's chips write their own lanes;
     ``requested`` must be None or equal). KV-R modes: ``requested`` (a divisor of ``lanes`` up to the dtype maximum),
-    default ``min(lanes, MAX_LANES_PER_CALL[kv_dtype_name])``: 32 for bfp8, 16 for bf16."""
+    default ``min(lanes, MAX_LANES_PER_CALL[kv_dtype_name])``: 32 for bfp8, 16 for bf16. With the split-order gather
+    (:func:`gathers_split`; a T64 step) the calls take the anchors and the drafts separately: ``requested`` divides
+    ``lanes / 2``, default ``min(lanes / 2, MAX_LANES_PER_CALL)`` (T64: 32 for bfp8, 16 for bf16)."""
     if kv_dtype_name not in MAX_LANES_PER_CALL:
         raise ValueError(f"KV cache dtype must be one of {tuple(MAX_LANES_PER_CALL)}, got {kv_dtype_name!r}")
     if not is_replicated(mode):
         return _users_per_call(mode, lanes, lanes_per_row, requested)
     if lanes % lanes_per_row:
         raise ValueError(f"{lanes} lanes do not split into DP rows of {lanes_per_row}")
-    cap = min(lanes, MAX_LANES_PER_CALL[kv_dtype_name])
+    split = gathers_split(mode, gather)
+    if split and lanes_per_row % 2:
+        raise ValueError(f"the split-order gather needs an even number of rows per DP row, got {lanes_per_row}")
+    users = lanes // 2 if split else lanes
+    cap = min(users, MAX_LANES_PER_CALL[kv_dtype_name])
     n = cap if requested is None else int(requested)
-    if n < 1 or lanes % n or n > cap:
+    if n < 1 or users % n or n > cap:
+        what = f"the {users} anchors (and drafts) of a split-order step" if split else f"{lanes}"
         raise ValueError(
-            f"lanes_per_call must divide {lanes} and be <= {cap} for a {kv_dtype_name} cache (the update op's output "
+            f"lanes_per_call must divide {what} and be <= {cap} for a {kv_dtype_name} cache (the update op's output "
             f"CB is users x 18 tiles per core), got {requested}"
         )
     return n
+
+
+# ======================================================================================================================
+# T64 rows (host)
+# ======================================================================================================================
+def wide_rows(lane: int, *, lanes_per_row: int = LANES_PER_GROUP) -> Tuple[int, int]:
+    """``(anchor row, draft row)`` of owner ``lane`` in a T64 step (design §4.1). DP row ``r = lane // lanes_per_row``
+    holds ``2 * lanes_per_row`` rows, ``[anchors | drafts]``: lane ``8 r + j`` -> rows ``16 r + j`` and ``16 r + 8 +
+    j``. ``lanes_per_row``: owner lanes per DP row (8)."""
+    n = int(lanes_per_row)
+    r, j = divmod(int(lane), n)
+    a = 2 * n * r + j
+    return a, a + n
+
+
+@lru_cache(maxsize=None)
+def split_order(rows: int, rows_per_dp: int = WIDE_ROWS_PER_GROUP) -> Tuple[int, ...]:
+    """The split-order gather of a T64 step (design §4.1): the physical row of each gathered user ``u``. Users ``[0,
+    rows / 2)`` are the first halves of the DP rows in DP order (the anchors, in T32 lane order ``8 dp + l``); users
+    ``[rows / 2, rows)`` are the second halves in the same order (the drafts). ``ccl.ag_dp_rows(x, halves=2)`` (view
+    ``[1, 2, L / 2, W]``, gather dim 2 over DP) produces this order: user ``u`` of the gathered ``[1, 1, rows, W]`` is
+    physical row ``split_order(rows, L)[u]``."""
+    rows, per = int(rows), int(rows_per_dp)
+    if per < 2 or per % 2 or rows % per:
+        raise ValueError(f"the split order needs DP rows of an even number of rows dividing {rows}, got {per}")
+    half, dp = per // 2, rows // per
+    return tuple(per * r + h * half + j for h in range(2) for r in range(dp) for j in range(half))
+
+
+@lru_cache(maxsize=None)
+def _split_user_of(rows: int, rows_per_dp: int) -> Tuple[int, ...]:
+    """Inverse of :func:`split_order`: the gathered user index of each physical row."""
+    inv = [0] * int(rows)
+    for u, row in enumerate(split_order(rows, rows_per_dp)):
+        inv[row] = u
+    return tuple(inv)
+
+
+@lru_cache(maxsize=None)
+def _anchor_rows(lanes: int, lanes_per_row: int) -> Tuple[int, ...]:
+    return tuple(wide_rows(lane, lanes_per_row=lanes_per_row)[0] for lane in range(int(lanes)))
 
 
 # ======================================================================================================================
@@ -197,8 +318,9 @@ class KVWriteStep:
         call_b: ``bool [B]``: lanes written by call B (packed-verify partners). Everything else is call A.
         owner: ``int32 [B]``: the owner lane of each call-B lane, ``-1`` on every other lane.
 
-    Construct with :meth:`inactive`, :meth:`ordinary`, :meth:`packed_verify` or :meth:`overflow_pass`.
-    :func:`check_kv_write_step` validates a step against a mode.
+    Construct with :meth:`inactive`, :meth:`ordinary`, :meth:`packed_verify` or :meth:`overflow_pass`; a T64 step
+    (``2 x`` the lanes, module docstring "T64") with :meth:`wide_verify`. :func:`check_kv_write_step` validates a step
+    against a mode (and :func:`check_wide_layout` a T64 step's layout).
     """
 
     positions: torch.Tensor
@@ -290,6 +412,60 @@ class KVWriteStep:
                 raise ValueError(f"overflow lane {l} is inactive")
             pos[l] = anchors[l] + 1
         return cls.ordinary(pos, page_table)
+
+    @classmethod
+    def wide_verify(
+        cls,
+        positions: torch.Tensor,
+        page_table: torch.Tensor,
+        has_draft: Optional[torch.Tensor] = None,
+        *,
+        lanes_per_row: int = LANES_PER_GROUP,
+    ) -> "KVWriteStep":
+        """A T64 step (design §4.1, §4.5; module docstring "T64") from an OWNER-lane-order batch: ``positions [B]``
+        (anchors at ``n``, ``-1`` = idle), ``page_table [B, W]`` and ``has_draft [B]`` (bool; None = no drafts, the
+        ``wide`` mode's ordinary step). Returns ``2 B`` physical rows, per DP row ``[anchors | drafts]``
+        (:func:`wide_rows`). Each lane's anchor sits in its anchor row (call A). A drafted lane's draft is written at
+        ``n + 1`` in its draft row, with the lane's page-table row (call B). Draft rows of idle or undrafted lanes are
+        idle. This is :meth:`packed_verify` on the physical rows with ``partner_of = {16 r + j: 16 r + 8 + j}``.
+        ``lanes_per_row``: owner lanes per DP row (8). Inputs are not modified."""
+        pos = torch.as_tensor(positions).to(torch.int32).reshape(-1)
+        pt = torch.as_tensor(page_table).to(torch.int32)
+        B, n = int(pos.shape[0]), int(lanes_per_row)
+        if n < 1 or B % n:
+            raise ValueError(f"{B} lanes do not split into DP rows of {lanes_per_row}")
+        if pt.ndim != 2 or int(pt.shape[0]) != B:
+            raise ValueError(f"page_table must be [{B}, W], got {tuple(pt.shape)}")
+        if has_draft is None:
+            draft_l = [False] * B
+        else:
+            draft = torch.as_tensor(has_draft).reshape(-1).to(torch.bool)
+            if int(draft.shape[0]) != B:
+                raise ValueError(f"has_draft has {int(draft.shape[0])} lanes, positions {B}")
+            draft_l = draft.tolist()
+        pos_l = pos.tolist()
+        bad = [lane for lane in range(B) if draft_l[lane] and pos_l[lane] < 0]
+        if bad:
+            raise ValueError(f"a draft on an inactive lane (has_draft where positions == -1): lanes {bad}")
+        # = packed_verify(pos2, pt2, {anchor row: draft row}) on the physical rows, built from lists and one concat (it
+        # runs every T64 step; tests/unit/test_kv_write.py checks the equality)
+        anchor_l = _anchor_rows(B, n)
+        pos2, cb2, ow2 = [-1] * (2 * B), [False] * (2 * B), [-1] * (2 * B)
+        for lane in range(B):
+            ra = anchor_l[lane]
+            pos2[ra] = pos_l[lane]
+            if draft_l[lane]:
+                pos2[ra + n], cb2[ra + n], ow2[ra + n] = pos_l[lane] + 1, True, ra
+        Wd = int(pt.shape[1])
+        pt_rows = pt.reshape(B // n, n, Wd)  # per DP row: the anchors' rows, then the drafts' (zero without a draft)
+        keep = torch.tensor(draft_l, dtype=torch.int32).reshape(B // n, n, 1)
+        pt2 = torch.cat([pt_rows, pt_rows * keep], dim=1).reshape(2 * B, Wd)
+        return cls(
+            positions=torch.tensor(pos2, dtype=torch.int32),
+            page_table=pt2,
+            call_b=torch.tensor(cb2, dtype=torch.bool),
+            owner=torch.tensor(ow2, dtype=torch.int32),
+        )
 
     # ---- views -------------------------------------------------------------------------------------------------
     @property
@@ -385,9 +561,13 @@ class KVWriteCall:
     positions: torch.Tensor
 
 
-def _users_per_call(mode: str, lanes: int, lanes_per_row: int, lanes_per_call: Optional[int]) -> int:
+def _users_per_call(
+    mode: str, lanes: int, lanes_per_row: int, lanes_per_call: Optional[int], split: bool = False
+) -> int:
     """Users per update call of the host plan: ``lanes_per_row`` in the row modes, ``lanes_per_call`` (default all
-    lanes; any divisor) in the KV-R modes. The dtype cap is a device limit (:func:`lanes_per_call_for`)."""
+    lanes; any divisor) in the KV-R modes; with the split-order gather (``split``) a divisor of ``lanes / 2`` (default
+    ``lanes / 2``: the anchors and the drafts never share a call). The dtype cap is a device limit
+    (:func:`lanes_per_call_for`)."""
     check_mode(mode)
     if lanes % lanes_per_row:
         raise ValueError(f"{lanes} lanes do not split into DP rows of {lanes_per_row}")
@@ -397,10 +577,43 @@ def _users_per_call(mode: str, lanes: int, lanes_per_row: int, lanes_per_call: O
                 f"mode {mode!r} writes {lanes_per_row} lanes per call, got lanes_per_call={lanes_per_call}"
             )
         return lanes_per_row
-    n = lanes if lanes_per_call is None else int(lanes_per_call)
-    if n < 1 or lanes % n:
-        raise ValueError(f"lanes_per_call must divide {lanes}, got {lanes_per_call}")
+    if split and lanes_per_row % 2:
+        raise ValueError(f"the split-order gather needs an even number of rows per DP row, got {lanes_per_row}")
+    users = lanes // 2 if split else lanes
+    n = users if lanes_per_call is None else int(lanes_per_call)
+    if n < 1 or users % n:
+        raise ValueError(f"lanes_per_call must divide {users}, got {lanes_per_call}")
     return n
+
+
+def check_wide_layout(step: KVWriteStep, *, lanes_per_row: int = WIDE_ROWS_PER_GROUP) -> None:
+    """Raise ``ValueError`` unless ``step`` has the T64 row layout of :meth:`KVWriteStep.wide_verify` (module docstring
+    "T64"). Each DP row of ``lanes_per_row`` rows (16) holds its anchors in the first half; they are never call-B
+    rows. Each row of the second half (slot ``half + j``) is idle, or the call-B draft of the anchor in slot ``j`` of
+    the same DP row.
+
+    The split-order gather (anchor calls A, draft calls B, one shared page table) and the FlashMLA groups of
+    :meth:`DecodeKVWrite.flash_groups` (the drafts read the anchors' ``[8, W]`` table) rely on this layout.
+    :func:`check_kv_write_step` checks the rest: positions ``n + 1``, the owner's page-table row, races."""
+    B, per = step.lanes, int(lanes_per_row)
+    if per < 2 or per % 2 or B % per:
+        raise ValueError(f"a T64 step needs DP rows of an even number of rows dividing {B}, got {lanes_per_row}")
+    half = per // 2
+    pos_l, cb_l, ow_l = step.positions.tolist(), step.call_b.tolist(), step.owner.tolist()
+    for row in range(B):
+        r, j = divmod(row, per)
+        if j < half:
+            if cb_l[row]:
+                raise ValueError(
+                    f"row {row} (DP row {r}, anchor slot {j}) is a call-B (draft) row: T64 drafts sit in slots "
+                    f"{half}..{per - 1} of their DP row"
+                )
+        elif pos_l[row] >= 0 and not (cb_l[row] and ow_l[row] == row - half):
+            raise ValueError(
+                f"row {row} (DP row {r}, draft slot {j}) must be idle or the call-B draft of anchor row {row - half} "
+                f"(the T64 layout of KVWriteStep.wide_verify); got position {pos_l[row]}, call B {bool(cb_l[row])}, "
+                f"owner {ow_l[row]}"
+            )
 
 
 def kv_write_calls(
@@ -409,17 +622,27 @@ def kv_write_calls(
     *,
     lanes_per_call: Optional[int] = None,
     lanes_per_row: int = LANES_PER_GROUP,
+    gather: str = "natural",
 ) -> List[KVWriteCall]:
     """The update calls of ``step`` under ``mode``, in device order. Row modes: per DP row, call A (then B); its chips
     write that row's lanes. KV-R modes: per chunk of ``lanes_per_call`` lanes (default all), call A (then B), on every
-    chip."""
+    chip. KV-R with the split-order gather (``gather="split"``, a T64 step; :func:`gathers_split`): the anchor users
+    (:func:`split_order`), per chunk of ``lanes_per_call`` (default all of them), each in one call A; then the draft
+    users the same way in calls B. ``lanes`` of each call are physical row ids, in user (core) order."""
     B = step.lanes
-    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call)
+    split_g = gathers_split(mode, gather)
+    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call, split=split_g)
     kinds = CALL_KINDS if is_split(mode) else ("",)
     pos = {k: step.call_positions(k) for k in kinds}
     dp = B // lanes_per_row
     calls = []
-    if is_replicated(mode):
+    if split_g:
+        order, half = split_order(B, lanes_per_row), B // 2
+        for kind, base in (("A", 0), ("B", half)):
+            for c in range(half // n):
+                lanes = order[base + c * n : base + (c + 1) * n]
+                calls.append(KVWriteCall(kind, tuple(range(dp)), lanes, pos[kind][list(lanes)].clone()))
+    elif is_replicated(mode):
         for c in range(B // n):
             lanes = tuple(range(c * n, (c + 1) * n))
             for k in kinds:
@@ -440,6 +663,7 @@ def check_kv_write_step(
     max_seq_len: Optional[int] = None,
     lanes_per_call: Optional[int] = None,
     lanes_per_row: int = LANES_PER_GROUP,
+    gather: str = "natural",
 ) -> None:
     """Raise ``ValueError`` unless ``step`` is a safe step for ``mode``:
 
@@ -451,6 +675,9 @@ def check_kv_write_step(
     * no two lanes write the same ``(block, row)`` slot in the step;
     * within one update call (:func:`kv_write_calls`) no block id is written twice. Two rows of one request therefore
       never share a call, and no two users of a call read-modify-write the same tile (the race of gate G12).
+
+    With the split-order gather (``gather="split"`` in a KV-R mode, a T64 step) the step must also have the T64 layout
+    (:func:`check_wide_layout`): the anchor halves get calls A only and the draft halves calls B only.
     """
     check_mode(mode)
     bs = int(block_size)
@@ -458,7 +685,11 @@ def check_kv_write_step(
     B, Wd = step.lanes, step.width
     if B % lanes_per_row:
         raise ValueError(f"{B} lanes do not split into DP rows of {lanes_per_row}")
-    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call)
+    split_g = gathers_split(mode, gather)
+    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call, split=split_g)
+    if split_g:
+        check_wide_layout(step, lanes_per_row=lanes_per_row)
+    user_l = _split_user_of(B, lanes_per_row) if split_g else None
     # 32-lane vectors as Python lists: a few us, where a torch op on them costs 3-5 us each (this runs every step)
     pos_l, cb_l, ow_l = pos.tolist(), call_b.tolist(), owner.tolist()
     act_l = [p >= 0 for p in pos_l]
@@ -494,9 +725,12 @@ def check_kv_write_step(
             o = ow_l[d]
             ok = act_l[d] and 0 <= o < B and o != d and not cb_l[o] and act_l[o] and o not in seen
             ok = ok and pos_l[d] == pos_l[o] + 1 and (cross or d // lanes_per_row == o // lanes_per_row)
-            if not ok or not torch.equal(pt[d], pt[o]):
+            if not ok:
                 _raise_partner_error(step, mode, act_l, lanes_per_row)
             seen.add(o)
+        # every partner carries its owner's page-table row: one comparison for all of them (a T64 step has up to 32)
+        if not torch.equal(pt[partners], pt[[ow_l[d] for d in partners]]):
+            _raise_partner_error(step, mode, act_l, lanes_per_row)
     # ---- slots and calls ---------------------------------------------------------------------------------------
     split = is_split(mode)
     slots, calls = {}, {}
@@ -507,8 +741,12 @@ def check_kv_write_step(
         if s_key in slots:
             raise ValueError(f"lanes {slots[s_key]} and {l} both write block {s_key[0]} row {s_key[1]} in one step")
         slots[s_key] = l
-        # the lane's update call (DP row in the row modes, lane chunk in the KV-R modes; call A / B): one block once
-        c_key = (l // n, bool(cb_l[l]) and split, blocks_l[l])
+        # the lane's update call (DP row in the row modes, lane chunk in the KV-R modes; call A / B; with the split
+        # gather the chunk of its gathered user, whose half names the kind): one block once
+        if user_l is not None:
+            c_key = (user_l[l] // n, user_l[l] >= B // 2, blocks_l[l])
+        else:
+            c_key = (l // n, bool(cb_l[l]) and split, blocks_l[l])
         if c_key in calls:
             kind = ("B" if c_key[1] else "A") if split else "(single)"
             rows = (l // lanes_per_row,) if not is_replicated(mode) else tuple(range(B // lanes_per_row))
@@ -557,11 +795,13 @@ def apply_kv_writes_host(
     block_size: int,
     lanes_per_call: Optional[int] = None,
     lanes_per_row: int = LANES_PER_GROUP,
+    gather: str = "natural",
 ) -> List[torch.Tensor]:
     """Host model of one layer's write: ``caches`` = the cache copy ``[N, 1, bs, D]`` of each DP row (one tensor =
     every row starts from it), ``rows [B, D]`` = each lane's latent row (``kv_row``, already representable in the
-    cache dtype for an exact comparison). Returns the new copy of every DP row (inputs untouched): what every chip of
-    that row holds after :meth:`DecodeKVWrite.write`."""
+    cache dtype for an exact comparison; a T64 step: per physical row, ``[anchors | drafts]`` per DP row). Returns the
+    new copy of every DP row (inputs untouched): what every chip of that row holds after :meth:`DecodeKVWrite.write`.
+    ``gather``: the KV-R gather order of the calls (:func:`kv_write_calls`)."""
     B = step.lanes
     dp = B // lanes_per_row
     if isinstance(caches, torch.Tensor):
@@ -573,7 +813,8 @@ def apply_kv_writes_host(
     if tuple(rows.shape[:1]) != (B,):
         raise ValueError(f"rows must be [{B}, D], got {tuple(rows.shape)}")
     bs = int(block_size)
-    for call in kv_write_calls(step, mode, lanes_per_call=lanes_per_call, lanes_per_row=lanes_per_row):
+    calls = kv_write_calls(step, mode, lanes_per_call=lanes_per_call, lanes_per_row=lanes_per_row, gather=gather)
+    for call in calls:
         for l, p in zip(call.lanes, call.positions.tolist()):
             if p < 0:
                 continue
@@ -589,19 +830,29 @@ def kv_write_inputs_host(
     *,
     lanes_per_call: Optional[int] = None,
     lanes_per_row: int = LANES_PER_GROUP,
+    gather: str = "natural",
+    wide: bool = False,
 ) -> Dict[str, Tuple[Placement, torch.Tensor]]:
     """Values of every persistent device input of :class:`DecodeKVWrite` for ``step``: ``{name: (placement,
     int32 tensor)}``. ``"row"`` tensors are lane ordered (``[B]`` / ``[B, W]``; DP row ``r`` receives lanes ``8 r ..
-    8 r + 7``), ``"rep"`` tensors are replicated on every chip.
+    8 r + 7``, or rows ``16 r .. 16 r + 15`` of a T64 step), ``"rep"`` tensors are replicated on every chip.
 
     * always ``cur_pos`` (``positions``) and ``page_table`` (rows of inactive lanes zeroed), per row: FlashMLA and the
       ``row`` update;
     * ``row_split``: ``cur_a`` / ``cur_b`` (per row);
     * KV-R, per chunk ``c`` of ``lanes_per_call`` lanes: ``cur{c}`` (``all``) or ``cur_a{c}`` / ``cur_b{c}``
-      (``all_split``), and ``pt{c}`` (``[n, W]``), replicated.
+      (``all_split``), and ``pt{c}`` (``[n, W]``), replicated;
+    * KV-R with the split-order gather (a T64 step that passed :func:`check_kv_write_step` with ``gather="split"``),
+      per chunk ``c`` of ``lanes_per_call`` lanes (owner lane order): ``cur_a{c}`` = the anchors' call-A positions,
+      ``cur_b{c}`` = the drafts' call-B positions, and ONE ``pt{c}`` = the anchors' rows, shared by both calls (a draft
+      carries its owner's row), replicated;
+    * ``wide`` (a T64 step, ``lanes_per_row`` = 16): the FlashMLA groups of option A'' per row, in owner lane order:
+      ``flash_cur_a`` (the anchors' positions), ``flash_cur_d`` (the drafts' positions, ``-1`` = none) and
+      ``flash_pt`` (the anchors' page-table rows, shared by both groups).
     """
     B = step.lanes
-    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call)
+    split_g = gathers_split(mode, gather)
+    n = _users_per_call(mode, B, lanes_per_row, lanes_per_call, split=split_g)
     act = step.active
     pos = step.positions.to(torch.int32)
     pt = torch.where(act[:, None], step.page_table, torch.zeros_like(step.page_table)).to(torch.int32)
@@ -609,6 +860,15 @@ def kv_write_inputs_host(
     if mode == "row_split":
         out["cur_a"] = ("row", step.call_positions("A"))
         out["cur_b"] = ("row", step.call_positions("B"))
+    elif split_g:
+        order, half = split_order(B, lanes_per_row), B // 2
+        ca, cb = step.call_positions("A"), step.call_positions("B")
+        for c in range(half // n):
+            ua = list(order[c * n : (c + 1) * n])
+            ub = list(order[half + c * n : half + (c + 1) * n])
+            out[f"cur_a{c}"] = ("rep", ca[ua].clone())
+            out[f"cur_b{c}"] = ("rep", cb[ub].clone())
+            out[f"pt{c}"] = ("rep", pt[ua].clone())
     elif is_replicated(mode):
         for c in range(B // n):
             sl = slice(c * n, (c + 1) * n)
@@ -618,6 +878,15 @@ def kv_write_inputs_host(
                 out[f"cur_a{c}"] = ("rep", step.call_positions("A")[sl].clone())
                 out[f"cur_b{c}"] = ("rep", step.call_positions("B")[sl].clone())
             out[f"pt{c}"] = ("rep", pt[sl].clone())
+    if wide:
+        if lanes_per_row % 2:
+            raise ValueError(f"a T64 step needs an even number of rows per DP row, got {lanes_per_row}")
+        half = lanes_per_row // 2
+        a_rows = [r * lanes_per_row + j for r in range(B // lanes_per_row) for j in range(half)]
+        d_rows = [x + half for x in a_rows]
+        out["flash_cur_a"] = ("row", pos[a_rows].clone())
+        out["flash_cur_d"] = ("row", pos[d_rows].clone())
+        out["flash_pt"] = ("row", pt[a_rows].clone())
     return out
 
 
@@ -643,15 +912,23 @@ class DecodeKVWrite:
     Args:
         mesh_device: the opened mesh.
         cfg: ``MotifTTConfig`` of the mesh (lanes, DP rows, block size, KV dtype, ``kv_write_mode``).
-        ccl: the model's ``MotifCCL`` (``ag_dp_rows`` for KV-R; semaphores in L1_SMALL).
+        ccl: the model's ``MotifCCL`` (``ag_dp_rows`` for KV-R, ``ag_dp_rows(x, halves=2)`` for the T64 split order;
+            semaphores in L1_SMALL).
         page_table_width: ``W`` of the decode trace (fixed for its life, like the generator's decode inputs).
         mode: one of :data:`generator_api.KV_WRITE_MODES`; default ``cfg.kv_write_mode``.
         lanes_per_call: KV-R users per update call (default :func:`lanes_per_call_for`: 32 for bfp8, 16 for bf16).
+        rows: decode rows of the step: ``cfg.max_batch`` (32, default: the T32 step, 8 rows per DP row) or ``2 *
+            cfg.max_batch`` (64: the T64 verify step, 16 rows per DP row ``[8 anchors | 8 drafts]``; module docstring
+            "T64").
+        gather: the KV-R gather order of a T64 step (:data:`GATHER_ORDERS`): ``"split"`` (default with ``rows=64``
+            in ``all_split``) or ``"natural"``. The row modes have no gather (each DP row writes its own rows) and
+            ignore it; the T32 step has only ``"natural"``.
 
-    Persistent device inputs (int32 ROW_MAJOR DRAM; rewritten by :meth:`write_step`): ``cur_pos [8]`` and
-    ``page_table [8, W]`` per DP row (FlashMLA's inputs; also the ``row`` update's), plus the mode's call inputs
-    (:func:`kv_write_inputs_host`). Never write them directly: :meth:`write_step` skips inputs whose values did not
-    change since its last write.
+    Persistent device inputs (int32 ROW_MAJOR DRAM; rewritten by :meth:`write_step`): ``cur_pos [L]`` and
+    ``page_table [L, W]`` per DP row (``L`` = :attr:`lanes_per_row`: 8, or 16 at T64; FlashMLA's inputs, also the
+    ``row`` update's), the mode's call inputs (:func:`kv_write_inputs_host`), and at T64 the FlashMLA group inputs
+    ``flash_cur_a [8]`` / ``flash_cur_d [8]`` / ``flash_pt [8, W]`` per DP row (:meth:`flash_groups`). Never write
+    them directly: :meth:`write_step` skips inputs whose values did not change since its last write.
     """
 
     def __init__(
@@ -663,20 +940,41 @@ class DecodeKVWrite:
         page_table_width: int,
         mode: Optional[str] = None,
         lanes_per_call: Optional[int] = None,
+        rows: Optional[int] = None,
+        gather: Optional[str] = None,
     ):
         self.mode = check_mode(cfg.kv_write_mode if mode is None else mode)
         self.mesh_device = mesh_device
         self.cfg = cfg
         self.ccl = ccl
-        self.lanes = int(cfg.max_batch)
-        self.lanes_per_row = int(cfg.lanes_per_row)
+        lanes = int(cfg.max_batch)
+        self.lanes = lanes if rows is None else int(rows)
+        if self.lanes not in (lanes, 2 * lanes):
+            raise ValueError(
+                f"rows must be {lanes} (the T32 step) or {2 * lanes} (the T64 step: per DP row 8 anchors + 8 drafts), "
+                f"got {rows}"
+            )
+        self.wide = self.lanes == 2 * lanes
+        self.lanes_per_row = int(cfg.lanes_per_row) * (2 if self.wide else 1)
         self.block_size = int(cfg.kv_block_size)
         self.width = int(page_table_width)
         if self.width < 1:
             raise ValueError(f"page_table_width must be >= 1, got {page_table_width}")
+        if gather is None:
+            gather = "split" if (self.wide and self.replicated and self.split) else "natural"
+        check_gather(gather)
+        if gather == "split" and not self.wide:
+            raise ValueError("the split-order gather orders a T64 step's [anchors | drafts] halves: it needs rows=64")
+        self.gather = gather if self.replicated else "natural"  # the row modes have no gather
+        gathers_split(self.mode, self.gather)  # "all" + "split" raises
         self.kv_dtype_name = cfg.dtypes.kv_cache_name
         self.lanes_per_call = lanes_per_call_for(
-            self.mode, self.kv_dtype_name, lanes=self.lanes, lanes_per_row=self.lanes_per_row, requested=lanes_per_call
+            self.mode,
+            self.kv_dtype_name,
+            lanes=self.lanes,
+            lanes_per_row=self.lanes_per_row,
+            requested=lanes_per_call,
+            gather=self.gather,
         )
         grid = mesh_device.compute_with_storage_grid_size()
         self.row_mc = update_input_memory_config(self.lanes_per_row, grid)
@@ -692,18 +990,39 @@ class DecodeKVWrite:
         self._bind_inputs()
 
     def _bind_inputs(self) -> None:
-        """Name the persistent inputs: FlashMLA's ``cur_pos`` / ``page_table`` and, per lane chunk, the update calls
-        ``[(update index tensor, page table tensor), ...]`` in device order (call A, then call B)."""
-        self.cur_pos = self._dev["cur_pos"]
-        self.page_table = self._dev["page_table"]
+        """Name the persistent inputs: FlashMLA's ``cur_pos`` / ``page_table`` and its groups (:meth:`flash_groups`),
+        and the update-call plan: per chunk of gathered users ``(lo, hi, [(update index tensor, page table tensor),
+        ...])`` in device order (call A, then call B; the split order has the anchor chunks' calls A, then the draft
+        chunks' calls B). The row modes have one entry (this DP row's rows)."""
+        d = self._dev
+        self.cur_pos = d["cur_pos"]
+        self.page_table = d["page_table"]
+        L, n = self.lanes_per_row, self.lanes_per_call
         if self.mode == "row":
-            calls = [[(self.cur_pos, self.page_table)]]
+            plan = [(0, L, [(self.cur_pos, self.page_table)])]
         elif self.mode == "row_split":
-            calls = [[(self._dev["cur_a"], self.page_table), (self._dev["cur_b"], self.page_table)]]
+            plan = [(0, L, [(d["cur_a"], self.page_table), (d["cur_b"], self.page_table)])]
+        elif self.gather == "split":  # the anchor chunks (calls A), then the draft chunks (calls B), one pt{c} each
+            half = self.lanes // 2
+            plan = [
+                (base + c * n, base + (c + 1) * n, [(d[f"{nm}{c}"], d[f"pt{c}"])])
+                for base, nm in ((0, "cur_a"), (half, "cur_b"))
+                for c in range(self.num_chunks)
+            ]
         else:
             names = ("cur",) if self.mode == "all" else ("cur_a", "cur_b")
-            calls = [[(self._dev[f"{nm}{c}"], self._dev[f"pt{c}"]) for nm in names] for c in range(self.num_chunks)]
-        self._calls = calls
+            plan = [
+                (c * n, (c + 1) * n, [(d[f"{nm}{c}"], d[f"pt{c}"]) for nm in names]) for c in range(self.num_chunks)
+            ]
+        self._plan = plan
+        if self.wide:  # option A'': anchors at n, drafts at n + 1, both on the anchors' [8, W] rows
+            h = L // 2
+            self._flash = [
+                (slice(0, h), d["flash_cur_a"], d["flash_pt"]),
+                (slice(h, L), d["flash_cur_d"], d["flash_pt"]),
+            ]
+        else:
+            self._flash = [(slice(0, L), self.cur_pos, self.page_table)]
 
     # ---- properties ------------------------------------------------------------------------------------------
     @property
@@ -721,18 +1040,33 @@ class DecodeKVWrite:
 
     @property
     def num_chunks(self) -> int:
-        """KV-R lane chunks (one per ``lanes_per_call`` lanes); 1 in the row modes (per-row tensors)."""
-        return self.lanes // self.lanes_per_call if self.replicated else 1
+        """KV-R lane chunks (one per ``lanes_per_call`` lanes, each with its own ``pt{c}``); with the split-order
+        gather the chunks of the anchors (the drafts reuse their ``pt{c}``); 1 in the row modes (per-row tensors)."""
+        if not self.replicated:
+            return 1
+        return (self.lanes // 2 if self.gather == "split" else self.lanes) // self.lanes_per_call
 
     @property
     def calls_per_layer(self) -> int:
         """``paged_update_cache`` calls per layer (per chip)."""
+        if self.gather == "split":
+            return 2 * self.num_chunks
         return self.num_chunks * len(self._kinds)
 
     @property
     def device_inputs(self) -> Dict[str, Any]:
         """The persistent device inputs by name (read-only use: tests, diagnostics)."""
         return dict(self._dev)
+
+    def flash_groups(self) -> List[Tuple[slice, Any, Any]]:
+        """FlashMLA's inputs per group of rows of this chip's DP row, ``[(row slice, cur_pos, page_table)]`` (module
+        docstring "FlashMLA groups", design §4.3 option A''): one group ``(0:8, cur_pos, page_table)`` at 8 rows per
+        DP row (the T32 call, unchanged); two B = 8 groups at 16 rows: the anchors ``(0:8, flash_cur_a, flash_pt)`` at
+        ``n`` and the drafts ``(8:16, flash_cur_d, flash_pt)`` at ``n + 1`` (they share the anchors' rows). The global
+        layers run one FlashMLA call per group on ``q[:, rows]`` and concatenate the outputs on dim 1, so every T64 row
+        equals its T32 row bit for bit; the SWA layers keep one call on :attr:`cur_pos` / :attr:`page_table`. The
+        tensors are persistent and rewritten by :meth:`write_step` (trace-safe)."""
+        return list(self._flash)
 
     # ---- per step (host) ---------------------------------------------------------------------------------------
     def _values(self, step: KVWriteStep) -> Dict[str, Tuple[Placement, torch.Tensor]]:
@@ -741,6 +1075,8 @@ class DecodeKVWrite:
             self.mode,
             lanes_per_call=self.lanes_per_call if self.replicated else None,
             lanes_per_row=self.lanes_per_row,
+            gather=self.gather,
+            wide=self.wide,
         )
 
     def _host(self, place: Placement, val: torch.Tensor):
@@ -754,12 +1090,15 @@ class DecodeKVWrite:
         )
 
     def check(self, step: KVWriteStep) -> None:
-        """:func:`check_kv_write_step` with this object's mode and geometry (raises ``ValueError``)."""
+        """:func:`check_kv_write_step` with this object's mode and geometry, and at T64 :func:`check_wide_layout`
+        (raises ``ValueError``)."""
         if step.lanes != self.lanes or step.width != self.width:
             raise ValueError(
                 f"step has {step.lanes} lanes x width {step.width}; this kv_write was built for {self.lanes} x "
                 f"{self.width} (the decode trace's page-table width)"
             )
+        if self.wide and self.gather != "split":  # the split gather's check includes it
+            check_wide_layout(step, lanes_per_row=self.lanes_per_row)
         check_kv_write_step(
             step,
             self.mode,
@@ -767,6 +1106,7 @@ class DecodeKVWrite:
             max_seq_len=self.cfg.max_model_len,
             lanes_per_call=self.lanes_per_call if self.replicated else None,
             lanes_per_row=self.lanes_per_row,
+            gather=self.gather,
         )
 
     def host_inputs(self, step: KVWriteStep) -> Dict[str, Any]:
@@ -807,8 +1147,9 @@ class DecodeKVWrite:
         module docstring).
 
         Args:
-            kv_row: ``[1, 1, 8, 576]`` bf16 TILE DRAM (this DP row's lanes, replicated in the row): the attention's
-                ``concat(n, rope(k_pe))``. Not consumed (the caller frees it).
+            kv_row: ``[1, 1, L, 576]`` bf16 TILE DRAM (this DP row's rows, replicated in the row; ``L`` =
+                :attr:`lanes_per_row`, 8, or 16 at T64 = ``[8 anchors | 8 drafts]``): the attention's ``concat(n,
+                rope(k_pe))``. Not consumed (the caller frees it).
             kv_cache: the layer's paged latent cache ``[N, 1, block, 576]`` (TILE, DRAM; any decode layer, the MTP
                 layer included). Updated in place.
             cur_pos / page_table: FlashMLA's per-row inputs of this layer. They must be :attr:`cur_pos` /
@@ -816,24 +1157,36 @@ class DecodeKVWrite:
         """
         self.check_flash_inputs(cur_pos, page_table)
         if not self.replicated:
-            u = ttnn.transpose(kv_row, 1, 2, memory_config=self.row_mc)  # [1, 8, 1, 576], one lane per core
-            for cur, pt in self._calls[0]:
+            u = ttnn.transpose(kv_row, 1, 2, memory_config=self.row_mc)  # [1, L, 1, 576], one row per core
+            for cur, pt in self._plan[0][2]:
                 ttnn.experimental.paged_update_cache(kv_cache, u, update_idxs_tensor=cur, page_table=pt)
             ttnn.deallocate(u)
             return
-        g = self.ccl.ag_dp_rows(kv_row)  # [1, 1, 32, 576] TILE DRAM, lane order 8 dp + l, identical on every chip
-        if self.num_chunks == 1:
+        if self.gather == "split":  # [1, 1, 64, 576]: rows 0..31 the anchors, 32..63 the drafts (lane order)
+            g = self.ccl.ag_dp_rows(kv_row, halves=2)
+        else:  # [1, 1, rows, 576] TILE DRAM, row order L dp + l, identical on every chip
+            g = self.ccl.ag_dp_rows(kv_row)
+        if len(self._plan) == 1:  # T32, 32 users: one transpose straight into the sharded layout
             u = ttnn.transpose(g, 1, 2, memory_config=self.call_mc)  # [1, 32, 1, 576], one lane per core
             ttnn.deallocate(g)
-            for cur, pt in self._calls[0]:
+            for cur, pt in self._plan[0][2]:
                 ttnn.experimental.paged_update_cache(kv_cache, u, update_idxs_tensor=cur, page_table=pt)
             ttnn.deallocate(u)
             return
-        t = ttnn.transpose(g, 1, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 32, 1, 576]
+        if self.lanes_per_call == TILE:  # T64, 32 users per call: each chunk is one tile row of g
+            for lo, hi, calls in self._plan:
+                s = ttnn.slice(g, [0, 0, lo, 0], [1, 1, hi, KV_LATENT_DIM])
+                u = ttnn.transpose(s, 1, 2, memory_config=self.call_mc)  # [1, 32, 1, 576], one user per core
+                ttnn.deallocate(s)
+                for cur, pt in calls:
+                    ttnn.experimental.paged_update_cache(kv_cache, u, update_idxs_tensor=cur, page_table=pt)
+                ttnn.deallocate(u)
+            ttnn.deallocate(g)
+            return
+        t = ttnn.transpose(g, 1, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, rows, 1, 576]
         ttnn.deallocate(g)
-        n = self.lanes_per_call
-        for c, calls in enumerate(self._calls):
-            s = ttnn.slice(t, [0, c * n, 0, 0], [1, (c + 1) * n, 1, KV_LATENT_DIM])
+        for lo, hi, calls in self._plan:
+            s = ttnn.slice(t, [0, lo, 0, 0], [1, hi, 1, KV_LATENT_DIM])
             u = ttnn.to_memory_config(s, self.call_mc)  # [1, n, 1, 576], one lane per core
             ttnn.deallocate(s)
             for cur, pt in calls:
@@ -851,7 +1204,8 @@ class DecodeKVWrite:
         for t in self._dev.values():
             ttnn.deallocate(t)
         self._dev = {}
-        self._calls = []
+        self._plan = []
+        self._flash = []
         self.cur_pos = self.page_table = None
 
 
@@ -886,6 +1240,7 @@ def cache_mismatches(
 __all__ = [
     "CALL_KINDS",
     "DecodeKVWrite",
+    "GATHER_ORDERS",
     "KVWriteCall",
     "KVWriteStep",
     "MAX_LANES_PER_CALL",
@@ -896,12 +1251,17 @@ __all__ = [
     "assign_partner_lanes",
     "cache_copies",
     "cache_mismatches",
+    "check_gather",
     "check_kv_write_step",
     "check_mode",
+    "check_wide_layout",
+    "gathers_split",
     "is_replicated",
     "is_split",
     "kv_write_calls",
     "kv_write_inputs_host",
     "lanes_per_call_for",
+    "split_order",
     "update_input_memory_config",
+    "wide_rows",
 ]

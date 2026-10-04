@@ -90,6 +90,17 @@ int32 ``min``), then the per-chip (value, index) pairs are gathered across the v
 row). Returns token ids ``[1, 1, 1, 32]`` uint32 ROW_MAJOR in lane order on every chip ("mesh"), or ``[1, 1, 1, 8]``
 per DP row ("tp").
 
+T64 verify step (docs/p5_t64/P5_T64_DESIGN.md §4.2, §4.4; "mesh" split): ``hn [1, 1, 16, 4096]`` per DP row (``[8
+anchors | 8 drafts]``) -> ``decode_logits(hn, halves=2)``: the split-order gather ``ccl.ag_dp_rows(hn, halves=2)`` ->
+``[1, 1, 64, 4096]`` (rows 0..31 = the anchors in lane order, i.e. the 32-lane layout; rows 32..63 = the drafts) -> the
+GEMM with ``per_core_M`` 2 (``lm_head_program_config(m_tiles=2)``, the G16-lite config: 149.2 vs 143.8 us, weight
+bound) -> ``[1, 1, 64, 6880]``. ``argmax_decode`` takes the row count L from the logits (32 or 64; its constants for
+64 rows -- the 1.76 MB int32 iota among them -- are allocated in the constructor when ``cfg.wide_rows_per_dp`` is set,
+never after a trace capture, F3N rule R3): ``[1, 1, 1, 64]`` = ``(a0 of lanes 0..31, a1 of lanes 0..31)``.
+``logits_rm(logits, rows=32)`` untilizes the anchor rows only (a tile-aligned slice; the ``wide`` mode's host-sampled
+steps). Every row equals the 32-lane head's row of the same hidden state bitwise (gather, GEMM and argmax are
+row-local; G16-lite measured GEMM rows bitwise; ``test_embed_head.py::test_embed_head_t64``).
+
 Compute roles (README §4): ``norm`` (HiFi4, fp32 acc) for the reduction / norm, ``lm_head`` (HiFi4, fp32 acc) for the
 GEMM; explicit 1D-multicast program configs (the head is bandwidth bound).
 
@@ -98,7 +109,7 @@ Import rule: ttnn, torch and the shared motif3 infra only; no other ``models/dem
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -211,22 +222,35 @@ def resolve_logits_dtype(cfg: MotifTTConfig, logits_dtype=None):
     return dt
 
 
-def mcast1d_pc(grid: Tuple[int, int], n_tiles: int, per_core_n: int, in0_block_w: int, fuse_batch: bool = True):
-    """``MatmulMultiCoreReuseMultiCast1DProgramConfig`` (in0 multicast, M = one tile) with ``ceil(N / per_core_n)``
-    output blocks on ``grid``; unlike ``model_config.mcast1d_matmul_pc`` the last block may be partial (215 vocab
-    tiles do not split evenly; the 1D factory handles the tail, verified bit-identical to the auto config)."""
+def mcast1d_pc(
+    grid: Tuple[int, int],
+    n_tiles: int,
+    per_core_n: int,
+    in0_block_w: int,
+    fuse_batch: bool = True,
+    *,
+    per_core_m: int = 1,
+):
+    """``MatmulMultiCoreReuseMultiCast1DProgramConfig`` (in0 multicast) with ``ceil(N / per_core_n)`` output blocks on
+    ``grid``; unlike ``model_config.mcast1d_matmul_pc`` the last block may be partial (215 vocab tiles do not split
+    evenly; the 1D factory handles the tail, verified bit-identical to the auto config). M = ``per_core_m`` tile rows
+    (in0 is multicast: every core computes all of them): 1 for the 32-lane step, 2 for the T64 step's 64 rows (out
+    subblock height 1 either way)."""
     n_blocks = -(-int(n_tiles) // int(per_core_n))
     if n_blocks > int(grid[0]) * int(grid[1]):
         raise ValueError(f"{n_blocks} output blocks do not fit grid {grid}")
+    pcm = int(per_core_m)
+    if pcm < 1:
+        raise ValueError(f"per_core_m must be >= 1 tile row, got {per_core_m}")
     sub_w = max(d for d in (1, 2, 4) if per_core_n % d == 0)
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(int(grid[0]), int(grid[1])),
         in0_block_w=int(in0_block_w),
         out_subblock_h=1,
         out_subblock_w=sub_w,
-        out_block_h=1,
+        out_block_h=pcm,
         out_block_w=int(per_core_n),
-        per_core_M=1,
+        per_core_M=pcm,
         per_core_N=int(per_core_n),
         fuse_batch=bool(fuse_batch),
         fused_activation=None,
@@ -244,16 +268,17 @@ DEFAULT_LM_HEAD_PC = {
 }
 
 
-def lm_head_program_config(cfg: MotifTTConfig, vocab_split: str = "mesh", spec=None):
-    """Program config of the LM-head GEMM ``[.., 32, 4096] @ [4096, Vc]``. ``spec`` = ``(grid, per_core_N,
-    in0_block_w)`` overrides the measured default; ``spec="auto"`` returns None (ttnn's auto config)."""
+def lm_head_program_config(cfg: MotifTTConfig, vocab_split: str = "mesh", spec=None, *, m_tiles: int = 1):
+    """Program config of the LM-head GEMM ``[.., 32 m_tiles, 4096] @ [4096, Vc]`` (``m_tiles=2``: the T64 step's 64
+    rows, ``per_core_M`` 2 on the same grid; equals ``model_config.lm_head_pc(m_tiles=)``). ``spec`` = ``(grid,
+    per_core_N, in0_block_w)`` overrides the measured default; ``spec="auto"`` returns None (ttnn's auto config)."""
     if spec == "auto":
         return None
     grid, pcn, ibw = spec if spec is not None else DEFAULT_LM_HEAD_PC[vocab_split]
     gx, gy = int(grid[0]), int(grid[1])
     if gx > cfg.compute_grid[0] or gy > cfg.compute_grid[1]:
         raise ValueError(f"grid {grid} exceeds the chip compute grid {cfg.compute_grid}")
-    return mcast1d_pc((gx, gy), vocab_per_shard(cfg, vocab_split) // TILE, pcn, ibw)
+    return mcast1d_pc((gx, gy), vocab_per_shard(cfg, vocab_split) // TILE, pcn, ibw, per_core_m=m_tiles)
 
 
 def _np_view(t: torch.Tensor):
@@ -483,39 +508,17 @@ class MotifLMHead:
                     mesh_mapper=rep,
                 )
         self.argmax_lanes = cfg.max_batch if vocab_split == "mesh" else self.lanes
-        # same dtype as the logits, so the per-shard maxima are compared across shards without a rounding step
-        self._am_zeros = ttnn.from_torch(
-            torch.zeros(1, 1, self.argmax_lanes, TILE, dtype=torch.float32),
-            dtype=self.logits_dtype,
-            layout=ttnn.TILE_LAYOUT,
-            device=mesh_device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=rep,
-        )
-        self._am_zeros_i32 = ttnn.from_torch(
-            torch.zeros(1, 1, self.argmax_lanes, TILE, dtype=torch.int32),
-            dtype=ttnn.int32,
-            layout=ttnn.TILE_LAYOUT,
-            device=mesh_device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=rep,
-        )
-        self._am_iota = ttnn.from_torch(
-            torch.arange(self.vc, dtype=torch.int32).reshape(1, 1, 1, -1).expand(1, 1, self.argmax_lanes, -1).contiguous(),
-            dtype=ttnn.int32,
-            layout=ttnn.TILE_LAYOUT,
-            device=mesh_device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=rep,
-        ) if self.argmax_local == "vector" else None
-        self._am_offsets = ttnn.from_torch(
-            argmax_offsets(cfg, vocab_split, self.argmax_lanes),
-            dtype=ttnn.int32,
-            layout=ttnn.TILE_LAYOUT,
-            device=mesh_device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=rep,
-        )
+        self._am_zeros, self._am_zeros_i32, self._am_iota, self._am_offsets = self._argmax_constants(self.argmax_lanes)
+        # T64 verify step ("mesh"; docs/p5_t64/P5_T64_DESIGN.md §4.2): the GEMM config of its 64 gathered rows
+        # (per_core_M 2; a config only) and, when cfg stages that step, the 64-row argmax constants -- allocated here,
+        # never after a trace capture (F3N rule R3; ~2 MB per chip, the int32 iota [64, 6880] among them).
+        self.pc_wide: Dict[int, object] = {}
+        self._am_wide: Dict[int, Tuple[object, object, object, object]] = {}
+        if vocab_split == "mesh":
+            wide = 2 * self.argmax_lanes
+            self.pc_wide[wide] = lm_head_program_config(cfg, vocab_split, program_config, m_tiles=wide // TILE)
+            if int(getattr(cfg, "wide_rows_per_dp", 0) or 0):
+                self._am_wide[wide] = self._argmax_constants(wide)
         # Prefill tile-row position: the start / end of the tensor-args slice live on the device (persistent [4]
         # int32 ROW_MAJOR, allocated here, before any trace exists, and rewritten in place per call by
         # set_prefill_position). The slice program is then keyed on the bucket shape only, never on the position.
@@ -531,10 +534,31 @@ class MotifLMHead:
             for _ in range(2)
         )
 
+    def _argmax_constants(self, rows: int):
+        """``(zeros [1,1,L,32] logits dtype, zeros [1,1,L,32] int32, iota [1,1,L,Vc] int32 or None, offsets)`` of
+        :meth:`argmax_decode` for ``L = rows`` logits rows (replicated, DRAM; created once, before any trace)."""
+        rep, dram = self._rep, ttnn.DRAM_MEMORY_CONFIG
+
+        def up(t, dtype):
+            return ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.mesh_device,
+                                   memory_config=dram, mesh_mapper=rep)  # fmt: skip
+
+        L = int(rows)
+        # same dtype as the logits, so the per-shard maxima are compared across shards without a rounding step
+        zeros = up(torch.zeros(1, 1, L, TILE, dtype=torch.float32), self.logits_dtype)
+        zeros_i32 = up(torch.zeros(1, 1, L, TILE, dtype=torch.int32), ttnn.int32)
+        iota = None
+        if self.argmax_local == "vector":
+            iota = up(torch.arange(self.vc, dtype=torch.int32).reshape(1, 1, 1, -1).expand(1, 1, L, -1).contiguous(),
+                      ttnn.int32)  # fmt: skip
+        offsets = up(argmax_offsets(self.cfg, self.vocab_split, L), ttnn.int32)
+        return zeros, zeros_i32, iota, offsets
+
     # ---- pieces ------------------------------------------------------------------------------------------
     def stream_mean_norm(self, x) -> ttnn.Tensor:
         """``X [1, 4, T, 4096]`` -> ``rms_norm(mean_streams(X); gamma_final)`` ``[1, 1, T, 4096]`` bf16 (T <= 32: decode
-        8 lanes or the prefill tile row), DRAM interleaved. The norm runs width-sharded on ``norm_grid``."""
+        8 lanes, the T64 step's 16 rows, or the prefill tile row), DRAM interleaved. The norm runs width-sharded on
+        ``norm_grid``."""
         T = int(x.shape[2])
         if self.stream_reduce == "wreduce":
             w = self._w_mean.get(T)
@@ -563,15 +587,27 @@ class MotifLMHead:
         return hn
 
     def project(self, hn) -> ttnn.Tensor:
-        """``[1, 1, M, 4096] @ W`` -> ``[1, 1, M, Vc]`` logits (``lm_head`` role, 1D-mcast config)."""
+        """``[1, 1, M, 4096] @ W`` -> ``[1, 1, M, Vc]`` logits (``lm_head`` role, 1D-mcast config): M <= 32 (one tile
+        row) the measured config, M = 64 (the T64 step, "mesh") its ``per_core_M`` 2 twin ``pc_wide[64]``."""
         return ttnn.linear(
             hn,
             self.weight,
-            program_config=self.pc,
+            program_config=self._pc_for_rows(int(hn.shape[-2])),
             compute_kernel_config=self.ckc_lm,
             dtype=self.logits_dtype,
             memory_config=self.memory_config,
         )
+
+    def _pc_for_rows(self, rows: int):
+        if rows <= TILE:
+            return self.pc
+        pcs = getattr(self, "pc_wide", {})
+        if rows not in pcs:
+            raise ValueError(
+                f"no LM-head GEMM config for {rows} rows: one tile row, or {sorted(pcs)} (the T64 step's gathered "
+                f"rows, vocab split 'mesh')"
+            )
+        return pcs[rows]
 
     # ---- forwards ----------------------------------------------------------------------------------------
     def forward_decode(self, x, *, row_major: bool = False) -> ttnn.Tensor:
@@ -585,7 +621,7 @@ class MotifLMHead:
         = :meth:`stream_mean_norm` + :meth:`decode_logits` (``consume=True``), the same ops in the same order."""
         return self.decode_logits(self.stream_mean_norm(x), row_major=row_major, consume=True)
 
-    def decode_logits(self, hn, *, row_major: bool = False, consume: bool = False) -> ttnn.Tensor:
+    def decode_logits(self, hn, *, row_major: bool = False, consume: bool = False, halves: int = 1) -> ttnn.Tensor:
         """The decode logits of a normalized hidden ``hn [1, 1, 8, 4096]`` bf16 (this DP row's lanes): "mesh"
         ``ccl.ag_dp_rows`` -> ``[1, 1, 32, 4096]`` -> :meth:`project`; "tp" :meth:`project`. Output as
         :meth:`forward_decode` (TILE, or ROW_MAJOR with ``row_major``). Trace-safe.
@@ -593,10 +629,21 @@ class MotifLMHead:
         ``hn`` is the post-final-norm hidden (:meth:`stream_mean_norm` of the residual streams) or the MTP layer's
         ``final_layernorm`` output (``tt/mtp.py``; README §17). ``consume=True`` frees ``hn`` (what
         :meth:`forward_decode` does); by default it is kept, so the speculative decode step can feed the same ``hn`` to
-        the MTP layer after the main head (features design §3.8.1)."""
+        the MTP layer after the main head (features design §3.8.1).
+
+        ``halves=2`` (T64 verify step, "mesh" only; docs/p5_t64/P5_T64_DESIGN.md §4.4): ``hn [1, 1, 16, 4096]`` per DP
+        row = ``[8 anchors | 8 drafts]``; the split-order gather ``ccl.ag_dp_rows(hn, halves=2)`` gives ``[1, 1, 64,
+        4096]`` and the logits ``[1, 1, 64, 6880]``: rows 0..31 = the anchors in lane order (the 32-lane layout), rows
+        32..63 = the drafts, each row bitwise the 32-lane head's row of the same hidden state."""
+        h = int(halves)
+        if h != 1 and self.vocab_split != "mesh":
+            raise ValueError(f"decode_logits(halves={halves}) needs the 'mesh' vocab split (got {self.vocab_split!r})")
         x = hn
         if self.vocab_split == "mesh":
-            x = self.ccl.ag_dp_rows(hn, memory_config=self.memory_config)  # [1, 1, 32, 4096]
+            if h == 1:
+                x = self.ccl.ag_dp_rows(hn, memory_config=self.memory_config)  # [1, 1, 32, 4096]
+            else:  # [1, 1, 64, 4096]: rows 0..31 anchors (lane order), 32..63 drafts
+                x = self.ccl.ag_dp_rows(hn, memory_config=self.memory_config, halves=h)
             if consume:
                 ttnn.deallocate(hn)
         logits = self.project(x)
@@ -653,10 +700,27 @@ class MotifLMHead:
         return rm
 
     # ---- host logits (EMB-3) --------------------------------------------------------------------------------
-    def logits_rm(self, logits, *, check_lanes: bool = True) -> ttnn.Tensor:
+    def logits_rm(self, logits, *, check_lanes: bool = True, rows: Optional[int] = None) -> ttnn.Tensor:
         """Device untilize of the decode logits (the host then reads the 8 / 32 real rows only, without a host-side
-        untilize). Not consumed. ``check_lanes``: require the decode row count ("tp": the row's 8 lanes)."""
-        if check_lanes and self.vocab_split == "tp" and int(logits.shape[2]) != self.lanes:
+        untilize). Not consumed. ``check_lanes``: require the decode row count ("tp": the row's 8 lanes).
+
+        ``rows`` (T64, "mesh"): untilize only the first ``rows`` rows (a multiple of 32, a tile-aligned slice; one
+        program, its bounds are fixed) -- ``rows=32`` on the T64 step's ``[1, 1, 64, 6880]`` logits gives the anchors'
+        ``[1, 1, 32, 6880]``, the 32-lane layout :meth:`logits_to_host` reads (the ``wide`` mode's host-sampled steps).
+        ``None`` (or all rows) = the whole tensor, as before."""
+        n = int(logits.shape[2])
+        if rows is not None and int(rows) != n:
+            r = int(rows)
+            if self.vocab_split != "mesh" or r <= 0 or r % TILE or r > n:
+                raise ValueError(
+                    f"logits_rm(rows={rows}): a positive multiple of {TILE} up to the {n} logits rows, 'mesh' split "
+                    f"only"
+                )
+            part = ttnn.slice(logits, [0, 0, 0, 0], [1, 1, r, int(logits.shape[3])], memory_config=self.memory_config)
+            rm = ttnn.untilize(part, memory_config=self.memory_config, use_multicore=True)
+            ttnn.deallocate(part)
+            return rm
+        if check_lanes and self.vocab_split == "tp" and n != self.lanes:
             raise ValueError(f"expected {self.lanes} lanes per chip, got {list(logits.shape)}")
         return ttnn.untilize(logits, memory_config=self.memory_config, use_multicore=True)
 
@@ -672,7 +736,13 @@ class MotifLMHead:
         untilized on device here first, an eager op) -> **fresh** host tensor ``[32, 220160]`` in lane order (``dtype``
         default: the device dtype, bf16). One concurrent read of every chip into persistent staging
         (:class:`HostShardReader`), then numpy block copies on ``host_copy_threads`` Python threads into the fresh
-        output (:meth:`_assemble_decode`). Rows of inactive lanes are garbage (the bridge ignores them)."""
+        output (:meth:`_assemble_decode`). Rows of inactive lanes are garbage (the bridge ignores them). The T64 step's
+        64-row logits are refused: read ``logits_rm(logits, rows=32)`` (its anchors, the 32-lane layout)."""
+        if self.vocab_split == "mesh" and int(logits.shape[2]) != self.cfg.max_batch:
+            raise ValueError(
+                f"logits_to_host reads the {self.cfg.max_batch}-lane decode logits, got {list(logits.shape)} (the T64 "
+                f"step's 64 rows: pass logits_rm(logits, rows={self.cfg.max_batch}), its anchors)"
+            )
         t = self.logits_rm(logits) if logits.layout == ttnn.TILE_LAYOUT else logits
         try:
             reader = self._reader(t)
@@ -734,11 +804,28 @@ class MotifLMHead:
         ``[1, 1, 1, 8]`` per DP row = that row's lanes ("tp"). Semantics: lowest vocab index among the maxima of the
         device logits (== ``torch.argmax`` of :meth:`logits_to_host`'s rows).
 
+        The row count L comes from the logits: the 32 lanes ("mesh"; 8 per DP row with "tp"), or the T64 step's 64
+        split-order rows ("mesh", :meth:`decode_logits` ``halves=2``; its constants exist when the head was built with
+        a T64 config, ``cfg.wide_rows_per_dp``): ``[1, 1, 1, 64]`` = ``(a0 of lanes 0..31, a1 of lanes 0..31)``, each
+        id the one the 32-row call computes for the same logits row. Any other L raises.
+
         Local stage (vectorized, multi-core; ``ttnn.argmax`` on ROW_MAJOR scans each row on one RISC-V: 242 us):
         ``m = max_W(logits)``, ``c = iota + 2^24 * (logits < m)`` in int32, ``idx = min_W(c)``. Cross-shard stage: the
         per-shard (max, idx) pairs, lanes on columns (W-broadcast + transpose: whole tiles for the H all-gathers),
         are gathered over the vocab shards; the token is ``min(idx + offset_shard + 2^24 * (max_shard < max))``."""
-        L = self.argmax_lanes
+        L = int(logits.shape[2])
+        if L == self.argmax_lanes:
+            am_zeros, am_zeros_i32, am_iota, am_offsets = (
+                self._am_zeros, self._am_zeros_i32, self._am_iota, self._am_offsets
+            )  # fmt: skip
+        elif L in getattr(self, "_am_wide", {}):
+            am_zeros, am_zeros_i32, am_iota, am_offsets = self._am_wide[L]
+        else:
+            raise ValueError(
+                f"argmax_decode: no constants for {L} logits rows (have {self.argmax_lanes} and "
+                f"{sorted(getattr(self, '_am_wide', {}))}; the T64 step's 64 rows need a head built with a T64 config, "
+                f"cfg.wide_rows_per_dp > 0, vocab split 'mesh')"
+            )
         mc = self.memory_config
         S = float(TIEBREAK_SENTINEL)
         m = ttnn.max(logits, dim=3, keepdim=True, memory_config=mc)  # [1,1,L,1] bf16 (exact)
@@ -748,7 +835,7 @@ class MotifLMHead:
             ttnn.deallocate(nm)
             si = ttnn.typecast(sm, ttnn.int32, memory_config=mc)
             ttnn.deallocate(sm)
-            c = ttnn.add(si, self._am_iota, memory_config=mc)  # int32: local index (+ 2^24 off the max)
+            c = ttnn.add(si, am_iota, memory_config=mc)  # int32: local index (+ 2^24 off the max)
             ttnn.deallocate(si)
             li = ttnn.min(c, dim=3, keepdim=True, memory_config=mc)  # [1,1,L,1] int32: lowest index of the max
             ttnn.deallocate(c)
@@ -761,11 +848,11 @@ class MotifLMHead:
             li = ttnn.typecast(at, ttnn.int32, memory_config=mc)
             ttnn.deallocate(at)
         # lanes on columns (rows of each 32-row block all equal; the offsets table masks all but row 32 j)
-        vb = ttnn.add(self._am_zeros, m, memory_config=mc)  # [1,1,L,32]
+        vb = ttnn.add(am_zeros, m, memory_config=mc)  # [1,1,L,32]
         ttnn.deallocate(m)
         vg = ttnn.transpose(vb, 2, 3, memory_config=mc)  # [1,1,32,L]
         ttnn.deallocate(vb)
-        ib = ttnn.add(self._am_zeros_i32, li, memory_config=mc)
+        ib = ttnn.add(am_zeros_i32, li, memory_config=mc)
         ttnn.deallocate(li)
         ig = ttnn.transpose(ib, 2, 3, memory_config=mc)  # [1,1,32,L] int32
         ttnn.deallocate(ib)
@@ -783,7 +870,7 @@ class MotifLMHead:
         ttnn.deallocate(not_max)
         sent_i = ttnn.typecast(sent, ttnn.int32, memory_config=mc)
         ttnn.deallocate(sent)
-        glob = ttnn.add(ig, self._am_offsets, memory_config=mc)
+        glob = ttnn.add(ig, am_offsets, memory_config=mc)
         ttnn.deallocate(ig)
         masked = ttnn.add(glob, sent_i, memory_config=mc)
         ttnn.deallocate(glob)
@@ -806,7 +893,8 @@ class MotifLMHead:
 
     def tokens_to_host(self, token_ids) -> torch.Tensor:
         """:meth:`argmax_decode` output -> host ``int64 [32]`` in lane order ("mesh": one chip's 128 B; "tp": every
-        chip's 32 B through the staging reader, one chip per DP row used)."""
+        chip's 32 B through the staging reader, one chip per DP row used). The T64 step's ``[1, 1, 1, 64]`` ("mesh")
+        gives ``int64 [64]``: ``[a0 of lanes 0..31 | a1 of lanes 0..31]``."""
         if self.vocab_split == "mesh":
             return ttnn.to_torch(ttnn.get_device_tensors(token_ids)[0]).reshape(-1).to(torch.int64)
         a = self.cfg.axes

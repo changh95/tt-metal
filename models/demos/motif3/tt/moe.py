@@ -59,6 +59,19 @@ Accuracy vs the fp32 reference (reference modules, bf16-valued weights): PCC 0.9
 rel 0.9 %), every token >= 0.9999 against the reference experts on the device's routes; bf16 experts: 0.999994 (real L2,
 ``fold_route_scale=False``), 0.999993 (random); traced output == eager bitwise.
 
+T64 verify step (docs/p5_t64/P5_T64_DESIGN.md §4.2, T4; ``cfg.wide_rows_per_dp`` = 16): ``forward_decode`` also takes
+16 rows per DP row (``[8 anchors | 8 drafts]``, still one tile row), so the gather yields M = 64 tokens (natural order
+``16 dp + j``) and ``partition`` returns the row's 16. The decode program configs are per M (:data:`DECODE_ROWS`): the
+router linear (12 x 1 cores, sigmoid fused) and gate_up (10 x 8) with ``per_core_M`` 2, the down projection with
+``per_core_M`` 2 on 8 x 8 cores (``model_config.experts_*_pc(m_tiles=2)`` / ``router_decode_pc(m_tiles=2)``, exactly the
+G16-lite probe's configs), L1 intermediates as at M = 32, and a 64-row -inf top-k pad allocated in the constructor when
+the config stages the T64 step (never after a trace capture; F3N rule R3). With ``router_logits="exact_fp32"`` the
+router runs the exact kernel at M = 64 too (:data:`EXACT_ROUTER_DECODE_ROWS`; the kernel takes M = 32 n, review edit
+R-E7).
+Every row of the M = 64 module equals the M = 32 module's row of the same token bitwise (both routers; G16-lite measured
+it with the composite router: 1204.1 us per layer at M = 64 vs 1038.6 us, +16 %; ``test_moe_device_t64_rows``).
+``forward_decode`` refuses a gathered row count the module was not built for (no silent fallback to auto configs).
+
 Prefill (:meth:`MotifMoE.forward_prefill`; MOE-6, design §3.3, "masked dense"): tokens replicated on all 32 chips; every
 chip routes all S tokens (composite router, DRAM) and runs its 12 experts on all of them in chunks of ``prefill_chunk``
 rows (unselected experts get weight 0; bf16 PolyNorm intermediates, ``rms`` impl), then ``ccl.rs_dp`` ->
@@ -104,6 +117,15 @@ from .model_config import TILE, MotifTTConfig, mcast1d_matmul_pc
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
 COMBINE_MODES = ("fold", "multiply_sum")
+# Gathered decode token counts M with measured decode program configs: the 32 lanes of the 32-lane step (one tile row)
+# and the 64 rows of the T64 verify step (16 per DP row; docs/p5_t64/P5_T64_DESIGN.md §4.2). A module serves M = 64 at
+# decode only when built with a T64 config (cfg.wide_rows_per_dp > 0: its 64-row constants exist).
+DECODE_ROWS = (TILE, 2 * TILE)
+# Gathered decode token counts at which MotifRouter runs the exact-fp32 logits kernel when it has one
+# (router_logits="exact_fp32"; kernels/router_fp32.py takes M = 32 n, the two-row launch pipelines its tile rows with
+# the same arithmetic per row). Review edit R-E7: at both counts the T64 rows then equal the T32 rows bitwise.
+# model_config.ROUTER_EXACT_FP32_DECODE_ROWS must list the same counts (it gates spec_verify="auto" + "exact_fp32").
+EXACT_ROUTER_DECODE_ROWS = (TILE, 2 * TILE)
 
 
 def _free(*ts) -> None:
@@ -156,6 +178,16 @@ def prefill_experts_pc(m_tiles: int, n_tiles: int, *, grid=(8, 8), in0_block_w: 
         fused_activation=None,
         mcast_in0=False,
     )
+
+
+def wide_decode_rows(cfg) -> int:
+    """Gathered decode token count of the T64 verify step ``cfg`` stages: ``dp * cfg.wide_rows_per_dp`` (64: 16 rows
+    per DP row), or 0 when it stages none (``spec_verify="packed"`` or no speculation). The modules allocate their
+    64-row constants when it is set (F3N rule R3). Raises for a T64 row count without decode configs here."""
+    m = int(cfg.dp) * int(getattr(cfg, "wide_rows_per_dp", 0) or 0)
+    if m and m not in DECODE_ROWS[1:]:
+        raise ValueError(f"T64 decode of {m} gathered rows has no MoE decode configs (have {DECODE_ROWS[1:]})")
+    return m
 
 
 def _dtype_of(name_or_dtype, default=ttnn.bfloat16):
@@ -257,7 +289,15 @@ class MotifRouter:
 
     Measured (traced, decode shape, DRAM intermediates, ``test_moe_device_router_variants``): plain composite 189 us,
     module default 126 us (118 us inside the MoE decode with L1 intermediates).
-    ``logits_fn``: optional decode-shape logits replacement (``kernels.router_fp32.RouterLogitsFP32``, exact fp32).
+    ``logits_fn``: optional decode-shape logits replacement (``kernels.router_fp32.RouterLogitsFP32``, exact fp32), used
+    at the gathered decode row counts :data:`EXACT_ROUTER_DECODE_ROWS` (32 and the T64 step's 64).
+
+    Decode shapes are per gathered row count M (:data:`DECODE_ROWS`; T64, docs/p5_t64/P5_T64_DESIGN.md §4.2): M = 32
+    uses ``decode_pc`` / ``decode_pc_sigmoid`` (diagnostics may replace ``decode_pc``; the fused twin is then not used),
+    M = 64 ``decode_pcs_wide[64]`` (the same 12 x 1 configs with ``per_core_M`` 2, ``model_config.router_decode_pc(
+    m_tiles=2)``). The -inf top-k pads ``_pads[M]``: M = 32 always (with ``topk_pad_to``), M = 64 when
+    ``cfg.wide_rows_per_dp`` is set -- allocated here, before any trace capture (F3N rule R3); without it a 64-row call
+    takes the unpadded single-core top-k.
     """
 
     def __init__(
@@ -277,9 +317,10 @@ class MotifRouter:
         logits_fn=None,
     ):
         self.mesh_device = mesh_device
-        # Optional replacement of the decode-shape (M = 32) logits, e.g. the exact-fp32 SFPU kernel
-        # ``kernels.router_fp32.RouterLogitsFP32`` (same contract as :meth:`route_logits`); prefill shapes keep the
-        # composite linear (the kernel handles exactly 32 tokens).
+        # Optional replacement of the decode-shape logits (M in EXACT_ROUTER_DECODE_ROWS: 32, and the T64 step's 64),
+        # e.g. the exact-fp32 SFPU kernel ``kernels.router_fp32.RouterLogitsFP32`` (same contract as
+        # :meth:`route_logits`); prefill shapes keep the composite linear (the kernel's prefill cost, ~30 us per 32
+        # tokens, would dominate there).
         self.logits_fn = logits_fn
         self.cfg = cfg
         self.layer_idx = int(layer_idx)
@@ -297,10 +338,17 @@ class MotifRouter:
         # config. decode_pc_sigmoid: the same config with the sigmoid as its fused_activation (sigmoid_in_pc).
         self.decode_pc = None
         self.decode_pc_sigmoid = None
+        # T64: the 64-row twins (per_core_M 2), {M: (config, config + sigmoid)}; configs only (no device memory)
+        self.decode_pcs_wide: Dict[int, Tuple[object, object]] = {}
         gx, gy = cfg.compute_grid
         if router_decode_pc and gx >= 12:
             self.decode_pc = self._decode_pc()
             self.decode_pc_sigmoid = self._decode_pc(sigmoid=True)
+            for m in DECODE_ROWS[1:]:
+                self.decode_pcs_wide[m] = (
+                    self._decode_pc(m_tiles=m // TILE),
+                    self._decode_pc(sigmoid=True, m_tiles=m // TILE),
+                )
         self._decode_pc_base = self.decode_pc  # decode_pc_sigmoid is this config + the sigmoid
         l = self.layer_idx
 
@@ -324,6 +372,9 @@ class MotifRouter:
             if topk_pad_to & (topk_pad_to - 1) or topk_pad_to <= self.n_experts:
                 raise ValueError(f"topk_pad_to must be a power of two > {self.n_experts}, got {topk_pad_to}")
             self._pads[TILE] = self._make_pad(TILE)  # decode: one tile row of tokens
+            wide = wide_decode_rows(cfg)
+            if wide:  # the T64 step's 64 gathered rows: allocated before any trace capture (F3N rule R3)
+                self._pads[wide] = self._make_pad(wide)
 
     def _make_pad(self, rows: int):
         import torch
@@ -337,17 +388,32 @@ class MotifRouter:
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
 
-    def _decode_pc(self, sigmoid: bool = False):
-        pc = mcast1d_matmul_pc((12, 1), self.n_experts // TILE, 32, self.cfg.hidden_size // TILE)
+    def _decode_pc(self, sigmoid: bool = False, m_tiles: int = 1):
+        """Decode router linear config on ``m_tiles`` tile rows of gathered tokens (``per_core_M``; 2 = the T64 step's
+        64 rows); equals ``model_config.router_decode_pc(sigmoid=, m_tiles=)``."""
+        pc = mcast1d_matmul_pc(
+            (12, 1), self.n_experts // TILE, 32, self.cfg.hidden_size // TILE, per_core_m=int(m_tiles)
+        )
         if sigmoid:  # SFPU sigmoid (accurate: sigmoid_tile<RC, false>) on the fp32 dest, before the pack
             pc.fused_activation = ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID)
         return pc
 
+    def _decode_pcs(self, M: int) -> Tuple[object, object]:
+        """``(linear config, its fused-sigmoid twin or None)`` of the router linear on ``M`` gathered decode rows;
+        ``(None, None)`` for other M (prefill shapes: ttnn's auto config). M = 32 reads ``decode_pc`` /
+        ``decode_pc_sigmoid``: a replaced ``decode_pc`` (diagnostics) runs without the fused twin."""
+        if M == TILE:
+            pc = self.decode_pc
+            return pc, (self.decode_pc_sigmoid if pc is not None and pc is self._decode_pc_base else None)
+        return self.decode_pcs_wide.get(M, (None, None))
+
     def _pc(self, f):
-        return self.decode_pc if int(f.shape[-2]) == TILE else None
+        return self._decode_pcs(int(f.shape[-2]))[0]
 
     def _use_logits_fn(self, f) -> bool:
-        return self.logits_fn is not None and int(f.shape[-2]) == TILE
+        """The decode-shape logits replacement (``logits_fn``) applies: one is set and ``f`` holds a gathered decode
+        row count of :data:`EXACT_ROUTER_DECODE_ROWS` (32, or the T64 step's 64; review edit R-E7)."""
+        return self.logits_fn is not None and int(f.shape[-2]) in EXACT_ROUTER_DECODE_ROWS
 
     def route_logits(self, f, *, memory_config=None):
         """``f [1, 1, M, 4096]`` bf16 -> fp32 logits ``[1, 1, M, 384]`` (bf16 x bf16, HiFi4, fp32 dest acc, fp32 out),
@@ -370,13 +436,13 @@ class MotifRouter:
         scale = self.route_scale if scale is None else float(scale)
         M = int(f.shape[-2])
         exact = self._use_logits_fn(f)
-        pc = self._pc(f)
-        if not exact and self.sigmoid_in_pc and pc is not None and pc is self._decode_pc_base:
-            # decode shape: sigmoid fused into the linear's program config (no separate op); a replaced decode_pc
-            # (diagnostics) falls through to the separate sigmoid with that config
+        pc, pc_sigmoid = self._decode_pcs(M)
+        if not exact and self.sigmoid_in_pc and pc_sigmoid is not None:
+            # decode shape (M = 32 or 64): sigmoid fused into the linear's program config (no separate op); a replaced
+            # decode_pc (diagnostics) falls through to the separate sigmoid with that config
             scores = ttnn.linear(
                 f, self.weight, dtype=ttnn.float32, compute_kernel_config=self.ckc,
-                program_config=self.decode_pc_sigmoid, memory_config=mc,
+                program_config=pc_sigmoid, memory_config=mc,
             )
         elif self.fuse_sigmoid and not exact:
             # ttnn runs ``activation=`` as a separate unary_chain op here (no core_grid): same as the plain composite
@@ -480,7 +546,8 @@ class MotifMoE:
             into ``up`` either way.
         router_logits: "composite" (default: ``ttnn.linear`` HiFi4 fp32-out, TF32-class partial sums, ~99.8 % top-8
             set agreement on real inputs) | "exact_fp32" (decode-shape logits from ``kernels.router_fp32`` -- true fp32
-            accumulation on the SFPU, ~45-50 us instead of ~14 us; prefill keeps the composite).
+            accumulation on the SFPU, ~45-50 us instead of ~14 us; at the 32-lane step's 32 and the T64 step's 64
+            gathered rows, :data:`EXACT_ROUTER_DECODE_ROWS`; prefill keeps the composite).
         prefill_pc: in1-multicast program configs for the prefill expert matmuls when the chunk has >= 2048 rows
             (:func:`prefill_experts_pc`; 2x faster than the auto config, bitwise identical); False = auto config.
         prefill_chunk: rows per masked-dense prefill chunk (default ``cfg.moe_prefill_chunk`` = 4096).
@@ -600,6 +667,16 @@ class MotifMoE:
         self.ckc_eltwise = cfg.compute_config("eltwise")
         self.pc_gate_up = cfg.experts_gate_up_pc()  # decode, M = 32 (one tile row)
         self.pc_down = cfg.experts_down_pc()
+        # T64 decode (M = 64, 16 rows per DP row): per_core_M 2, gate_up on the same 10 x 8 cores, down on 8 x 8
+        # (model_config.experts_*_pc(m_tiles=2) = the G16-lite configs); configs only, no device memory
+        self.pc_wide = {
+            m: (cfg.experts_gate_up_pc(m_tiles=m // TILE), cfg.experts_down_pc(m_tiles=m // TILE))
+            for m in DECODE_ROWS[1:]
+        }
+        # gathered decode row counts forward_decode serves: 32, and 64 when cfg stages the T64 step (the router then
+        # holds its 64-row top-k pad, allocated above)
+        wide = wide_decode_rows(cfg)
+        self.decode_rows: Tuple[int, ...] = (TILE,) + ((wide,) if wide else ())
         self.dram = ttnn.DRAM_MEMORY_CONFIG
 
     # ==========================================================================================================
@@ -629,9 +706,10 @@ class MotifMoE:
     def experts(self, f, *, polynorm: str, decode: bool, row_scale=None, memory_config=None):
         """``f [1, 1, M, 4096]`` bf16 (identical on all chips) -> ``y [1, 12, M, 4096]`` = this chip's 12 experts
         applied to every token (``row_scale [1, 12, M, 1]``: routing weights folded into the PolyNorm output, so ``y``
-        is already weighted). Decode (M = 32) uses the G6 1D-multicast program configs; prefill (M = chunk) the
-        in1-multicast :func:`prefill_experts_pc` when M splits over its 64 cores (>= 2048 rows), else the op's auto
-        config. Intermediates and ``y`` in ``memory_config`` (decode: L1; prefill: DRAM)."""
+        is already weighted). Decode (M = 32) uses the G6 1D-multicast program configs, decode M = 64 (the T64 step)
+        their ``per_core_M`` 2 twins (``pc_wide``); prefill (M = chunk) the in1-multicast :func:`prefill_experts_pc`
+        when M splits over its 64 cores (>= 2048 rows), else the op's auto config. Intermediates and ``y`` in
+        ``memory_config`` (decode: L1; prefill: DRAM)."""
         mc = memory_config or self.dram
         M = int(f.shape[-2])
         x12 = ttnn.repeat(f, ttnn.Shape([1, self.e_loc, 1, 1]), memory_config=mc)
@@ -640,6 +718,8 @@ class MotifMoE:
             gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
         if decode and M == TILE:
             pc_gu, pc_dn = self.pc_gate_up, self.pc_down
+        elif decode and M in self.pc_wide:
+            pc_gu, pc_dn = self.pc_wide[M]
         elif not decode and self.prefill_pc:
             pc_gu = prefill_experts_pc(M // TILE, 2 * self.inter // TILE, out_block_w=20)
             pc_dn = prefill_experts_pc(M // TILE, self.hidden // TILE, out_block_w=16)
@@ -744,22 +824,34 @@ class MotifMoE:
     # decode (MOE-1, MOE-5)
     # ==========================================================================================================
     def forward_decode(self, x, *, add_partial=None, reduce_tp: bool = True, taps: Optional[dict] = None):
-        """Decode MoE for this DP row's 8 lanes.
+        """Decode MoE for this DP row's rows: its 8 lanes, or the T64 verify step's 16 rows (``[8 anchors | 8
+        drafts]``, still one tile row; docs/p5_t64/P5_T64_DESIGN.md §4.2).
 
         Args:
-            x: ``[1, 1, 8, 4096]`` bf16 TILE (post_attention_layernorm output; replicated in the row, rows differ).
-                Not consumed.
-            add_partial: optional ``[1, 1, 8, 4096]`` TP partial (e.g. the shared expert's down-projection partial
+            x: ``[1, 1, L, 4096]`` bf16 TILE, L = 8 (or 16 when the module was built with a T64 config:
+                ``self.decode_rows`` holds 64 = 4 x 16 gathered rows), post_attention_layernorm output; replicated in
+                the row, rows differ. Not consumed.
+            add_partial: optional ``[1, 1, L, 4096]`` TP partial (e.g. the shared expert's down-projection partial
                 before its all_reduce) added before the final ``all_reduce(tp)``; dtype bf16 or ``combine_dtype``.
-            reduce_tp: False returns the column partial ``[1, 1, 8, 4096]`` (``combine_dtype``) without the final
+            reduce_tp: False returns the column partial ``[1, 1, L, 4096]`` (``combine_dtype``) without the final
                 ``all_reduce(tp)`` (the caller closes it).
             taps: tests only (eager): receives ``f_all``, ``idx``, ``w``, ``w_loc``, ``part`` (not freed).
 
-        Returns ``[1, 1, 8, 4096]`` bf16 TILE DRAM: the routed MoE output (+ ``add_partial``), replicated in the row.
-        On a mesh with a size-1 axis the collectives of that axis hand their input back; nothing the caller owns (``x``,
-        ``add_partial``, ``taps``) is ever freed (:class:`_Keep`).
+        Returns ``[1, 1, L, 4096]`` bf16 TILE DRAM: the routed MoE output (+ ``add_partial``), replicated in the row.
+        Row ``j`` depends on input row ``j`` only, bitwise the same at L = 8 and 16 (the per-M configs keep every row's
+        arithmetic). On a mesh with a size-1 axis the collectives of that axis hand their input back; nothing the caller
+        owns (``x``, ``add_partial``, ``taps``) is ever freed (:class:`_Keep`). A row count whose gathered M is not in
+        ``self.decode_rows`` raises before any device op (no silent fallback to auto configs).
         """
-        f_all = self.ccl.ag_dp_rows(x, memory_config=self.decode_mc)  # [1, 1, 32, 4096], lane order 8 dp + l
+        rows = int(x.shape[-2])
+        if rows * int(self.cfg.dp) not in self.decode_rows:
+            raise ValueError(
+                f"MotifMoE layer {getattr(self, 'layer_idx', '?')}: decode input of {rows} rows per DP row gathers "
+                f"{rows * int(self.cfg.dp)} tokens; this module serves {self.decode_rows} (the T64 step's 64 need a "
+                f"config that stages it, cfg.wide_rows_per_dp > 0: spec_tokens > 0 and spec_verify 'wide' / 'auto', so "
+                f"its 64-row constants exist before any trace capture, F3N rule R3)"
+            )
+        f_all = self.ccl.ag_dp_rows(x, memory_config=self.decode_mc)  # [1, 1, 4 L, 4096], natural order L dp + j
         part = self.local_partial(f_all, polynorm=self.decode_polynorm, decode=True, taps=taps,
                                   memory_config=self.decode_mc)
         if taps is not None:
@@ -767,9 +859,9 @@ class MotifMoE:
             taps["part"] = part
         keep = _Keep(x, add_partial, *(taps.values() if taps is not None else ()))
         keep.drop(f_all)  # (is x itself when the DP axis has size 1)
-        red = self.ccl.ar_dp(part)  # sum over the 4 chips of this column (all 32 tokens)
+        red = self.ccl.ar_dp(part)  # sum over the 4 chips of this column (all 4 L tokens)
         keep.drop(part, red)
-        mine = self.ccl.partition(red, 2, "dp")  # this row's 8 lanes
+        mine = self.ccl.partition(red, 2, "dp")  # this row's L rows
         keep.drop(red, mine)
         return self._close_tp(mine, add_partial, reduce_tp, keep)
 
@@ -872,5 +964,5 @@ class MotifMoE:
         _free(self.w_gate_up, self.w_down, self.local_ids)
 
 
-__all__ = ["COMBINE_MODES", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "grouped_polynorm",
-           "prefill_experts_pc"]
+__all__ = ["COMBINE_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS",
+           "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc", "wide_decode_rows"]

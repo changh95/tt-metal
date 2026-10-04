@@ -11,8 +11,9 @@ closed with ``all_reduce(tp)``. The latent projection is replicated (no CCL befo
 Module boundary (README CONVENTIONS §3): input = the *normalized* attention input (``input_layernorm`` output; the
 decoder owns that norm), output = the attention output after ``wo`` and ``all_reduce(tp)``:
 
-* decode: ``x [1, 1, L, 4096]`` bf16 TILE DRAM (L = 8 lanes of this chip's DP row, replicated in the row)
-  -> ``[1, 1, L, 4096]`` bf16 TILE DRAM, bitwise identical on the 8 TP chips of a row;
+* decode: ``x [1, 1, L, 4096]`` bf16 TILE DRAM (L = 8 lanes of this chip's DP row, replicated in the row; L = 16
+  rows ``[8 anchors | 8 drafts]`` in the T64 verify step, below) -> ``[1, 1, L, 4096]`` bf16 TILE DRAM, bitwise
+  identical on the 8 TP chips of a row;
 * prefill (one user, S = bucket, replicated on all 32 chips): ``x [1, 1, S, 4096]`` -> ``[1, 1, S, 4096]``.
 
 Decode (all 53 layers; absorbed MLA over the paged latent cache; per chip, lanes on tile rows)::
@@ -174,7 +175,73 @@ reads the cached prefix:
   :meth:`PrefillChunkInputs.write`; ``regather=False`` (captured prefill) drops the eager RoPE rows, which a trace
   must gather itself.
 * ``forward_decode(..., kv_write=w)``: :class:`DecodeKVWriter` hook for the KV-R / speculative KV-write modes of
-  ``tt/kv_write.py`` (design §3.5). ``None`` keeps the draft-1 8-lane update (bitwise unchanged).
+  ``tt/kv_write.py`` (design §3.5). ``None`` keeps the draft-1 8-lane update (bitwise unchanged; 8 rows only, see
+  "T64 verify step" below).
+
+Packed (multi-row) prefill passes (P5; ``docs/p5_t64/P5_T64_DESIGN.md`` §3.2-§3.5, gate G15a, GATES_RESULTS §13). The
+short chunks of several rows run as ONE pass of ``T = B * S`` rows: ``B`` segments (``generator_api.PACK_BATCHES``,
+dummy segments included) of ``S`` rows each. Segment ``k`` occupies packed rows ``[k S, k S + S)``: its real rows, then
+padding. The inputs are a :class:`PrefillChunkInputs` uploaded from :class:`PackedHostTables`
+(:func:`packed_host_tables` of a ``prefill_plan.PrefillPass``; ``path`` ``"pk0"`` = sp0 segments, ``"pk1"`` = sp1
+segments at one common start ``a``). They hold the concatenated fill table ``[1, T / bs]`` (``-1`` for shared, padding
+and dummy blocks) and, always, the gathered RoPE rows ``[1, 1, T, 64]`` of every segment's positions (review edit
+R-E11). Every row-local op (projections, norms, the epilogue, ``wo``) runs unchanged at bucket ``T``; only the SDPA,
+the RoPE positions and the KV fill are per segment. The SDPA runs on a metadata view ``[1, H, T, d] -> [H, B, S, d]``
+plus a CN ``transpose(0, 1)`` -> ``[B, H, S, d]`` (batch row ``k`` = segment ``k``), and back:
+
+* **pk0**: ``q_full / k_full / v_pad`` -> ONE batched causal SDPA with the per-row bucket-``S`` config
+  (``cfg.sdpa_prefill_pc(kind, seq_len=S)`` and :meth:`MotifAttention.prefill_sdpa_window_and_config` ``(S)``: window
+  129 only at ``S >= 129``) -> CN back -> the draft-1 epilogue; the fill after the SDPA. G15a (a): every segment
+  bitwise equal to the single-row SDPA at bucket ``S``.
+* **pk1 global**: ``Q_abs [1, 10, T, 576]``; the fill FIRST (no segment of a pass reads a block the pass writes:
+  the planner's writer-first rule); ``chunked_scaled_dot_product_attention(Q [B, 10, S, 576], cache, cache,
+  page_table [B, W'], chunk_start_idx_tensor [a])`` with ``cfg.resumed_prefill_pc("global", S, kv_dtype)`` and the G9
+  role; CN back; ``[..., :512]``; the absorbed epilogue. G15a (b): bitwise per segment vs the single-row sp1 call.
+* **pk1 SWA**: per segment the square ``[tail ‖ segment]``. The tails ``[B, 1, 128, 576]`` bf16
+  (:meth:`MotifAttention._gather_tails_packed`) come in one of two variants, fixed per pass (review edit R-E2):
+  ``shared`` (every segment has the same tail blocks: the solo 2-block gather + typecast + ``repeat``) or ``distinct``
+  (2B tensor-args block slices + ONE concat + view + typecast). Then ``lat = concat([tail_b, view(kv_row, [B, 1, S,
+  576])], 2)``, the draft-1 expansion at batch ``B`` (the ``[512, 640]`` weight unbatched), ``Q_cat = concat([qb[:, :,
+  :128], qb], 2)``, the causal window-129 SDPA with ``cfg.resumed_prefill_pc("swa", S)``, rows ``[128, 128 + S)``, CN
+  back, the epilogue; the fill after the SDPA. G15a (c): bitwise per segment vs the solo sp1 SWA dataflow. The two
+  variants are different programs, so the warm-up runs both per pk1 shape (:func:`warmup_packed_host_tables`).
+
+Programs depend on ``(path, T, S)`` and, for pk1, the tail variant only (the starts, block ids and RoPE rows are device
+data). A batched SDPA's static CBs are the per-row bucket-``S`` program's (they do not depend on ``B``); G15a found
+every new program's CB end below the L1_SMALL region. Dummy segments write nothing and copy segment 0's tables (pk1:
+its SDPA row and tails), so they read only what segment 0 reads; their outputs are dropped.
+
+T64 verify step (``docs/p5_t64/P5_T64_DESIGN.md`` §4.1-§4.4, T1-T3; gate G-S1w; ``tt/kv_write.py`` "T64"). Each DP row
+decodes 16 rows ``[8 anchors | 8 drafts]``: lane ``8 r + j`` has its anchor at ``n`` in row ``j`` and its draft at
+``n + 1`` in row ``8 + j``, with the lane's own page-table row. The 16 rows are still one 32-row tile row, so every op
+of :meth:`MotifAttention.forward_decode` before and after FlashMLA runs unchanged on ``L = 16`` rows (RoPE rows from
+``rope.rot_idxs_host(positions, rows_per_dp=16)``, the mask from ``active_mask_from_cur_pos(cur_pos, 16)``). The KV
+write is ``kv_write.DecodeKVWrite(rows=64)``: call A writes the anchors at ``n``, then call B the drafts at ``n + 1``,
+both before FlashMLA. Causality is per row through ``cur_pos``: a draft sees its anchor's key ``n``, an anchor never
+sees ``n + 1``. FlashMLA runs as **option A''**:
+
+* SWA layers (39, and the MTP layer): ONE call at B = 16 on ``kv_write.cur_pos [16]`` / ``kv_write.page_table [16,
+  W]`` (a draft row carries its owner's table row). A user reads at most 2 K chunks of 128 inside the 129-key window,
+  so the per-user core split of B = 16 cannot change the flash-decode reduction: bitwise the B = 8 rows, +0.7 us
+  (T64N §5.1).
+* global layers (14): one B = 8 call per entry of ``kv_write.flash_groups()``: ``q_mla[:, 0:8]`` (the anchors, at
+  ``flash_cur_a``) and ``q_mla[:, 8:16]`` (the drafts, at ``flash_cur_d``), both on the anchors' ``[8, W]`` table
+  ``flash_pt``, outputs concatenated on dim 1. That is the T32 call's program and core split (15 cores per user), so
+  every row equals its T32 row bit for bit. One B = 16 call (option A) splits each user over 7 cores and changes the
+  reduction tree: FlashMLA alone PCC 0.99991 (G-S1w b), a whole layer max |d| 0.0156 (T64N §5.1), this module's
+  output max |d| 0.003-0.004 at PCC 0.999926 (random weights, below).
+
+So every T64 row is bitwise the T32 row of the same token, position and cache, anchors and drafts, which keeps
+``spec_verify="auto"`` lossless when steps alternate between the two traces. At 8 rows per DP row
+``flash_groups()`` is the one T32 call: the T32 step issues exactly today's ops. Host guards (before any op): the
+draft-1 update (``kv_write=None``) writes 8 lanes on 8 cores, so it refuses any other row count; a writer's
+``lanes_per_row`` must match ``x``; a global layer at more than 8 rows needs ``flash_groups()``. Option A stays
+available for measurements (gate G16): a writer whose ``flash_groups()`` returns the one group ``(0:16, cur_pos,
+page_table)``. Measured (``tests/unit/test_attention_kvr.py``, 2026-10-03; layers 0 (global), 1 (SWA) and the MTP
+layer, anchors at ~1K / ~4K / ~32K, the real ``DecodeKVWrite(rows=64)``): every anchor row and every draft row is
+bitwise its row of two T32 steps (the anchors at ``n``, then the drafts at ``n + 1``), and every chip's cache bitwise
+the T32 caches, for bfp8 ``all_split`` / ``row_split`` and bf16 ``all_split``; a traced T64 step replays bitwise equal
+to eager with no program compiled after the warmup; no static-CB clash with an L1 pin page alive.
 
 Measured on this Galaxy (``tests/unit/test_attention.py``, fabric committed TORUS_Y, mesh opened with
 ``l1_small_size=32768``; PCC vs the fp32 reference): prefill (default role) global 0.99965-0.99978 random / 0.99996-
@@ -210,7 +277,7 @@ per-head copies of the per-group ``W_UK'`` / ``W_UV'`` (one head per core in the
 the ``wo`` input (1024 columns) instead of the output (identical result, half the cost).
 
 Import rule: only ``torch``, ``ttnn`` and the motif3 shared infra (``model_config``, ``weights``, ``ccl``, ``rope``,
-``prefill_plan``).
+``prefill_plan``; the P5 constants of ``generator_api``).
 """
 
 from __future__ import annotations
@@ -226,8 +293,14 @@ import ttnn
 from . import prefill_plan as PP
 from . import weights as W
 from .ccl import MotifCCL
+from .generator_api import PACK_BATCHES, PACK_SEG_BUCKETS, PACK_SP1_SEG_BUCKETS, PACKED_PASS_KINDS, PK1_TAIL_VARIANTS
 from .model_config import TILE, LayerSpec, MotifTTConfig, make_compute_kernel_config, mcast1d_matmul_pc
-from .rope import MotifRope
+from .rope import MotifRope, decode_rows_per_dp
+
+# Packed prefill passes (P5, docs/p5_t64/P5_T64_DESIGN.md §3): "pk0" = sp0 segments, "pk1" = sp1 segments at one start.
+PK0, PK1 = PACKED_PASS_KINDS
+# pk1 SWA tails gathered once and repeated ("shared") or per segment ("distinct"): two program sets (review edit R-E2).
+SHARED_TAILS, DISTINCT_TAILS = PK1_TAIL_VARIANTS
 
 # Cache-name prefix of every tensor this module writes to the TT weight cache. Bump the version whenever a transform
 # below changes (head order, scale / gamma folding, layouts), so stale .tensorbin files are never loaded silently.
@@ -547,6 +620,16 @@ def _cdiv(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
+def _block_bounds(blocks: Sequence[int], block_size: int, latent_dim: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Tensor-args dim-0 slice bounds ``([blk, 0, 0, 0], [blk + 1, 1, bs, latent_dim])`` (int32 ``[4]`` pairs) of the
+    cache blocks ``blocks``, in order. The bounds are device data, so one slice program serves every block id (G10a)."""
+    bs, d = int(block_size), int(latent_dim)
+    return [
+        (torch.tensor([b, 0, 0, 0], dtype=torch.int32), torch.tensor([b + 1, 1, bs, d], dtype=torch.int32))
+        for b in blocks
+    ]
+
+
 @dataclass(frozen=True)
 class ChunkHostTables:
     """The host tables of one prefill chunk (pure torch; :func:`chunk_host_tables`, :func:`warmup_chunk_host_tables`).
@@ -673,16 +756,22 @@ class ChunkHostTables:
     def is_sp1(self) -> bool:
         return self.path == PP.SP1
 
+    @property
+    def is_packed(self) -> bool:
+        """A packed pass (:class:`PackedHostTables`): never for a chunk."""
+        return False
+
+    @property
+    def reads_cache(self) -> bool:
+        """The chunk reads the paged cache (sp1; review edit R-E11: the guard every cache reader keys on)."""
+        return self.is_sp1
+
     def tail_bounds(self, latent_dim: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Tensor-args slice bounds of every tail block, in position order: ``([blk, 0, 0, 0], [blk + 1, 1, bs,
         latent_dim])`` int32 ``[4]`` pairs (empty for sp0 / no tail)."""
         if self.tail is None:
             return []
-        bs, d = int(self.block_size), int(latent_dim)
-        return [
-            (torch.tensor([b, 0, 0, 0], dtype=torch.int32), torch.tensor([b + 1, 1, bs, d], dtype=torch.int32))
-            for b in self.tail.tolist()
-        ]
+        return _block_bounds(self.tail.tolist(), self.block_size, latent_dim)
 
 
 def chunk_host_tables(cfg: MotifTTConfig, plan: "PP.RowPlan", chunk: "PP.ChunkPlan", page_table_row) -> ChunkHostTables:
@@ -769,6 +858,292 @@ def warmup_chunk_host_tables(cfg: MotifTTConfig, path: str, bucket: int) -> Chun
     )
 
 
+# ======================================================================================================================
+# packed prefill passes (P5): the host tables of one pass (docs/p5_t64/P5_T64_DESIGN.md §3.2-§3.5)
+# ======================================================================================================================
+@dataclass(frozen=True)
+class PackedHostTables:
+    """The host tables of one packed prefill pass (pure torch; :func:`packed_host_tables`,
+    :func:`warmup_packed_host_tables`): ``B`` segments of ``S`` rows, ``T = B * S`` rows in all, segment ``k`` at
+    packed rows ``[k S, k S + S)`` (module docstring, "Packed (multi-row) prefill passes").
+
+    Attributes:
+        path: ``"pk0"`` (sp0 segments, start 0) or ``"pk1"`` (sp1 segments at one common start).
+        segments: ``B``, one of ``generator_api.PACK_BATCHES`` (dummy segments included).
+        seg_rows: ``S``, one of ``generator_api.PACK_SEG_BUCKETS`` (pk0) / ``PACK_SP1_SEG_BUCKETS`` (pk1), a multiple
+            of the block size: every segment starts on a block, and the fill kernel maps packed row ``i`` to entry
+            ``i // bs``.
+        bucket: ``T = B * S``, the bucket every row-local program of the pass runs at.
+        start: the common start ``a`` (pk1: a positive multiple of the block size); 0 (pk0).
+        ends: ``int32 [B]``: one past each segment's last real row (absolute position).
+        block_size: KV block size ``bs``.
+        fill: ``int32 [1, T / bs]``: entries ``[k S / bs, (k + 1) S / bs)`` = segment ``k``'s ``fill_table``.
+        rope: ``int32 [T]``: RoPE table rows; ``[k S, k S + S)`` = segment ``k``'s ``rope_positions``.
+        sdpa: pk1: ``int32 [B, W']``, row ``k`` = segment ``k``'s SDPA table (real ids, then 0; never -1).
+        start_idx: pk1: ``int32 [1]`` = ``[start]``.
+        tail: pk1: ``int32 [B, tail / bs]``, row ``k`` = segment ``k``'s SWA tail blocks (positions ``[a - tail,
+            a)``); None without a sliding window.
+        tails: pk1: the SWA tail variant (review edit R-E2): ``"shared"`` (every row of ``tail`` is the same: one
+            gather, then ``repeat``) or ``"distinct"`` (a gather per segment; also valid for equal rows, which is how
+            the warm-up compiles it). None for pk0.
+        dummies: the last ``dummies`` segments are dummies. They write nothing (fill entries all -1) and copy
+            segment 0's end and RoPE rows, and in pk1 its SDPA row and tail blocks (R-E2). So they read only what
+            segment 0 reads, and a pass whose real segments share one prefix stays ``shared``.
+
+    ``__post_init__`` checks the pass structure, then runs the :class:`ChunkHostTables` checks on every segment's slice
+    (:meth:`segment`: the per-chunk tables of the segment's chunk re-bucketed to ``S``, review edit R-E12): fill ids vs
+    SDPA ids, tail ids vs SDPA ids, the RoPE rows of the real rows at their positions, one contiguous written run that
+    ends at the block of the last real row, never -1 in an SDPA table, never the null block in a fill table. A segment
+    that writes nothing is a dummy or a warm-up segment.
+    """
+
+    path: str
+    segments: int
+    seg_rows: int
+    bucket: int
+    start: int
+    ends: torch.Tensor
+    block_size: int
+    fill: torch.Tensor
+    rope: torch.Tensor
+    sdpa: Optional[torch.Tensor] = None
+    start_idx: Optional[torch.Tensor] = None
+    tail: Optional[torch.Tensor] = None
+    tails: Optional[str] = None
+    dummies: int = 0
+
+    def __post_init__(self):
+        B, S, T, a, bs = int(self.segments), int(self.seg_rows), int(self.bucket), int(self.start), int(self.block_size)
+        if self.path not in PACKED_PASS_KINDS:
+            raise ValueError(f"packed path must be one of {PACKED_PASS_KINDS}, got {self.path!r}")
+        sizes = PACK_SEG_BUCKETS if self.path == PK0 else PACK_SP1_SEG_BUCKETS
+        if B not in PACK_BATCHES or S not in sizes or T != B * S:
+            raise ValueError(
+                f"a {self.path} pass is B in {PACK_BATCHES} segments of S in {sizes} rows, T = B * S rows; got "
+                f"B = {B}, S = {S}, T = {T}"
+            )
+        if bs < TILE or bs % TILE or S % bs:
+            raise ValueError(f"segment rows {S} must be a multiple of the block size {bs} (a multiple of {TILE})")
+        if not 0 <= int(self.dummies) < B:
+            raise ValueError(f"dummies must be in [0, {B}) (segment 0 is real), got {self.dummies}")
+        _check_host_i32("fill", self.fill, (1, T // bs))
+        _check_host_i32("rope", self.rope, (T,))
+        _check_host_i32("ends", self.ends, (B,))
+        if int(self.rope.min()) < 0:
+            raise ValueError("RoPE rows are table positions >= 0")
+        if self.path == PK0:
+            if a != 0 or any(t is not None for t in (self.sdpa, self.start_idx, self.tail, self.tails)):
+                raise ValueError("a pk0 pass starts at 0 and has no SDPA tables, start index, SWA tails or variant")
+        else:
+            if self.sdpa is None or self.start_idx is None:
+                raise ValueError("a pk1 pass needs its SDPA tables and start index")
+            _check_host_i32("sdpa", self.sdpa, ndim=2)
+            if int(self.sdpa.shape[0]) != B:
+                raise ValueError(f"pk1 SDPA tables {tuple(self.sdpa.shape)}: the batched op reads one row per segment")
+            if self.tail is None:
+                if self.tails not in (None,) + tuple(PK1_TAIL_VARIANTS):
+                    raise ValueError(f"tail variant must be one of {PK1_TAIL_VARIANTS} or None, got {self.tails!r}")
+            else:
+                _check_host_i32("tail", self.tail, ndim=2)
+                if int(self.tail.shape[0]) != B:
+                    raise ValueError(f"pk1 SWA tails {tuple(self.tail.shape)}: one row per segment ({B})")
+                if self.tails not in PK1_TAIL_VARIANTS:
+                    raise ValueError(
+                        f"a pk1 pass needs its SWA tail variant, one of {PK1_TAIL_VARIANTS}, got {self.tails!r}"
+                    )
+                if self.tails == SHARED_TAILS and not bool((self.tail == self.tail[:1]).all()):
+                    raise ValueError(
+                        f"shared tails gather segment 0's tail once for the whole pass, but the segments' tail blocks "
+                        f"differ: {self.tail.tolist()} (use 'distinct'; review edit R-E2)"
+                    )
+        for k in range(B):
+            try:
+                self.segment(k)  # the ChunkHostTables checks of the segment's slice (R-E12)
+            except ValueError as e:
+                raise ValueError(f"{self.path} segment {k} of {B}: {e}") from e
+            if self.path == PK0:  # an sp0 chunk carries no RoPE rows: the pass's rows must be the positions 0 .. e - 1
+                e = int(self.ends[k])
+                if not torch.equal(self.rope[k * S : k * S + e], torch.arange(e, dtype=torch.int32)):
+                    raise ValueError(
+                        f"pk0 segment {k}: the RoPE rows of its real rows must be the positions 0 .. {e - 1}, got "
+                        f"{self.rope[k * S : k * S + min(e, 8)].tolist()} ..."
+                    )
+        n = S // bs
+        for k in range(B - int(self.dummies), B):
+            same = (
+                int(self.ends[k]) == int(self.ends[0])
+                and torch.equal(self.rope[k * S : (k + 1) * S], self.rope[:S])
+                and (self.sdpa is None or torch.equal(self.sdpa[k], self.sdpa[0]))
+                and (self.tail is None or torch.equal(self.tail[k], self.tail[0]))
+            )
+            if bool((self.fill[0, k * n : (k + 1) * n] >= 0).any()) or not same:
+                raise ValueError(
+                    f"dummy segment {k} must write nothing (fill entries -1) and copy segment 0's end, RoPE rows, SDPA "
+                    "row and tail blocks (review edit R-E2)"
+                )
+
+    def segment(self, k: int) -> ChunkHostTables:
+        """Segment ``k``'s tables as one chunk of ``seg_rows`` rows (the per-chunk tables re-bucketed to ``S``, review
+        edit R-E12): ``fill [1, S / bs]``; pk1 also its SDPA row ``[1, W']``, ``start_idx``, RoPE rows ``[S]`` and tail
+        blocks."""
+        B, S, bs, k = int(self.segments), int(self.seg_rows), int(self.block_size), int(k)
+        if not 0 <= k < B:
+            raise IndexError(f"segment {k} outside the pass's {B} segments")
+        n = S // bs
+        fill = self.fill[:, k * n : (k + 1) * n].contiguous()
+        if self.path == PK0:
+            return ChunkHostTables(PP.SP0, 0, S, int(self.ends[k]), bs, fill)
+        return ChunkHostTables(
+            PP.SP1,
+            int(self.start),
+            S,
+            int(self.ends[k]),
+            bs,
+            fill,
+            sdpa=self.sdpa[k : k + 1].contiguous(),
+            start_idx=self.start_idx,
+            rope=self.rope[k * S : (k + 1) * S].contiguous(),
+            tail=None if self.tail is None else self.tail[k].contiguous(),
+        )
+
+    @property
+    def is_sp1(self) -> bool:
+        """A single sp1 chunk: never for a pass (:attr:`reads_cache` covers pk1)."""
+        return False
+
+    @property
+    def is_packed(self) -> bool:
+        return True
+
+    @property
+    def reads_cache(self) -> bool:
+        """The pass reads the paged cache (pk1; review edit R-E11)."""
+        return self.path == PK1
+
+    @property
+    def real_segments(self) -> int:
+        """Segments ``[0, B - dummies)`` hold real chunks."""
+        return int(self.segments) - int(self.dummies)
+
+    @property
+    def end(self) -> int:
+        """The largest segment end (:attr:`ends` holds each segment's)."""
+        return int(self.ends.max())
+
+    @property
+    def shape(self) -> Tuple[Any, ...]:
+        """The pass shape key, as ``prefill_plan.PrefillPass.shape`` and ``MotifTTConfig.packed_prefill_shapes()``
+        name it: ``("pk0", T, S)``, ``("pk1", T, S, tails)``."""
+        key = (self.path, int(self.bucket), int(self.seg_rows))
+        return key if self.path == PK0 else key + (self.tails,)
+
+    def head_row(self, k: int) -> int:
+        """Packed row of segment ``k``'s last real row: ``k S + ends[k] - 1 - start`` (``PrefillPass.head_rows``)."""
+        return int(k) * int(self.seg_rows) + int(self.ends[int(k)]) - 1 - int(self.start)
+
+    def tail_bounds(self, latent_dim: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Tensor-args slice bounds of the tail blocks the pass gathers (:func:`_block_bounds`): ``shared``: segment
+        0's blocks (the solo gather); ``distinct``: every segment's blocks, segment-major (``2 B`` pairs for bs 64).
+        Empty for pk0 / no tail."""
+        if self.tail is None:
+            return []
+        rows = self.tail[:1] if self.tails == SHARED_TAILS else self.tail
+        return _block_bounds(rows.reshape(-1).tolist(), self.block_size, latent_dim)
+
+
+def packed_host_tables(cfg: MotifTTConfig, pass_, requests: Sequence[Any], plans: Sequence["PP.RowPlan"]):
+    """Host tables of the packed pass ``pass_`` (a ``prefill_plan.PrefillPass`` of kind ``pk0`` / ``pk1`` from
+    ``prefill_plan.plan_prefill_passes``) of one call's ``requests`` (``PrefillRequest``-like: ``page_table``) and
+    their row ``plans`` (``cfg.plan_prefill_row``): ``prefill_plan.pass_tables`` with this config's geometry (block
+    size, SDPA width ``cfg.sp1_page_table_width``, RoPE rows clamped to ``cfg.max_model_len``, the
+    ``cfg.prefill_swa_tail`` tail), checked as :class:`PackedHostTables`. Each segment's slice is the per-chunk tables
+    of its chunk re-bucketed to ``S`` (R-E12); dummies write nothing and copy segment 0 (R-E2). Pure host: raises
+    ``ValueError`` before any device work. Solo passes keep :func:`chunk_host_tables` of their chunk."""
+    kind = getattr(pass_, "kind", None)
+    if kind not in PACKED_PASS_KINDS:
+        raise ValueError(
+            f"packed_host_tables takes a pass of kind {PACKED_PASS_KINDS}, got {kind!r} (a solo pass runs its chunk: "
+            "chunk_host_tables)"
+        )
+    T = int(pass_.tokens)
+    if T not in cfg.prefill_span_buckets:
+        raise ValueError(
+            f"a packed pass of T = {T} rows runs the bucket-T programs: T must be a prefill span bucket "
+            f"{cfg.prefill_span_buckets}"
+        )
+    bs = int(cfg.kv_block_size)
+    t = PP.pass_tables(
+        pass_,
+        requests,
+        plans,
+        block_size=bs,
+        sdpa_width=cfg.sp1_page_table_width,
+        max_positions=cfg.max_model_len,
+        swa_tail=cfg.prefill_swa_tail,
+    )
+    return PackedHostTables(
+        path=kind,
+        segments=int(pass_.batch),
+        seg_rows=int(pass_.seg_rows),
+        bucket=T,
+        start=int(pass_.start),
+        ends=t.ends,
+        block_size=bs,
+        fill=t.fill,
+        rope=t.rope,
+        sdpa=t.sdpa,
+        start_idx=t.start_idx,
+        tail=t.tail,
+        tails=t.tails if kind == PK1 else None,
+        dummies=int(pass_.dummies),
+    )
+
+
+def warmup_packed_host_tables(
+    cfg: MotifTTConfig, path: str, bucket: int, seg_rows: int, tails: Optional[str] = None
+) -> PackedHostTables:
+    """Tables of a warm-up pass of the packed shape ``(path, T, S[, tails])`` (an entry of
+    ``cfg.packed_prefill_shapes()``: ``warmup_packed_host_tables(cfg, *shape)``) that writes nothing and reads only the
+    null block 0 (design §3.5): every segment is the warm-up chunk of :func:`warmup_chunk_host_tables` at ``S`` rows
+    (fill all -1; pk1 at :func:`warmup_start` with all-zero SDPA rows and tail blocks 0). pk1 needs ``tails``: the
+    ``distinct`` variant gathers ``2 B`` null-block slices, so warming both variants per pk1 shape compiles both program
+    sets (review edit R-E2). One attention call per shape and layer kind compiles every program of the packed SDPA
+    path; the row-local programs at ``T`` are the solo bucket-``T`` ones."""
+    T, S, bs = int(bucket), int(seg_rows), int(cfg.kv_block_size)
+    if path not in PACKED_PASS_KINDS:
+        raise ValueError(f"packed path must be one of {PACKED_PASS_KINDS}, got {path!r}")
+    if S < 1 or T % S:
+        raise ValueError(f"a packed pass of T = {T} rows holds whole segments of S = {S} rows")
+    if T not in cfg.prefill_span_buckets:
+        raise ValueError(f"packed pass T = {T} must be a prefill span bucket {cfg.prefill_span_buckets}")
+    B = T // S
+    fill = torch.full((1, T // bs), -1, dtype=torch.int32)
+    if path == PK0:
+        if tails is not None:
+            raise ValueError("a pk0 pass has no SWA tail variant")
+        w = warmup_chunk_host_tables(cfg, PP.SP0, S)
+        rope = torch.arange(S, dtype=torch.int32).repeat(B)
+        return PackedHostTables(PK0, B, S, T, 0, torch.full((B,), w.end, dtype=torch.int32), bs, fill, rope)
+    if tails not in PK1_TAIL_VARIANTS:
+        raise ValueError(f"a pk1 warm-up names its SWA tail variant, one of {PK1_TAIL_VARIANTS}, got {tails!r}")
+    w = warmup_chunk_host_tables(cfg, PP.SP1, S)
+    return PackedHostTables(
+        PK1,
+        B,
+        S,
+        T,
+        int(w.start),
+        torch.full((B,), w.end, dtype=torch.int32),
+        bs,
+        fill,
+        w.rope.repeat(B),
+        sdpa=w.sdpa.repeat(B, 1),
+        start_idx=w.start_idx.clone(),
+        tail=None if w.tail is None else w.tail[None].repeat(B, 1),
+        tails=tails,
+    )
+
+
 def _replicate_i32(mesh_device, t: torch.Tensor, *, device: bool = True):
     """``int32`` ROW_MAJOR replicated mesh tensor (``device=False``: a host mesh tensor for
     ``ttnn.copy_host_to_device_tensor``)."""
@@ -791,15 +1166,23 @@ class PrefillChunkInputs:
 
     Attributes:
         path, start, bucket, end: host copies of the chunk (``prefill_plan.ChunkPlan``); the attention checks the sp1
-            start alignment against them before every call.
+            start alignment against them before every call. A packed pass (:class:`PackedHostTables`): ``"pk0"`` /
+            ``"pk1"``, the common start (0 for pk0), ``T``, the largest segment end.
         fill_pt: ``[1, C / bs]`` int32 ROW_MAJOR fill table (``-1`` = skip).
-        rot: sp1: ``{kind: (cos, sin)}`` ``[1, 1, C, 64]`` TILE, the RoPE rows of positions ``a .. a + C - 1``
-            (``rope.chunk_rope_tables``); ``None`` after :meth:`write` with ``regather=False`` (the caller passes
-            tables of the new positions). sp0: ``None`` (each layer uses ``rope.prefill_cos_sin(kind, C)``, draft 1).
-        sdpa_pt: sp1: ``[1, W']`` int32 ROW_MAJOR, 0-padded (global layers).
-        start_idx: sp1: ``[1]`` int32 ROW_MAJOR = ``[start]`` (global layers' ``chunk_start_idx_tensor``).
-        tail_bounds: sp1: per SWA tail block a ``(start [4], end [4])`` int32 ROW_MAJOR pair (SWA layers).
-        rot_idx: sp1: the ``[1, C]`` uint32 gather indices behind ``rot``.
+        rot: sp1 and packed: ``{kind: (cos, sin)}`` ``[1, 1, C, 64]`` TILE, the RoPE rows of the rows' positions
+            (``a .. a + C - 1``; packed: every segment's, review edit R-E11) (``rope.chunk_rope_tables``); ``None``
+            after :meth:`write` with ``regather=False`` (the caller passes tables of the new positions). sp0: ``None``
+            (each layer uses ``rope.prefill_cos_sin(kind, C)``, draft 1).
+        sdpa_pt: sp1: ``[1, W']`` int32 ROW_MAJOR, 0-padded (global layers); pk1: ``[B, W']``, one row per segment.
+        start_idx: sp1 / pk1: ``[1]`` int32 ROW_MAJOR = ``[start]`` (global layers' ``chunk_start_idx_tensor``).
+        tail_bounds: sp1: per SWA tail block a ``(start [4], end [4])`` int32 ROW_MAJOR pair (SWA layers); pk1: the
+            pairs of :meth:`PackedHostTables.tail_bounds` (``shared``: segment 0's; ``distinct``: every segment's,
+            segment-major).
+        rot_idx: sp1 and packed: the ``[1, C]`` uint32 gather indices behind ``rot``.
+        segments, seg_rows: packed: ``B`` segments (dummies included) of ``S`` rows, ``bucket = B * S``; 1 / None for a
+            chunk.
+        tails: pk1: the SWA tail variant (``"shared"`` / ``"distinct"``, review edit R-E2); None otherwise.
+        ends: packed: one past each segment's last real row (host ints, :meth:`segment_head_row`); ``()`` otherwise.
     """
 
     path: str
@@ -812,29 +1195,68 @@ class PrefillChunkInputs:
     start_idx: Any = None
     tail_bounds: Tuple[Tuple[Any, Any], ...] = ()
     rot_idx: Any = None
+    segments: int = 1
+    seg_rows: Optional[int] = None
+    tails: Optional[str] = None
+    ends: Tuple[int, ...] = ()
 
     @property
     def is_sp1(self) -> bool:
         return self.path == PP.SP1
 
     @property
+    def is_packed(self) -> bool:
+        """A packed pass (``"pk0"`` / ``"pk1"``): the attention runs the batched per-segment SDPA paths."""
+        return self.path in PACKED_PASS_KINDS
+
+    @property
+    def reads_cache(self) -> bool:
+        """The rows read the paged cache: sp1 and pk1 (review edit R-E11; ``is_sp1`` is False for a pk1 pass)."""
+        return self.path in (PP.SP1, PK1)
+
+    @property
     def head_row(self) -> int:
-        """Chunk-local row of the last real token (the LM head's row on the last chunk)."""
+        """Chunk-local row of the last real token (the LM head's row on the last chunk). A packed pass has one per
+        segment (:meth:`segment_head_row`)."""
+        if self.is_packed:
+            raise ValueError(f"a {self.path} pass has one head row per segment: segment_head_row(k)")
         return int(self.end) - 1 - int(self.start)
 
+    def segment_head_row(self, k: int) -> int:
+        """Packed row of segment ``k``'s last real token: ``k S + ends[k] - 1 - start`` (``PrefillPass.head_rows``
+        names the segments that need logits). For a chunk, ``k = 0`` gives :attr:`head_row`."""
+        if not self.is_packed:
+            if int(k) != 0:
+                raise IndexError(f"a chunk is one segment, got segment {k}")
+            return self.head_row
+        if not 0 <= int(k) < len(self.ends):
+            raise IndexError(f"segment {k} outside the pass's {len(self.ends)} segments")
+        return int(k) * int(self.seg_rows) + int(self.ends[int(k)]) - 1 - int(self.start)
+
     @classmethod
-    def upload(cls, mesh_device, cfg: MotifTTConfig, rope: MotifRope, host: ChunkHostTables) -> "PrefillChunkInputs":
-        """Upload ``host`` (eager: a few small host-to-device copies and, for sp1, 2 x 2 RoPE gathers)."""
+    def upload(
+        cls, mesh_device, cfg: MotifTTConfig, rope: MotifRope, host: Union[ChunkHostTables, PackedHostTables]
+    ) -> "PrefillChunkInputs":
+        """Upload ``host`` (eager: a few small host-to-device copies; sp1 chunks and packed passes add 2 x 2 RoPE
+        gathers): a chunk's :class:`ChunkHostTables` or a packed pass's :class:`PackedHostTables` (which always
+        gathers its RoPE rows, pk0 included: every segment starts at its own position 0 / ``a``, review edit
+        R-E11)."""
         if host.block_size != cfg.kv_block_size:
             raise ValueError(f"chunk tables for block size {host.block_size}, the config has {cfg.kv_block_size}")
+        packed = bool(getattr(host, "is_packed", False))
+        reads = bool(getattr(host, "reads_cache", host.is_sp1))
         inp = cls(host.path, int(host.start), int(host.bucket), int(host.end), _replicate_i32(mesh_device, host.fill))
-        if host.is_sp1:
+        if packed:
+            inp.segments, inp.seg_rows, inp.tails = int(host.segments), int(host.seg_rows), host.tails
+            inp.ends = tuple(int(e) for e in host.ends.tolist())
+        if reads:
             inp.sdpa_pt = _replicate_i32(mesh_device, host.sdpa)
             inp.start_idx = _replicate_i32(mesh_device, host.start_idx)
             inp.tail_bounds = tuple(
                 (_replicate_i32(mesh_device, s), _replicate_i32(mesh_device, e))
                 for s, e in host.tail_bounds(cfg.kv_latent_dim)
             )
+        if reads or packed:
             inp.rot_idx = rope.chunk_rot_idxs_device(host.rope)
             inp.rot = rope.chunk_rope_tables(inp.rot_idx)
         return inp
@@ -848,17 +1270,41 @@ class PrefillChunkInputs:
         return cls.upload(mesh_device, cfg, rope, chunk_host_tables(cfg, plan, chunk, page_table_row))
 
     @classmethod
-    def warmup(cls, mesh_device, cfg: MotifTTConfig, rope: MotifRope, path: str, bucket: int) -> "PrefillChunkInputs":
-        """Inputs of a warm-up chunk (:func:`warmup_chunk_host_tables`): nothing is written, only the null block is
-        read. Run every ``(path, bucket)`` once before the decode capture (D12)."""
-        return cls.upload(mesh_device, cfg, rope, warmup_chunk_host_tables(cfg, path, bucket))
+    def warmup(
+        cls,
+        mesh_device,
+        cfg: MotifTTConfig,
+        rope: MotifRope,
+        path: str,
+        bucket: int,
+        seg_rows: Optional[int] = None,
+        tails: Optional[str] = None,
+    ) -> "PrefillChunkInputs":
+        """Inputs of a warm-up chunk (:func:`warmup_chunk_host_tables`) or, for ``path`` ``"pk0"`` / ``"pk1"``, of a
+        warm-up packed pass of ``bucket = T`` rows in segments of ``seg_rows`` (:func:`warmup_packed_host_tables`;
+        pk1 with its ``tails`` variant): nothing is written, only the null block is read. Run every ``(path, bucket)``
+        and every packed shape (both pk1 variants) once before the decode capture (D12, review edit R-E2)."""
+        if path in PACKED_PASS_KINDS:
+            host = warmup_packed_host_tables(cfg, path, bucket, seg_rows, tails)
+        elif seg_rows is not None or tails is not None:
+            raise ValueError(f"seg_rows / tails describe a packed pass ({PACKED_PASS_KINDS}), not a {path!r} chunk")
+        else:
+            host = warmup_chunk_host_tables(cfg, path, bucket)
+        return cls.upload(mesh_device, cfg, rope, host)
 
     def write(
-        self, mesh_device, cfg: MotifTTConfig, rope: MotifRope, host: ChunkHostTables, *, regather: bool = True
+        self,
+        mesh_device,
+        cfg: MotifTTConfig,
+        rope: MotifRope,
+        host: Union[ChunkHostTables, PackedHostTables],
+        *,
+        regather: bool = True,
     ) -> None:
-        """Rewrite these (persistent) inputs in place for another chunk of the same ``(path, bucket)``
-        (``ttnn.copy_host_to_device_tensor``; the buffers keep their addresses). The previous chunk's gathered RoPE
-        rows (``rot``) are freed in either case: they hold the old positions.
+        """Rewrite these (persistent) inputs in place for another chunk of the same ``(path, bucket)`` (a packed
+        pass: of the same shape ``(path, T, S[, tails])``) (``ttnn.copy_host_to_device_tensor``; the buffers keep
+        their addresses). The previous chunk's gathered RoPE rows (``rot``) are freed in either case: they hold the
+        old positions.
 
         ``regather=True``: gather the new rows from ``rot_idx`` here (eager, new tensors), for eager calls.
         ``regather=False``: no device allocation; ``rot`` becomes ``None``, so an eager ``forward_prefill(chunk=)`` /
@@ -868,24 +1314,36 @@ class PrefillChunkInputs:
         replaced on every write)."""
         if (host.path, int(host.bucket)) != (self.path, int(self.bucket)):
             raise ValueError(f"inputs of ({self.path}, {self.bucket}) cannot hold a ({host.path}, {host.bucket}) chunk")
+        packed = bool(getattr(host, "is_packed", False))
+        reads = bool(getattr(host, "reads_cache", host.is_sp1))
+        if packed:
+            want = (int(self.segments), self.seg_rows, self.tails)
+            if (int(host.segments), int(host.seg_rows), host.tails) != want:
+                raise ValueError(
+                    f"inputs of {self.path} B x S = {self.segments} x {self.seg_rows} (tails {self.tails}) cannot hold "
+                    f"a pass of {host.segments} x {host.seg_rows} (tails {host.tails}): another program set"
+                )
         if host.block_size != cfg.kv_block_size:
             raise ValueError(f"chunk tables for block size {host.block_size}, the config has {cfg.kv_block_size}")
         bounds = host.tail_bounds(cfg.kv_latent_dim)
-        if host.is_sp1 and len(bounds) != len(self.tail_bounds):  # every check before the first copy
+        if reads and len(bounds) != len(self.tail_bounds):  # every check before the first copy
             raise ValueError(f"{len(bounds)} tail blocks, the inputs hold {len(self.tail_bounds)}")
         ttnn.copy_host_to_device_tensor(_replicate_i32(mesh_device, host.fill, device=False), self.fill_pt)
-        if host.is_sp1:
+        if reads:
             ttnn.copy_host_to_device_tensor(_replicate_i32(mesh_device, host.sdpa, device=False), self.sdpa_pt)
             ttnn.copy_host_to_device_tensor(_replicate_i32(mesh_device, host.start_idx, device=False), self.start_idx)
             for (s, e), (s_dev, e_dev) in zip(bounds, self.tail_bounds):
                 ttnn.copy_host_to_device_tensor(_replicate_i32(mesh_device, s, device=False), s_dev)
                 ttnn.copy_host_to_device_tensor(_replicate_i32(mesh_device, e, device=False), e_dev)
+        if reads or packed:
             ttnn.copy_host_to_device_tensor(rope.chunk_rot_idxs_host(host.rope), self.rot_idx)
             for cs in (self.rot or {}).values():  # the old chunk's rows: stale from here on
                 for t in cs:
                     ttnn.deallocate(t)
             self.rot = rope.chunk_rope_tables(self.rot_idx) if regather else None
         self.start, self.end = int(host.start), int(host.end)
+        if packed:
+            self.ends = tuple(int(e) for e in host.ends.tolist())
 
     def tensors(self) -> List[Any]:
         """Every device tensor these inputs hold."""
@@ -909,10 +1367,19 @@ class DecodeKVWriter(Protocol):
     8-lane ``paged_update_cache``.
 
     * ``kv_row``: this step's latent rows ``[1, 1, L, 576]`` bf16 TILE DRAM interleaved (L = the 8 lanes of this chip's
-      DP row; ``[n | rope(k_pe)]``, exactly what draft 1 writes). Not consumed: the attention frees it afterwards.
+      DP row, or the T64 step's 16 rows ``[8 anchors | 8 drafts]``; ``[n | rope(k_pe)]``, exactly what draft 1 writes).
+      Not consumed: the attention frees it afterwards.
     * ``kv_cache``: the layer's paged latent cache (``cfg.dtypes.kv_cache``), updated in place.
     * ``cur_pos`` / ``page_table``: the per-row ``[L]`` / ``[L, W]`` tensors the layer's FlashMLA reads (draft-lane rows
       included). The ``row`` mode writes through them; the split and KV-R modes through their own per-step tensors.
+
+    Optional (``tt/kv_write.DecodeKVWrite`` has both; module docstring "T64 verify step"):
+
+    * ``lanes_per_row``: the rows per DP row the writer writes (8, or 16 at T64); ``forward_decode`` refuses an ``x``
+      with another row count.
+    * ``flash_groups() -> [(row slice, cur_pos, page_table)]``: the global layers' FlashMLA calls (option A''), slices
+      partitioning ``[0, L)`` in order: one group over all rows = one call (the T32 step), two B = 8 groups at 16 rows.
+      A writer without it serves global layers at 8 rows only (one call on ``cur_pos`` / ``page_table``).
 
     Device ops only (it runs inside the decode trace); one object per step serves all 53 layers and the MTP layer."""
 
@@ -1079,17 +1546,18 @@ class MotifAttention:
     # ==================================================================================================================
     @staticmethod
     def decode_rope_tables(rope: MotifRope, rot_idxs, kinds: Sequence[str] = ("yarn", "plain")) -> Dict[str, Tuple]:
-        """``{kind: (cos, sin)}`` ``[1, 1, 32, 64]`` TILE (row t = lane t of this DP row; ``rope.decode_cos_sin(...,
-        layout="rows")``) from the per-step ``rot_idxs [1, 32]`` uint32 device tensor. Trace-safe (2 embedding gathers
-        per kind). Pass the dict as ``rot=`` to every layer's :meth:`forward_decode`."""
+        """``{kind: (cos, sin)}`` ``[1, 1, 32, 64]`` TILE (row t = row t of this DP row: lane t, or in the T64 step row
+        t of ``[8 anchors | 8 drafts]``; ``rope.decode_cos_sin(..., layout="rows")``) from the per-step ``rot_idxs [1,
+        32]`` uint32 device tensor (``rope.rot_idxs_host(positions, rows_per_dp=...)``). Trace-safe (2 embedding
+        gathers per kind). Pass the dict as ``rot=`` to every layer's :meth:`forward_decode`."""
         return {k: rope.decode_cos_sin(k, rot_idxs, layout="rows") for k in kinds}
 
     @staticmethod
     def active_mask_from_cur_pos(cur_pos, lanes: int = 8, width: int = MASK_WIDTH):
         """Trace-safe ``[1, 1, L, width]`` bf16 TILE 0/1 mask (1 = lane active, ``cur_pos >= 0``) from the ``[L]`` int32
-        ROW_MAJOR ``cur_pos`` device tensor. Build it once per step and pass it as ``active=`` to every layer
-        (``width`` 1024 = the ``wo`` input width: a full-width predicate is 2x cheaper than a broadcast one; ``width=1``
-        gives the broadcastable ``[1, 1, L, 1]``)."""
+        ROW_MAJOR ``cur_pos`` device tensor (``lanes`` = L: 8, or 16 for the T64 step's ``kv_write.cur_pos``). Build it
+        once per step and pass it as ``active=`` to every layer (``width`` 1024 = the ``wo`` input width: a full-width
+        predicate is 2x cheaper than a broadcast one; ``width=1`` gives the broadcastable ``[1, 1, L, 1]``)."""
         p = ttnn.reshape(cur_pos, (1, 1, lanes, 1))
         p = ttnn.typecast(p, ttnn.float32)
         t = ttnn.to_layout(p, ttnn.TILE_LAYOUT)
@@ -1108,12 +1576,22 @@ class MotifAttention:
 
     @staticmethod
     def active_mask_host(
-        positions: torch.Tensor, cfg: MotifTTConfig, mesh_device, *, device=None, width: int = MASK_WIDTH
+        positions: torch.Tensor,
+        cfg: MotifTTConfig,
+        mesh_device,
+        *,
+        device=None,
+        width: int = MASK_WIDTH,
+        rows_per_dp: Optional[int] = None,
     ):
         """Host (``device=None``, for ``ttnn.copy_host_to_device_tensor``) or device mesh tensor ``[1, 1, L, width]``
-        bf16 per DP row from the 32 lane positions (``-1`` = inactive), lane order."""
-        pos = torch.as_tensor(positions).reshape(cfg.max_batch)
-        rows = (pos >= 0).to(torch.float32).reshape(cfg.dp, 1, cfg.lanes_per_row, 1).expand(-1, -1, -1, int(width))
+        bf16 per DP row from the positions (``-1`` = inactive) of ``dp * L`` rows in DP-row order: by default the 32
+        lane positions (L = 8, lane order); ``rows_per_dp=16`` takes the T64 step's 64 rows (row ``16 r + j``)."""
+        L = decode_rows_per_dp(cfg, rows_per_dp)
+        pos = torch.as_tensor(positions).reshape(-1)
+        if int(pos.numel()) != cfg.dp * L:
+            raise ValueError(f"expected {cfg.dp * L} positions ({cfg.dp} DP rows x {L}), got {int(pos.numel())}")
+        rows = (pos >= 0).to(torch.float32).reshape(cfg.dp, 1, L, 1).expand(-1, -1, -1, int(width))
         return _shard_rows(rows.contiguous(), cfg, mesh_device, ttnn.bfloat16, ttnn.TILE_LAYOUT, device)
 
     # ==================================================================================================================
@@ -1265,13 +1743,15 @@ class MotifAttention:
         taps: Optional[Dict[str, Any]] = None,
         kv_write: Optional[DecodeKVWriter] = None,
     ):
-        """One decode step for the L = 8 lanes of this chip's DP row (trace-safe; design §2.3.4 decode steps 1-12).
+        """One decode step for the L = 8 lanes of this chip's DP row, or the T64 verify step's L = 16 rows ``[8 anchors
+        | 8 drafts]`` (trace-safe; design §2.3.4 decode steps 1-12; module docstring "T64 verify step").
 
         Args:
-            x: normalized input ``[1, 1, L, 4096]`` bf16 TILE DRAM (replicated in the row).
+            x: normalized input ``[1, 1, L, 4096]`` bf16 TILE DRAM (replicated in the row). L = 16 needs a ``kv_write``
+                built for 16 rows per DP row (``DecodeKVWrite(rows=64)``).
             rot: this step's RoPE tables: ``{kind: (cos, sin)}`` from :meth:`decode_rope_tables` (preferred, built once
                 per step), a ``(cos, sin)`` pair ``[1,1,32,64]`` for this layer's kind, or the ``rot_idxs [1, 32]``
-                uint32 tensor (gathered here).
+                uint32 tensor (gathered here). Row t of the tables rotates row t of ``x``.
             cur_pos: ``[L]`` int32 ROW_MAJOR (per row; ``-1`` = inactive lane: skipped by the cache update and
                 FlashMLA).
             page_table: ``[L, W]`` int32 ROW_MAJOR (per row). ``W x block`` must be a multiple of the FlashMLA k chunk
@@ -1287,7 +1767,9 @@ class MotifAttention:
             taps: optional dict that receives intermediate tensors (debug / tests; never inside a trace).
             kv_write: the step's :class:`DecodeKVWriter` (``tt/kv_write.py``: ``row`` / ``row_split`` / ``all`` /
                 ``all_split``, design §3.5), called once in place of the cache update. ``None`` (default) = draft 1:
-                one 8-lane ``paged_update_cache`` of this row's lanes through ``cur_pos`` / ``page_table``.
+                one 8-lane ``paged_update_cache`` of this row's lanes through ``cur_pos`` / ``page_table`` (8 rows
+                only). On a global layer FlashMLA runs once per entry of ``kv_write.flash_groups()`` (option A''): one
+                call at 8 rows per DP row, two B = 8 calls at 16.
 
         Returns ``[1, 1, L, 4096]`` bf16 TILE DRAM, identical on the TP chips of the row.
         """
@@ -1300,6 +1782,8 @@ class MotifAttention:
             raise TypeError(
                 f"kv_write must have a write(kv_row, kv_cache, *, cur_pos, page_table) method, got {kv_write!r}"
             )
+        # host checks before any device op: the row count and, on global layers, the FlashMLA groups (option A'')
+        groups = self._flash_groups(kv_write, self._decode_rows(x, kv_write, active), cur_pos, page_table)
         cos, sin = self._rot_tables(rot)
         q, g, n, kpe, lam = self._project(x, decode=True)
 
@@ -1343,20 +1827,12 @@ class MotifAttention:
             else:
                 ttnn.deallocate(kv_row)
 
-        # ---- FlashMLA decode (G1 config, scale folded into q, ATTN-2) ----------------------------------------------
-        o_lat = ttnn.transformer.paged_flash_multi_latent_attention_decode(
-            q_mla,
-            kv_cache,
-            None,
-            head_dim_v=self.rank,
-            page_table_tensor=page_table,
-            cur_pos_tensor=cur_pos,
-            scale=1.0,
-            sliding_window_size=self.window,
-            program_config=self.decode_pc,
-            compute_kernel_config=self.ckc_sdpa_decode,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )  # [1, L, 10, 512]
+        # ---- FlashMLA decode (G1 config, scale folded into q, ATTN-2); option A'' on global layers at 16 rows ------
+        if len(groups) == 1:  # draft 1, T32, every SWA layer (B = L)
+            _, cur, pt = groups[0]
+            o_lat = self._flash_mla(q_mla, kv_cache, cur, pt)  # [1, L, 10, 512]
+        else:  # one B = 8 call per group (anchors at n, drafts at n + 1), concatenated: [1, L, 10, 512]
+            o_lat = self._flash_mla_groups(q_mla, kv_cache, groups)
         if taps is not None:
             taps["q_mla"] = q_mla
             taps["o_lat"] = o_lat
@@ -1368,6 +1844,119 @@ class MotifAttention:
         if taps is None:
             ttnn.deallocate(o_lat)
         return self._absorbed_epilogue(o_heads, g, lam, active=active, taps=taps, decode=True)
+
+    def _decode_rows(self, x, kv_write, active) -> int:
+        """Rows ``L`` per DP row of the decode input ``x [1, 1, L, 4096]`` (host checks, no device op). ``L`` is at
+        most one tile row (the decode program configs, the ``[1, 32]`` RoPE index row), and the ``active`` mask has
+        ``L`` rows too. The draft-1 update (``kv_write=None``) transposes into :attr:`update_mc` (one lane per core on
+        ``self.lanes`` = 8 cores) and writes every row through ``cur_pos``: it serves exactly 8 rows. The T64 step's 16
+        rows ``[8 anchors | 8 drafts]`` need a writer that writes the anchors and the drafts in two calls
+        (``DecodeKVWrite(rows=64)``). A writer that names its rows (``lanes_per_row``) must match ``x``."""
+        L = int(x.shape[-2])
+        if not 1 <= L <= TILE:
+            raise ValueError(f"forward_decode: x has {L} rows per DP row; decode takes 1..{TILE} (one tile row)")
+        a_rows = int(active.shape[-2])
+        if a_rows != L:
+            raise ValueError(
+                f"forward_decode: the active mask has {a_rows} rows, x has {L} rows per DP row (build it with "
+                f"active_mask_from_cur_pos(cur_pos, {L}))"
+            )
+        if kv_write is None:
+            if L != self.lanes:
+                raise ValueError(
+                    f"forward_decode: x has {L} rows per DP row, but the draft-1 update (kv_write=None) writes "
+                    f"exactly {self.lanes} lanes (one {self.lanes}-core paged_update_cache through cur_pos). The T64 "
+                    f"verify step (16 rows = [8 anchors | 8 drafts]) needs kv_write=DecodeKVWrite(rows=64): call A "
+                    f"writes the anchors at n, call B the drafts at n + 1"
+                )
+            return L
+        per = getattr(kv_write, "lanes_per_row", None)
+        if per is not None and int(per) != L:
+            raise ValueError(
+                f"forward_decode: x has {L} rows per DP row, kv_write writes {int(per)} (kv_write.lanes_per_row): "
+                f"build the writer for the step's rows (DecodeKVWrite(rows=64) for 16 rows per DP row)"
+            )
+        return L
+
+    def _flash_groups(self, kv_write, L: int, cur_pos, page_table) -> List[Tuple[slice, Any, Any]]:
+        """FlashMLA's calls of this layer, ``[(row slice, cur_pos, page_table)]`` (host only, trace-safe; module
+        docstring "T64 verify step", design §4.3 option A'').
+
+        * SWA layers (and the MTP layer), draft 1 (``kv_write=None``), or a writer without ``flash_groups`` at 8 rows:
+          the single call ``[(0:L, cur_pos, page_table)]``. At B = 16 the SWA rows are bitwise the B = 8 rows.
+        * global layers: ``kv_write.flash_groups()``, whose row slices must partition ``[0, L)`` in order. One group =
+          one call on the group's tensors (the T32 step: ``(0:8, kv_write.cur_pos, kv_write.page_table)``, today's
+          operands). Two groups at 16 rows = two B = 8 calls with the T32 call's core split, so every row equals its
+          T32 row bit for bit. A writer without ``flash_groups`` is refused at more than 8 rows (one B = 16 call is
+          not bitwise; ask for it explicitly with the one group ``(0:16, cur_pos, page_table)``)."""
+        single = [(slice(0, L), cur_pos, page_table)]
+        if self.window is not None or kv_write is None:
+            return single
+        fg = getattr(kv_write, "flash_groups", None)
+        if fg is None:
+            if L != self.lanes:
+                raise ValueError(
+                    f"forward_decode: a global layer at {L} rows per DP row needs kv_write.flash_groups() (option A'': "
+                    f"one B = {self.lanes} FlashMLA call per group, bitwise the T32 rows); {type(kv_write).__name__} "
+                    f"has none. For option A (one B = {L} call, not bitwise) return [(slice(0, {L}), cur_pos, "
+                    f"page_table)] from it"
+                )
+            return single
+        groups = [tuple(gr) for gr in fg()]
+        lo = 0
+        for gr in groups:
+            rows = gr[0] if len(gr) == 3 else None
+            if not (
+                isinstance(rows, slice)
+                and rows.step in (None, 1)
+                and rows.start == lo
+                and isinstance(rows.stop, int)
+                and lo < rows.stop <= L
+            ):
+                raise ValueError(
+                    f"kv_write.flash_groups() must give (row slice, cur_pos, page_table) entries whose slices "
+                    f"partition [0, {L}) in order; got {[gr[0] if gr else None for gr in groups]}"
+                )
+            lo = rows.stop
+        if lo != L:
+            raise ValueError(f"kv_write.flash_groups() covers rows [0, {lo}) of the step's {L} rows per DP row")
+        return groups
+
+    def _flash_mla(self, q_mla, kv_cache, cur_pos, page_table):
+        """``paged_flash_multi_latent_attention_decode`` of ``q_mla [1, B, 10, 576]`` (G1 config, scale folded into q,
+        ATTN-2) -> ``[1, B, 10, 512]``. Does not consume ``q_mla``."""
+        return ttnn.transformer.paged_flash_multi_latent_attention_decode(
+            q_mla,
+            kv_cache,
+            None,
+            head_dim_v=self.rank,
+            page_table_tensor=page_table,
+            cur_pos_tensor=cur_pos,
+            scale=1.0,
+            sliding_window_size=self.window,
+            program_config=self.decode_pc,
+            compute_kernel_config=self.ckc_sdpa_decode,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def _flash_mla_groups(self, q_mla, kv_cache, groups):
+        """Option A'' on a global layer: per group ``(rows, cur_pos, page_table)`` one FlashMLA call on ``q_mla[:,
+        rows]`` (a dim-1 slice of ``[1, L, 10, 576]``: the group's users), then ONE ``concat`` of the outputs on dim 1
+        -> ``[1, L, 10, 512]``. Does not consume ``q_mla``; frees the slices and the per-group outputs."""
+        outs = []
+        for rows, cur, pt in groups:
+            qg = ttnn.slice(
+                q_mla,
+                [0, rows.start, 0, 0],
+                [1, rows.stop, self.H, self.latent_dim],
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )  # [1, n, 10, 576]
+            outs.append(self._flash_mla(qg, kv_cache, cur, pt))
+            ttnn.deallocate(qg)
+        o_lat = ttnn.concat(outs, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        for o in outs:
+            ttnn.deallocate(o)
+        return o_lat
 
     def _absorbed_epilogue(self, o_heads, g, lam, *, active, taps, decode: bool):
         """Absorbed-form epilogue (decode, sp1 global): ``o_heads [1, 10, T, 512]`` (latent outputs per virtual head,
@@ -1558,6 +2147,15 @@ class MotifAttention:
                 "forward_prefill: pass chunk= or page_table= / rot=, not both (the chunk carries its tables)"
             )
         self._check_chunk_rows(x, chunk, "forward_prefill")
+        if chunk.is_packed:  # P5: B segments of S rows in one pass (module docstring)
+            B, S = self._check_packed(chunk, "forward_prefill")
+            if chunk.path == PK0:
+                return self._prefill_packed_sp0(x, chunk, kv_cache, taps, B, S)
+            if kv_cache is None:
+                raise ValueError("a pk1 pass reads its segments' cached prefixes from the paged cache: pass kv_cache=")
+            if self.window is None:
+                return self._prefill_packed_sp1_global(x, chunk, kv_cache, taps, B, S)
+            return self._prefill_packed_sp1_swa(x, chunk, kv_cache, taps, B, S)
         if not chunk.is_sp1:  # sp0: draft 1 with the chunk's fill table
             return self.forward_prefill(x, page_table=chunk.fill_pt, kv_cache=kv_cache, rot=chunk.rot, taps=taps)
         if kv_cache is None:
@@ -1567,17 +2165,43 @@ class MotifAttention:
         return self._prefill_sp1_swa(x, chunk, kv_cache, taps)
 
     def _check_chunk_rows(self, x, chunk: PrefillChunkInputs, where: str) -> int:
+        """``x``'s rows against the chunk's bucket, and the RoPE rows the chunk must carry (review edit R-E11): an sp1
+        chunk and EVERY packed pass (pk0 included) need ``chunk.rot``. Without it ``forward_prefill`` / ``fill_kv``
+        (the MTP fill) would rope with ``rope.prefill_cos_sin(kind, C)``, positions ``0 .. C-1``: wrong for an sp1
+        chunk and for every segment but the first of a packed pass."""
         if len(x.shape) != 4 or int(x.shape[-1]) != self.cfg.hidden_size:
             raise ValueError(f"{where} expects x [1, 1, C, {self.cfg.hidden_size}], got {tuple(x.shape)}")
         C = int(x.shape[-2])
         if C != int(chunk.bucket):
             raise ValueError(f"{where}: x has {C} rows, the chunk's bucket is {chunk.bucket}")
-        if chunk.is_sp1 and (chunk.rot is None or self.kind not in chunk.rot):
+        if (chunk.is_sp1 or chunk.is_packed) and (chunk.rot is None or self.kind not in chunk.rot):
+            what = "an sp1 chunk" if chunk.is_sp1 else f"a {chunk.path} pass (every segment at its own positions)"
             raise ValueError(
-                f"{where}: an sp1 chunk needs the {self.kind!r} RoPE rows of its positions (chunk.rot; None after "
+                f"{where}: {what} needs the {self.kind!r} RoPE rows of its positions (chunk.rot; None after "
                 "PrefillChunkInputs.write(regather=False): pass dataclasses.replace(chunk, rot=tables))"
             )
         return C
+
+    def _check_packed(self, chunk: PrefillChunkInputs, where: str) -> Tuple[int, int]:
+        """``(B, S)`` of a packed pass after its structural checks (before any device op): ``bucket = B x S`` with
+        ``S`` a multiple of the block size and of a tile (the views ``[1, H, T, d] <-> [H, B, S, d]`` are then
+        metadata-only and every segment starts on a block); pk1 also carries one SDPA page-table row per segment and
+        the start index."""
+        B, S, T, bs = int(chunk.segments), chunk.seg_rows, int(chunk.bucket), int(self.cfg.kv_block_size)
+        if S is None or B < 1 or int(S) * B != T or int(S) % bs or int(S) % TILE:
+            raise ValueError(
+                f"{where}: a packed pass is segments x seg_rows = bucket rows, seg_rows a multiple of the block size "
+                f"{bs}; got {B} x {S} for bucket {T}"
+            )
+        if chunk.path == PK1:
+            if chunk.sdpa_pt is None or chunk.start_idx is None:
+                raise ValueError(f"{where}: a pk1 pass needs its SDPA page tables and start index (sdpa_pt, start_idx)")
+            if len(chunk.sdpa_pt.shape) != 2 or int(chunk.sdpa_pt.shape[0]) != B:
+                raise ValueError(
+                    f"{where}: pk1 SDPA page tables {tuple(chunk.sdpa_pt.shape)}: the batched chunked SDPA reads one "
+                    f"row per segment ({B})"
+                )
+        return B, int(S)
 
     def sp1_global_program_config(self, bucket: int, kv_dtype=None):
         """Program config of the sp1 global chunked SDPA at ``bucket`` rows (``cfg.resumed_prefill_pc``, gate G9).
@@ -1599,6 +2223,23 @@ class MotifAttention:
         if int(chunk.sdpa_pt.shape[-1]) * int(self.cfg.kv_block_size) < a + C:
             raise ValueError(f"SDPA page table {tuple(chunk.sdpa_pt.shape)} does not cover positions [0, {a + C})")
 
+    def _q_absorbed(self, q, cos, sin):
+        """``q [1, 1, T, 1920]`` (virtual order) -> ``Q_abs [1, 10, T, 576] = [q_nope @ W_UK' | rope(q_pe)]`` (heads on
+        dim 1, virtual order, as in decode): the query of the absorbed chunked SDPA (sp1 / pk1 global layers). Consumes
+        ``q``."""
+        q_nope, q_pe = ttnn.experimental.nlp_create_q_heads_split(q, num_heads=self.H, split_head_dim=self.nope)
+        ttnn.deallocate(q)
+        q_lat = ttnn.matmul(
+            q_nope, self.w_uk, compute_kernel_config=self.ckc_heads, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )  # [1, 10, T, 512]
+        ttnn.deallocate(q_nope)
+        q_pe_r = self._rope(q_pe, cos, sin)
+        ttnn.deallocate(q_pe)
+        q_abs = ttnn.concat([q_lat, q_pe_r], dim=-1)  # [1, 10, T, 576]
+        ttnn.deallocate(q_lat)
+        ttnn.deallocate(q_pe_r)
+        return q_abs
+
     def _prefill_sp1_global(self, x, chunk: PrefillChunkInputs, kv_cache, taps):
         """sp1 global layer: absorbed MLA over the paged latent cache (D2, G9). Row ``i`` (position ``a + i``) attends
         keys ``[0, a + i]``, all of them read from the cache, so the chunk's latent is filled first."""
@@ -1607,19 +2248,7 @@ class MotifAttention:
         self._check_sp1_global(chunk, pc, C)
         cos, sin = self._rot_tables(chunk.rot)
         q, g, n, kpe, lam = self._project(x, decode=False)
-
-        # ---- Q_abs [1, 10, C, 576] = [q_nope @ W_UK' | rope(q_pe)] (heads on dim 1, virtual order as in decode) ------
-        q_nope, q_pe = ttnn.experimental.nlp_create_q_heads_split(q, num_heads=self.H, split_head_dim=self.nope)
-        ttnn.deallocate(q)
-        q_lat = ttnn.matmul(
-            q_nope, self.w_uk, compute_kernel_config=self.ckc_heads, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )  # [1, 10, C, 512]
-        ttnn.deallocate(q_nope)
-        q_pe_r = self._rope(q_pe, cos, sin)
-        ttnn.deallocate(q_pe)
-        q_abs = ttnn.concat([q_lat, q_pe_r], dim=-1)  # [1, 10, C, 576]
-        ttnn.deallocate(q_lat)
-        ttnn.deallocate(q_pe_r)
+        q_abs = self._q_absorbed(q, cos, sin)  # [1, 10, C, 576]
 
         # ---- fill FIRST (the chunk's own keys come from the cache), through the -1-skip fill table ------------------
         k_pe = self._rope(kpe, cos, sin)
@@ -1743,6 +2372,208 @@ class MotifAttention:
         self._fill_rows(kv_row, chunk.fill_pt, kv_cache, keep=taps is not None)
         return out
 
+    # ---- packed passes (P5): docs/p5_t64/P5_T64_DESIGN.md §3.4, gate G15a (GATES_RESULTS §13.2) ----------------------
+    def _prefill_packed_sp0(self, x, chunk: PrefillChunkInputs, kv_cache, taps, B: int, S: int):
+        """pk0 pass: ``B`` sp0 segments of ``S`` rows. :meth:`forward_prefill`'s bucket-``T`` op sequence with the
+        gathered RoPE rows (``chunk.rot``: every segment at positions ``0 .. S-1``), except the SDPA: ``q_full`` /
+        ``k_full`` / ``v_pad`` -> :func:`_to_segments` -> ONE batched causal SDPA with the per-row bucket-``S`` config
+        and window rule (:meth:`prefill_sdpa_window_and_config` ``(S)``) -> :func:`_from_segments`. Per segment that is
+        bitwise the single-row SDPA of a bucket-``S`` chunk (G15a (a)). The fill follows the SDPA, through the packed
+        ``[1, T / bs]`` table (``-1``: shared blocks, padding blocks, dummy segments); ``kv_cache=None`` skips it, as
+        for sp0. ``taps``: ``u_flat`` and, with a cache, ``kv_row``."""
+        T = B * S
+        cos, sin = self._rot_tables(chunk.rot)
+        q, g, n, kpe, lam = self._project(x, decode=False)
+        q_full = self._q_expanded(q, cos, sin)  # [1, 10, T, 192], HF head order
+        k_pe = self._rope(kpe, cos, sin)  # [1, 1, T, 64]
+        ttnn.deallocate(kpe)
+        k_full, v_pad = self._expanded_kv(n, k_pe)  # [1, 2, T, 192] each
+
+        # ---- batched SDPA: segment k = batch row k, the per-row bucket-S program config and window -----------------
+        qb, kb, vb = (_to_segments(t, B, S) for t in (q_full, k_full, v_pad))  # [B, 10 | 2, S, 192]
+        for t in (q_full, k_full, v_pad):
+            ttnn.deallocate(t)
+        window, ckc = self.prefill_sdpa_window_and_config(S)
+        o_b = ttnn.transformer.scaled_dot_product_attention(
+            qb,
+            kb,
+            vb,
+            is_causal=True,
+            scale=1.0,
+            sliding_window_size=window,
+            program_config=self.cfg.sdpa_prefill_pc(self.spec, seq_len=S),
+            compute_kernel_config=ckc,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [B, 10, S, 192] (columns 128..191 = 0)
+        for t in (qb, kb, vb):
+            ttnn.deallocate(t)
+        o = _from_segments(o_b)  # [1, 10, T, 192]
+        o_v = ttnn.slice(o, [0, 0, 0, 0], [1, self.H, T, self.vdim])
+        ttnn.deallocate(o)
+        out = self._expanded_epilogue(o_v, g, lam, taps)
+
+        # ---- cache fill (after the SDPA, as sp0): segment k's rows through entries [k S / bs, (k + 1) S / bs) --------
+        if kv_cache is not None:
+            self._fill_latent(n, k_pe, chunk.fill_pt, kv_cache, taps=taps)
+        ttnn.deallocate(n)
+        ttnn.deallocate(k_pe)
+        return out
+
+    def _prefill_packed_sp1_global(self, x, chunk: PrefillChunkInputs, kv_cache, taps, B: int, S: int):
+        """pk1 pass, global layer: ``B`` sp1 segments at the common start ``a``. ``Q_abs`` at bucket ``T``; the fill
+        FIRST through the packed table (a segment's own keys come from the cache; no segment of a pass reads a block the
+        pass writes, the planner's writer-first rule); ``Q_abs`` -> :func:`_to_segments` ``[B, 10, S, 576]`` -> ONE
+        ``chunked_scaled_dot_product_attention`` over the paged cache with one SDPA page-table row per segment and the
+        one start ``[a]`` (``cfg.resumed_prefill_pc("global", S, kv_dtype)``, the G9 role): row ``i`` of segment ``k``
+        attends keys ``[0, a + i]`` of its own table -> :func:`_from_segments` -> ``[..., :512]`` -> the absorbed
+        epilogue. Per segment bitwise the single-row sp1 call at bucket ``S`` (G15a (b))."""
+        T = B * S
+        pc = self.sp1_global_program_config(S, kv_dtype=kv_cache.dtype)  # the per-bucket (q, k) of S
+        self._check_sp1_global(chunk, pc, S)
+        cos, sin = self._rot_tables(chunk.rot)
+        q, g, n, kpe, lam = self._project(x, decode=False)
+        q_abs = self._q_absorbed(q, cos, sin)  # [1, 10, T, 576]
+
+        # ---- fill FIRST, every segment through its entries of the packed -1-skip table ------------------------------
+        k_pe = self._rope(kpe, cos, sin)
+        ttnn.deallocate(kpe)
+        self._fill_latent(n, k_pe, chunk.fill_pt, kv_cache, taps=taps)
+        ttnn.deallocate(n)
+        ttnn.deallocate(k_pe)
+
+        # ---- batched chunked SDPA: segment k = batch row k, its own page-table row, one start -----------------------
+        qb = _to_segments(q_abs, B, S)  # [B, 10, S, 576]
+        ttnn.deallocate(q_abs)
+        o_b = ttnn.transformer.chunked_scaled_dot_product_attention(
+            qb,
+            kv_cache,
+            kv_cache,
+            chunk.sdpa_pt,
+            chunk_start_idx_tensor=chunk.start_idx,
+            scale=1.0,
+            program_config=pc,
+            compute_kernel_config=self.ckc_sdpa_sp1_global,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [B, 10, S, 576]
+        ttnn.deallocate(qb)
+        o = _from_segments(o_b)  # [1, 10, T, 576]
+        o_lat = ttnn.slice(o, [0, 0, 0, 0], [1, self.H, T, self.rank])  # the attention-weighted k_pe is discarded
+        ttnn.deallocate(o)
+        return self._absorbed_epilogue(o_lat, g, lam, active=None, taps=taps, decode=False)
+
+    def _check_pk1_tail(self, chunk: PrefillChunkInputs, B: int, S: int) -> int:
+        """Rows of every segment's SWA tail (the window minus the current key, 128) after the checks of the pass's tail
+        variant (review edit R-E2): ``shared`` carries segment 0's ``tail / bs`` bound pairs, ``distinct`` every
+        segment's (``B x tail / bs``, segment-major); the start lies past the tail; the square ``[tail ‖ segment]`` fits
+        ``max_model_len``."""
+        bs, n = int(self.cfg.kv_block_size), len(chunk.tail_bounds)
+        if chunk.tails not in PK1_TAIL_VARIANTS:
+            raise ValueError(f"a pk1 SWA pass needs its tail variant, one of {PK1_TAIL_VARIANTS}, got {chunk.tails!r}")
+        per = n if chunk.tails == SHARED_TAILS else (n // B if n % B == 0 else 0)
+        Tt, want = per * bs, int(self.window) - 1
+        if Tt != want or Tt != int(self.cfg.prefill_swa_tail):
+            pairs = f"{want // bs}" if chunk.tails == SHARED_TAILS else f"{want // bs} x {B}"
+            raise ValueError(
+                f"a pk1 SWA pass needs every segment's {want} cached rows before the start ({want // bs} tail blocks "
+                f"of {bs}): {chunk.tails} tails carry {pairs} bound pairs, the inputs hold {n}"
+            )
+        if int(chunk.start) < Tt or int(chunk.start) % bs:
+            raise ValueError(f"pk1 SWA pass start {chunk.start} must be a multiple of {bs} and >= the {Tt}-row tail")
+        if Tt + S > int(self.cfg.max_model_len):
+            raise ValueError(f"the square [tail | segment] SDPA of {Tt + S} rows exceeds max_model_len")
+        return Tt
+
+    def _gather_tails_packed(self, kv_cache, chunk: PrefillChunkInputs, B: int, Tt: int):
+        """The SWA tails of a pk1 pass, ``[B, 1, Tt, 576]`` bf16: row ``k`` = segment ``k``'s cached rows of positions
+        ``[a - Tt, a)`` (roped ``k_pe``; ``Tt`` = 128). The variant is fixed per pass, never a partial dedupe (the
+        program set must not depend on the data; review edit R-E2):
+
+        * ``shared`` (every segment has segment 0's tail blocks): the solo 2-block gather (:meth:`_gather_tail` on
+          segment 0's bounds) + ``repeat`` over the batch;
+        * ``distinct``: ``2 B`` tensor-args dim-0 block slices (segment-major; one program for every block id) -> ONE
+          ``concat(dim=2)`` ``[1, 1, B Tt, 576]`` in the cache dtype (ttnn splits a concat of more than 47 inputs into
+          batches) -> metadata view ``[B, 1, Tt, 576]`` -> typecast to bf16 (a bf16 cache: the view itself, which
+          shares the concat's buffer; the caller frees it)."""
+        if chunk.tails == SHARED_TAILS:
+            tail1 = self._gather_tail(kv_cache, chunk)  # [1, 1, Tt, 576] bf16
+            tail_b = ttnn.repeat(tail1, ttnn.Shape([B, 1, 1, 1]))
+            ttnn.deallocate(tail1)
+            return tail_b
+        nb = int(kv_cache.shape[0])
+        parts = [
+            ttnn.slice(kv_cache, s, e, slice_dim=0, num_devices=nb, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            for s, e in chunk.tail_bounds
+        ]  # 2 B x [1, 1, bs, 576]
+        cat = ttnn.concat(parts, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 1, B Tt, 576]
+        for t in parts:
+            ttnn.deallocate(t)
+        view = ttnn.reshape(cat, (B, 1, Tt, self.latent_dim))  # metadata only
+        if cat.dtype == ttnn.bfloat16:
+            return view
+        tail_b = ttnn.typecast(view, ttnn.bfloat16)
+        ttnn.deallocate(cat)
+        return tail_b
+
+    def _prefill_packed_sp1_swa(self, x, chunk: PrefillChunkInputs, kv_cache, taps, B: int, S: int):
+        """pk1 pass, SWA layer: per segment the square ``[tail ‖ segment]`` causal window-129 SDPA of
+        :meth:`_prefill_sp1_swa`, batched. ``Q_cat [B, 10, Tt + S, 192]`` = every segment's first ``Tt = 128`` rows
+        (filler, dropped) then its rows; the latent ``[tails (cache, :meth:`_gather_tails_packed`) ‖ view(kv_row,
+        [B, 1, S, 576])]`` -> the draft-1 expansion at batch ``B``; one SDPA with ``cfg.resumed_prefill_pc("swa", S)``
+        and the ``sdpa_prefill`` role; rows ``[Tt, Tt + S)`` -> :func:`_from_segments` -> the draft-1 epilogue at
+        ``B S``; the fill after the SDPA. Per segment bitwise the solo sp1 SWA dataflow at bucket ``S`` (G15a (c))."""
+        Tt = self._check_pk1_tail(chunk, B, S)
+        cos, sin = self._rot_tables(chunk.rot)
+        q, g, n, kpe, lam = self._project(x, decode=False)
+
+        # ---- Q_cat [B, 10, Tt + S, 192]: per segment its first Tt rows (filler; outputs dropped) | its Q (HF order) --
+        q_full = self._q_expanded(q, cos, sin)  # [1, 10, B S, 192]
+        qb = _to_segments(q_full, B, S)  # [B, 10, S, 192]
+        ttnn.deallocate(q_full)
+        q_pad = ttnn.slice(qb, [0, 0, 0, 0], [B, self.H, Tt, self.cfg.head_dim])
+        q_cat = ttnn.concat([q_pad, qb], dim=2)
+        if S != Tt:  # S == Tt: the full-extent slice is a ttnn no-op returning qb itself (GATES_RESULTS §13.2)
+            ttnn.deallocate(q_pad)
+        ttnn.deallocate(qb)
+
+        # ---- latent [tails (cache) | segment] -> expanded K / V_pad over Tt + S rows per segment ---------------------
+        k_pe = self._rope(kpe, cos, sin)
+        ttnn.deallocate(kpe)
+        kv_row = ttnn.concat([n, k_pe], dim=-1)  # [1, 1, B S, 576] bf16: the pass's latent (what the fill writes)
+        ttnn.deallocate(n)
+        ttnn.deallocate(k_pe)
+        tail_b = self._gather_tails_packed(kv_cache, chunk, B, Tt)  # [B, 1, Tt, 576] bf16
+        lat = ttnn.concat([tail_b, ttnn.reshape(kv_row, (B, 1, S, self.latent_dim))], dim=2)  # [B, 1, Tt + S, 576]
+        ttnn.deallocate(tail_b)
+        n_cat, kpe_cat = ttnn.experimental.nlp_create_q_heads_split(lat, num_heads=1, split_head_dim=self.rank)
+        ttnn.deallocate(lat)
+        k_full, v_pad = self._expanded_kv(n_cat, kpe_cat)  # [B, 2, Tt + S, 192]
+        ttnn.deallocate(n_cat)
+        ttnn.deallocate(kpe_cat)
+
+        # ---- batched square SDPA: causal + window 129, the sdpa_prefill role, the per-row bucket-S config ------------
+        o = ttnn.transformer.scaled_dot_product_attention(
+            q_cat,
+            k_full,
+            v_pad,
+            is_causal=True,
+            scale=1.0,
+            sliding_window_size=self.window,
+            program_config=self.cfg.resumed_prefill_pc(self.spec, S),
+            compute_kernel_config=self.ckc_sdpa_prefill,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [B, 10, Tt + S, 192]
+        for t in (q_cat, k_full, v_pad):
+            ttnn.deallocate(t)
+        o_v = ttnn.slice(o, [0, 0, Tt, 0], [B, self.H, Tt + S, self.vdim])  # every segment's rows [B, 10, S, 128]
+        ttnn.deallocate(o)
+        out = self._expanded_epilogue(_from_segments(o_v), g, lam, taps)
+
+        # ---- fill (after the SDPA): segment k's rows through entries [k S / bs, (k + 1) S / bs) ----------------------
+        if taps is not None:
+            taps["kv_row"] = kv_row
+        self._fill_rows(kv_row, chunk.fill_pt, kv_cache, keep=taps is not None)
+        return out
+
     # ==================================================================================================================
     # KV-only latent fill (MTP prefill, chunked fills; features design §3.6.3, §3.2.2 step 3)
     # ==================================================================================================================
@@ -1826,6 +2657,25 @@ class MotifAttention:
 # ======================================================================================================================
 # small helpers
 # ======================================================================================================================
+def _to_segments(t, B: int, S: int):
+    """Packed rows -> batch of segments: ``[1, H, B S, d]`` -> metadata view ``[H, B, S, d]`` (the last dim unchanged,
+    ``S`` a tile multiple: same buffer) -> CN ``transpose(0, 1)`` -> ``[B, H, S, d]`` (a new tensor; batch row ``k`` =
+    packed rows ``[k S, k S + S)``). Does not consume ``t``. The SDPA ops batch over dim 0 only: the absorbed per-head
+    matmuls keep ``[1, H, T, d]`` (an in1 batch of 1), so the packed layout stays ``[1, H, T, d]`` outside the SDPA."""
+    H, d = int(t.shape[1]), int(t.shape[3])
+    return ttnn.transpose(ttnn.reshape(t, (H, int(B), int(S), d)), 0, 1)
+
+
+def _from_segments(t):
+    """Inverse of :func:`_to_segments`: ``[B, H, S, d]`` -> CN ``transpose(0, 1)`` -> ``[H, B, S, d]`` -> metadata view
+    ``[1, H, B S, d]``. Consumes ``t``. The result is a view of the transposed tensor: deallocating it frees that buffer
+    (never deallocate the transposed tensor separately)."""
+    B, H, S, d = (int(s) for s in t.shape)
+    tt = ttnn.transpose(t, 0, 1)
+    ttnn.deallocate(t)
+    return ttnn.reshape(tt, (1, H, B * S, d))
+
+
 def _shard_rows(rows: torch.Tensor, cfg: MotifTTConfig, mesh_device, dtype, layout, device=None):
     """``[dp, ...]`` host tensor -> mesh tensor with DP row ``r`` holding ``rows[r]`` (``[1, ...]``), replicated over TP
     (same placement as ``rope.shard_lanes``, any layout / dtype)."""
@@ -1855,6 +2705,7 @@ __all__ = [
     "MASK_WIDTH",
     "MTP_ATTN_PREFIX",
     "MotifAttention",
+    "PackedHostTables",
     "PrefillChunkInputs",
     "RECOMMENDED_L1_SMALL_SIZE",
     "attn_weight_prefix",
@@ -1869,12 +2720,14 @@ __all__ = [
     "latent_q_weight",
     "max_sp1_bucket",
     "noise_expansion",
+    "packed_host_tables",
     "resolve_attn_layer",
     "virtual_head_groups",
     "virtual_head_order",
     "w_uk_virtual_for_chip",
     "w_uv_virtual_for_chip",
     "warmup_chunk_host_tables",
+    "warmup_packed_host_tables",
     "warmup_start",
     "wq_b_gate_for_chip",
     "wq_b_virtual_for_chip",

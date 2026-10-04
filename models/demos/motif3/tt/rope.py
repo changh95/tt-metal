@@ -21,7 +21,8 @@ Device layouts (all tables replicated on every chip):
 use                   tensor                           how it is produced
 ====================  ===============================  ===================================================
 decode, lanes on rows ``cos/sin [1, 1, 32, 64]`` TILE  ``ttnn.embedding(rot_idxs [1,32] uint32, table)``:
-                      (rows 0..7 = this row's lanes)   one gather per step, trace-safe (DeepSeek pattern)
+                      (rows 0..7 = this row's lanes;   one gather per step, trace-safe (DeepSeek pattern)
+                      T64: rows 0..15)
 decode, lanes on dim1 ``cos/sin [1, L, 1, 64]`` TILE   transpose + slice of the above; optionally
                                                        HEIGHT_SHARDED (one lane per core) for
                                                        ``rotary_embedding_hf(..., is_decode_mode=True)``
@@ -171,12 +172,33 @@ def rotate_half_matrix(dim: int = 64, dtype: torch.dtype = torch.float32) -> tor
 # ------------------------------------------------------------------------------------------------------------
 # per-lane decode inputs (host side)
 # ------------------------------------------------------------------------------------------------------------
-def lanes_to_rows(values: torch.Tensor, cfg: MotifTTConfig, *, pad_to: Optional[int] = None, fill=0) -> torch.Tensor:
-    """Lane-ordered ``values [max_batch, ...]`` -> ``[dp, n, ...]``: row ``r`` holds lanes ``8r .. 8r+7`` (design
-    §2.3.10), padded with ``fill`` to ``n = pad_to`` entries (``pad_to=None`` keeps 8)."""
-    B, L = cfg.max_batch, cfg.lanes_per_row
+def decode_rows_per_dp(cfg: MotifTTConfig, rows_per_dp: Optional[int] = None) -> int:
+    """Decode rows per DP row: ``cfg.lanes_per_row`` (8 lanes) by default, or ``rows_per_dp`` (the T64 verify step's
+    16 = ``[8 anchors | 8 drafts]``, ``docs/p5_t64/P5_T64_DESIGN.md`` §4.1), at most one 32-row tile row (the ``[1,
+    32]`` index row of :func:`positions_to_rot_idxs`). ``ValueError`` outside ``[1, 32]``."""
+    r = int(cfg.lanes_per_row) if rows_per_dp is None else int(rows_per_dp)
+    if not 1 <= r <= 32:
+        raise ValueError(f"rows_per_dp must be in [1, 32] (one tile row per DP row), got {rows_per_dp}")
+    return r
+
+
+def lanes_to_rows(
+    values: torch.Tensor,
+    cfg: MotifTTConfig,
+    *,
+    pad_to: Optional[int] = None,
+    fill=0,
+    rows_per_dp: Optional[int] = None,
+) -> torch.Tensor:
+    """Row-ordered ``values [dp * n, ...]`` -> ``[dp, n', ...]``: DP row ``r`` holds entries ``n r .. n r + n - 1``
+    (design §2.3.10), padded with ``fill`` to ``n' = pad_to`` entries (``pad_to=None`` keeps ``n``). ``n`` =
+    :func:`decode_rows_per_dp` (``rows_per_dp``): by default the 32 lane-ordered values, row ``r`` = lanes ``8r ..
+    8r+7``; ``rows_per_dp=16`` takes the T64 step's 64 rows in physical order (row ``r`` = rows ``16r .. 16r+15``,
+    ``[8 anchors | 8 drafts]``)."""
+    L = decode_rows_per_dp(cfg, rows_per_dp)
+    B = cfg.dp * L
     if values.shape[0] != B:
-        raise ValueError(f"expected {B} lanes, got {values.shape[0]}")
+        raise ValueError(f"expected {B} lanes ({cfg.dp} DP rows x {L}), got {values.shape[0]}")
     rows = values.reshape(cfg.dp, L, *values.shape[1:])
     if pad_to is not None and pad_to > L:
         pad = torch.full((cfg.dp, pad_to - L, *values.shape[1:]), fill, dtype=values.dtype)
@@ -184,13 +206,18 @@ def lanes_to_rows(values: torch.Tensor, cfg: MotifTTConfig, *, pad_to: Optional[
     return rows
 
 
-def positions_to_rot_idxs(positions: torch.Tensor, cfg: MotifTTConfig) -> torch.Tensor:
-    """Decode positions ``[32]`` (lane order, ``-1`` = inactive lane) -> rot table indices ``[dp, 32]`` int32: each
-    row's 8 lanes first, then 24 pad entries; inactive lanes and pads read row 0 (their output is masked later)."""
+def positions_to_rot_idxs(
+    positions: torch.Tensor, cfg: MotifTTConfig, *, rows_per_dp: Optional[int] = None
+) -> torch.Tensor:
+    """Decode positions ``[dp * n]`` (``-1`` = inactive) -> rot table indices ``[dp, 32]`` int32: each DP row's ``n``
+    rows first, then ``32 - n`` pad entries; inactive rows and pads read row 0 (their output is masked later). ``n`` =
+    :func:`decode_rows_per_dp`: by default the 32 lane positions (lane order, 8 per DP row); ``rows_per_dp=16`` takes
+    the T64 step's 64 rows in physical order (anchors at ``n``, drafts at ``n + 1``), so row ``t`` of the gathered
+    ``[1, 1, 32, 64]`` tables rotates row ``t`` of the step's ``[1, 1, 16, 4096]`` input."""
     pos = torch.as_tensor(positions, dtype=torch.int64).clamp_min(0)
     if int(pos.max()) >= cfg.max_model_len:
         raise ValueError(f"position {int(pos.max())} >= max_model_len {cfg.max_model_len}")
-    return lanes_to_rows(pos.to(torch.int32), cfg, pad_to=32, fill=0)
+    return lanes_to_rows(pos.to(torch.int32), cfg, pad_to=32, fill=0, rows_per_dp=rows_per_dp)
 
 
 def chunk_rot_rows(positions, max_positions: int) -> torch.Tensor:
@@ -291,16 +318,22 @@ class MotifRope:
         )
 
     # ---- decode ----------------------------------------------------------------------------------------
-    def rot_idxs_host(self, positions: torch.Tensor):
-        """Host mesh tensor ``[1, 32]`` uint32 per chip (row r: its 8 lanes, then pad) for
-        ``ttnn.copy_host_to_device_tensor`` into the persistent decode input."""
+    def rot_idxs_host(self, positions: torch.Tensor, *, rows_per_dp: Optional[int] = None):
+        """Host mesh tensor ``[1, 32]`` uint32 per chip (DP row r: its rows, then pad; :func:`positions_to_rot_idxs`)
+        for ``ttnn.copy_host_to_device_tensor`` into the persistent decode input. ``positions``: the 32 lane positions,
+        or with ``rows_per_dp=16`` the T64 step's 64 row positions (physical order ``16 r + j``)."""
         return shard_lanes(
-            positions_to_rot_idxs(positions, self.cfg), self.cfg, self.mesh_device, dtype=ttnn.uint32, device=None
+            positions_to_rot_idxs(positions, self.cfg, rows_per_dp=rows_per_dp),
+            self.cfg,
+            self.mesh_device,
+            dtype=ttnn.uint32,
+            device=None,
         )
 
-    def rot_idxs_device(self, positions: torch.Tensor):
+    def rot_idxs_device(self, positions: torch.Tensor, *, rows_per_dp: Optional[int] = None):
+        """:meth:`rot_idxs_host` uploaded to the mesh (a device tensor ``[1, 32]`` uint32 per chip)."""
         return shard_lanes(
-            positions_to_rot_idxs(positions, self.cfg),
+            positions_to_rot_idxs(positions, self.cfg, rows_per_dp=rows_per_dp),
             self.cfg,
             self.mesh_device,
             dtype=ttnn.uint32,
@@ -310,9 +343,11 @@ class MotifRope:
     def decode_cos_sin(self, kind: str, rot_idxs, *, layout: str = "rows", memory_config=None):
         """Trace-safe per-lane gather (device ops only).
 
-        ``layout="rows"``: ``[1, 1, 32, 64]`` TILE, row t = lane t of this DP row (rows >= 8 hold position 0).
-        ``layout="batch"``: ``[1, L, 1, 64]`` TILE (L = lanes per row). ``layout="batch_sharded"``: the same,
-        HEIGHT_SHARDED one lane per core (``rotary_embedding_hf`` decode mode).
+        ``layout="rows"``: ``[1, 1, 32, 64]`` TILE, row t = row t of this DP row (lane t; in the T64 step row t of
+        ``[8 anchors | 8 drafts]``); the pad rows past the used ones hold position 0.
+        ``layout="batch"``: ``[1, L, 1, 64]`` TILE (L = ``cfg.lanes_per_row``, 8 lanes; the T64 step uses the rows
+        layout). ``layout="batch_sharded"``: the same, HEIGHT_SHARDED one lane per core (``rotary_embedding_hf`` decode
+        mode).
         """
         cos_t, sin_t = self.tables[kind]
         mc = memory_config or ttnn.DRAM_MEMORY_CONFIG
@@ -440,6 +475,7 @@ __all__ = [
     "apply_rope_torch",
     "chunk_rot_rows",
     "cos_sin_table",
+    "decode_rows_per_dp",
     "inv_freq_for_kind",
     "inv_freq_for_layer",
     "lanes_to_rows",

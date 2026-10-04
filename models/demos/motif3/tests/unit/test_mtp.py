@@ -37,6 +37,13 @@ then compare all 32 chips' cache copies with the ``tt/kv_write.py`` host model o
 the slots the mode writes, on the chips it writes, nothing else). :func:`test_mtp_decode_kv_writes` covers inactive
 lanes, DP-row relocation, ``kv_write`` modes ``all`` / ``all_split`` (packed verify with partners on other DP rows) and
 a partner row vs the same row computed by an ordinary step.
+
+T64 verify step (WP-D D1; docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4): :func:`test_cpu_t64_decode_ops` (host, recording
+fake ttnn: ``ag_dp_rows`` ``halves=1`` == HEAD and the ``halves=2`` split-order sequence, the head's split-order logits
+on the 64-row GEMM config, the split-order id embedding, the MTP's 16-row guards) and :func:`test_mtp_t64_rows`
+(device: the MTP layer at 16 rows per DP row -- anchors at n, drafts at n + 1, written by a split-order KV-R stand-in
+for K1's writer -- bitwise == two 32-lane steps: argmax, outputs and every chip's MTP cache; drafts missing on odd
+lanes; a traced replay == eager; ``-k t64_rows``).
 """
 
 from __future__ import annotations
@@ -424,6 +431,13 @@ class _FakeTTNN(ModuleType):
     def repeat(self, x, reps, **kw):
         return self._rec("repeat", (x, tuple(reps)), kw, tuple(a * b for a, b in zip(x.shape, reps)), x.layout)
 
+    def to_layout(self, x, layout, **kw):
+        return self._rec("to_layout", (x, layout), kw, x.shape, layout if isinstance(layout, str) else repr(layout))
+
+    def slice(self, x, start, end, **kw):
+        return self._rec("slice", (x, tuple(start), tuple(end)), kw, tuple(int(e) - int(s) for s, e in zip(start, end)),
+                         x.layout)  # fmt: skip
+
 
 class _FakeCCL:
     def __init__(self, fake: _FakeTTNN, dp: int = 4):
@@ -788,6 +802,146 @@ def test_cpu_embedding_rows_ops():
             mod.ttnn = real_ttnn
     row = cur.prefill_token_row(torch.tensor([5, 6, 7]), 32, cfg, n_copies=1)
     assert row.shape == (1, 32) and row[0, :3].tolist() == [5, 6, 7] and int(row[0, 3:].unique()) == cfg.pad_token_id
+
+
+def test_cpu_t64_decode_ops():
+    """T64 (docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4), host side of WP-D's decode modules (recording fake ttnn):
+
+    * ``MotifCCL.ag_dp_rows``: ``halves=1`` issues exactly the committed (git ``HEAD``) op sequence, also at 16 rows
+      per DP row; ``halves=2`` views the ROW_MAJOR rows as ``[1, 2, L/2, W]``, gathers dim 2 over DP, views the result
+      as ``[1, 1, 4 L, W]`` and tilizes, freeing exactly its intermediates; a torch emulation of that sequence puts
+      every DP row's first half (lane order) in rows 0..31 and the second halves in 32..63;
+    * ``MotifLMHead.decode_logits(hn [1, 1, 16, 4096], halves=2)``: the split-order gather (``halves=2``) then the GEMM
+      with the 64-row config ``pc_wide[64]``; ``halves=2`` is refused with the "tp" split; ``argmax_decode`` refuses a
+      row count without constants before any op;
+    * ``MotifEmbedding.embed_rows_from_device`` of the split-order ``[1, 1, 1, 64]``: reshape ``[1, 1, 2, 32]``,
+      ``partition`` dim 3 over DP, reshape ``[1, 16]``, the gather, every intermediate freed and the input kept;
+    * ``MotifMTP.forward_decode`` at 16 rows refuses 32-lane ids, a "tp" head and a missing ``kv_write`` before any
+      op."""
+    from types import SimpleNamespace
+
+    from models.demos.motif3.tt import ccl as cur_ccl
+    from models.demos.motif3.tt import embedding as cur_emb
+    from models.demos.motif3.tt import lm_head as cur_head
+    from models.demos.motif3.tt.model_config import MeshAxes
+
+    cfg = host_cfg()
+    fake = _FakeTTNN()
+    old_ccl = _git_module("models/demos/motif3/tt/ccl.py", "models.demos.motif3.tt._ccl_head")
+
+    def make_ccl(mod):
+        c = object.__new__(mod.MotifCCL)
+        c.axes, c.memory_config = MeshAxes.detect((4, 8)), "DRAM"
+
+        def all_gather(x, dim, axis, **kw):
+            s = list(x.shape)
+            s[dim] *= 4
+            return fake._rec(f"ccl.all_gather.{axis}", (x, dim), kw, s, x.layout)
+
+        c.all_gather = all_gather
+        return c
+
+    mods = (old_ccl, cur_ccl, cur_emb, cur_head)
+    saved = [m.ttnn for m in mods]
+    for m in mods:
+        m.ttnn = fake
+    try:
+        for rows in (8, 16):  # the committed sequence, also for the T64 step's natural-order (MoE) gather
+            seqs = []
+            for mod in (old_ccl, cur_ccl):
+                _FT._n = 0
+                fake.calls = []
+                mod.MotifCCL.ag_dp_rows(make_ccl(mod), _FT((1, 1, rows, 4096)), memory_config="DRAM")
+                seqs.append(list(fake.calls))
+            assert seqs[0] == seqs[1], f"ag_dp_rows(halves=1) at {rows} rows changed: {seqs}"
+        _FT._n = 0
+        fake.calls = []
+        x = _FT((1, 1, 16, 576))
+        out = cur_ccl.MotifCCL.ag_dp_rows(make_ccl(cur_ccl), x, halves=2)
+        ops = [(c[0], tuple(int(v) for v in c[1][-1]) if c[0] == "reshape" else None) for c in fake.calls]
+        assert ops == [("to_layout", None), ("reshape", (1, 2, 8, 576)), ("ccl.all_gather.dp", None),
+                       ("reshape", (1, 1, 64, 576)), ("deallocate", None), ("to_layout", None),
+                       ("deallocate", None)], ops  # fmt: skip
+        freed = [c[1][0][1] for c in fake.calls if c[0] == "deallocate"]
+        assert out.shape == (1, 1, 64, 576) and x.id not in freed and len(set(freed)) == 2, (out.shape, freed)
+        with pytest.raises(ValueError, match="halves"):
+            cur_ccl.MotifCCL.ag_dp_rows(make_ccl(cur_ccl), _FT((1, 1, 15, 576)), halves=2)
+        with pytest.raises(ValueError, match="halves"):
+            cur_ccl.MotifCCL.ag_dp_rows(make_ccl(cur_ccl), _FT((1, 4, 16, 576)), halves=2)
+        # the row order of that sequence (torch emulation): rows 0..31 = first halves in lane order, 32..63 = second
+        per_row = [torch.arange(16 * r, 16 * r + 16).reshape(1, 1, 16, 1).float() for r in range(4)]
+        g = torch.cat([p.reshape(1, 2, 8, 1) for p in per_row], dim=2).reshape(1, 1, 64, 1).flatten().long()
+        lanes = torch.arange(64).reshape(4, 2, 8)  # row 16 r + 8 h + j
+        assert g.tolist() == torch.cat([lanes[:, 0].reshape(-1), lanes[:, 1].reshape(-1)]).tolist()
+
+        # LM head: the split-order logits of 16 rows per DP row
+        _FT._n = 0
+        h = _fake_head(cur_head, fake, "mesh")
+        h.pc_wide = {64: "pc_lm_wide"}
+        seen_pc = []
+        lin = fake.linear
+        fake.linear = lambda x, w, **kw: seen_pc.append(kw.get("program_config")) or lin(x, w, **kw)
+        fake.calls = []
+        hn = _FT((1, 1, 16, 4096))
+        lg = h.decode_logits(hn, halves=2)
+        assert lg.shape == (1, 1, 64, h.vc) and seen_pc == ["pc_lm_wide"], (lg.shape, seen_pc)
+        assert fake.calls[0][0] == "ccl.ag_dp_rows" and fake.calls[0][2] == ("halves", "memory_config"), fake.calls[0]
+        seen_pc.clear()
+        h.decode_logits(_FT((1, 1, 8, 4096)))
+        assert seen_pc == ["pc_lm"]  # the 32-lane config
+        fake.linear = lin
+        h_tp = _fake_head(cur_head, fake, "tp")
+        with pytest.raises(ValueError, match="mesh"):
+            h_tp.decode_logits(_FT((1, 1, 16, 4096)), halves=2)
+        h.argmax_lanes, h._am_wide = 32, {}
+        fake.calls = []
+        with pytest.raises(ValueError, match="no constants for 64"):
+            h.argmax_decode(_FT((1, 1, 64, h.vc)))
+        assert fake.calls == []
+
+        # embedding: the split-order argmax -> this DP row's [a0 x 8 | a1 x 8]
+        e = object.__new__(cur_emb.MotifEmbedding)
+        e.cfg, e.ccl, e.n_streams, e.hidden, e.lanes = cfg, _FakeCCL(fake), 4, 4096, 8
+        e.shard_hidden, e.prefill_mode, e.memory_config = False, "auto", "DRAM"
+        e.weight = _FT((cfg.vocab_size, 4096), "ROW_MAJOR")
+        _FT._n = 0
+        fake.calls = []
+        ids = _FT((1, 1, 1, 64), "ROW_MAJOR")
+        out = e.embed_rows_from_device(ids)
+        ops = [c[0] for c in fake.calls]
+        assert out.shape == (1, 1, 16, 4096) and ops == [
+            "reshape", "ccl.partition.dp", "deallocate", "reshape", "deallocate", "embedding", "reshape", "deallocate"
+        ], ops  # fmt: skip
+        shapes = [tuple(int(v) for v in c[1][-1]) for c in fake.calls if c[0] == "reshape"]
+        assert shapes[:2] == [(1, 1, 2, 32), (1, 16)], shapes
+        assert ("deallocate", (("T", ids.id, ids.shape),), ()) not in fake.calls  # the argmax is not consumed
+        fake.calls = []
+        x = e.forward_decode(_FT((4, 16), "ROW_MAJOR"))
+        assert x.shape == (1, 4, 16, 4096) and [c[0] for c in fake.calls] == ["embedding", "reshape"]
+    finally:
+        for m, t in zip(mods, saved):
+            m.ttnn = t
+
+    # MTP: the 16-row guards fire before any op
+    class Never:
+        def __getattr__(self, name):
+            raise AssertionError(f"{name} reached before the T64 input checks")
+
+    for vocab_split, ids, kvw, msg in (("mesh", (1, 1, 1, 32), object(), "split-order"),
+                                       ("tp", (1, 1, 1, 64), object(), "split-order"),
+                                       ("mesh", (1, 1, 1, 64), None, "kv_write")):  # fmt: skip
+        m = object.__new__(MTPM.MotifMTP)
+        m.cfg, m.lanes, m.hidden = cfg, 8, 4096
+        m.embed, m.head, m.attn = Never(), SimpleNamespace(vocab_split=vocab_split), Never()
+        with pytest.raises(ValueError, match=msg):
+            m.forward_decode(_FT((1, 1, 16, 4096)), _FT(ids, "ROW_MAJOR"), rot=None, cur_pos=None, page_table=None,
+                             kv_cache=None, active=None, kv_write=kvw)  # fmt: skip
+    m.head = SimpleNamespace(vocab_split="mesh")
+    with pytest.raises(ValueError, match="MTP decode expects"):
+        m.forward_decode(_FT((1, 1, 24, 4096)), _FT((1, 1, 1, 64), "ROW_MAJOR"), rot=None, cur_pos=None,
+                         page_table=None, kv_cache=None, active=None, kv_write=object())  # fmt: skip
+    log("T64 host ops: ag_dp_rows halves=1 == HEAD (8 and 16 rows), halves=2 split order; head split-order logits on "
+        "the 64-row config; embedding split-order ids; MTP 16-row guards")
 
 
 def _converter():
@@ -1649,6 +1803,245 @@ def test_mtp_decode_kv_writes(mesh_device, device_params):
     kvw.deallocate()
     _free(c)
     mtp.deallocate()
+    assert not failures, "\n".join(failures)
+
+
+class _T64SplitKVWrite:
+    """Test stand-in for WP-K's ``DecodeKVWrite(rows=64, gather="split")`` on the KV-R path (P5_T64_DESIGN.md T2,
+    §4.3; the G16-lite probe's writer, ``docs/p5_t64/scripts/t64_bench2.py`` ``T64SplitWriter``), so the MTP layer is
+    checked at 16 rows per DP row before K1 lands. Per layer: the split-order gather ``ccl.ag_dp_rows(kv_row,
+    halves=2)`` -> ``[1, 1, 64, 576]`` (rows 0..31 the anchors in lane order, 32..63 the drafts), call A on the anchors
+    (``cur_a [32]`` = n), call B on the drafts (``cur_b [32]`` = n + 1, -1 = no draft), one replicated page table
+    ``[32, W]`` in lane order (a draft writes through its owner's row). FlashMLA's per-row inputs: ``cur_pos [16]`` (the
+    row's 8 anchors' n, then their drafts' n + 1) and ``page_table [16, W]`` (the 8 lanes' rows twice); ``rot_idxs``
+    ``[1, 32]`` per DP row with the 16 rows' positions first."""
+
+    def __init__(self, mesh_device, cfg, ccl, pos: torch.Tensor, draft_pos: torch.Tensor, pt: torch.Tensor):
+        from models.demos.motif3.tt.rope import shard_lanes
+
+        self.ccl = ccl
+        L = cfg.lanes_per_row
+        rep = ttnn.ReplicateTensorToMesh(mesh_device)
+
+        def rep_i32(t):
+            return ttnn.from_torch(t.to(torch.int32).contiguous(), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                                   device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                                   mesh_mapper=rep)  # fmt: skip
+
+        def rows_i32(t, dtype=ttnn.int32):
+            return shard_lanes(t.contiguous(), cfg, mesh_device, dtype=dtype, device=mesh_device)
+
+        self.cur_a, self.cur_b, self.pt = rep_i32(pos), rep_i32(draft_pos), rep_i32(pt)
+        row_pos = torch.cat([pos.reshape(cfg.dp, L), draft_pos.reshape(cfg.dp, L)], dim=1).to(torch.int32)  # [dp, 16]
+        self.cur_pos = rows_i32(row_pos.reshape(-1))  # [16] per DP row
+        self.page_table = rows_i32(torch.cat([pt.reshape(cfg.dp, L, -1)] * 2, dim=1).reshape(2 * cfg.max_batch, -1))
+        idx = torch.zeros(cfg.dp, 32, dtype=torch.int32)
+        idx[:, : 2 * L] = row_pos.clamp_min(0)
+        self.rot_idxs = rows_i32(idx, ttnn.uint32)  # [1, 32] per DP row
+        self.mc = KW.update_input_memory_config(32, mesh_device.compute_with_storage_grid_size())
+
+    def write(self, kv_row, kv_cache, *, cur_pos, page_table) -> None:
+        g = self.ccl.ag_dp_rows(kv_row, halves=2)  # [1, 1, 64, 576]: anchors 0..31, drafts 32..63 (lane order)
+        for h, cur in ((0, self.cur_a), (1, self.cur_b)):
+            s = ttnn.slice(g, [0, 0, 32 * h, 0], [1, 1, 32 * h + 32, int(g.shape[-1])])
+            u = ttnn.transpose(s, 1, 2, memory_config=self.mc)  # [1, 32, 1, 576], one user per core
+            ttnn.deallocate(s)
+            ttnn.experimental.paged_update_cache(kv_cache, u, update_idxs_tensor=cur, page_table=self.pt)
+            ttnn.deallocate(u)
+        ttnn.deallocate(g)
+
+    def end_step(self) -> None:
+        return None
+
+    def deallocate(self) -> None:
+        _free([self.cur_a, self.cur_b, self.pt, self.cur_pos, self.page_table, self.rot_idxs])
+
+
+def _rows16_out(cfg, mesh_device, out) -> torch.Tensor:
+    """T64 decode output ``[1, 1, 16, W]`` per DP row -> ``[64, W]`` = ``[anchors of lanes 0..31 | drafts of lanes
+    0..31]`` (TP index 0 of each DP row)."""
+    from models.demos.motif3.tt.ccl import device_tensors_to_torch
+
+    full = device_tensors_to_torch(out, mesh_device).float()  # [R, C, 1, 1, 16, W]
+    L = cfg.lanes_per_row
+    rows = [full[cfg.axes.coord(dp, 0)][0, 0] for dp in range(cfg.dp)]
+    return torch.cat([r[:L] for r in rows] + [r[L:] for r in rows])
+
+
+def _mtp_t64_inputs(mesh_device, cfg, rope, kvw, x64: torch.Tensor, tok64: torch.Tensor):
+    """Persistent device inputs of one T64 MTP step: ``hn [1, 1, 16, 4096]`` per DP row from ``x64 [64, 4096]``, the
+    split-order main argmax ``[1, 1, 1, 64]`` from ``tok64 [64]`` (both ``[anchors of lanes 0..31 | drafts]``), the RoPE
+    tables of the writer's 16 rows and the 16-row active mask."""
+    from models.demos.motif3.tests.unit.test_moe import upload_rows16
+
+    rot = MotifAttention.decode_rope_tables(rope, kvw.rot_idxs)
+    act = MotifAttention.active_mask_from_cur_pos(kvw.cur_pos, 2 * cfg.lanes_per_row)
+    return {"hn": upload_rows16(x64, cfg, mesh_device), "tok": _tokens_tt(mesh_device, tok64), "rot": rot, "act": act}
+
+
+def _free_t64_inputs(d) -> None:
+    _free([d["hn"], d["tok"], d["act"]] + [t for cs in d["rot"].values() for t in cs])
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_mtp_t64_rows(mesh_device, device_params):
+    """WP-D (D1) module test of the MTP layer in the T64 verify step (P5_T64_DESIGN.md §4.4, T5): 16 rows per DP row
+    (``[8 anchors at n | their 8 drafts at n + 1]``) vs the same rows as two 32-lane steps (the anchors at n, then the
+    drafts at n + 1 on the cache the anchors' step wrote; ``kv_write`` ``all_split``, ordinary steps), KV-R path; the
+    T64 write is :class:`_T64SplitKVWrite` (the split-order writer K1 productizes). C2 golden inputs (hidden states and
+    next tokens of the 4 decode prompts, positions ``DECODE_POS``), real MTP weights from the TT cache, histories
+    0 .. 511 KV-only-filled from the C2 hidden states with every lane's p and p + 1 then poisoned (only the step's own
+    writes make them right); the comparisons with the 32-lane steps are bitwise:
+
+    A. every lane drafts: MTP argmax ``m [1, 1, 1, 64]`` == (the anchors' step's m, the drafts' step's m); attention and
+       final-norm output rows == the 32-lane rows; every chip's MTP cache after the step == after the two 32-lane steps
+       (n by call A, n + 1 by call B, all 32 chips); replicas identical; and the 64 rows vs the fp32 reference ``MotifMTP``
+       (anchors: the golden rows at p, drafts: at p + 1) with gate G14's bars (GDLA >= 0.999, output >= 0.995,
+       aggregate and per row; argmax == the reference on >= 99 % of the rows without a bf16 tie);
+    B. odd lanes without a draft (``cur_b`` -1: inactive draft rows): every row == the 32-lane steps with those
+       drafts inactive; caches equal (no n + 1 written for the odd lanes);
+    C. step A captured in a trace and replayed on a fresh cache == the eager step (argmax, final-norm output, cache).
+    Every new program's static CBs end below a one-page L1 pin."""
+    from models.demos.motif3.tests.unit.test_moe import l1_pin, t64_cfg
+    from models.demos.motif3.tt.ccl import MotifCCL, log_fabric
+    from models.demos.motif3.tt.rope import MotifRope
+
+    gold = load_goldens()
+    cfg = t64_cfg(mesh_device)
+    log_fabric(mesh_device, "mtp t64")
+    log(cfg.describe())
+    ccl, rope = MotifCCL(mesh_device, cfg), MotifRope(mesh_device, cfg)
+    pin = l1_pin(mesh_device)
+    embed, head, mtp = build_mtp_modules(mesh_device, cfg, ccl, rope)
+    assert sorted(head._am_wide) == [64], sorted(head._am_wide)
+    block, kvdt = cfg.kv_block_size, cfg.dtypes.kv_cache
+    B, per = cfg.max_batch, HIST // block
+    pool = 1 + B * per + 3
+    pt_lanes = _page_table(pool, B * per, seed=64).reshape(B, per)
+    cache, stale = _stale_cache(mesh_device, cfg, pool, seed=65)
+    lane_pos, lane_rows, hist_rows = _decode_lanes(gold, cfg)
+    t0 = time.time()
+    _fill_histories(mesh_device, cfg, rope, embed, mtp, gold, cache, pt_lanes, hist_rows)
+    hist = _dev(cache)
+    _free(cache)
+    base = _poisoned(hist, stale, pt_lanes, {lane: (lane_pos[lane], lane_pos[lane] + 1) for lane in range(B)}, block)
+    log(f"histories filled (KV-only, C2 hidden states; positions 0 .. {HIST - 1}) and every lane's p / p + 1 poisoned "
+        f"in {time.time() - t0:.1f} s")
+    pos, rows_p = torch.tensor(lane_pos, dtype=torch.int32), torch.tensor(lane_rows)
+    x_a, tok_a = gold["hn"][rows_p].float(), gold["next_ids"][rows_p]
+    x_d, tok_d = gold["hn"][rows_p + 1].float(), gold["next_ids"][rows_p + 1]  # the drafts: positions n + 1
+    x64, tok64 = torch.cat([x_a, x_d]), torch.cat([tok_a, tok_d])
+    failures: List[str] = []
+
+    def check(tag: str, ok: bool, detail: str) -> None:
+        log(f"{tag}: {'ok' if ok else 'FAIL'}; {detail}")
+        if not ok:
+            failures.append(f"{tag}: {detail}")
+
+    def reference(draft_pos):
+        """The two 32-lane steps on a fresh cache (anchors at ``pos``, then drafts at ``draft_pos``)."""
+        c = _upload_cache(mesh_device, base, kvdt)
+        kvw = KW.DecodeKVWrite(mesh_device, cfg, ccl=ccl, page_table_width=per, mode="all_split")
+        try:
+            m_a, out_a, rep_a = _mtp_decode_step(mesh_device, cfg, rope, mtp, head, c, pos, x_a, tok_a, pt_lanes,
+                                                 kvw=kvw, step=KW.KVWriteStep.ordinary(pos, pt_lanes))  # fmt: skip
+            st_d = KW.KVWriteStep.ordinary(draft_pos, pt_lanes)
+            m_d, out_d, rep_d = _mtp_decode_step(mesh_device, cfg, rope, mtp, head, c, draft_pos, x_d, tok_d, pt_lanes,
+                                                 kvw=kvw, step=st_d)  # fmt: skip
+            copies = KW.cache_copies(c, mesh_device, cfg)
+        finally:
+            kvw.deallocate()
+            _free(c)
+        return torch.cat([m_a, m_d]), {k: torch.cat([out_a[k], out_d[k]]) for k in out_a}, copies, rep_a and rep_d
+
+    def t64(draft_pos):
+        """One eager T64 step on a fresh cache."""
+        from models.demos.motif3.tt.ccl import replicas_identical
+
+        c = _upload_cache(mesh_device, base, kvdt)
+        kvw = _T64SplitKVWrite(mesh_device, cfg, ccl, pos, draft_pos, pt_lanes)
+        d = _mtp_t64_inputs(mesh_device, cfg, rope, kvw, x64, tok64)
+        taps: Dict[str, Any] = {}
+        try:
+            m_tt = mtp.forward_decode(d["hn"], d["tok"], rot=d["rot"], cur_pos=kvw.cur_pos, page_table=kvw.page_table,
+                                      kv_cache=c, active=d["act"], kv_write=kvw, taps=taps)  # fmt: skip
+            assert list(m_tt.shape) == [1, 1, 1, 64], list(m_tt.shape)
+            m = head.tokens_to_host(m_tt)
+            out = {k: _rows16_out(cfg, mesh_device, taps[k]) for k in ("attn_out", "out")}
+            rep = replicas_identical(taps["out"], mesh_device, "tp", cfg.axes) and _all_equal_chips(m_tt, mesh_device)
+            copies = KW.cache_copies(c, mesh_device, cfg)
+            _free(m_tt)
+        finally:
+            for k in list(taps):
+                _free(taps.pop(k))
+            _free_t64_inputs(d)
+            kvw.deallocate()
+            _free(c)
+        return m, out, copies, rep
+
+    def compare(tag, ref, got, extra=""):
+        (m_r, o_r, c_r, rep_r), (m_g, o_g, c_g, rep_g) = ref, got
+        eq_m = bool(torch.equal(m_g, m_r))
+        eq_o = {k: bool(torch.equal(o_g[k], o_r[k])) for k in o_r}
+        diff = {k: float((o_g[k] - o_r[k]).abs().max()) for k in o_r}
+        bad = sorted(k for k in c_r if not torch.equal(c_g[k], c_r[k]))
+        ok = eq_m and all(eq_o.values()) and not bad and rep_r and rep_g
+        check(tag, ok, f"argmax [64] == 32-lane steps {eq_m} ({int((m_g == m_r).sum())}/64); rows bitwise {eq_o} "
+                       f"(max |diff| {diff}); chips whose MTP cache differs {bad or 'none'} of 32; replicas "
+                       f"{rep_r}/{rep_g}{extra}")  # fmt: skip
+
+    # ---- A: every lane drafts ------------------------------------------------------------------------------------
+    t0 = time.time()
+    ref_a, got_a = reference(pos + 1), t64(pos + 1)
+    compare("A every lane drafts (T64 16 rows per DP row vs two 32-lane steps)", ref_a, got_a,
+            f"; {time.time() - t0:.1f} s incl. readbacks")
+    # the same 64 rows vs the fp32 reference (gate G14's bars): anchors = golden rows at p, drafts = rows at p + 1
+    gr = torch.cat([rows_p, rows_p + 1])
+    nt = non_tie_rows(gold)[gr]
+    m64, out64 = got_a[0], got_a[1]
+    s_attn, s_out = stats(gold["o"][gr], out64["attn_out"]), stats(gold["out"][gr], out64["out"])
+    row_attn = min(pcc(gold["o"][gr][i], out64["attn_out"][i]) for i in range(len(gr)))
+    row_out = min(pcc(gold["out"][gr][i], out64["out"][i]) for i in range(len(gr)))
+    agree = m64 == gold["m32"][gr]
+    ok = (_good(s_attn, ATTN_PCC_MIN) and row_attn >= ATTN_PCC_MIN and _good(s_out, OUT_PCC_MIN)
+          and row_out >= OUT_PCC_MIN and float(agree[nt].float().mean()) >= ARGMAX_AGREE_MIN)  # fmt: skip
+    check("A vs the fp32 reference (G14 bars: GDLA >= 0.999, output >= 0.995, aggregate and per row; argmax)", ok,
+          f"GDLA {fmt(s_attn)} worst row {row_attn:.6f}; output {fmt(s_out)} worst row {row_out:.6f}; argmax == "
+          f"fp32 ref {int(agree.sum())}/64 ({int(agree[nt].sum())}/{int(nt.sum())} without a bf16 tie)")
+    # ---- B: odd lanes without a draft ------------------------------------------------------------------------------
+    nodraft = torch.where(torch.arange(B) % 2 == 1, torch.full_like(pos, -1), pos + 1)
+    ref_b, got_b = reference(nodraft), t64(nodraft)
+    zero = bool((got_b[1]["attn_out"][B:][1::2] == 0).all())
+    compare("B odd lanes without a draft (inactive draft rows)", ref_b, got_b,
+            f"; inactive draft rows' attention 0 {zero}")
+    if not zero:
+        failures.append("B: an inactive draft row's attention output is not 0")
+    # ---- C: step A traced, replayed on a fresh cache --------------------------------------------------------------
+    c = _upload_cache(mesh_device, base, kvdt)
+    kvw = _T64SplitKVWrite(mesh_device, cfg, ccl, pos, pos + 1, pt_lanes)
+    d = _mtp_t64_inputs(mesh_device, cfg, rope, kvw, x64, tok64)
+    with _Capture(mesh_device) as cap:
+        m_t, out_t = mtp.forward_decode(d["hn"], d["tok"], rot=d["rot"], cur_pos=kvw.cur_pos,
+                                        page_table=kvw.page_table, kv_cache=c, active=d["act"], kv_write=kvw,
+                                        return_hidden=True)  # fmt: skip
+    try:
+        ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+        m_tr, out_tr = head.tokens_to_host(m_t), _rows16_out(cfg, mesh_device, out_t)
+        copies = KW.cache_copies(c, mesh_device, cfg)
+        bad = sorted(k for k in copies if not torch.equal(copies[k], got_a[2][k]))
+        eq_m, eq_o = bool(torch.equal(m_tr, got_a[0])), bool(torch.equal(out_tr, got_a[1]["out"]))
+        check("C step A traced and replayed on a fresh cache == eager", eq_m and eq_o and not bad,
+              f"argmax {eq_m}; final-norm rows {eq_o}; chips whose cache differs {bad or 'none'}")
+    finally:
+        ttnn.release_trace(mesh_device, cap.tid)
+        _free([m_t, out_t])
+        _free_t64_inputs(d)
+        kvw.deallocate()
+        _free(c)
+    _free(pin)
+    mtp.deallocate()
+    _free([embed.weight, head.weight, head.gamma])
+    head.close()
     assert not failures, "\n".join(failures)
 
 

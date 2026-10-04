@@ -46,6 +46,20 @@ greedy / agentic / low-concurrency serving (and the TIS greedy benchmark variant
 ``--no-enable-prefix-caching`` (or a per-request ``cache_salt``); evals that need logprobs (N > 0) or structured output
 are served on any launch without ``--speculative-config`` (those steps sample on the host).
 
+Packed prefill and full-batch verify (``docs/p5_t64/P5_T64_DESIGN.md``; read by ``GeneratorSettings.from_env`` in
+EngineCore, so export them in the API server and EngineCore alike):
+
+* P5, ``MOTIF3_PACKED_PREFILL=1`` (off until gates CP-P / CP9-P / E2E-P; knobs ``MOTIF3_PACKED_PREFILL_MAX_SEG`` /
+  ``_MAX_TOKENS`` / ``_PK1`` and ``MOTIF3_PACKED_WARMUP``): the generator runs the short chunks of one prefill step
+  together. The bridge is unchanged: ONE ``prefill_forward_batch`` call per step, the same per-row logits.
+* T64, ``MOTIF3_SPEC_VERIFY=auto`` on the MTP launch (``packed`` until gates G-X / G-serve; ``wide`` is the one-trace
+  fallback): a 64-row verify trace next to the 32-lane one. The bridge drafts every live lane once the live lanes reach
+  the generator's ``c*`` (``MotifGenerator.drafts_all_lanes``: about 19 at the acceptance prior 0.85;
+  ``MOTIF3_WIDE_MIN_LANES`` overrides it), and keeps the idle-lane budget below it, so c = 32 greedy traffic speculates
+  too.
+
+The ``Motif-3 features:`` line, logged once the generator exists, shows ``spec_verify``, ``c*`` and ``packed_prefill``.
+
 Rollback (FEATURES_REVIEW F2 / F6(d)): ``MOTIF3_*=0`` (or ``--no-enable-chunked-prefill --no-enable-prefix-caching``,
 no ``--speculative-config``, no ``sample_on_device_mode``) turns the features off, but it is NOT draft 1: the span cap
 8192 (design D8) still splits every prompt longer than 8192 tokens into sp0 + sp1 chunks inside the generator (other
@@ -74,10 +88,11 @@ What the plugin calls, and what this class does
   ``MOTIF3_SPEC_DECODE`` (they only *allow* a feature; vLLM's flags -- ``sample_on_device_mode`` for sampling --
   enable it). Speculation declares the model-owned drafter: ``spec_requirements`` ``(device_propose, hidden_feed)``
   with ``spec_hidden_handoff`` ``(on_device,)``.
-* ``spec_plan`` (classmethod, config time, never raises): K = 1, packed verify (``lanes_per_request=2``), the MTP
-  latent cache as ``extra_bytes_per_token`` (612 B per chip in bfp8), ``supports_narrow_decode=True`` and, when the
-  installed plugin has it, ``verify_requires_speculable_rows=True`` (PS-1). Refuses K < 1, ``max_num_seqs > 32``,
-  any method but ``custom_class`` and a checkpoint without ``model.mtp_layers.0.*``.
+* ``spec_plan`` (classmethod, config time, never raises): K = 1, ``lanes_per_request=2`` (a draft takes one more row:
+  an idle partner lane in packed verify, its owner's draft row in the 64-row verify), the MTP latent cache as
+  ``extra_bytes_per_token`` (612 B per chip in bfp8), ``supports_narrow_decode=True`` and, when the installed plugin
+  has it, ``verify_requires_speculable_rows=True`` (PS-1). Refuses K < 1, ``max_num_seqs > 32``, any method but
+  ``custom_class`` and a checkpoint without ``model.mtp_layers.0.*``.
 * ``get_max_tokens_all_users``: the usable KV pool (``MOTIF3_KV_POOL_TOKENS``, default 262,144) plus a 32-token
   reserve that makes the plugin allocate exactly one extra block for vLLM's null block, which upstream
   ``get_num_available_blocks_tt`` does not budget (``vllm_tt_plugin/worker.py:553-675``; ``block_pool.py:190``). It
@@ -98,7 +113,9 @@ What the plugin calls, and what this class does
   ``generator.decode_forward_spec`` (ordinary device-sampled steps with ``sampling``) and a verify step (``[B, 2]``
   block + ``num_valid_drafts`` / ``accepted_counts`` / ``spec_mode="argmax_ids"``) returns ``VerifyOutput(argmax_ids
   [B, 2])`` whether or not it carries ``sampling_params`` (PS-1 keeps sampled rows out of verify steps).
-* ``propose_draft_tokens``: host only; the drafts are the MTP predictions the last decode step already computed.
+* ``propose_draft_tokens``: host only; the drafts are the MTP predictions the last decode step already computed. How
+  many: the idle-lane budget, or every live lane when the generator verifies them in one 64-row step
+  (``drafts_all_lanes``, asked with the prior-smoothed running acceptance).
 * ``warmup_model_prefill`` / ``warmup_model_decode`` / ``release_request`` / ``release_persistent_capture``.
 
 Decode-reload contract v1, partial adapter (``vllm-tt-plugin/docs/DECODE_RELOAD_CONTRACT.md``): every decode must
@@ -129,6 +146,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     DEFAULT_KV_POOL_TOKENS,
     DEFAULT_PREFILL_ALIGNMENT,
     DEFAULT_PREFILL_SPAN_CAP,
+    DEFAULT_SPEC_ALPHA_PRIOR,
     FEATURE_SWITCHES,
     KV_LATENT_DIM,
     KV_LORA_RANK,
@@ -145,8 +163,11 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     NUM_LANES,
     QK_ROPE_HEAD_DIM,
     SERVING_TT_CONFIG,
+    SPEC_ALPHA_PRIOR_WEIGHT,
     SUPPORTED_BLOCK_SIZES,
     SUPPORTED_SPEC_TOKENS,
+    WIDE_MIN_LANES_NEVER,
+    WIDE_SPEC_VERIFY_MODES,
     DecodeBatch,
     GeneratorSettings,
     MotifGenerator,
@@ -171,6 +192,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     resolve_tt_cache_path,
     resolve_weights_location,
     serving_additional_config,
+    smoothed_acceptance,
 )
 
 ARCHITECTURE = "MotifForCausalLM"
@@ -196,7 +218,9 @@ MODEL_OWNED_DRAFTER = "vllm_tt_plugin.model_owned_drafter"
 SPEC_REQUIREMENTS = ("device_propose", "hidden_feed")  # the MTP layer reads the target's last hidden, on device
 SPEC_HIDDEN_HANDOFF = ("on_device",)  # keeps supports_narrow_decode (SPEC_DECODE_CONTRACT.md §1a)
 SPEC_ACCEPT_MODE = "argmax_ids"
-SPEC_LANES_PER_REQUEST = 2  # packed verify: the owner's lane + one idle partner lane per draft (features design §3.8.2)
+# A drafted request takes two rows: its own lane + an idle partner lane (packed verify, features design §3.8.2), or its
+# anchor row + its draft row on the owner's DP row (the 64-row verify, T64; docs/p5_t64/P5_T64_DESIGN.md §4.1).
+SPEC_LANES_PER_REQUEST = 2
 SPECULATIVE_CONFIG = {"method": SPEC_METHOD, "model": MODEL_OWNED_DRAFTER, "num_speculative_tokens": 1}
 
 MTP_WEIGHT_PREFIX = "model.mtp_layers.0."
@@ -212,9 +236,10 @@ DEVICE_SAMPLING_TT_CONFIG = {"sample_on_device_mode": SAMPLE_ON_DEVICE_MODE}
 # or host-routed) and at shutdown; MOTIF3_SAMPLING_LOG_EVERY overrides it (0 = at shutdown only).
 SAMPLING_LOG_EVERY = 2000
 
-# The vLLM flags of the features launch WITH the opt-in MTP speculation (features design §1.1 with the lead decision:
-# threshold = budget). The production default launch (lead decision 1) is these flags WITHOUT the
-# "--speculative-config" pair, plus DEVICE_SAMPLING_TT_CONFIG in --additional-config "tt" (module docstring).
+# The vLLM flags of the opt-in MTP launch (features design §1.1 with the lead decision threshold = budget): chunked
+# prefill, prefix caching and the model-owned MTP drafter. They are NOT the production default launch (lead decision
+# 1), which is these flags WITHOUT the "--speculative-config" pair, plus DEVICE_SAMPLING_TT_CONFIG in
+# --additional-config "tt" (module docstring).
 FEATURE_VLLM_ARGS = (
     "--enable-chunked-prefill",
     "--max-num-batched-tokens",
@@ -818,7 +843,21 @@ class SpecStats:
     rejected: int = 0  # verified drafts the plugin rejected (count 1)
     declined_stale: int = 0  # live rows with no retained step at the committed position
     declined_mismatch: int = 0  # committed tokens are not the retained argmax (a sampled row)
-    declined_budget: int = 0  # no idle lane left for the draft in the next step
+    declined_budget: int = 0  # the next step cannot verify the draft (no idle lane left, no 64-row step)
+    # T64 (docs/p5_t64/P5_T64_DESIGN.md §4.7): proposals in which the generator let every live lane draft
+    # (MotifGenerator.drafts_all_lanes), and the drafts they offered past the idle-lane budget (the 64-row step's own)
+    all_lane_proposals: int = 0
+    drafts_beyond_budget: int = 0
+
+    @property
+    def verdicts(self) -> int:
+        """Verified drafts whose outcome the bridge saw (``accepted + rejected``)."""
+        return self.accepted + self.rejected
+
+    def acceptance(self, prior: float = DEFAULT_SPEC_ALPHA_PRIOR, weight: int = SPEC_ALPHA_PRIOR_WEIGHT) -> float:
+        """The drafting policy's acceptance estimate (review edit R-E3, ``generator_api.smoothed_acceptance``):
+        ``(accepted + weight * prior) / (verdicts + weight)``; ``prior`` before any verdict."""
+        return smoothed_acceptance(self.accepted, self.verdicts, prior=prior, weight=weight)
 
     def as_dict(self) -> Dict[str, int]:
         return dataclasses.asdict(self)
@@ -1003,7 +1042,8 @@ class MotifForCausalLM:
         captured by ``get_max_tokens_all_users`` in ``init_device``. The runtime class is ``MOTIF3_GENERATOR_CLASS``
         (default ``models.demos.motif3.tt.generator:MotifGenerator``), imported here, never at module import time; a
         class that cannot serve an enabled feature is refused before ``create`` loads the weights
-        (:func:`precheck_generator_class`), the instance right after (``check_generator_features``).
+        (:func:`precheck_generator_class`), the instance right after (``check_generator_features``). The resolved
+        launch is logged after ``create`` (:meth:`log_features`, the ``Motif-3 features:`` line).
         """
         if int(tt_data_parallel) != 1:
             raise ValueError(
@@ -1040,24 +1080,12 @@ class MotifForCausalLM:
             settings.weights_revision,
             l1_small,
         )
-        logger.info(
-            "Motif-3 features: chunked_prefill={} (budget {}, threshold {}) prefix_caching={} kv_replicated={} "
-            "spec_tokens={} kv_write={} span_cap={} spec_verify={}",
-            settings.chunked_prefill,
-            settings.max_num_batched_tokens,
-            settings.long_prefill_token_threshold,
-            settings.prefix_caching,
-            settings.kv_replicated,
-            settings.spec_tokens,
-            settings.kv_write_mode,
-            settings.prefill_span_cap,
-            settings.spec_verify,
-        )
         generator = impl.create(hf_config=hf_config, mesh_device=mesh_device, settings=settings)
         if int(generator.vocab_size) != int(getattr(hf_config, "vocab_size", generator.vocab_size)):
             raise ValueError(f"generator vocab {generator.vocab_size} != config vocab {hf_config.vocab_size}")
         bridge = cls(generator, settings)
         bridge._check_generator_geometry(serving)
+        bridge.log_features()  # after create: c* is the generator's answer (drafts_all_lanes)
         return bridge
 
     def _check_generator_geometry(self, serving: Optional[Mapping[str, Any]]) -> None:
@@ -1071,6 +1099,44 @@ class MotifForCausalLM:
         for w in check_serving_config(serving, max_model_len=L, align=A, span_cap=cap):
             if w not in assumed:
                 logger.warning("Motif-3 serving config (generator A={}, span cap {}): {}", A, cap, w)
+
+    def log_features(self) -> None:
+        """The ``Motif-3 features:`` line: the launch this bridge serves (``initialize_vllm_model`` logs it once the
+        generator exists). It starts ``chunked_prefill=<b> (budget <n>, threshold <n>) prefix_caching=<b>
+        kv_replicated=<b> spec_tokens=<k> kv_write=<mode> span_cap=<n|None>`` (the fields server checks grep), then
+        ``spec_verify=<packed|wide|auto> c*=<...>`` (:meth:`drafting_threshold_text` at the acceptance prior: ``n/a``
+        without speculation, ``never`` when the generator never lets every lane draft) and ``packed_prefill=<b>``
+        (with its knobs when on).
+
+        Also warns when ``spec_verify`` is ``"wide"`` / ``"auto"`` but the generator class keeps
+        ``MotifGenerator.drafts_all_lanes``' default (always False): the 64-row verify would then never engage."""
+        s = self.settings
+        packed = "True (max_seg {}, max_tokens {}, pk1 {}, warmup {})".format(
+            s.packed_prefill_max_seg, s.packed_prefill_max_tokens, s.packed_prefill_pk1, s.packed_warmup
+        )
+        logger.info(
+            "Motif-3 features: chunked_prefill={} (budget {}, threshold {}) prefix_caching={} kv_replicated={} "
+            "spec_tokens={} kv_write={} span_cap={} spec_verify={} {} packed_prefill={}",
+            s.chunked_prefill,
+            s.max_num_batched_tokens,
+            s.long_prefill_token_threshold,
+            s.prefix_caching,
+            s.kv_replicated,
+            s.spec_tokens,
+            s.kv_write_mode,
+            s.prefill_span_cap,
+            s.spec_verify,
+            self.drafting_threshold_text(),
+            packed if s.packed_prefill else False,
+        )
+        never = _inherits_default(type(self.generator), "drafts_all_lanes")
+        if self._spec and s.spec_verify in WIDE_SPEC_VERIFY_MODES and never:
+            logger.warning(
+                "Motif-3: spec_verify={!r}, but the generator class {} keeps MotifGenerator.drafts_all_lanes' default "
+                "(False): the bridge keeps the idle-lane draft budget and the 64-row verify never engages",
+                s.spec_verify,
+                type(self.generator).__name__,
+            )
 
     # ---- KV pool sizing (runs in init_device, before the weights load) ------------------------------------------
     @classmethod
@@ -1512,7 +1578,8 @@ class MotifForCausalLM:
             ``logprobs=0`` (vLLM's raw logprob of the sampled token); a verify step returns
             ``VerifyOutput(spec_mode="argmax_ids", argmax_ids=int32 [B, 2], hidden=None)``: column 0 = the target's
             choice after the row's last committed token, column 1 = its choice after the draft (``-1`` on rows without
-            one). In a speculating launch every step runs ``generator.decode_forward_spec`` (one decode trace) and the
+            one). In a speculating launch every step runs ``generator.decode_forward_spec`` (one decode trace; with
+            ``MOTIF3_SPEC_VERIFY=auto`` the generator also holds the 64-row trace and picks one per step) and the
             bridge retains, per lane, the MTP drafts ``propose_draft_tokens`` hands out next.
         """
         kv = self._check_kv(kv_cache)
@@ -1710,7 +1777,11 @@ class MotifForCausalLM:
         decode_forward_spec(want_logits=False)`` -> ``VerifyOutput(argmax_ids [B, 1+K])``. ``sampling_params`` (a
         device-sampling launch sends them on every step its routing samples on device, verify steps included) do not
         change the argmax path: PS-1 keeps sampled rows out of verify steps, so every active row is greedy; a
-        non-greedy row is counted (``sampling_stats.nongreedy_verify_rows``) and logged once."""
+        non-greedy row is counted (``sampling_stats.nongreedy_verify_rows``) and logged once.
+
+        The generator chooses how to verify (``spec_verify``): the 32-lane trace with the drafts on idle lanes, or one
+        64-row step (T64). The call carries neither logits nor ``sampling`` on purpose: in ``"auto"`` such a step can
+        always take the 64-row trace, so bridge traffic never needs the overflow pass (review edit R-E6)."""
         from vllm_tt_plugin.spec_decode import (
             ACCEPT_MODE_ARGMAX_IDS,
             PLACEHOLDER_TOKEN_ID,
@@ -1829,11 +1900,48 @@ class MotifForCausalLM:
             out[int(lane)] = SpecRetained(int(p), a, m)
         return out
 
-    def _draft_budget(self, live_lanes: Sequence[int]) -> Callable[[int], bool]:
+    # ---- drafting policy (T64: docs/p5_t64/P5_T64_DESIGN.md §4.5, §4.7; review edits R-E3, R-E9) --------------
+    def spec_acceptance(self) -> float:
+        """alpha_hat, the acceptance the drafting policy works with: the running acceptance of this bridge's verified
+        drafts pulled toward the prior ``settings.spec_alpha_prior`` (0.85) with weight ``SPEC_ALPHA_PRIOR_WEIGHT``
+        (64) (:meth:`SpecStats.acceptance`, review edit R-E3). It is the prior before any draft was verified, so a
+        server whose first traffic is a 32-request burst still drafts: under the idle-lane budget alone it would never
+        verify a draft, never measure alpha, and the 64-row verify would never engage."""
+        return self.spec_stats.acceptance(self.settings.spec_alpha_prior)
+
+    def all_lanes_threshold(self, acceptance: Optional[float] = None) -> int:
+        """``c*``: the fewest live lanes from which the generator lets every live lane draft
+        (``generator.drafts_all_lanes``), at ``acceptance`` (default :meth:`spec_acceptance`); ``WIDE_MIN_LANES_NEVER``
+        (33) = never. Probed with the first ``c`` lanes of a fresh lane map, ``c`` = 1 .. 32 (host only, no device
+        work). Not used to serve: every proposal asks the generator itself (:meth:`_draft_budget`)."""
+        a = self.spec_acceptance() if acceptance is None else float(acceptance)
+        lanes = LaneMap(NUM_LANES).slot_to_lane
+        for c in range(1, NUM_LANES + 1):
+            if bool(self.generator.drafts_all_lanes(lanes[:c], acceptance=a)):
+                return c
+        return WIDE_MIN_LANES_NEVER
+
+    def drafting_threshold_text(self, acceptance: Optional[float] = None) -> str:
+        """``c*=<n>`` for the log lines: ``c*=n/a`` without speculation, ``c*=never`` when no live-lane count makes the
+        generator draft every lane, and in ``spec_verify="auto"`` what decides it: ``(MOTIF3_WIDE_MIN_LANES=<n>)`` or
+        ``(alpha <a>)`` (:meth:`all_lanes_threshold` at ``acceptance``, default :meth:`spec_acceptance`)."""
+        if not self._spec:
+            return "c*=n/a"
+        a = self.spec_acceptance() if acceptance is None else float(acceptance)
+        c = self.all_lanes_threshold(a)
+        text = f"c*={'never' if c > NUM_LANES else c}"
+        s = self.settings
+        if s.spec_verify == "auto":
+            why = f"MOTIF3_WIDE_MIN_LANES={s.wide_min_lanes}" if s.wide_min_lanes is not None else f"alpha {a:.3f}"
+            text += f" ({why})"
+        return text
+
+    def _idle_lane_budget(self, live_lanes: Sequence[int]) -> Callable[[int], bool]:
         """``take(owner_lane) -> bool``: whether the next step still has an idle lane for one more draft. A draft runs
         on a lane no request uses (packed verify, features design §3.8.2): with KV-R any idle lane (every chip holds
-        every lane's KV), without it an idle lane of the owner's DP row. A draft past the budget would cost the
-        generator a second trace replay (its overflow pass), so it is declined instead."""
+        every lane's KV), so ``32 - live`` drafts in all; without it an idle lane of the owner's DP row, so ``8 -
+        active`` per DP row. A draft past the budget would cost the generator a second trace replay (its overflow
+        pass), so it is declined instead."""
         if self.settings.kv_replicated:
             left = {None: NUM_LANES - len(set(live_lanes))}
 
@@ -1857,6 +1965,29 @@ class MotifForCausalLM:
 
         return take
 
+    def _draft_budget(self, live_lanes: Sequence[int]) -> Callable[[int], bool]:
+        """``take(owner_lane) -> bool``: whether the next step can verify one more draft.
+
+        The generator answers first: ``generator.drafts_all_lanes(live_lanes, acceptance=alpha_hat)``, alpha_hat =
+        :meth:`spec_acceptance` (review edits R-E3, R-E9). True: every live lane may draft; the generator verifies
+        the drafts that do not fit idle lanes in one 64-row step (``spec_verify`` "wide", or "auto" from ``c*`` live
+        lanes on). False (``MotifGenerator``'s default, ``spec_verify="packed"``, "auto" below ``c*``): the idle-lane
+        budget, unchanged (:meth:`_idle_lane_budget`; without KV-R its per-DP-row budget, which a lane count could
+        not express). Counted in ``spec_stats.all_lane_proposals`` / ``drafts_beyond_budget``."""
+        live = tuple(dict.fromkeys(int(lane) for lane in live_lanes))
+        budget = self._idle_lane_budget(live)
+        if not live or not bool(self.generator.drafts_all_lanes(live, acceptance=self.spec_acceptance())):
+            return budget
+        stats = self.spec_stats
+        stats.all_lane_proposals += 1
+
+        def take_all(lane: int) -> bool:
+            if not budget(lane):
+                stats.drafts_beyond_budget += 1
+            return True
+
+        return take_all
+
     def propose_draft_tokens(self, num_drafts, committed_tokens, committed_positions, accepted_counts, hidden=None):
         """The model-owned drafter (``SPEC_DECODE_CONTRACT.md`` §4b; features design §3.8.3, §3.9 item 4): host only.
 
@@ -1872,8 +2003,10 @@ class MotifForCausalLM:
 
         A row is declined (``num_valid`` 0, always legal) when it is padding, when the lane holds no step anchored at
         ``committed_positions[i, 0] - 1``, when the committed tokens are not the retained argmax (a sampled row: its
-        next anchor is not what the MTP drafted after), or when the next step has no idle lane left for its draft
-        (:meth:`_draft_budget`; rows are visited from a rotating start so capped drafting is fair). ``hidden`` is
+        next anchor is not what the MTP drafted after), or when the next step cannot verify its draft
+        (:meth:`_draft_budget`: the idle-lane budget, unless the generator lets every live lane draft because it
+        verifies them in one 64-row step; rows are visited from a rotating start so capped drafting is fair). The
+        budget is asked after this step's verdicts are counted, so the acceptance it uses includes them. ``hidden`` is
         ignored (the MTP state stays on device: ``spec_hidden_handoff`` ``on_device``).
 
         Returns ``DraftOutput(draft_token_ids=int32 [B, K], num_valid=int32 [B])``."""
@@ -1903,13 +2036,13 @@ class MotifForCausalLM:
         if any(on and not 1 <= c <= 1 + K for on, c in zip(live, count_l)):
             raise ValueError(f"propose_draft_tokens: accepted_counts outside [1, {1 + K}]: {count_l}")
         lanes = self._lanes.slot_to_lane[:B]
-        take = self._draft_budget([lane for lane, on in zip(lanes, live) if on])
         draft_l = [PLACEHOLDER_TOKEN_ID] * B
         valid_l = [0] * B
         stats = self.spec_stats
         stats.proposals += 1
         first = self._propose_calls % B
         self._propose_calls += 1
+        candidates: List[Tuple[int, int]] = []  # (row, draft) in the rotating visit order
         for k in range(B):
             i = (first + k) % B
             if not live[i]:
@@ -1927,12 +2060,16 @@ class MotifForCausalLM:
             if tuple(committed_l[i][:c]) != st.argmax[:c]:
                 stats.declined_mismatch += 1
                 continue
-            if not take(lanes[i]):
-                stats.declined_budget += 1
-                continue
-            draft_l[i] = st.mtp[c - 1]
-            valid_l[i] = 1
-            stats.drafts_offered += 1
+            candidates.append((i, st.mtp[c - 1]))
+        if candidates:  # after this step's verdicts: the acceptance the budget asks with includes them
+            take = self._draft_budget([lane for lane, on in zip(lanes, live) if on])
+            for i, draft in candidates:
+                if not take(lanes[i]):
+                    stats.declined_budget += 1
+                    continue
+                draft_l[i] = draft
+                valid_l[i] = 1
+                stats.drafts_offered += 1
         drafts = torch.tensor(draft_l, dtype=torch.int32).reshape(B, K)
         return DraftOutput(draft_token_ids=drafts, num_valid=torch.tensor(valid_l, dtype=torch.int32))
 
@@ -1978,7 +2115,9 @@ class MotifForCausalLM:
         ``num_blocks`` is the plugin's page-table width (``max_num_blocks_per_req``), fixed for the server's life;
         ``max_batch_size`` is ``max_num_seqs``. ``can_sample_on_device`` (``sample_on_device_mode`` "decode_only"):
         the generator builds its exact device sampler before the eager warmup, so the warmup compiles it and the
-        capture puts it into the one decode trace (plain or spec).
+        capture puts it into the decode trace (plain or spec). With ``MOTIF3_SPEC_VERIFY=auto`` the generator stages,
+        warms and captures its two decode traces here, once (the 32-lane spec trace with the sampler, then the 64-row
+        verify trace; ``docs/p5_t64/P5_T64_DESIGN.md`` §2.3-§2.4); ``wide``: the 64-row trace alone.
         """
         kv = self._check_kv(kv_cache)
         if can_sample_on_device:
@@ -2010,12 +2149,18 @@ class MotifForCausalLM:
         self.generator.release_lane(lane)
 
     def release_persistent_capture(self):
-        """Shutdown, mesh still open (``model_runner.py:392-419``): log the bridge's speculation and device-sampling
-        counters and the generator's own counters (``MotifGenerator.stats``: prefill calls / rows / chunks / sp1
-        chunks / recomputed rows / MTP fills, decode and spec steps, drafts, packed drafts, cross-row partners, overflow
-        passes, device-sampled steps, host fallbacks), then free the decode trace (and the sampler's trace outputs)."""
+        """Shutdown, mesh still open (``model_runner.py:392-419``): log the bridge's speculation counters (with
+        alpha_hat and ``c*`` at it) and device-sampling counters and the generator's own counters
+        (``MotifGenerator.stats``: prefill calls / rows / chunks / sp1 chunks / recomputed rows / MTP fills, decode and
+        spec steps, drafts, packed drafts, cross-row partners, overflow passes, device-sampled steps, host fallbacks),
+        then free the decode traces (and the sampler's trace outputs)."""
         if self._spec:
-            logger.info("Motif-3 speculation: {}", self.spec_stats.as_dict())
+            alpha = self.spec_acceptance()
+            try:
+                drafting = self.drafting_threshold_text(alpha)
+            except Exception as exc:  # the log must not keep release_traces from running
+                drafting = f"c*=? ({exc!r})"
+            logger.info("Motif-3 speculation: {} alpha_hat={:.4f} {}", self.spec_stats.as_dict(), alpha, drafting)
         if self._device_sampling:
             self.log_sampling_stats()
         stats = getattr(self.generator, "stats", None)

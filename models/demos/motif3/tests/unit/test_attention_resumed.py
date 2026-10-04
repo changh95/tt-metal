@@ -30,6 +30,20 @@ WP2b (``forward_prefill(chunk=PrefillChunkInputs)``, ``forward_decode(kv_write=)
   needs and writes nothing; the decode hook with a draft-1 writer and a KV-R writer; an sp1 chunk captured in a trace
   at one start and replayed at another; a cost report.
 
+Work package A1 of P5 / T64 (packed multi-row prefill: ``forward_prefill(chunk=PrefillChunkInputs.upload(
+PackedHostTables))``; ``docs/p5_t64/P5_T64_DESIGN.md`` §3, §6.2 G15b, §7.1):
+
+* host: ``packed_host_tables`` on the design's packed-call scenarios planned by ``prefill_plan.plan_prefill_passes``
+  (every segment's slice == the per-chunk tables re-bucketed to S, R-E12; dummies and tail variants, R-E2; shape keys;
+  the R-E1 odd-block order) and its guards; the warm-up tables of every packed shape; the recorded op sequences of the
+  pk0 / pk1 global / pk1 SWA (both tail variants) paths -- the solo paths' bucket-T ops except the batched SDPA, no
+  leaks, guards before any op (R-E11); the packed ``PrefillChunkInputs`` (upload, write, warmup, free); the solo paths
+  and decode op-for-op identical to the B0 module from git; packed calls through an fp64 emulation of the packed
+  dataflow driven only by the tables, with negative controls (a wrong tail variant, a wrong SDPA row, R-E1's order);
+* device (``test_g15b_packed_attention``, gate G15b): packed passes through the real-weight L0 / L1 against the
+  per-row calls, the fp32 reference and the per-row fills; the warm-up compiles every program a real pass needs;
+  repeat determinism; R-E2's two program sets.
+
 Every chunk input is the prompt rows plus JUNK bucket-padding rows (:func:`chunk_input_rows`): serving pads a bucket
 with padding tokens, never with the prompt's next rows. With the true next rows as padding, an intermediate chunk's
 fill would already write the correct latents into the request's own partial last block, and a continuation that
@@ -103,12 +117,14 @@ from models.demos.motif3.tests.unit.test_attention import (
     stats,
 )
 from models.demos.motif3.tt import attention as A
+from models.demos.motif3.tt import generator_api as api
 from models.demos.motif3.tt import prefill_plan as PP
 from models.demos.motif3.tt import weights as W
 from models.demos.motif3.tt.attention import (
     MTP_ATTN_PREFIX,
     ChunkHostTables,
     MotifAttention,
+    PackedHostTables,
     PrefillChunkInputs,
     _AttnSource,
     attn_weight_prefix,
@@ -120,11 +136,13 @@ from models.demos.motif3.tt.attention import (
     latent_q_weight,
     max_sp1_bucket,
     noise_expansion,
+    packed_host_tables,
     resolve_attn_layer,
     virtual_head_order,
     w_uk_virtual_for_chip,
     w_uv_virtual_for_chip,
     warmup_chunk_host_tables,
+    warmup_packed_host_tables,
     warmup_start,
     wq_b_gate_for_chip,
     wq_b_virtual_for_chip,
@@ -141,6 +159,8 @@ MTP_INPUTS_FORMAT = 1  # bump when make_mtp_attention_inputs changes meaning
 METAL_ROOT = Path(__file__).resolve().parents[5]
 DRAFT1_COMMIT = "01d0781cb56"  # last commit of tt/attention.py before WP2a: draft 1, validated end to end
 DRAFT1_MODULE = "models.demos.motif3.tt._attention_draft1"
+B0_COMMIT = "277df0e9f2d"  # base B0 of P5 / T64: the solo sp0 / sp1 paths and decode stay op-for-op its own
+B0_MODULE = "models.demos.motif3.tt._attention_b0"
 OUT_PCC_MIN = 0.999  # module output vs the fp32 reference (test_attention.py's bar)
 LANE_PCC_MIN = 0.999  # per decode lane
 LAT_PCC_MIN = 0.9999  # latent cache rows vs the reference c_kv / gamma and k_pe (gate G14's bar)
@@ -284,31 +304,40 @@ def emulate_latent(cfg: MotifTTConfig, spec, src: _AttnSource, x: torch.Tensor, 
     return torch.stack(out)
 
 
-def draft1_attention_module():
-    """``tt/attention.py`` as of :data:`DRAFT1_COMMIT` (draft 1), loaded from git as :data:`DRAFT1_MODULE`. Its
-    relative imports resolve to the current shared infra. Skips when git or the commit is unavailable, e.g. in a
-    packaged copy."""
-    if DRAFT1_MODULE in sys.modules:
-        return sys.modules[DRAFT1_MODULE]
+def git_attention_module(commit: str, module_name: str):
+    """``tt/attention.py`` as of ``commit``, loaded from git as ``module_name``. Its relative imports resolve to the
+    current shared infra. Skips when git or the commit is unavailable, e.g. in a packaged copy."""
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     rel = "models/demos/motif3/tt/attention.py"
     try:
         res = subprocess.run(
-            ["git", "-C", str(METAL_ROOT), "show", f"{DRAFT1_COMMIT}:{rel}"],
+            ["git", "-C", str(METAL_ROOT), "show", f"{commit}:{rel}"],
             capture_output=True,
             text=True,
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        pytest.skip(f"git unavailable ({e}): cannot load the draft-1 attention module")
+        pytest.skip(f"git unavailable ({e}): cannot load the attention module of {commit}")
     if res.returncode != 0:
-        pytest.skip(f"draft-1 attention module not in git: {res.stderr.strip()[:300]}")
-    spec = importlib.util.spec_from_loader(DRAFT1_MODULE, loader=None)
+        pytest.skip(f"attention module of {commit} not in git: {res.stderr.strip()[:300]}")
+    spec = importlib.util.spec_from_loader(module_name, loader=None)
     mod = importlib.util.module_from_spec(spec)
     mod.__package__ = "models.demos.motif3.tt"
-    mod.__file__ = f"<git {DRAFT1_COMMIT}>/{rel}"
-    exec(compile(res.stdout, mod.__file__, "exec"), mod.__dict__)
-    sys.modules[DRAFT1_MODULE] = mod
+    mod.__file__ = f"<git {commit}>/{rel}"
+    sys.modules[module_name] = mod  # registered first: @dataclass resolves annotations through sys.modules
+    try:
+        exec(compile(res.stdout, mod.__file__, "exec"), mod.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
     return mod
+
+
+def draft1_attention_module():
+    """``tt/attention.py`` as of :data:`DRAFT1_COMMIT` (draft 1), loaded from git as :data:`DRAFT1_MODULE`
+    (:func:`git_attention_module`)."""
+    return git_attention_module(DRAFT1_COMMIT, DRAFT1_MODULE)
 
 
 def make_mtp_attention_inputs(path: Path = MTP_INPUTS, prompt: str = MTP_PROMPT) -> Path:
@@ -603,6 +632,12 @@ class _FT:
         self.src = frozenset(src)
         self.data: Optional[torch.Tensor] = None  # host values (uploads / copies of :class:`_FakeTTNN` only)
         self.on_device = True
+        self.base: Optional["_FT"] = None  # a metadata view (reshape, full-extent slice) shares this tensor's buffer
+
+    @property
+    def root(self) -> "_FT":
+        """The tensor that owns the buffer (itself unless a view)."""
+        return self.base if self.base is not None else self
 
     def desc(self):
         return ("T", self.shape, self.dtype, tuple(sorted(self.src)))
@@ -622,7 +657,9 @@ class _FakeTTNN:
     """Records every ttnn call the attention methods make (op, operand descriptors, kwargs) and returns fake tensors
     of the right shape / dtype / lineage. Patched in as the module-global ``ttnn`` of ``tt/attention.py`` (and of the
     draft-1 module) to compare op sequences on the host. ``made`` lists every tensor an op returned and ``freed``
-    every deallocation (by identity), for the leak checks."""
+    every deallocation (by identity), for the leak checks. ``reshape`` returns a metadata view and a full-extent
+    ``slice`` returns a view of its input, as ttnn does (``slice.cpp``'s no-op branch, GATES_RESULTS §13.2): a view
+    owns no buffer, and deallocating it frees its base's."""
 
     DRAM_MEMORY_CONFIG = "DRAM"
     TILE_LAYOUT, ROW_MAJOR_LAYOUT = "TILE", "RM"
@@ -667,10 +704,10 @@ class _FakeTTNN:
 
     def _split(self, x, num_heads, split_head_dim, **kw):
         self._rec("nlp_create_q_heads_split", (x,), dict(kw, num_heads=num_heads, split_head_dim=split_head_dim))
-        T, Wd = x.shape[-2], x.shape[-1] // num_heads
+        Bt, T, Wd = x.shape[0], x.shape[-2], x.shape[-1] // num_heads  # batch rows stay (packed passes: [B, 1, R, d])
         h = 1 if num_heads == 1 else num_heads
-        return self.new((1, h, T, split_head_dim), x.dtype, x.src), self.new(
-            (1, h, T, Wd - split_head_dim), x.dtype, x.src
+        return self.new((Bt, h, T, split_head_dim), x.dtype, x.src), self.new(
+            (Bt, h, T, Wd - split_head_dim), x.dtype, x.src
         )
 
     def _concat_heads(self, u, **kw):
@@ -695,7 +732,21 @@ class _FakeTTNN:
             shape = list(t.shape)
             shape[kw["slice_dim"]] //= kw["num_devices"]
             return self._out("slice", (t, start, end), kw, shape)
+        if all(int(s) == 0 for s in start) and tuple(int(e) for e in end) == t.shape:  # ttnn: the input itself
+            self._rec("slice", (t, tuple(start), tuple(end)), kw)
+            return self._view(t, t.shape)
         return self._out("slice", (t, tuple(start), tuple(end)), kw, [e - s for s, e in zip(start, end)])
+
+    def _view(self, t: _FT, shape) -> _FT:
+        v = _FT(shape, t.dtype, t.src)
+        v.base = t.root
+        return v
+
+    def reshape(self, t, shape, *a, **kw):
+        shape = tuple(int(s) for s in shape)
+        assert int(torch.tensor(shape).prod()) == int(torch.tensor(t.shape).prod()), (t.shape, shape)
+        self._rec("reshape", (t, shape), kw)
+        return self._view(t, shape)
 
     def repeat(self, t, reps):
         return self._out("repeat", (t, tuple(reps)), {}, [s * r for s, r in zip(t.shape, reps)])
@@ -743,15 +794,15 @@ class _FakeTTNN:
         self._rec("copy_host_to_device_tensor", (src, dst), {})
 
     def leaks(self, keep=()) -> Tuple[List[_FT], List[_FT]]:
-        """``(never freed, freed twice or not made by an op)`` among the op outputs, ``keep`` (returned / tapped
-        tensors) excluded."""
+        """``(never freed, freed twice or not made by an op)`` among the op outputs (buffers: a view counts for its
+        base), ``keep`` (returned / tapped tensors) excluded."""
         made = {id(t): t for t in self.made}
-        kept = {id(t) for t in keep}
+        kept = {id(t.root) for t in keep}
         counts: Dict[int, int] = {}
         for t in self.freed:
-            counts[id(t)] = counts.get(id(t), 0) + 1
+            counts[id(t.root)] = counts.get(id(t.root), 0) + 1
         never = [t for i, t in made.items() if i not in kept and counts.get(i, 0) == 0]
-        bad = [t for t in self.freed if id(t) not in made or counts[id(t)] > 1 or id(t) in kept]
+        bad = [t for t in self.freed if id(t.root) not in made or counts[id(t.root)] > 1 or id(t.root) in kept]
         return never, bad
 
 
@@ -1265,19 +1316,38 @@ def test_cpu_chunk_host_tables():
     log("chunk host tables: worked examples (A = 64 / 128), planner invariants, warm-up tables and the guards ok")
 
 
-def _fake_chunk(cfg: MotifTTConfig, host: ChunkHostTables) -> PrefillChunkInputs:
-    """:class:`PrefillChunkInputs` of :class:`_FT` fake device tensors with the device inputs' shapes."""
+def _fake_chunk(cfg: MotifTTConfig, host: ChunkHostTables, mod=A) -> PrefillChunkInputs:
+    """``mod.PrefillChunkInputs`` (default: the current module) of :class:`_FT` fake device tensors with the device
+    inputs' shapes."""
     C, rd = host.bucket, cfg.rope_dim
     fill = _FT((1, C // host.block_size), "i32", {"fill_pt"})
     if not host.is_sp1:
-        return PrefillChunkInputs(host.path, 0, C, host.end, fill)
+        return mod.PrefillChunkInputs(host.path, 0, C, host.end, fill)
     rot = {k: (_FT((1, 1, C, rd), "bf16", {f"cos_{k}_chunk"}), _FT((1, 1, C, rd), "bf16", {f"sin_{k}_chunk"}))
            for k in ("yarn", "plain")}  # fmt: skip
     tail = tuple((_FT((4,), "i32", {f"tail{j}_s"}), _FT((4,), "i32", {f"tail{j}_e"})) for j in range(host.tail.numel()))
-    return PrefillChunkInputs(
+    return mod.PrefillChunkInputs(
         host.path, host.start, C, host.end, fill, rot=rot, sdpa_pt=_FT(tuple(host.sdpa.shape), "i32", {"sdpa_pt"}),
         start_idx=_FT((1,), "i32", {"start_idx"}), tail_bounds=tail, rot_idx=_FT((1, C), "u32", {"rot_idx"}),
     )  # fmt: skip
+
+
+def _fake_packed(cfg: MotifTTConfig, host: "A.PackedHostTables") -> PrefillChunkInputs:
+    """:class:`PrefillChunkInputs` of a packed pass on :class:`_FT` fake device tensors with the device inputs'
+    shapes: what :meth:`PrefillChunkInputs.upload` builds (RoPE rows gathered for pk0 too; pk1 SDPA rows ``[B, W']``
+    and the variant's tail bounds)."""
+    T, rd = host.bucket, cfg.rope_dim
+    rot = {k: (_FT((1, 1, T, rd), "bf16", {f"cos_{k}_pass"}), _FT((1, 1, T, rd), "bf16", {f"sin_{k}_pass"}))
+           for k in ("yarn", "plain")}  # fmt: skip
+    kw = dict(rot=rot, rot_idx=_FT((1, T), "u32", {"rot_idx"}), segments=host.segments, seg_rows=host.seg_rows,
+              tails=host.tails, ends=tuple(int(e) for e in host.ends.tolist()))  # fmt: skip
+    if host.reads_cache:
+        n = len(host.tail_bounds(cfg.kv_latent_dim))
+        kw.update(sdpa_pt=_FT(tuple(host.sdpa.shape), "i32", {"sdpa_pt"}), start_idx=_FT((1,), "i32", {"start_idx"}),
+                  tail_bounds=tuple((_FT((4,), "i32", {f"tail{j}_s"}), _FT((4,), "i32", {f"tail{j}_e"}))
+                                    for j in range(n)))  # fmt: skip
+    fill = _FT((1, T // host.block_size), "i32", {"fill_pt"})
+    return PrefillChunkInputs(host.path, host.start, T, host.end, fill, **kw)
 
 
 def _kw(call) -> Dict[str, Any]:
@@ -1705,6 +1775,836 @@ def _unchecked_replace(host: ChunkHostTables, **changes) -> ChunkHostTables:
     for k, v in changes.items():
         object.__setattr__(out, k, v)
     return out
+
+
+# ======================================================================================================================
+# work package A1 (P5): packed prefill passes -- host tables, op sequences, inputs, fp64 emulation
+# (docs/p5_t64/P5_T64_DESIGN.md §3.2-§3.5, §6.2 G15b, §7.1; gate G15a, GATES_RESULTS §13)
+# ======================================================================================================================
+PAGE_W = 512  # page-table width of a PrefillRequest (the serving W)
+
+
+class _Blocks:
+    """Distinct block ids from ``1 .. pool - 1`` in a seeded random order (block 0 = the null block)."""
+
+    def __init__(self, pool: int, seed: int):
+        self.pool = int(pool)
+        self.free = (torch.randperm(self.pool - 1, generator=torch.Generator().manual_seed(seed)) + 1).tolist()
+
+    def take(self, n: int) -> List[int]:
+        if n > len(self.free):
+            raise AssertionError(f"block pool of {self.pool} exhausted")
+        out, self.free = self.free[:n], self.free[n:]
+        return out
+
+
+def _request(lane: int, end: int, start: int, blocks: Sequence[int]) -> "api.PrefillRequest":
+    """A ``PrefillRequest`` of ``end`` tokens with positions ``[0, start)`` cached and the page table ``blocks`` (the
+    ids of blocks ``[0, cdiv(end, bs))``) then 0. The attention never reads the token ids (they feed the embedding)."""
+    pt = torch.zeros(PAGE_W, dtype=torch.int32)
+    pt[: len(blocks)] = torch.tensor([int(b) for b in blocks], dtype=torch.int32)
+    toks = ((torch.arange(end) * 7919 + lane * 104729) % 150000).to(torch.int32)
+    return api.PrefillRequest(lane=lane % api.NUM_LANES, tokens=toks, page_table=pt, start=int(start))
+
+
+def plan_packed_call(cfg: MotifTTConfig, reqs, plans=None, *, allowed=None):
+    """``(plans, passes)`` of one call: row plans (default ``cfg.plan_prefill_row``) and
+    ``prefill_plan.plan_prefill_passes`` with this config's packing knobs and cost model (as the generator plans)."""
+    plans = [cfg.plan_prefill_row(int(r.start), r.end) for r in reqs] if plans is None else list(plans)
+    passes = PP.plan_prefill_passes(
+        reqs, plans, block_size=cfg.kv_block_size, max_seg=cfg.pack_max_seg, max_tokens=cfg.pack_tokens_cap,
+        pk1=cfg.pack_pk1, allowed=allowed, seg_buckets=cfg.pack_seg_buckets, sp1_seg_buckets=cfg.pack_sp1_seg_buckets,
+        swa_tail=cfg.prefill_swa_tail,
+        cost=PP.prefill_cost_model(cfg.prefill_cost_table, sp1_s_per_row_key=cfg.prefill_sp1_s_per_row_key),
+    )  # fmt: skip
+    return plans, passes
+
+
+def oracle_segment_tables(cfg: MotifTTConfig, g, req, plan, S: int) -> ChunkHostTables:
+    """Segment ``g``'s tables built directly from the per-chunk builders on its chunk re-bucketed to ``S`` (review
+    edit R-E12), independently of ``prefill_plan.pass_tables`` / :func:`packed_host_tables`."""
+    bs, P = cfg.kv_block_size, cfg.max_model_len
+    ch = plan.chunks[g.chunk_index]
+    assert (ch.start, ch.end, ch.path, ch.last) == (g.start, g.end, g.path, g.last)
+    c = dataclasses.replace(ch, bucket=S)
+    fill = PP.fill_table(req.page_table, c, plan.w0, bs)[None].contiguous()
+    if not ch.is_sp1:
+        return ChunkHostTables(PP.SP0, 0, S, ch.end, bs, fill)
+    return ChunkHostTables(
+        PP.SP1, ch.start, S, ch.end, bs, fill,
+        sdpa=PP.sdpa_table(req.page_table, ch.end, bs, cfg.sp1_page_table_width)[None].contiguous(),
+        start_idx=torch.tensor([ch.start], dtype=torch.int32), rope=PP.rope_positions(c, P),
+        tail=PP.tail_blocks(req.page_table, c, bs, cfg.prefill_swa_tail),
+    )  # fmt: skip
+
+
+def _same_tables(a: ChunkHostTables, b: ChunkHostTables) -> bool:
+    def eq(x, y):
+        return (x is None and y is None) or (x is not None and y is not None and torch.equal(x, y))
+
+    return (a.path, a.start, a.bucket, a.end, a.block_size) == (b.path, b.start, b.bucket, b.end, b.block_size) and all(
+        eq(getattr(a, f), getattr(b, f)) for f in ("fill", "sdpa", "start_idx", "rope", "tail")
+    )
+
+
+def host_packed_scenarios(cfg: MotifTTConfig):
+    """The design's packed-call scenarios (§3.3 table, §6.2 CP-P (i)-(vi)) at serving sizes, as ``{name: (requests,
+    plans or None)}``: a burst of 32 short cold prompts; 32 rows behind one 2K prompt in one step (row 0 cold, 31 hits;
+    review §3.3: solo sp0 2048, then pk1 S 128 at 2048, shared tails); 5 rows with their own cached prefixes at one
+    start (pk1, distinct tails, 3 dummies); a 64-token template (hits < 128: sp0, packed with their writer); the R-E1
+    odd-block same-step hit (explicit plans at A = 128: rows W 200 and X 330 cold in two chunks, rows Y x 2 hitting
+    192 = 3 blocks of X, so c0 128 < w0 192 and the readers must run after X's chunk that writes block 2)."""
+    bs, A_ = cfg.kv_block_size, cfg.prefill_resume_alignment
+    pool = _Blocks(4129, seed=31)
+    out = {}
+    out["burst32_cold"] = ([_request(k, 20 + (13 * k) % 45, 0, pool.take(1)) for k in range(32)], None)
+    pre = pool.take(32)
+    rows = [_request(0, 2108, 0, pre + pool.take(1))]
+    for k in range(1, 32):
+        e = 2048 + 30 + 3 * k
+        rows.append(_request(k, e, 2048, pre + pool.take(cdiv(e, bs) - 32)))
+    out["shared_prefix_2k"] = (rows, None)
+    rows = []
+    for k in range(5):
+        e = 256 + 40 + 17 * k
+        rows.append(_request(k, e, 256, pool.take(cdiv(e, bs))))
+    out["distinct_prefixes"] = (rows, None)
+    t0 = pool.take(2)
+    rows = [_request(0, 100, 0, t0)] + [_request(k, 64 + 30 + 4 * k, 64, t0[:1] + pool.take(1)) for k in range(1, 8)]
+    out["template_hit"] = (rows, None)
+    xb = pool.take(cdiv(330, bs))
+    reqs = [_request(0, 200, 0, pool.take(cdiv(200, bs))), _request(1, 330, 0, xb)]
+    reqs += [_request(2, 230, 192, xb[:3] + pool.take(1)), _request(3, 240, 192, xb[:3] + pool.take(1))]
+    plans = [
+        explicit_plan(0, 200, [(0, 128), (128, 128)], block=bs, align=A_),
+        explicit_plan(0, 330, [(0, 128), (128, 256)], block=bs, align=A_),
+        cfg.plan_prefill_row(192, 230),
+        cfg.plan_prefill_row(192, 240),
+    ]
+    out["odd_block_hit"] = (reqs, plans)
+    return out
+
+
+def test_cpu_packed_host_tables():
+    """``packed_host_tables`` / :class:`PackedHostTables` on the design's packed-call scenarios, planned by the
+    packed planner (``prefill_plan.plan_prefill_passes``; :func:`host_packed_scenarios`):
+
+    * every real segment's slice (:meth:`PackedHostTables.segment`) equals the per-chunk tables of its chunk
+      re-bucketed to ``S`` built independently (:func:`oracle_segment_tables`, R-E12); dummies write nothing and copy
+      segment 0 (R-E2); pk0 RoPE rows are ``0 .. S-1`` per segment; head rows; the shape key is the pass's
+      (``PrefillPass.shape``) and one of ``cfg.packed_prefill_shapes()``; the tail variant (``shared`` iff every
+      segment has the same tail blocks) and its bound pairs (2, or ``2 B`` segment-major);
+    * the expected pass structure of each scenario (§3.3 table), including R-E1: the odd-block readers run in a pass
+      after the writer chunk that writes the block ``[c0, w0)`` they read from the cache;
+    * the warm-up tables of every shape of ``cfg.packed_prefill_shapes()`` (56: 22 pk0, 17 x 2 pk1) write nothing,
+      read only the null block and round-trip their shape key;
+    * malformed tables raise (structure, dummies, tail variant, per-segment cross-table checks), as do
+      ``packed_host_tables`` of a solo pass or of a ``T`` that is not a span bucket and malformed warm-up shapes."""
+    cfg = host_cfg()
+    bs, P, D = cfg.kv_block_size, cfg.max_model_len, cfg.kv_latent_dim
+    shapes = set(cfg.packed_prefill_shapes())
+    assert len(shapes) == 56 and sum(s[0] == "pk0" for s in shapes) == 22
+    seen = []
+    for name, (reqs, plans_in) in host_packed_scenarios(cfg).items():
+        plans, passes = plan_packed_call(cfg, reqs, plans_in)
+        packed = [p for p in passes if p.is_packed]
+        for p in packed:
+            t = packed_host_tables(cfg, p, reqs, plans)
+            B, S, T = p.batch, p.seg_rows, p.tokens
+            assert isinstance(t, PackedHostTables) and t.shape == p.shape and t.shape in shapes, (name, t.shape)
+            assert (t.path, t.segments, t.seg_rows, t.bucket, t.start) == (p.kind, B, S, T, p.start)
+            assert t.dummies == p.dummies and t.real_segments == len(p.segments)
+            assert t.is_packed and not t.is_sp1 and t.reads_cache == (p.kind == "pk1")
+            assert [t.head_row(k) for k, _ in p.head_rows()] == [r for _, r in p.head_rows()]
+            for k, g in enumerate(p.segments):
+                want = oracle_segment_tables(cfg, g, reqs[g.row], plans[g.row], S)
+                assert _same_tables(t.segment(k), want), (name, k, g)
+                if p.kind == "pk0":
+                    assert torch.equal(t.rope[k * S : (k + 1) * S], torch.arange(S, dtype=torch.int32))
+            for k in range(len(p.segments), B):  # dummies (R-E2)
+                assert bool((t.fill[0, k * S // bs : (k + 1) * S // bs] == -1).all())
+                assert torch.equal(t.rope[k * S : (k + 1) * S], t.rope[:S]) and int(t.ends[k]) == int(t.ends[0])
+                if t.sdpa is not None:
+                    assert torch.equal(t.sdpa[k], t.sdpa[0]) and torch.equal(t.tail[k], t.tail[0])
+            if p.kind == "pk1":
+                same = bool((t.tail == t.tail[:1]).all())
+                assert t.tails == ("shared" if same else "distinct") == p.tails, (name, t.tails)
+                b = t.tail_bounds(D)
+                rows = t.tail[:1] if same else t.tail
+                assert len(b) == (2 if same else 2 * B)
+                assert [(s.tolist(), e.tolist()) for s, e in b] == [
+                    ([i, 0, 0, 0], [i + 1, 1, bs, D]) for i in rows.reshape(-1).tolist()
+                ]  # segment-major
+            seen.append((name, p.describe()))
+    log(f"packed passes: {seen}")
+    kinds = {n: [d.split()[0] for n2, d in seen if n2 == n] for n in host_packed_scenarios(cfg)}
+    assert kinds["burst32_cold"] == ["pk0"] and "S=64 B=32" in seen[0][1]
+    assert kinds["shared_prefix_2k"] == ["pk1"]
+    assert any("T=4096 S=128 B=32 (32 real) a=2048 tails=shared" in d for _, d in seen)
+    assert any("pk1 T=1024 S=128 B=8 (5 real) a=256 tails=distinct" in d for _, d in seen)
+    assert any(n == "template_hit" and "pk0 T=1024 S=128 B=8 (8 real)" in d for n, d in seen)
+    # R-E1: the readers of X's block 2 ([c0, w0) = [128, 192)) run after X's second chunk (which writes it)
+    reqs, plans_in = host_packed_scenarios(cfg)["odd_block_hit"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    where = {g.key: n for n, p in enumerate(passes) for g in p.segments}
+    assert plans[2].c0 == 128 < plans[2].w0 == 192
+    assert where[(2, 0)] > where[(1, 1)] and where[(3, 0)] > where[(1, 1)], [p.describe() for p in passes]
+    t = packed_host_tables(cfg, passes[where[(2, 0)]], reqs, plans) if passes[where[(2, 0)]].is_packed else None
+    if t is not None:  # the readers' fill skips the shared block [128, 192) and their SDPA rows read X's id there
+        k = [g.key for g in passes[where[(2, 0)]].segments].index((2, 0))
+        assert int(t.fill[0, k * t.seg_rows // bs]) == -1 and int(t.sdpa[k, 2]) == int(reqs[1].page_table[2])
+    log(f"R-E1 odd-block hit: {[p.describe() for p in passes]}")
+
+    # ---- warm-up tables of every packed shape ----
+    a_w = warmup_start(cfg)
+    for shape in cfg.packed_prefill_shapes():
+        w = warmup_packed_host_tables(cfg, *shape)
+        assert w.shape == shape and bool((w.fill == -1).all()) and w.dummies == 0
+        if shape[0] == "pk1":
+            assert w.start == a_w and int(w.sdpa.abs().sum()) == 0 and int(w.tail.abs().sum()) == 0
+            assert len(w.tail_bounds(D)) == (2 if shape[3] == "shared" else 2 * w.segments)
+            assert torch.equal(w.rope, torch.arange(a_w, a_w + w.seg_rows, dtype=torch.int32).repeat(w.segments))
+        else:
+            assert torch.equal(w.rope, torch.arange(w.seg_rows, dtype=torch.int32).repeat(w.segments))
+    for bad in (("pk0", 2048, 64, "shared"), ("pk1", 2048, 128), ("pk1", 2048, 128, "both"), ("pk2", 2048, 64),
+                ("pk0", 2048, 96), ("pk0", 16384, 1024)):  # fmt: skip
+        with pytest.raises(ValueError):
+            warmup_packed_host_tables(cfg, *bad)
+
+    # ---- packed_host_tables refusals ----
+    reqs, plans_in = host_packed_scenarios(cfg)["burst32_cold"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    with pytest.raises(ValueError, match="solo"):
+        packed_host_tables(cfg, PP.solo_prefill_passes(plans)[0], reqs, plans)
+    big = PP.PrefillPass("pk0", passes[0].segments[:2], 1024, 16, 0)  # T = 16384 > the span cap
+    with pytest.raises(ValueError, match="span bucket"):
+        packed_host_tables(cfg, big, reqs, plans)
+
+    # ---- malformed tables raise ----
+    reqs, plans_in = host_packed_scenarios(cfg)["distinct_prefixes"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    good = packed_host_tables(cfg, next(p for p in passes if p.is_packed), reqs, plans)  # pk1 B 8, 3 dummies
+    B, S = good.segments, good.seg_rows
+    n = S // bs
+
+    def col(t, k, v):
+        t = t.clone()
+        t[k] = v
+        return t
+
+    fill_dummy_writes = good.fill.clone()
+    fill_dummy_writes[0, (B - 1) * n] = 4000
+    fill_null = good.fill.clone()
+    fill_null[0, 0] = 0
+    sdpa_swap = good.sdpa.clone()
+    sdpa_swap[1] = good.sdpa[0]
+    bad = [
+        dict(segments=3, bucket=3 * S),  # B not a power of two
+        dict(seg_rows=96, bucket=B * 96),  # S not a packed segment size
+        dict(bucket=2 * B * S),  # T != B S
+        dict(dummies=B),  # no real segment
+        dict(dummies=4),  # real segment 4 (it writes) taken for a dummy
+        dict(path="pk2"),
+        dict(fill=good.fill[:, :-1].contiguous()),  # wrong fill width
+        dict(fill=fill_dummy_writes),  # a dummy that writes
+        dict(fill=fill_null),  # the null block in a fill table
+        dict(sdpa=good.sdpa[:4].contiguous()),  # one SDPA row per segment
+        dict(sdpa=sdpa_swap),  # segment 1 attends segment 0's blocks: its fill writes blocks its SDPA row does not read
+        dict(sdpa=col(good.sdpa, B - 1, good.sdpa[1])),  # a dummy that does not copy segment 0
+        dict(tail=col(good.tail, 2, good.tail[0])),  # a tail that is not the segment's SDPA blocks before the start
+        dict(tails="shared"),  # shared tails, but the segments' tail blocks differ (R-E2)
+        dict(tails=None),
+        dict(rope=good.rope + 1),  # real rows roped one position late
+        dict(start=192, start_idx=torch.tensor([192], dtype=torch.int32)),  # a start the segments do not have
+        dict(ends=good.ends.to(torch.int64)),
+        dict(sdpa=None),
+    ]
+    for kw in bad:
+        with pytest.raises((ValueError, TypeError)):
+            dataclasses.replace(good, **kw)
+    reqs, plans_in = host_packed_scenarios(cfg)["burst32_cold"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    p0 = packed_host_tables(cfg, passes[0], reqs, plans)  # pk0 S 64 B 32
+    rope_bad = p0.rope.clone()
+    rope_bad[64 + 3] = 7  # segment 1's real row 3 at position 7
+    for kw in (dict(rope=rope_bad), dict(tails="shared"), dict(sdpa=good.sdpa), dict(start=64)):
+        with pytest.raises(ValueError):
+            dataclasses.replace(p0, **kw)
+    log("packed host tables: scenarios == per-chunk oracle at S, dummies, tail variants, shapes; warm-up; guards")
+
+
+def test_cpu_packed_op_sequences(monkeypatch):
+    """Host proof of the packed paths' structure (recording fake ``ttnn``; module docstring, design §3.4):
+
+    * pk0: exactly the bucket-``T`` draft-1 op sequence of ``forward_prefill(x, page_table=fill_pt, rot=chunk.rot)``
+      (same ops and operands: projections, the gathered RoPE rows, expansion, epilogue, fill), except the SDPA, which
+      becomes 3 x (view ``[H, B, S, d]`` + CN transpose) -> ONE batched SDPA (``q [B,10,S,192]``, ``k / v [B,2,S,192]``,
+      causal, scale 1, the per-row bucket-``S`` program config, window 129 only on SWA at ``S >= 129``, the
+      ``sdpa_prefill`` role) -> CN transpose + view;
+    * pk1 global: the bucket-``T`` sp1 global sequence (``Q_abs``, the fill FIRST) with the chunked SDPA on
+      ``[B,10,S,576]``, ``K = V`` = the cache, the ``[B, W']`` page tables, the start index, ``cfg.resumed_prefill_pc``
+      at ``S`` for the cache's dtype and the G9 role; ``[:512]`` and the absorbed epilogue after the CN transpose back;
+    * pk1 SWA: ``shared`` = the solo 2-block gather + ``repeat([B, 1, 1, 1])``; ``distinct`` = ``2 B`` tensor-args
+      slices in the inputs' (segment-major) order + ONE concat + view ``[B,1,128,576]`` + typecast (bf16 cache: the
+      view itself); the square SDPA ``[B,10,128+S,192]`` (window 129, the ``sdpa_prefill`` role,
+      ``resumed_prefill_pc("swa", S)``); rows ``[128, 128+S)``; the fill after the SDPA. At ``S = 128`` the ``q_pad``
+      slice is ttnn's full-extent no-op (a view of ``qb``) and is not freed twice;
+    * no leaks (view-aware: every buffer freed exactly once; neither the cache nor any input freed);
+      ``fill_kv(chunk=packed)`` == ``fill_kv(fill_pt=, rot=)``;
+    * the guards raise before any op: no RoPE rows (R-E11) for pk0 and pk1, wrong rows, ``B x S != T``, ``S`` not a
+      block multiple, a pk1 pass without cache / SDPA tables / one SDPA row per segment, a misaligned global start, a
+      wrong or missing tail variant, the wrong number of tail bounds, a start inside the tail."""
+    cfg = host_cfg()
+    bs, D = cfg.kv_block_size, cfg.kv_latent_dim
+    N = 300
+
+    def nd(calls):
+        return [c for c in calls if c[0] != "deallocate"]
+
+    def run(spec, fn):
+        fake = _FakeTTNN()
+        monkeypatch.setattr(A, "ttnn", fake)
+        attn = _fake_attention(A, cfg, spec, fake)
+        out = fn(attn)
+        return fake, out
+
+    scen = host_packed_scenarios(cfg)
+    reqs, plans_in = scen["distinct_prefixes"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    t_distinct = packed_host_tables(cfg, next(p for p in passes if p.is_packed), reqs, plans)  # pk1 S 128 B 8
+    reqs, plans_in = scen["shared_prefix_2k"]
+    plans, passes = plan_packed_call(cfg, reqs, plans_in)
+    t_shared = packed_host_tables(cfg, next(p for p in passes if p.is_packed), reqs, plans)  # pk1 S 128 B 32
+    pk0_tables = [warmup_packed_host_tables(cfg, "pk0", B * S, S) for S, B in ((64, 4), (128, 2), (256, 2), (1024, 2))]
+    for layer in (0, 1):
+        spec = cfg.layer(layer)
+        glob = spec.sliding_window_size is None
+        cache = _FT((N, 1, bs, D), "bfp8", {"cache"})
+        # ---- pk0 == the bucket-T draft-1 sequence with the SDPA batched over the segments ----
+        for host in pk0_tables:
+            B, S, T = host.segments, host.seg_rows, host.bucket
+            inp = _fake_packed(cfg, host)
+            x = _FT((1, 1, T, 4096), "bf16", {"x"})
+            fake, out = run(spec, lambda a: a.forward_prefill(x, chunk=inp, kv_cache=cache))
+            never, bad = fake.leaks(keep=[out])
+            assert not never and not bad, (never, bad)
+            packed = nd(fake.calls)
+            fake_s, _ = run(spec, lambda a: a.forward_prefill(x, page_table=inp.fill_pt, kv_cache=cache, rot=inp.rot))
+            solo = nd(fake_s.calls)
+            i_s = [c[0] for c in solo].index("scaled_dot_product_attention")
+            i_p = [c[0] for c in packed].index("scaled_dot_product_attention")
+            assert packed[:i_s] == solo[:i_s] and len(solo[:i_s]) > 15  # everything before the SDPA: bucket-T ops
+            assert [c[0] for c in packed[i_s:i_p]] == ["reshape", "transpose"] * 3
+            assert [c[1][1] for c in packed[i_s:i_p:2]] == [(10, B, S, 192), (2, B, S, 192), (2, B, S, 192)]
+            assert [c[0] for c in packed[i_p + 1 : i_p + 3]] == ["transpose", "reshape"]
+            assert packed[i_p + 3 :] == solo[i_s + 1 :]  # the epilogue and the fill: identical
+            call = packed[i_p]
+            assert [d[1] for d in call[1]] == [(B, 10, S, 192), (B, 2, S, 192), (B, 2, S, 192)]
+            kw = _kw(call)
+            want_w = 129 if (not glob and S >= 129) else None
+            assert kw["sliding_window_size"] == want_w and kw["is_causal"] is True and kw["scale"] == 1.0
+            assert kw["compute_kernel_config"] == "ckc:sdpa_prefill"
+            pc = cfg.sdpa_prefill_pc(spec, seq_len=S)
+            assert kw["program_config"][2:] == (pc.q_chunk_size, pc.k_chunk_size)
+            roped = [c for c in packed if c[0] == "rotary_embedding_hf"]
+            assert len(roped) == 2 and all(c[1][1] == _desc(inp.rot[spec.rope_kind][0]) for c in roped)
+            fill = [c for c in packed if c[0] == "paged_fill_cache"]
+            assert len(fill) == 1 and fill[0][1][2] == _desc(inp.fill_pt)
+            # fill_kv(chunk=) == fill_kv(fill_pt=, rot=) (the MTP fill of a packed pass)
+            fk, _ = run(spec, lambda a: a.fill_kv(x, chunk=inp, kv_cache=cache))
+            fk2, _ = run(spec, lambda a: a.fill_kv(x, fill_pt=inp.fill_pt, rot=inp.rot, kv_cache=cache))
+            assert fk.calls == fk2.calls and len(fk.calls) > 5
+        # ---- pk1 (S 128: the q_pad slice is ttnn's full-extent no-op; S 256: a real slice, freed once) ----
+        pk1_cases = [(t_distinct, "bfp8"), (t_shared, "bfp8"), (t_distinct, "bf16")]
+        pk1_cases += [(warmup_packed_host_tables(cfg, "pk1", 1024, 256, v), "bfp8") for v in ("shared", "distinct")]
+        for host, kv in pk1_cases:
+            B, S, T, a = host.segments, host.seg_rows, host.bucket, host.start
+            inp = _fake_packed(cfg, host)
+            cache = _FT((N, 1, bs, D), kv, {"cache"})
+            x = _FT((1, 1, T, 4096), "bf16", {"x"})
+            fake, out = run(spec, lambda a_: a_.forward_prefill(x, chunk=inp, kv_cache=cache))
+            never, bad = fake.leaks(keep=[out])
+            assert not never and not bad, (host.tails, kv, never, bad)
+            packed = nd(fake.calls)
+            ops = [c[0] for c in packed]
+            assert tuple(out.shape) == (1, 1, T, 4096) and ops.count("ar_tp") == ops.count("paged_fill_cache") == 1
+            fill_i = ops.index("paged_fill_cache")
+            assert packed[fill_i][1][0] == _desc(cache) and packed[fill_i][1][2] == _desc(inp.fill_pt)
+            if glob:
+                solo_inp = PrefillChunkInputs(
+                    "sp1", a, T, host.end, inp.fill_pt, rot=inp.rot, sdpa_pt=_FT((1, 640), "i32", {"sdpa_pt"}),
+                    start_idx=inp.start_idx, rot_idx=inp.rot_idx,
+                )  # fmt: skip
+                fake_s, _ = run(spec, lambda a_: a_.forward_prefill(x, chunk=solo_inp, kv_cache=cache))
+                solo = nd(fake_s.calls)
+                i_s = [c[0] for c in solo].index("chunked_scaled_dot_product_attention")
+                i_p = ops.index("chunked_scaled_dot_product_attention")
+                assert packed[:i_s] == solo[:i_s] and fill_i < i_s  # Q_abs at T and the fill FIRST: the sp1 ops
+                assert ops[i_s:i_p] == ["reshape", "transpose"] and ops[i_p + 1 : i_p + 3] == ["transpose", "reshape"]
+                assert packed[i_p + 3 :] == solo[i_s + 1 :]  # [:512] and the absorbed epilogue
+                q_d, k_d, v_d, pt_d = packed[i_p][1]
+                assert q_d[1] == (B, 10, S, 576) and k_d == v_d == _desc(cache) and pt_d == _desc(inp.sdpa_pt)
+                kw = _kw(packed[i_p])
+                assert kw["chunk_start_idx_tensor"] == _desc(inp.start_idx) and kw["scale"] == 1.0
+                assert kw["compute_kernel_config"] == "ckc:sdpa_prefill_fp32"
+                assert kw["program_config"][2:] == cfg.sp1_global_chunks(S, kv_dtype=kv)
+                continue
+            i_p = ops.index("scaled_dot_product_attention")
+            tails = [c for c in packed if c[0] == "slice" and _kw(c).get("slice_dim") == 0]
+            assert all(c[1][0] == _desc(cache) and _kw(c)["num_devices"] == N for c in tails)
+            assert [c[1][1:] for c in tails] == [(_desc(s), _desc(e)) for s, e in inp.tail_bounds]
+            i_t0, i_t1 = packed.index(tails[0]), packed.index(tails[-1])
+            assert i_t1 - i_t0 == len(tails) - 1  # the tail slices back to back
+            if host.tails == "shared":
+                want = ["concat", "typecast", "repeat"]
+                assert len(tails) == 2 and ops[i_t1 + 1 : i_t1 + 4] == want, ops[i_t1 + 1 : i_t1 + 4]
+                assert packed[i_t1 + 3][1][1] == (B, 1, 1, 1)
+            else:
+                want = ["concat", "reshape"] + (["typecast"] if kv == "bfp8" else [])
+                assert len(tails) == 2 * B and ops[i_t1 + 1 : i_t1 + 1 + len(want)] == want, ops[i_t1 + 1 : i_t1 + 4]
+                cat = packed[i_t1 + 1]
+                assert len(cat[1]) == 2 * B and _kw(cat)["dim"] == 2  # ONE concat of the 2B blocks
+                assert packed[i_t1 + 2][1][1] == (B, 1, 128, D)
+            lat = next(c for c in packed[i_t1:] if c[0] == "concat" and c[1][0][1] == (B, 1, 128, D))
+            assert lat[1][1][1] == (B, 1, S, D) and _kw(lat)["dim"] == 2
+            q_cat = next(c for c in packed if c[0] == "concat" and c[1][0][1] == (B, 10, 128, 192))
+            assert q_cat[1][1][1] == (B, 10, S, 192)
+            call = packed[i_p]
+            assert [d[1] for d in call[1]] == [(B, 10, 128 + S, 192), (B, 2, 128 + S, 192), (B, 2, 128 + S, 192)]
+            kw = _kw(call)
+            assert kw["sliding_window_size"] == 129 and kw["is_causal"] is True and kw["scale"] == 1.0
+            assert kw["compute_kernel_config"] == "ckc:sdpa_prefill" and kw["program_config"][2:] == (128, 128)
+            assert packed[i_p + 1][0] == "slice" and packed[i_p + 1][1][1:] == ((0, 0, 128, 0), (B, 10, 128 + S, 128))
+            assert ops[i_p + 2 : i_p + 4] == ["transpose", "reshape"]
+            assert fill_i > ops.index("ar_tp") > i_p  # the fill after the SDPA
+        # ---- guards: raise before any op ----
+        inp0, inp1 = _fake_packed(cfg, pk0_tables[0]), _fake_packed(cfg, t_distinct)
+        x0, x1 = _FT((1, 1, inp0.bucket, 4096), "bf16", {"x"}), _FT((1, 1, inp1.bucket, 4096), "bf16", {"x"})
+        c1 = _FT((N, 1, bs, D), "bfp8", {"cache"})
+        bad_cases = [
+            (x0, dict(chunk=dataclasses.replace(inp0, rot=None), kv_cache=c1), ValueError),  # R-E11
+            (x1, dict(chunk=dataclasses.replace(inp1, rot=None), kv_cache=c1), ValueError),  # R-E11
+            (x1, dict(chunk=inp0, kv_cache=c1), ValueError),  # rows != bucket
+            (x0, dict(chunk=dataclasses.replace(inp0, segments=2 * inp0.segments), kv_cache=c1), ValueError),
+            (x0, dict(chunk=dataclasses.replace(inp0, segments=2 * inp0.segments, seg_rows=32), kv_cache=c1),
+             ValueError),  # S not a block multiple  # fmt: skip
+            (x1, dict(chunk=inp1), ValueError),  # no cache
+            (x1, dict(chunk=dataclasses.replace(inp1, sdpa_pt=None), kv_cache=c1), ValueError),
+            (x1, dict(chunk=dataclasses.replace(inp1, sdpa_pt=_FT((1, 640), "i32", {"pt"})), kv_cache=c1), ValueError),
+        ]
+        if glob:
+            misaligned = dataclasses.replace(inp1, start=inp1.start + 64)
+            bad_cases.append((x1, dict(chunk=misaligned, kv_cache=c1), ValueError))
+        else:
+            bad_cases += [
+                (x1, dict(chunk=dataclasses.replace(inp1, tails=None), kv_cache=c1), ValueError),
+                (x1, dict(chunk=dataclasses.replace(inp1, tails="both"), kv_cache=c1), ValueError),
+                (x1, dict(chunk=dataclasses.replace(inp1, tail_bounds=inp1.tail_bounds[:2]), kv_cache=c1), ValueError),
+                (x1, dict(chunk=dataclasses.replace(inp1, tails="shared"), kv_cache=c1), ValueError),  # 2B bounds
+                (x1, dict(chunk=dataclasses.replace(inp1, start=64), kv_cache=c1), ValueError),  # inside the tail
+            ]
+        for xx, kw, exc in bad_cases:
+            fake, _ = run(spec, lambda a: None)
+            with pytest.raises(exc):
+                a_ = _fake_attention(A, cfg, spec, fake)
+                a_.forward_prefill(xx, **kw)
+            assert not fake.calls, (kw, fake.calls[:3])
+        fake, _ = run(spec, lambda a: None)
+        with pytest.raises(ValueError, match="RoPE rows"):
+            _fake_attention(A, cfg, spec, fake).fill_kv(x0, chunk=dataclasses.replace(inp0, rot=None), kv_cache=c1)
+        assert not fake.calls
+        log(f"packed op sequences L{layer} ({spec.attn_kind}): pk0 x4, pk1 S 128 shared / distinct (bfp8, bf16) and "
+            "S 256 (both variants); no leaks")
+
+
+def test_cpu_packed_inputs_upload_write(monkeypatch):
+    """``PrefillChunkInputs.upload`` / ``write`` / ``warmup`` / ``free`` of packed passes (recording fake ``ttnn``,
+    tensors carry their values): every table lands in its device tensor (pk1: SDPA rows ``[B, W']``, the start, the
+    variant's tail bounds -- 2 for ``shared``, ``2 B`` segment-major for ``distinct``); the RoPE rows are gathered for
+    pk0 too (R-E11); the packed fields (``segments``, ``seg_rows``, ``tails``, ``ends``, ``is_packed``,
+    ``reads_cache``) and the per-segment head rows; ``head_row`` refuses a packed input. ``write`` rewrites in place for
+    a pass of the same shape (same tensors, stale RoPE rows freed; ``regather=False`` drops them, so an eager call
+    refuses the inputs before any op) and refuses another shape before any copy. ``free`` frees every tensor once."""
+    cfg = host_cfg()
+    bs, D = cfg.kv_block_size, cfg.kv_latent_dim
+    fake = _FakeTTNN()
+    monkeypatch.setattr(A, "ttnn", fake)
+    rope = _FakeRope(fake, cfg.max_model_len)
+    mesh = SimpleNamespace(name="fake mesh")
+    scen = host_packed_scenarios(cfg)
+
+    def first_packed(name):
+        reqs, plans_in = scen[name]
+        plans, passes = plan_packed_call(cfg, reqs, plans_in)
+        p = next(p for p in passes if p.is_packed)
+        return p, packed_host_tables(cfg, p, reqs, plans)
+
+    def holds(inp, h) -> bool:
+        ok = torch.equal(inp.fill_pt.data, h.fill) and torch.equal(inp.rot_idx.data[0], h.rope)
+        ok = ok and (inp.start, inp.bucket, inp.end, inp.segments, inp.seg_rows, inp.tails) == (
+            h.start, h.bucket, h.end, h.segments, h.seg_rows, h.tails)  # fmt: skip
+        ok = ok and inp.ends == tuple(h.ends.tolist())
+        if h.reads_cache:
+            tb = [(s.data, e.data) for s, e in inp.tail_bounds]
+            want = h.tail_bounds(D)
+            ok = ok and torch.equal(inp.sdpa_pt.data, h.sdpa) and torch.equal(inp.start_idx.data, h.start_idx)
+            ok = ok and len(tb) == len(want)
+            ok = ok and all(torch.equal(a, s) and torch.equal(b, e) for (a, b), (s, e) in zip(tb, want))
+        return ok
+
+    p_d, h_d = first_packed("distinct_prefixes")
+    p_s, h_s = first_packed("shared_prefix_2k")
+    p_0, h_0 = first_packed("burst32_cold")
+    for p, h in ((p_d, h_d), (p_s, h_s), (p_0, h_0)):
+        g0 = rope.gathers
+        inp = PrefillChunkInputs.upload(mesh, cfg, rope, h)
+        assert holds(inp, h) and rope.gathers == g0 + 1 and inp.rot is not None  # gathered for pk0 too (R-E11)
+        assert inp.is_packed and not inp.is_sp1 and inp.reads_cache == (h.path == "pk1")
+        assert len(inp.tail_bounds) == {"distinct": 2 * h.segments, "shared": 2, None: 0}[h.tails]
+        assert (inp.sdpa_pt is None) == (h.path == "pk0")
+        assert [inp.segment_head_row(k) for k, _ in p.head_rows()] == [r for _, r in p.head_rows()]
+        with pytest.raises(ValueError, match="segment_head_row"):
+            inp.head_row
+        inp.free()
+    # ---- write: in place for another pass of the same shape (pk1, distinct) ----
+    inp = PrefillChunkInputs.upload(mesh, cfg, rope, h_d)
+    persistent = [inp.fill_pt, inp.sdpa_pt, inp.start_idx, inp.rot_idx] + [t for pr in inp.tail_bounds for t in pr]
+    reqs, plans_in = scen["distinct_prefixes"]
+    pool = _Blocks(4129, seed=77)
+    reqs2 = [_request(k, 512 + 30 + 9 * k, 512, pool.take(cdiv(512 + 30 + 9 * k, bs))) for k in range(5)]
+    plans2, passes2 = plan_packed_call(cfg, reqs2)
+    h2 = packed_host_tables(cfg, next(p for p in passes2 if p.is_packed), reqs2, plans2)
+    assert h2.shape == h_d.shape and h2.start == 512 != h_d.start
+    old = [t for cs in inp.rot.values() for t in cs]
+    inp.write(mesh, cfg, rope, h2, regather=True)
+    now = [inp.fill_pt, inp.sdpa_pt, inp.start_idx, inp.rot_idx] + [t for pr in inp.tail_bounds for t in pr]
+    assert holds(inp, h2) and all(a is b for a, b in zip(now, persistent)) and len(now) == len(persistent)
+    assert all(sum(f is t for f in fake.freed) == 1 for t in old)
+    old = [t for cs in inp.rot.values() for t in cs]
+    inp.write(mesh, cfg, rope, h_d, regather=False)
+    assert holds(inp, h_d) and inp.rot is None and all(sum(f is t for f in fake.freed) == 1 for t in old)
+    attn = _fake_attention(A, cfg, cfg.layer(1), fake)
+    n_calls = len(fake.calls)
+    with pytest.raises(ValueError, match="regather=False"):
+        attn.forward_prefill(_FT((1, 1, h_d.bucket, 4096), "bf16", {"x"}), chunk=inp,
+                             kv_cache=_FT((300, 1, bs, D), "bfp8", {"cache"}))  # fmt: skip
+    assert len(fake.calls) == n_calls
+    # ---- refusals: another shape (B, S or the tail variant), a chunk ----
+    n_calls = len(fake.calls)
+    for other in (warmup_packed_host_tables(cfg, "pk1", h_d.bucket, h_d.seg_rows, "shared"),  # the other variant
+                  warmup_packed_host_tables(cfg, "pk1", 2 * h_d.bucket, h_d.seg_rows, "distinct"),  # B 16
+                  warmup_packed_host_tables(cfg, "pk0", h_d.bucket, h_d.seg_rows)):  # fmt: skip
+        with pytest.raises(ValueError):
+            inp.write(mesh, cfg, rope, other, regather=False)
+    plan0 = cfg.plan_prefill_row(0, 500)
+    pt0 = step_page_table(torch.arange(1, 513, dtype=torch.int32), 500, bs)
+    sp0 = chunk_host_tables(cfg, plan0, plan0.chunks[0], pt0)
+    with pytest.raises(ValueError):
+        inp.write(mesh, cfg, rope, sp0)
+    assert len(fake.calls) == n_calls and holds(inp, h_d), "a refused write must not copy anything"
+    held = inp.tensors()
+    inp.free()
+    assert inp.tensors() == [] and all(sum(f is t for f in fake.freed) == 1 for t in held)
+    # ---- warmup(): packed shapes (both pk1 variants); seg_rows / tails refused for a chunk ----
+    for shape in (("pk0", 2048, 64), ("pk1", 1024, 128, "shared"), ("pk1", 1024, 128, "distinct")):
+        w = PrefillChunkInputs.warmup(mesh, cfg, rope, *shape)
+        assert holds(w, warmup_packed_host_tables(cfg, *shape))
+        w.free()
+    with pytest.raises(ValueError):
+        PrefillChunkInputs.warmup(mesh, cfg, rope, "sp0", 128, 64)
+    log("packed PrefillChunkInputs: upload (pk0 gathers RoPE), write in place / refusals, warmup, free ok")
+
+
+def test_cpu_solo_paths_unchanged_vs_b0(monkeypatch):
+    """Host proof that A1 leaves every existing path bitwise unchanged (design §8.6, §7.5: packing off = today's
+    prefill): the B0 module (git :data:`B0_COMMIT`) and the current one issue the identical op sequence (every op,
+    operand shape / dtype / lineage, program and compute config, deallocation) for the draft-1 ``forward_prefill``, sp0
+    / sp1 chunks on global and SWA layers (buckets 128 to 2048, the bucket-128 SWA chunk's full-extent ``q_pad`` slice
+    included), ``fill_kv`` in both forms, ``forward_decode`` with and without a KV writer, and
+    ``PrefillChunkInputs.upload`` / ``write`` / ``free`` (the same copies and RoPE gathers). ``chunk_host_tables`` (tail
+    bounds included) and ``warmup_chunk_host_tables`` return equal tables."""
+    b0 = git_attention_module(B0_COMMIT, B0_MODULE)
+    cfg = host_cfg()
+    bs, D = cfg.kv_block_size, cfg.kv_latent_dim
+    pt = torch.arange(1, 513, dtype=torch.int32)
+    rows = [(0, 900), (64, 900), (640, 1000), (1024, 1100), (1348, 3000), (2048, 2100)]
+    for layer in (0, 1):
+        spec = cfg.layer(layer)
+        runs = {}
+        for name, mod in (("b0", b0), ("new", A)):
+            fake = _FakeTTNN()
+            monkeypatch.setattr(mod, "ttnn", fake)
+            attn = _fake_attention(mod, cfg, spec, fake)
+            cache = _FT((300, 1, bs, D), "bfp8", {"cache"})
+            for S in (128, 1024):
+                x = _FT((1, 1, S, 4096), "bf16", {"x"})
+                attn.forward_prefill(x, page_table=_FT((1, S // bs), "i32", {"pt"}), kv_cache=cache)
+                attn.forward_prefill(x)
+            for s, e in rows:
+                plan = cfg.plan_prefill_row(s, e)
+                for ch in plan.chunks:
+                    inp = _fake_chunk(cfg, mod.chunk_host_tables(cfg, plan, ch, step_page_table(pt, e, bs)), mod)
+                    x = _FT((1, 1, ch.bucket, 4096), "bf16", {"x"})
+                    attn.forward_prefill(x, chunk=inp, kv_cache=cache)
+                    attn.fill_kv(x, chunk=inp, kv_cache=cache)
+                    attn.fill_kv(x, fill_pt=inp.fill_pt, rot=inp.rot, kv_cache=cache)
+            rot = {k: (_FT((1, 1, 32, 64), "bf16", {f"cos_{k}"}), _FT((1, 1, 32, 64), "bf16", {f"sin_{k}"}))
+                   for k in ("yarn", "plain")}  # fmt: skip
+            kw = dict(rot=rot, cur_pos=_FT((8,), "i32", {"cur"}), page_table=_FT((8, 8), "i32", {"pt"}),
+                      kv_cache=cache, active=_FT((1, 1, 8, 1024), "bf16", {"act"}))  # fmt: skip
+            xd = _FT((1, 1, 8, 4096), "bf16", {"x"})
+            attn.forward_decode(xd, **kw)
+
+            class Writer:
+                def write(self, kv_row, kv_cache, *, cur_pos, page_table, fake=fake):
+                    fake.calls.append(("kv_write", _desc((kv_row, kv_cache, cur_pos, page_table)), ()))
+
+            attn.forward_decode(xd, kv_write=Writer(), **kw)
+            rope = _FakeRope(fake, cfg.max_model_len)
+            mesh = SimpleNamespace(name="fake mesh")
+            for s, e in ((0, 500), (1024, 1536), (2048, 2100)):
+                plan = cfg.plan_prefill_row(s, e)
+                host = mod.chunk_host_tables(cfg, plan, plan.chunks[0], step_page_table(pt, e, bs))
+                inp = mod.PrefillChunkInputs.upload(mesh, cfg, rope, host)
+                inp.write(mesh, cfg, rope, host, regather=True)
+                inp.write(mesh, cfg, rope, host, regather=False)
+                inp.free()
+            runs[name] = list(fake.calls)
+        assert len(runs["new"]) > 1000
+        assert runs["b0"] == runs["new"], next(
+            (i, a, b) for i, (a, b) in enumerate(zip(runs["b0"], runs["new"])) if a != b
+        )
+        log(f"solo paths L{layer}: B0 ({B0_COMMIT}) == current, {len(runs['new'])} recorded calls")
+    for s, e in rows + [(30000, 32768), (130, 4000), (0, 16736)]:
+        plan = cfg.plan_prefill_row(s, e)
+        for ch in plan.chunks:
+            h0 = b0.chunk_host_tables(cfg, plan, ch, step_page_table(pt, e, bs))
+            h1 = chunk_host_tables(cfg, plan, ch, step_page_table(pt, e, bs))
+            assert _same_tables(h0, h1) and h1.reads_cache == h1.is_sp1 and not h1.is_packed
+            assert [(a.tolist(), b.tolist()) for a, b in h0.tail_bounds(D)] == [
+                (a.tolist(), b.tolist()) for a, b in h1.tail_bounds(D)
+            ]
+    for path in ("sp0", "sp1"):
+        for C in cfg.prefill_span_buckets:
+            assert _same_tables(b0.warmup_chunk_host_tables(cfg, path, C), warmup_chunk_host_tables(cfg, path, C))
+
+
+@dataclass
+class _FpRow:
+    """One row of an fp64 packed-call scenario: positions ``[0, start)`` cached, layer inputs ``x [end, D]`` at
+    positions ``0 .. end-1``, page table ``blocks``. ``precached``: blocks below ``w0`` hold the row's prefix latents
+    before the call (written by another request); otherwise a row of the same call writes them (a same-step hit)."""
+
+    start: int
+    end: int
+    blocks: List[int]
+    x: torch.Tensor
+    precached: bool = False
+
+
+def fp64_packed_scenarios(cfg: MotifTTConfig, D: int, g: torch.Generator):
+    """Small packed calls for the fp64 emulation, ``{name: (rows, plans)}`` (``plans[i]`` None = the config's row
+    planner): (A) 4 cold rows of <= 64 tokens (pk0 S 64); (B) a 64-token template: row 0 cold 100, rows 1-2 hit its
+    block 0 (c0 = 0: sp0, the shared block skipped; pk0 S 128 with their writer, 1 dummy); (C) row 0 cold 300 in two
+    chunks, rows 1-2 hit its 256-token prefix in the same step (solo sp0 256, then pk1 S 128 at 256: shared tails,
+    1 dummy); (D) 3 rows with their own cached 256-token prefixes (pk1 at 256, distinct tails, 1 dummy); (E) the R-E1
+    odd-block same-step hit: W 200 and X 330 cold in two chunks, Y1 / Y2 hit 192 tokens of X (c0 128 < w0 192)."""
+    bs, A_ = cfg.kv_block_size, cfg.prefill_resume_alignment
+    pool = _Blocks(160, seed=1500)
+
+    def x(n):
+        return torch.randn(n, D, generator=g, dtype=torch.float64)
+
+    out = {}
+    out["pk0_cold"] = ([_FpRow(0, e, pool.take(1), x(e)) for e in (37, 50, 64, 21)], None)
+    xt, t0 = x(100), pool.take(2)
+    rows = [_FpRow(0, 100, t0, xt)]
+    rows += [_FpRow(64, e, t0[:1] + pool.take(1), torch.cat([xt[:64], x(e - 64)])) for e in (90, 120)]
+    out["pk0_template_hit"] = (rows, None)
+    xc, cb = x(300), pool.take(cdiv(300, bs))
+    rows = [_FpRow(0, 300, cb, xc)]
+    rows += [_FpRow(256, e, cb[:4] + pool.take(cdiv(e, bs) - 4), torch.cat([xc[:256], x(e - 256)])) for e in (300, 340)]
+    out["pk1_shared"] = (rows, [explicit_plan(0, 300, [(0, 256), (256, 128)], block=bs, align=A_), None, None])
+    out["pk1_distinct"] = ([_FpRow(256, e, pool.take(cdiv(e, bs)), x(e), True) for e in (296, 333, 384)], None)
+    xw, xx, wb, xb = x(200), x(330), pool.take(cdiv(200, bs)), pool.take(cdiv(330, bs))
+    rows = [_FpRow(0, 200, wb, xw), _FpRow(0, 330, xb, xx)]
+    rows += [_FpRow(192, e, xb[:3] + pool.take(cdiv(e, bs) - 3), torch.cat([xx[:192], x(e - 192)])) for e in (230, 240)]
+    plans = [explicit_plan(0, 200, [(0, 128), (128, 128)], block=bs, align=A_),
+             explicit_plan(0, 330, [(0, 128), (128, 256)], block=bs, align=A_), None, None]  # fmt: skip
+    out["odd_block_hit"] = (rows, plans)
+    return out, pool.pool
+
+
+def emulate_packed(cfg, spec, src, x_pass: torch.Tensor, tables: PackedHostTables, cache: torch.Tensor) -> torch.Tensor:
+    """fp64 emulation of ``forward_prefill(x, chunk=PrefillChunkInputs.upload(tables), kv_cache)`` for a packed pass,
+    driven only by the tables: the latent of every packed row at its RoPE row; per segment the solo dataflow of a
+    chunk of ``S`` rows -- pk0: causal within the segment at positions ``0 .. S-1``, the fill after; pk1 global: the
+    whole pass's fill FIRST, then each segment's rows attend keys ``[0, a + i]`` through its own SDPA row; pk1 SWA:
+    the tails read BEFORE the pass's fill (segment 0's for every segment when ``shared``, as the device gathers
+    them), the square ``[tail ‖ segment]``. Returns the ``[T, D]`` output rows; ``cache [N, bs, 576]`` is updated."""
+    B, S, bs, L = tables.segments, tables.seg_rows, tables.block_size, cache.shape[-1]
+    lat = emulate_latent(cfg, spec, src, x_pass, tables.rope.long())[0]
+    out = torch.empty_like(x_pass)
+    segs = [slice(k * S, (k + 1) * S) for k in range(B)]
+
+    def fill():
+        for j, b in enumerate(tables.fill[0].tolist()):
+            if b >= 0:
+                cache[b] = lat[j * bs : (j + 1) * bs]
+
+    if tables.path == "pk0":
+        for r in segs:
+            assert torch.equal(tables.rope[r], torch.arange(S, dtype=torch.int32))
+            out[r] = emulate_attention(cfg, spec, src, x_pass[r], "prefill")
+        fill()
+        return out
+    a = int(tables.start_idx[0])
+    if spec.sliding_window_size is None:
+        fill()
+        for k, r in enumerate(segs):
+            keys = cache[tables.sdpa[k].long()].reshape(-1, L)[: a + S]
+            out[r] = emulate_sp1_global(cfg, spec, src, x_pass[r], tables.rope[r].long(), keys, a)
+        return out
+    rows = tables.tail[:1].expand(B, -1) if tables.tails == "shared" else tables.tail
+    tails = [cache[rows[k].long()].reshape(-1, L).clone() for k in range(B)]
+    for k, r in enumerate(segs):
+        out[r] = emulate_sp1_swa(cfg, spec, src, x_pass[r], tables.rope[r].long(), tails[k])
+    fill()
+    return out
+
+
+def _run_passes_fp64(cfg, spec, src, rows, reqs, plans, passes, cache, g, tables_hook=None):
+    """Every pass of a call through the fp64 emulation, in order (solo: :func:`emulate_chunk`; packed:
+    :func:`emulate_packed`), with junk padding rows and dummy segments. ``tables_hook(n, pass, tables) -> tables``
+    replaces a packed pass's tables (negative controls). Returns each row's output rows ``[end, D]`` (NaN where not
+    computed); ``cache`` is updated in place."""
+    D = cfg.hidden_size
+    got = [torch.full((r.end, D), float("nan"), dtype=torch.float64) for r in rows]
+    for n, p in enumerate(passes):
+        if not p.is_packed:
+            seg = p.segments[0]
+            ch = plans[seg.row].chunks[seg.chunk_index]
+            host = chunk_host_tables(cfg, plans[seg.row], ch, reqs[seg.row].page_table)
+            xr = rows[seg.row].x[ch.start : ch.end]
+            x_rows = torch.cat([xr, torch.randn(ch.bucket - xr.shape[0], D, generator=g, dtype=torch.float64)])
+            got[seg.row][ch.start : ch.end] = emulate_chunk(cfg, spec, src, x_rows, host, cache)[: ch.end - ch.start]
+            continue
+        tables = packed_host_tables(cfg, p, reqs, plans)
+        if tables_hook is not None:
+            tables = tables_hook(n, p, tables)
+        S = p.seg_rows
+        junk = torch.randn(p.tokens, D, generator=g, dtype=torch.float64)  # padding rows, dummy segments
+        x_pass = junk.clone()
+        for k, seg in enumerate(p.segments):
+            x_pass[k * S : k * S + seg.real_rows] = rows[seg.row].x[seg.start : seg.end]
+        out = emulate_packed(cfg, spec, src, x_pass, tables, cache)
+        for k, seg in enumerate(p.segments):
+            got[seg.row][seg.start : seg.end] = out[k * S : k * S + seg.real_rows]
+    return got
+
+
+@pytest.mark.parametrize("layer", [0, 1], ids=["global_L0", "swa_L1"])
+def test_cpu_packed_passes_fp64(layer):
+    """Packed calls (:func:`fp64_packed_scenarios`) planned by the packed planner and run pass by pass through the fp64
+    emulation of the packed dataflow (:func:`emulate_packed`), driven only by :func:`packed_host_tables` on an emulated
+    paged cache (stale rows everywhere; precached prefixes written "by another request" + 1e-9, so a rewrite shows):
+
+    * every row's computed rows (``[c0, e)``, recomputed rows included) equal the reference ``GDLAttention`` single
+      shot of the row (fp64); the junk padding rows and dummy segments change nothing;
+    * every block a row owns holds its single-shot latent; precached prefix blocks and every other block (null block,
+      spares, dummy targets) are untouched;
+    * negative controls, refused by :class:`PackedHostTables` (checked) and run unchecked to show what that prevents:
+      a distinct-tail pass run as ``shared`` (SWA: every segment but 0 reads segment 0's tail, so its rows are wrong;
+      global: no tails, unchanged); segment 1 attending through segment 0's SDPA row (global: wrong; SWA: unchanged);
+      and review edit R-E1's schedule (the odd-block readers one pass before the writer chunk that writes the block
+      ``[c0, w0)`` they read): global rows read the stale block (wrong), SWA rows are exact (their tail lies below
+      ``c0``)."""
+    cfg = host_cfg()
+    args = ref_args(q_path_fp32=False)
+    spec, prefix = resolve_attn_layer(cfg, layer, cache=False)
+    t64 = {k: v.double() for k, v in random_attn_tensors(args, seed=1300 + layer).items()}
+    ref = ref_attention_spec(args, layer, t64, torch.float64)
+    src = _AttnSource(source_for(t64, prefix), layer, prefix)
+    D, L, bs = cfg.hidden_size, cfg.kv_latent_dim, cfg.kv_block_size
+    glob = spec.sliding_window_size is None
+    g = torch.Generator().manual_seed(1400 + layer)
+    scen, pool = fp64_packed_scenarios(cfg, D, g)
+    stale = torch.randn(pool, bs, L, generator=g, dtype=torch.float64)
+    detected: Dict[str, bool] = {}
+    for name, (rows, plans_in) in scen.items():
+        reqs = [_request(i, r.end, r.start, r.blocks) for i, r in enumerate(rows)]
+        plans = [cfg.plan_prefill_row(r.start, r.end) for r in rows] if plans_in is None else [
+            p if p is not None else cfg.plan_prefill_row(r.start, r.end) for p, r in zip(plans_in, rows)]  # fmt: skip
+        _, passes = plan_packed_call(cfg, reqs, plans)
+        assert any(p.is_packed for p in passes), (name, [p.describe() for p in passes])
+        with torch.no_grad():
+            want = [ref(r.x[None], torch.arange(r.end)[None])[0] for r in rows]
+        lat = [emulate_latent(cfg, spec, src, r.x, torch.arange(r.end))[0] for r in rows]
+        init = stale.clone()
+        precached = set()
+        for r, lt in zip(rows, lat):
+            if r.precached:
+                for j in range(r.start // bs):
+                    noise = 1e-9 * torch.randn(bs, L, generator=g, dtype=torch.float64)
+                    init[r.blocks[j]] = lt[j * bs : (j + 1) * bs] + noise
+                    precached.add(r.blocks[j])
+
+        def check(got, cache):
+            """(rows ok, own blocks ok, precached + other blocks untouched, row stats)."""
+            s_rows = [stats(w[p.c0 :], o[p.c0 :]) for w, o, p in zip(want, got, plans)]
+            rows_ok = all(s["rel_fro"] < 1e-6 and s["nonfinite"] == 0 for s in s_rows)
+            own_ok = True
+            for r, p, lt in zip(rows, plans, lat):
+                for j in range(p.w0 // bs, cdiv(r.end, bs)):
+                    n = min(bs, r.end - j * bs)
+                    own_ok &= torch.allclose(cache[r.blocks[j]][:n], lt[j * bs : j * bs + n], rtol=0, atol=1e-12)
+            used = {b for r in rows for b in r.blocks}
+            keep = sorted(precached | (set(range(pool)) - used))
+            return rows_ok, own_ok, torch.equal(cache[keep], init[keep]), s_rows
+
+        cache = init.clone()
+        got = _run_passes_fp64(cfg, spec, src, rows, reqs, plans, passes, cache, g)
+        rows_ok, own_ok, untouched, s_rows = check(got, cache)
+        log(
+            f"cpu fp64 L{layer} {name}: passes {[p.describe() for p in passes]}; rows vs single shots max rel "
+            f"{max(s['rel_fro'] for s in s_rows):.2e}; own blocks == single-shot latent {own_ok}; precached / other "
+            f"blocks untouched {untouched}"
+        )
+        assert rows_ok and own_ok and untouched, (name, [fmt(s) for s in s_rows])
+
+        # ---- negative controls (refused by the host tables, run unchecked) ----
+        if name == "pk1_distinct":
+            for what in ("shared", "sdpa"):
+                p = next(q for q in passes if q.is_packed)
+                t = packed_host_tables(cfg, p, reqs, plans)
+                change = dict(tails="shared") if what == "shared" else dict(sdpa=t.sdpa.clone().index_copy_(
+                    0, torch.tensor([1]), t.sdpa[:1]))  # fmt: skip
+                with pytest.raises(ValueError):
+                    dataclasses.replace(t, **change)
+                cache = init.clone()
+                got_bad = _run_passes_fp64(cfg, spec, src, rows, reqs, plans, passes, cache, g,
+                                           tables_hook=lambda n, q, tt: _unchecked_replace(tt, **change))  # fmt: skip
+                bad = [stats(w[p_.c0 :], o[p_.c0 :])["rel_fro"] for w, o, p_ in zip(want, got_bad, plans)]
+                hits = (what == "shared") != glob  # tails matter on SWA layers, SDPA rows on global layers
+                detected[f"{name}/{what}"] = (max(bad[1:]) > 1e-2 and bad[0] < 1e-6) if hits else max(bad) < 1e-6
+                errs = [f"{b:.1e}" for b in bad]
+                log(f"cpu fp64 L{layer} negative control ({what} on {spec.attn_kind}): row errors {errs}")
+        if name == "odd_block_hit":  # R-E1: the old [0, a) read set put the readers one pass before X's chunk 1
+            segs = {g_.key: g_ for p in passes for g_ in p.segments}
+            early = [q for q in passes if (1, 1) not in {g_.key for g_ in q.segments}
+                     and not any(g_.row in (2, 3) for g_ in q.segments) and (0, 1) not in {g_.key for g_ in q.segments}]
+            old = early + [
+                PP.PrefillPass("pk1", (segs[(0, 1)], segs[(2, 0)], segs[(3, 0)]), 128, 4, 128, tails="distinct"),
+                next(q for q in passes if (1, 1) in {g_.key for g_ in q.segments}),
+            ]  # fmt: skip
+            assert sorted(g_.key for q in old for g_ in q.segments) == sorted(segs)
+            cache = init.clone()
+            got_old = _run_passes_fp64(cfg, spec, src, rows, reqs, plans, old, cache, g)
+            bad = [stats(w[p_.c0 :], o[p_.c0 :])["rel_fro"] for w, o, p_ in zip(want, got_old, plans)]
+            detected[f"{name}/R-E1"] = (max(bad[2:]) > 1e-2) if glob else max(bad) < 1e-6
+            log(f"cpu fp64 L{layer} negative control (R-E1 old order {[q.describe() for q in old]}): row errors "
+                f"{[f'{b:.1e}' for b in bad]}")  # fmt: skip
+    assert detected and all(detected.values()), detected
 
 
 # ======================================================================================================================
@@ -2760,4 +3660,299 @@ def test_wp2b_sp1_cost(mesh_device, device_params):
         free_tensors(attn)
     for k, v in table.items():
         log(f"cost {k}: " + ", ".join(f"{p} {ms:.2f} ms" for p, ms in v.items()))
+    assert not failures, "\n".join(failures)
+
+
+# ======================================================================================================================
+# device tests, work package A1 (P5): gate G15b -- packed passes through the attention module
+# ======================================================================================================================
+G15B_PK0 = [(64, 32, 0), (128, 16, 3), (512, 4, 0), (1024, 2, 0)]  # (S, B, dummies): design §6.2 G15b pk0 shapes
+# (S, B, start, tails, dummies, cache): design §6.2 G15b pk1 shapes, plus a bf16-cache distinct pass (its tail view)
+# the S = 512 pass runs the q_pad slice that is not a no-op (at S = 128 it is the full extent: ttnn returns qb itself)
+G15B_PK1 = [(128, 32, 2048, "shared", 0, "bfp8"), (128, 8, 256, "distinct", 1, "bfp8"),
+            (128, 4, 256, "distinct", 1, "bf16"), (512, 4, 2048, "distinct", 1, "bfp8")]  # fmt: skip
+PACKED_SEG_PCC_MIN = 0.9999  # per segment vs the per-row forward_prefill (design §6.2 G15b)
+PACKED_CACHE_PCC_MIN = 0.99999  # written cache rows vs the per-row fills when matmul blocking differs (G15b)
+
+
+def _pinned(mesh_device, fn):
+    """``fn()`` with a one-page L1 tensor alive (G15a's static-CB check, GATES_RESULTS §13.6 item 5): allocated
+    top-down, it sits just below the L1_SMALL region, and tt-metal re-validates static circular buffers against the
+    lowest L1 buffer on every enqueue, so a program whose CBs reach it raises ("region ends at N")."""
+    import re
+
+    pin = ttnn.from_torch(
+        torch.zeros(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+        memory_config=ttnn.L1_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+    )  # fmt: skip
+    try:
+        out = fn()
+        ttnn.synchronize_device(mesh_device)
+        return out
+    except Exception as e:
+        m = re.search(r"region ends at (\d+)", str(e))
+        if m is None:
+            raise
+        raise AssertionError(f"static CBs end at {m.group(1)} B, past the L1 pin: {str(e)[:300]}") from e
+    finally:
+        ttnn.deallocate(pin)
+
+
+def _programs(mesh_device) -> int:
+    ttnn.synchronize_device(mesh_device)
+    return int(mesh_device.num_program_cache_entries())
+
+
+def _g15b_rows(cfg, x_real, kind: str, S: int, real: int, start: int, tails: Optional[str], g: torch.Generator):
+    """Rows of one G15b pass: ``[(start, end, blocks, x [end, D])]`` and the pool size. pk0: cold rows of ``S/2 < r <=
+    S`` real tokens (the last one exactly ``S``), each a window of the real 4096-token inputs; pk1: rows behind a
+    ``start``-token prefix (one shared prefix, or one per row), ``S/4 <= r <= S`` new rows each."""
+    bs, n_in = cfg.kv_block_size, x_real.shape[0]
+    rows, used = [], 0
+    pre_shared = list(range(1, 1 + start // bs)) if tails == "shared" else None
+    nxt = 1 + (start // bs if pre_shared else 0)
+    for k in range(real):
+        if kind == "pk0":
+            r = S if k == real - 1 else S // 2 + 1 + (37 * k + 11) % (S // 2)
+            o = (911 * k + 17) % (n_in - r)
+            x = x_real[o : o + r]
+            e, s = r, 0
+        else:
+            r = S if k == real - 1 else S // 4 + (29 * k + 5) % (3 * S // 4)
+            o = (613 * k + 31) % (n_in - r)
+            po = 0 if tails == "shared" else (307 * k + 3) % (n_in - start)
+            x = torch.cat([x_real[po : po + start], x_real[o : o + r]])
+            e, s = start + r, start
+        if pre_shared is not None:
+            blocks = pre_shared + list(range(nxt, nxt + cdiv(e, bs) - len(pre_shared)))
+        else:
+            blocks = list(range(nxt, nxt + cdiv(e, bs)))
+        nxt = blocks[-1] + 1 if blocks[-1] >= nxt else nxt
+        rows.append((s, e, blocks, x))
+    pool = nxt + 8  # spares: never written, must stay untouched
+    perm = torch.randperm(pool - 1, generator=g) + 1  # scatter the ids over the pool (block 0 = the null block)
+    rows = [(s, e, [int(perm[b - 1]) for b in blocks], x) for s, e, blocks, x in rows]
+    return rows, pool
+
+
+def _g15b_case(mesh_device, cfg, rope, attn, ref, x_real, kind, S, B, dummies, start, tails, kv_name, seed):
+    """One G15b pass (module docstring of :func:`test_g15b_packed_attention`). Returns (failures, summary dict)."""
+    bs, D, L = cfg.kv_block_size, cfg.hidden_size, cfg.kv_latent_dim
+    kvdt = ttnn.bfloat16 if kv_name == "bf16" else ttnn.bfloat8_b
+    g = torch.Generator().manual_seed(seed)
+    real, T = B - dummies, B * S
+    tag = f"L{attn.layer_idx} {attn.spec.attn_kind} {kind} S={S} B={B} ({real} real) a={start}" + (
+        f" {tails} tails" if tails else "") + f" {kv_name}"  # fmt: skip
+    rows, pool = _g15b_rows(cfg, x_real, kind, S, real, start, tails, g)
+    reqs = [_request(k, e, s, blocks) for k, (s, e, blocks, _) in enumerate(rows)]
+    plans = [cfg.plan_prefill_row(s, e) for s, e, _, _ in rows]
+    assert all(len(p.chunks) == 1 for p in plans), [p.chunks for p in plans]
+    segs = tuple(PP.PackSegment(k, 0, p.chunks[0].path, p.chunks[0].start, p.chunks[0].end, S, True)
+                 for k, p in enumerate(plans))  # fmt: skip
+    pass_ = PP.PrefillPass(kind, segs, S, B, start if kind == "pk1" else 0, tails=tails)
+    host = packed_host_tables(cfg, pass_, reqs, plans)
+    assert host.shape == pass_.shape and host.shape in cfg.packed_prefill_shapes(), host.shape
+
+    # ---- the cache before the pass: stale rows; pk1 prefixes written by TT (fill_kv, sp0 positions) ----------------
+    bank = stale_bank(ref, "random", attn.layer_idx, n=512, seed=seed)
+    dev = _upload_cache(mesh_device, _host_quant(stale_paged(bank, pool, bs, seed=seed), kvdt), kvdt)
+    done = set()
+    for s, e, blocks, x in rows:
+        if s and tuple(blocks[: s // bs]) not in done:
+            done.add(tuple(blocks[: s // bs]))
+            xp = _replicated(mesh_device, x[:s][None, None], ttnn.bfloat16)
+            pt = _rep_i32(mesh_device, torch.tensor(blocks[: s // bs], dtype=torch.int32)[None])
+            attn.fill_kv(xp, fill_pt=pt, kv_cache=dev)
+            _free([xp, pt])
+    base = _dev(dev)  # [pool, 1, bs, 576]: the pass's starting cache, exact in the cache dtype
+    _free(dev)
+
+    # ---- inputs: segment k = row k's chunk rows, then junk padding; dummy segments junk ------------------------------
+    junk = x_real[torch.randint(0, x_real.shape[0], (T,), generator=g)]
+    X = junk.clone()
+    for k, (s, e, _, x) in enumerate(rows):
+        X[k * S : k * S + e - s] = x[s:e]
+
+    # ---- warm-up of the pass shape, then the real pass compiles nothing (design §3.5) -------------------------------
+    n0 = _programs(mesh_device)
+    w = PrefillChunkInputs.warmup(mesh_device, cfg, rope, *host.shape)
+    scratch = _upload_cache(mesh_device, base, kvdt)
+    xw = _replicated(mesh_device, torch.zeros(1, 1, T, D), ttnn.bfloat16)
+    o_w = _pinned(mesh_device, lambda: attn.forward_prefill(xw, chunk=w, kv_cache=scratch))
+    attn.fill_kv(xw, chunk=w, kv_cache=scratch)
+    n_warm = _programs(mesh_device) - n0
+    warm_ok = bool(torch.isfinite(_dev(o_w)).all())
+    warm_ok = warm_ok and torch.equal(_chips(scratch), base.expand(len(CHIPS), *base.shape))
+    _free([o_w, scratch, xw])
+    w.free()
+    x_tt = _replicated(mesh_device, X[None, None], ttnn.bfloat16)
+    caches = {k: _upload_cache(mesh_device, base, kvdt) for k in ("packed", "repeat", "fill_kv")}
+    n1 = _programs(mesh_device)
+    inp = PrefillChunkInputs.upload(mesh_device, cfg, rope, host)
+    t0 = time.perf_counter()
+    out = _pinned(mesh_device, lambda: attn.forward_prefill(x_tt, chunk=inp, kv_cache=caches["packed"]))
+    t_packed = time.perf_counter() - t0
+    attn.fill_kv(x_tt, chunk=inp, kv_cache=caches["fill_kv"])  # the MTP-fill form on the same inputs
+    n_real = _programs(mesh_device) - n1
+    out2 = attn.forward_prefill(x_tt, chunk=inp, kv_cache=caches["repeat"])
+    got_chips = _chips(out)
+    got = got_chips[0, 0, 0]  # [T, D]
+    rep_ok = all(torch.equal(got_chips[0], got_chips[i]) for i in range(1, got_chips.shape[0]))
+    hc = {k: _chips(c) for k, c in caches.items()}
+    det_ok = torch.equal(_chips(out2), got_chips) and torch.equal(hc["repeat"], hc["packed"])
+    fill_ok = torch.equal(hc["fill_kv"], hc["packed"])
+    finite = bool(torch.isfinite(got).all())
+    _free([out, out2, x_tt] + list(caches.values()))
+    inp.free()
+
+    # ---- per-row solo passes: at the planner's bucket (production) and at bucket S (the segment's own tables) --------
+    solo: Dict[str, Any] = {}
+    t_solo = 0.0
+    for mode in ("C", "S"):
+        cache = _upload_cache(mesh_device, base, kvdt)
+        outs = []
+        for k, ((s, e, _, x), plan) in enumerate(zip(rows, plans)):
+            ch = plan.chunks[0]
+            h = chunk_host_tables(cfg, plan, ch, reqs[k].page_table) if mode == "C" else host.segment(k)
+            rows_k = torch.cat([X[k * S : (k + 1) * S], junk[: max(0, h.bucket - S)]])[: h.bucket]
+            ik = PrefillChunkInputs.upload(mesh_device, cfg, rope, h)
+            xk = _replicated(mesh_device, rows_k[None, None], ttnn.bfloat16)
+            ttnn.synchronize_device(mesh_device)
+            t0 = time.perf_counter()
+            ok_ = attn.forward_prefill(xk, chunk=ik, kv_cache=cache)
+            ttnn.synchronize_device(mesh_device)
+            if mode == "C":
+                t_solo += time.perf_counter() - t0
+            outs.append(_dev(ok_)[0, 0, : e - s])
+            _free([ok_, xk])
+            ik.free()
+        solo[mode] = (outs, _chips(cache))
+        _free(cache)
+
+    # ---- comparisons ----------------------------------------------------------------------------------------------
+    seg_rows = [got[k * S : k * S + e - s] for k, (s, e, _, _) in enumerate(rows)]
+    res: Dict[str, Any] = {}
+    for mode, (outs, _) in solo.items():
+        res[f"bit_{mode}"] = sum(torch.equal(a, b) for a, b in zip(seg_rows, outs))
+        res[f"pcc_{mode}"] = min(pcc(b, a) for a, b in zip(seg_rows, outs))
+    written = sorted({b for (s, e, blocks, _), p in zip(rows, plans) for b in blocks[p.w0 // bs : cdiv(e, bs)]})
+    keep = torch.tensor(sorted(set(range(pool)) - set(written)), dtype=torch.long)
+    wb = torch.tensor(written, dtype=torch.long)
+    untouched = torch.equal(hc["packed"][:, keep], base[keep].expand(len(CHIPS), *base[keep].shape))  # [chip, block]
+    cache_bit = torch.equal(hc["packed"][:, wb], solo["C"][1][:, wb])
+    cache_pcc = pcc(solo["C"][1][:, wb], hc["packed"][:, wb])
+    ref_ks = sorted({0, real // 2, real - 1})
+    ref_s = {}
+    with torch.no_grad():
+        for k in ref_ks:
+            s, e, _, x = rows[k]
+            want = ref(x[None], torch.arange(e)[None])[0][s:e]
+            ref_s[k] = stats(want, seg_rows[k])
+    ref_ok = all(_good(v, OUT_PCC_MIN) for v in ref_s.values())
+    log(
+        f"G15b {tag}: programs warm-up {n_warm}, real pass after it {n_real}; warm-up writes nothing {warm_ok}; "
+        f"segments vs per-row solo at the planner bucket: bitwise {res['bit_C']}/{real}, min pcc {res['pcc_C']:.6f}; "
+        f"vs solo at bucket S: bitwise {res['bit_S']}/{real}, min pcc {res['pcc_S']:.6f}; vs fp32 ref "
+        f"{ {k: round(v['pcc'], 6) for k, v in ref_s.items()} }; cache: written {len(written)} blocks == per-row fills "
+        f"bitwise {cache_bit} (pcc {cache_pcc:.7f}), other {len(keep)} untouched {untouched}; fill_kv == forward's "
+        f"fill {fill_ok}; repeat bitwise {det_ok}; replicas {rep_ok}; finite {finite}; eager packed "
+        f"{1e3 * t_packed:.1f} ms vs {real} solo calls {1e3 * t_solo:.1f} ms"
+    )
+    fails = []
+    if n_real or not warm_ok:
+        fails.append(f"{tag}: the real pass compiled {n_real} programs after the warm-up (warm-up ok {warm_ok})")
+    if res["pcc_C"] < PACKED_SEG_PCC_MIN or res["pcc_S"] < PACKED_SEG_PCC_MIN:
+        fails.append(f"{tag}: segment pcc vs per-row {res['pcc_C']:.6f} (bucket C) / {res['pcc_S']:.6f} (bucket S)")
+    if not ref_ok:
+        fails.append(f"{tag}: rows vs fp32 reference {[fmt(v) for v in ref_s.values()]}")
+    if not (untouched and (cache_bit or cache_pcc >= PACKED_CACHE_PCC_MIN)):
+        fails.append(f"{tag}: cache untouched {untouched}, written rows bitwise {cache_bit} pcc {cache_pcc:.7f}")
+    if not (det_ok and fill_ok and rep_ok and finite):
+        fails.append(f"{tag}: repeat {det_ok}, fill_kv {fill_ok}, replicas {rep_ok}, finite {finite}")
+    summary = dict(case=tag, programs_warm=n_warm, programs_real=n_real, ms_packed=1e3 * t_packed,
+                   ms_solo=1e3 * t_solo, **res)  # fmt: skip
+    return fails, summary
+
+
+def _g15b_r_e2(mesh_device, cfg, rope, attn, ref, seed: int = 1700):
+    """Review edit R-E2 on the device: the two pk1 tail variants are different program sets. A shared-tail warm-up does
+    not compile the distinct variant (its first call compiles programs), and each variant compiles nothing on its
+    second call. Returns failures."""
+    bs, D = cfg.kv_block_size, cfg.hidden_size
+    T, S = 256, 128
+    pool = 64
+    bank = stale_bank(ref, "random", attn.layer_idx, n=256, seed=seed)
+    cache = _upload_cache(mesh_device, _host_quant(stale_paged(bank, pool, bs, seed=seed), cfg.dtypes.kv_cache),
+                          cfg.dtypes.kv_cache)  # fmt: skip
+    xw = _replicated(mesh_device, torch.zeros(1, 1, T, D), ttnn.bfloat16)
+    counts = []
+    for tails in ("shared", "distinct", "shared", "distinct"):
+        n0 = _programs(mesh_device)
+        w = PrefillChunkInputs.warmup(mesh_device, cfg, rope, "pk1", T, S, tails)
+        _free(attn.forward_prefill(xw, chunk=w, kv_cache=cache))
+        w.free()
+        counts.append(_programs(mesh_device) - n0)
+    _free([cache, xw])
+    log(f"G15b R-E2 (pk1 T={T} S={S}, L{attn.layer_idx}): programs per call shared, distinct, shared, distinct "
+        f"= {counts}")
+    ok = counts[1] > 0 and counts[2] == 0 and counts[3] == 0
+    return [] if ok else [f"R-E2: the tail variants' program counts {counts} (want distinct > 0 after shared, then 0)"]
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_g15b_packed_attention(mesh_device, device_params):
+    """Gate G15b (design §6.2; work package A1): packed prefill passes through the real-weight ``MotifAttention`` of
+    L0 (global) and L1 (SWA), real 4096-token inputs, against the per-row ``forward_prefill(chunk=sp0 / sp1)``:
+
+    * pk0 at (S, B) in {(64, 32), (128, 16) with 3 dummies, (512, 4), (1024, 2)}: B cold rows of ``S/2 < r <= S``
+      tokens; pk1 at (S 128, B 32, a 2048, shared tails: 32 rows behind one 2K prefix), (S 128, B 8, a 256, distinct
+      tails: own 256-token prefixes, 1 dummy), the same distinct pass at B 4 on a bf16 cache, and (S 512, B 4, a 2048,
+      distinct tails, 1 dummy). Prefixes are written by TT's ``fill_kv``; every other block holds stale rows;
+    * per segment: output PCC >= 0.9999 vs the per-row call at the planner's bucket (production) and at bucket ``S``
+      (the segment's own tables; bitwise where the row-local matmuls block alike at M = T and M = S), and vs the fp32
+      reference (>= 0.999); written cache rows bitwise equal to the per-row fills (else PCC >= 0.99999), every other
+      block (shared prefixes, dummy targets, spares, the null block) untouched;
+    * the warm-up of the pass shape (``PrefillChunkInputs.warmup``: attention + ``fill_kv``) writes nothing, and the
+      real pass (inputs, forward, ``fill_kv``) compiles no program after it (design §3.5, R2); the two pk1 tail
+      variants are different program sets (R-E2);
+    * the same packed pass twice is bitwise identical (outputs and caches); ``fill_kv(chunk=)`` writes exactly the
+      forward's rows; replicas identical (3 chips); static CBs below a one-page L1 pin (G15a's CB-end method);
+    * a report of the eager wall time of the packed call vs the B per-row calls."""
+    from models.demos.motif3.tt.decoder import free_tensors
+
+    import hashlib
+
+    import models.demos.motif3 as m3
+
+    cfg, ccl, rope = _setup(mesh_device, "g15b packed attention")
+    assert cfg.ring_gather == "safe", cfg.ring_gather
+    pkg = Path(m3.__file__).parent
+    md5 = {f: hashlib.md5((pkg / "tt" / f).read_bytes()).hexdigest()[:8]
+           for f in ("attention.py", "prefill_plan.py", "generator_api.py", "model_config.py", "ccl.py")}  # fmt: skip
+    log(f"G15b provenance: motif3 package {pkg}; md5 {md5}; ring_gather {cfg.ring_gather}")
+    torch.set_num_threads(max(8, min(32, (os.cpu_count() or 8) // 2)))
+    args = ref_args()
+    failures: List[str] = []
+    summary: List[Dict[str, Any]] = []
+    for layer in (0, 1):
+        tensors = {k: v.float() for k, v in real_attn_tensors(layer).items()}
+        attn = MotifAttention(mesh_device, cfg, layer, source=source_for(tensors, W.hf_name(layer, "self_attn")),
+                              ccl=ccl, rope=rope, cache=False)  # fmt: skip
+        ref = ref_attention_spec(args, layer, tensors)
+        x_real = load_long_real_inputs(layer, DEVICE_S)
+        for i, (S, B, dummies) in enumerate(G15B_PK0):
+            f, s = _g15b_case(mesh_device, cfg, rope, attn, ref, x_real, "pk0", S, B, dummies, 0, None, "bfp8",
+                              seed=1500 + 10 * layer + i)  # fmt: skip
+            failures += f
+            summary.append(s)
+        for i, (S, B, a, tails, dummies, kv) in enumerate(G15B_PK1):
+            f, s = _g15b_case(mesh_device, cfg, rope, attn, ref, x_real, "pk1", S, B, dummies, a, tails, kv,
+                              seed=1600 + 10 * layer + i)  # fmt: skip
+            failures += f
+            summary.append(s)
+        if attn.window is not None:
+            failures += _g15b_r_e2(mesh_device, cfg, rope, attn, ref)
+        free_tensors(attn)
+    for s in summary:
+        log(f"G15b summary {s}")
     assert not failures, "\n".join(failures)

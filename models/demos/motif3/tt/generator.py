@@ -14,13 +14,16 @@ Lifecycle (vllm-tt-plugin call order, ``generator_api.MotifGenerator`` docstring
 2. ``allocate_kv_cache(num_blocks=, block_size=, num_layers=)`` (GEN-2): ``cfg.set_kv_geometry`` with the plugin's
    values (4129 x 64 for the serving defaults), one ``ttnn.empty`` + ``ttnn.fill(0)`` cache per layer, plus the MTP
    layer's cache (``pool.mtp``) with speculation.
-3. ``warmup_prefill`` (every ``(path, bucket)`` of :meth:`MotifGenerator.prefill_shapes`, eager, writes nothing) ->
+3. ``warmup_prefill`` (every ``(path, bucket)`` of :meth:`MotifGenerator.prefill_shapes`, eager, writes nothing;
+   with packed prefill also every packed shape of :meth:`MotifGenerator.packed_shapes`) ->
    ``warmup_decode(enable_trace=False)`` (stages the persistent inputs of every decode path for width W, one eager
-   all-inactive step each) -> ``warmup_decode(enable_trace=True)`` (captures each path's trace, exception-safe).
+   all-inactive step each) -> ``warmup_decode(enable_trace=True)`` (captures each path's trace, exception-safe; with
+   ``spec_verify="auto"`` the T32-spec trace, then the T64 trace).
    Capture refuses to run before every prefill shape was compiled, and after the capture a prefill chunk of a shape the
    warmup did not compile is refused (a program compiled after capture can corrupt the trace: plugin
-   ``model_runner.py:3735-3745``; features design D12 / G7); a decode path is never staged after a capture (a buffer
-   allocated after a capture and kept across replays may be overwritten by them).
+   ``model_runner.py:3735-3745``; features design D12 / G7); a packed pass of an unwarmed shape runs as solo chunks
+   instead (never refused, never compiled); a decode path is never staged after a capture (a buffer allocated after a
+   capture and kept across replays may be overwritten by them).
 4. ``prefill_forward_batch`` (features design §3.7; README §15) and ``decode_forward`` (GEN-3), below.
 5. ``release_traces`` / ``close`` (GEN-6). ``release_lane`` is a no-op (no lane-owned device state: the paged cache is
    the only cross-call state).
@@ -51,6 +54,24 @@ Prefill (resumed / chunked; ``supports_resumed_prefill``). One call per plugin s
 * Returns ``[B, vocab]`` host logits (position ``end - 1`` of each row) in input order. ``prefill_forward(r)`` is
   ``prefill_forward_batch([r])[0]``.
 
+Packed prefill (P5, ``settings.packed_prefill`` / ``MOTIF3_PACKED_PREFILL``; docs/p5_t64/P5_T64_DESIGN.md §3; the
+switch :attr:`MotifGenerator.packed_prefill`). The call runs as **passes** (``PrefillBatchPlan.passes``, in order;
+``prefill_plan.plan_prefill_passes``): a chunk of ``r`` rows is a segment of ``S`` rows (the smallest of
+``cfg.pack_seg_buckets`` / ``cfg.pack_sp1_seg_buckets`` ``>= r``); the segments whose dependencies have run (a row's
+previous chunk; for an sp1 segment every writer of its row's read-only prefix ``[0, w0)``, review edit R-E1) are
+grouped as ``pk0`` (start 0, by ``S``) or ``pk1`` (one common start ``a``, by ``(S, a)``) and cut into packed passes of
+``B`` segments (a power of two, dummies fill it), ``T = B * S`` rows (a compiled bucket), where the cost model prefers
+it; the rest run **solo** (``_run_chunk``, bitwise the chunk path above). A packed pass (``_run_packed``): its host
+tables (``attention.packed_host_tables``: every segment's slice is its chunk's tables re-bucketed to ``S``) ->
+``model.chunk_inputs`` -> ``model.prefill_chunk`` at ``T`` (only the attention treats the segments apart) -> the LM
+head once per segment that ends its row -> one MTP KV-only fill of the whole pass (each segment's next tokens, the
+row's argmax stand-in where it ends). Every pass's tables are built before the first device op. After the decode
+capture a packed pass whose shape (``("pk0", T, S)`` / ``("pk1", T, S, tails)``, review edit R-E2) was not warmed
+runs as one solo pass per segment (``packed_solo_fallbacks``, logged once per shape). A packed plan that fails its own
+checks (a planner bug) never refuses the call: the call runs with the packing-off passes (``packed_plan_errors``,
+logged per call). Packing off: one solo pass per chunk in writer-first row order, the device-op sequence of the per-row
+path.
+
 Decode paths. A path is ``(kind, KV-write mode)`` with its own persistent inputs and trace (:class:`DecodePath`):
 
 * **plain** (``decode_forward`` on a launch without speculation): embedding -> 53 layers -> LM head; the logits
@@ -63,6 +84,36 @@ Decode paths. A path is ``(kind, KV-write mode)`` with its own persistent inputs
   (``row_split``, or ``all_split`` = KV-R + split, the production mode), the LM head, the main argmax ``a`` and the MTP
   layer on every lane (``m``, its own cache written at the same lanes and positions). Outputs: ROW_MAJOR logits (read
   only when wanted, ~2 ms), ``a`` and ``m`` (128 B each).
+* **wide** (``decode_forward_spec`` with ``spec_verify`` "wide" / "auto"; docs/p5_t64/P5_T64_DESIGN.md §4): the
+  **T64** step ``MotifModel.decode_wide``: per DP row 16 rows ``[8 anchors at n | the same lanes' 8 drafts at n +
+  1]`` (each draft on its owner's DP row with the owner's page-table row), ``DecodeKVWrite(rows=64, gather="split")``,
+  FlashMLA option A'' (bitwise the T32 rows), the M = 64 MoE / LM heads. Outputs ``a`` / ``m`` ``[64]`` (split order:
+  ``[l]`` = lane ``l``'s anchor row, ``[32 + l]`` its draft row) and, in ``wide`` only, the anchors' ROW_MAJOR logits.
+
+T64 verify (``spec_verify`` = ``cfg.spec_verify``, ``MOTIF3_SPEC_VERIFY``; design §2.2-§2.4, §4.5; X2-X4). The launch's
+serving decode paths (:attr:`MotifGenerator.serving_paths`):
+
+* ``packed`` (default): the T32-spec trace alone (packed verify below; drafts without an idle lane take an overflow
+  pass);
+* ``auto``: the T32-spec trace (with the device sampler) AND the T64 trace (argmax only), each staged, run eagerly once
+  and captured once at warmup (T32 first). Each step is routed on the host (``verify_plan.choose_verify_kind``):
+  ordinary steps, steps that want logits or sampling, and verify steps whose drafts all fit idle partner lanes run on
+  T32 (one replay); every other verify step runs as ONE T64 replay (never an overflow pass for bridge traffic: its
+  verify steps carry neither logits nor sampling, review edit R-E6). T64 rows equal T32 rows bitwise, so the switch is
+  lossless;
+* ``wide``: the T64 trace alone (ordinary steps too, with idle draft rows; it then also carries the anchors' logits and
+  the device sampler on them).
+
+:meth:`MotifGenerator.drafts_all_lanes` (review edits R-E3, R-E9) tells the bridge when every live lane may draft
+(``verify_plan.drafts_all_lanes``: ``wide`` always, ``auto`` from ``c*`` live lanes, ``packed`` never). The F3N rules
+(design §2.3) are invariants here: R1 -- ``create`` / the constructor / the capture refuse ``wide`` / ``auto`` unless
+``ring_gather="safe"`` (``native`` and ``lean`` refused, R-E5) on the config and the model's ``MotifCCL`` (any other
+launch with ``native`` / ``lean`` logs a warning, X3), and ``auto`` with ``router_logits="exact_fp32"`` unless the MoE
+runs its exact router at the T64 row count and the config lists it (R-E7); R2 -- every
+decode path is staged and run eagerly before the first capture (prefill shapes compiled first); R3 -- every persistent
+input (the T64 path's ``DecodeKVWrite(rows=64)`` and its A'' group inputs included) is allocated by ``_stage_path``,
+which refuses after a capture; R4 -- every decode step ends in a blocking read of the outputs it replayed, and a replay
+of one trace while another trace's outputs are unread is refused; R5 -- serving never releases or re-captures.
 
 Speculative decode (``decode_forward_spec``, features design §3.8.2; host plan :func:`plan_spec_step`, before any
 device op). The ``SpecDecodeBatch`` is in owner-lane order (anchor ``t`` at ``n`` per active lane, at most one draft
@@ -89,10 +140,14 @@ planning (+4.7 ms per verify step measured): ``create`` logs a warning.
 
 Device sampling (``docs/sampling/DEVICE_SAMPLER.md`` §6; the bridge turns it on for ``sample_on_device_mode:
 "decode_only"`` through :meth:`MotifGenerator.enable_device_sampling`, before the decode warmup): the exact sampler
-``tt/sampling.MotifDeviceSampler`` runs at the end of EVERY decode step of the one decode trace (no second trace,
-FEATURES_REVIEW F3): the plain step samples the TILE logits (``model.decode(return_streams=True)`` -> ``head.
-forward_decode`` -> ``logits_rm`` for the host + ``sampler.sample``), the spec step samples its ROW_MAJOR logits ``rm``
-(one tilize; ``MotifModel.decode_spec`` frees its TILE logits). The sampler's outputs (``tokens`` / ``info``) are
+``tt/sampling.MotifDeviceSampler`` runs at the end of EVERY replay of the trace that serves sampled steps: the plain
+trace, the T32-spec trace, or with ``spec_verify="wide"`` the T64 trace (on its anchor rows). In ``auto`` the T64 trace
+holds no sampler: sampled steps are ordinary steps and run on T32 (PS-1 keeps them out of verify steps). Two decode
+traces are safe under F3N rules R1-R5 (``docs/p5_t64/f3.md`` §6-§7: F3 was the TP-ring all-gather race, closed by
+``ring_gather="safe"``, not a trace effect). The plain step samples the TILE logits (``model.decode(return_streams=
+True)`` -> ``head.forward_decode`` -> ``logits_rm`` for the host + ``sampler.sample``), the spec step samples its
+ROW_MAJOR logits ``rm`` (one tilize; ``MotifModel.decode_spec`` frees its TILE logits), the ``wide`` T64 step its
+anchors' ROW_MAJOR logits (the same ``[1, 1, 32, 6880]``). The sampler's outputs (``tokens`` / ``info``) are
 extra trace outputs (``DecodePath.so``), freed in :meth:`MotifGenerator.release_traces`. A device-sampled step
 (:meth:`MotifGenerator.decode_forward_sampled`, or :meth:`MotifGenerator.decode_forward_spec` with ``sampling``)
 writes the lane parameters (host compare, device write only on change) and the RNG counters of the lanes' positions,
@@ -128,7 +183,16 @@ import ttnn
 
 from . import generator_api as api
 from . import prefill_plan as PP
-from .attention import ChunkHostTables, chunk_host_tables, max_sp1_bucket, warmup_chunk_host_tables
+from . import verify_plan as VP
+from .attention import (
+    ChunkHostTables,
+    PackedHostTables,
+    chunk_host_tables,
+    max_sp1_bucket,
+    packed_host_tables,
+    warmup_chunk_host_tables,
+    warmup_packed_host_tables,
+)
 from .embedding import check_token_ids
 from .kv_write import (
     DecodeKVWrite,
@@ -143,12 +207,15 @@ from .kv_write import (
 )
 from .lm_head import HostShardReader
 from .model import LazySource, MotifKVPool, MotifModel
-from .model_config import MotifTTConfig, require_l1_small
+from .model_config import ROUTER_EXACT_FP32_DECODE_ROWS, MotifTTConfig, require_l1_small
+from .moe import EXACT_ROUTER_DECODE_ROWS
 from .mtp import mtp_next_tokens
 from .rope import positions_to_rot_idxs, shard_lanes
 from .sampling import MotifDeviceSampler, SampleResult, SamplerOutput
 
-PrefillShape = Tuple[str, int]  # (path "sp0" | "sp1", bucket)
+# A prefill program-set key: solo (path "sp0" | "sp1", bucket); packed ("pk0", T, S) | ("pk1", T, S, "shared" |
+# "distinct") (prefill_plan.PrefillPass.shape; MotifTTConfig.packed_prefill_shapes()).
+PrefillShape = Tuple[Any, ...]
 
 
 def _log_default(msg: str) -> None:
@@ -181,6 +248,29 @@ def _free(*ts) -> None:
             pass
 
 
+def _exact_router_refusal(wide_m: int) -> Optional[str]:
+    """Why ``spec_verify="auto"`` cannot run with ``router_logits="exact_fp32"`` at the T64 step's ``wide_m`` gathered
+    decode rows (review edit R-E7), or None when it can. Both lists must name ``wide_m``:
+    ``moe.EXACT_ROUTER_DECODE_ROWS`` (where ``tt/moe.py`` runs the exact kernel; at any other row count the T64 rows
+    would take the composite router and differ from the T32 rows, so ``auto`` would not be lossless) and
+    ``model_config.ROUTER_EXACT_FP32_DECODE_ROWS`` (the config's validated list, which ``MotifTTConfig.validate``
+    checks). Read at call time (tests patch them)."""
+    moe_rows, cfg_rows = tuple(EXACT_ROUTER_DECODE_ROWS), tuple(ROUTER_EXACT_FP32_DECODE_ROWS)
+    if wide_m not in moe_rows:
+        return (
+            f"tt/moe.py runs the exact-fp32 router only at {moe_rows} gathered decode rows "
+            f"(moe.EXACT_ROUTER_DECODE_ROWS), so the {wide_m}-row T64 step would take the composite router and its "
+            f"rows would differ from the T32 rows: 'auto' would not be lossless (P5_T64_DESIGN.md R-E7)"
+        )
+    if wide_m not in cfg_rows:
+        return (
+            f"tt/moe.py runs the exact-fp32 router at {moe_rows} gathered decode rows, but the config's validated list "
+            f"model_config.ROUTER_EXACT_FP32_DECODE_ROWS = {cfg_rows} lacks the {wide_m}-row T64 step (the two lists "
+            f"must agree; MotifTTConfig.validate refuses the launch until the config lists it, P5_T64_DESIGN.md R-E7)"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class SampledSpecDecodeResult(api.SpecDecodeResult):
     """``decode_forward_spec(..., sampling=...)``: the ordinary spec step's ids (``argmax`` / ``mtp_argmax``, for the
@@ -196,10 +286,12 @@ LaneSampling = Tuple[Sequence[float], Sequence[float], Sequence[int], Sequence[O
 # ======================================================================================================================
 # decode paths and the speculative step plan (features design §3.8, D10; host only)
 # ======================================================================================================================
-PLAIN, SPEC = "plain", "spec"
-DECODE_KINDS = (PLAIN, SPEC)
-DecodeKey = Tuple[str, str]  # (kind "plain" | "spec", KV-write mode)
-SPEC_PROFILE_KEYS = ("steps", "passes", "plan", "write", "enqueue", "wait", "read", "result", "total")
+PLAIN, SPEC, WIDE = "plain", "spec", VP.WIDE_STEP  # "wide": the T64 step (verify_plan's kinds: "spec" | "wide")
+DECODE_KINDS = (PLAIN, SPEC, WIDE)
+SPEC_KINDS = (SPEC, WIDE)  # the decode paths of a speculating launch (decode_forward_spec)
+DecodeKey = Tuple[str, str]  # (kind "plain" | "spec" | "wide", KV-write mode)
+# decode_forward_spec's host profile (reset_spec_profile): "steps" calls, "passes" device runs, "wide" T64 steps
+SPEC_PROFILE_KEYS = ("steps", "passes", "wide", "plan", "write", "enqueue", "wait", "read", "result", "total")
 
 
 @dataclass(frozen=True)
@@ -272,10 +364,11 @@ class SpecStepPlan:
         )
 
 
-def _ids_from_staging(reader) -> torch.Tensor:
-    """Lane-ordered ``int64 [32]`` ids from a ``HostShardReader`` of a ``[1, 1, 1, 32]`` uint32 output ("mesh" vocab
-    split: identical on every chip, chip 0's copy); a fresh tensor (the staging is overwritten by the next read)."""
-    return reader.views[0].reshape(-1)[: api.NUM_LANES].to(torch.int64).clone()
+def _ids_from_staging(reader, n: int = api.NUM_LANES) -> torch.Tensor:
+    """``int64 [n]`` ids from a ``HostShardReader`` of a ``[1, 1, 1, n]`` uint32 output ("mesh" vocab split: identical
+    on every chip, chip 0's copy): the T32 step's 32 lane-ordered ids, or the T64 step's 64 split-order ids; a fresh
+    tensor (the staging is overwritten by the next read)."""
+    return reader.views[0].reshape(-1)[: int(n)].to(torch.int64).clone()
 
 
 def check_decode_page_tables(
@@ -426,12 +519,15 @@ def plan_spec_step(
 class DecodePath:
     """One decode step kind with its persistent device inputs and, once captured, its trace.
 
-    ``kind`` ``"plain"`` (embedding -> layers -> LM head logits; :meth:`MotifGenerator.decode_forward`) or ``"spec"``
+    ``kind`` ``"plain"`` (embedding -> layers -> LM head logits; :meth:`MotifGenerator.decode_forward`), ``"spec"``
     (the T32-spec step ``MotifModel.decode_spec``: + main argmax + the MTP layer + MTP argmax;
-    :meth:`MotifGenerator.decode_forward_spec`). ``mode``: the KV-write mode (``row`` on the plain path = the
-    draft-1 ops, no ``DecodeKVWrite``). ``inputs``: ``tokens`` / ``rot`` (and ``cur`` / ``pt`` for the draft-1
-    ``row`` path); ``kv_write``: the ``DecodeKVWrite`` (FlashMLA's ``cur_pos`` / ``page_table`` and the update-call
-    inputs) of every other path. ``out``: the captured outputs (plain: the ROW_MAJOR logits; spec: ``(rm, a, m)``).
+    :meth:`MotifGenerator.decode_forward_spec`) or ``"wide"`` (the T64 step ``MotifModel.decode_wide``: 16 rows per
+    DP row, anchors + drafts; :meth:`MotifGenerator.decode_forward_spec` with ``spec_verify`` "wide" / "auto").
+    ``mode``: the KV-write mode (``row`` on the plain path = the draft-1 ops, no ``DecodeKVWrite``). ``inputs``:
+    ``tokens`` / ``rot`` (``[4, 16]`` / 16 used rot rows per DP row on the wide path; and ``cur`` / ``pt`` for the
+    draft-1 ``row`` path); ``kv_write``: the ``DecodeKVWrite`` (FlashMLA's ``cur_pos`` / ``page_table``, the A''
+    groups and the update-call inputs; ``rows=64`` on the wide path) of every other path. ``out``: the captured
+    outputs (plain: the ROW_MAJOR logits; spec / wide: ``(rm, a, m)``, ``rm`` None on an argmax-only wide path).
     ``so``: the captured device sampler's outputs (:class:`~models.demos.motif3.tt.sampling.SamplerOutput`) when the
     trace holds the sampler, else None."""
 
@@ -467,36 +563,84 @@ class PrefillRowJob:
 
 @dataclass
 class PrefillBatchPlan:
-    """The host plan of one ``prefill_forward_batch`` call (:meth:`MotifGenerator.plan_prefill_batch`)."""
+    """The host plan of one ``prefill_forward_batch`` call (:meth:`MotifGenerator.plan_prefill_batch`).
+
+    ``jobs``: one per row, in input order (the row plan and every chunk's ``ChunkHostTables``). ``order``: the
+    writer-first row order (``prefill_plan.order_prefill_requests``; the execution order with packing off).
+    ``passes``: the execution order, one ``prefill_plan.PrefillPass`` per device run: ``solo`` (one chunk:
+    ``tables[i]`` is its ``ChunkHostTables``) or packed ``pk0`` / ``pk1`` (``tables[i]`` its ``PackedHostTables``).
+    With packing off, one solo pass per chunk in ``order``. ``shapes``: the program-set key of every pass (solo
+    ``(path, bucket)``, packed ``PrefillPass.shape``). ``packed``: planned with packed prefill on. ``plan_error``: with
+    packing on, the packed planner's (or a packed table check's) failure, ``"<exception type>: <message>"`` (a planner
+    bug); the passes are then the packing-off ones (:meth:`MotifGenerator.plan_prefill_batch`). None otherwise."""
 
     jobs: List[PrefillRowJob]
-    order: List[int]  # writer-first execution order (indices into ``jobs`` = input order)
+    order: List[int]  # writer-first row order (indices into ``jobs`` = input order)
     shapes: Set[PrefillShape] = field(default_factory=set)
+    passes: List[PP.PrefillPass] = field(default_factory=list)
+    tables: List[Any] = field(default_factory=list)  # per pass: ChunkHostTables (solo) | PackedHostTables (packed)
+    packed: bool = False
+    plan_error: Optional[str] = None
 
     @property
     def chunks(self) -> int:
         return sum(len(j.plan.chunks) for j in self.jobs)
+
+    @property
+    def requests(self) -> List[api.PrefillRequest]:
+        return [j.request for j in self.jobs]
+
+    @property
+    def packed_passes(self) -> List[PP.PrefillPass]:
+        return [p for p in self.passes if p.is_packed]
+
+    @property
+    def fallbacks(self) -> List[PP.PrefillPass]:
+        """Solo passes the post-capture shape filter made from a packed pass of an unwarmed shape."""
+        return [p for p in self.passes if p.fallback is not None]
+
+    def describe(self) -> str:
+        """One line per call for logs: the passes in order."""
+        return "; ".join(p.describe() for p in self.passes)
 
 
 class MotifGenerator(api.MotifGenerator):
     """The Motif-3 runtime (see the module docstring). Build with :meth:`create` (vLLM) or directly from an existing
     :class:`MotifModel` (tests / demo): ``MotifGenerator(mesh_device, cfg, model)``.
 
-    Test hooks: ``chunk_observer(job, chunk, streams)`` (default None), called after every prefill chunk's layers with
-    the chunk's residual streams ``[1, 4, C, 4096]`` (eager; it must not free or keep them). Teacher-forced checks read
-    the LM head on every tile of a chunk through it (``head.forward_prefill(streams, row)``: no new program).
+    Test hooks: ``chunk_observer(job, chunk, streams)`` (default None), called after every solo prefill chunk's layers
+    with the chunk's residual streams ``[1, 4, C, 4096]`` (eager; it must not free or keep them). Teacher-forced checks
+    read the LM head on every tile of a chunk through it (``head.forward_prefill(streams, row)``: no new program).
+    ``pass_observer(batch, pass_, streams)`` (default None): the same after every packed pass, with the pass's streams
+    ``[1, 4, T, 4096]`` (segment ``k``'s rows start at ``pass_.offset(k)``; its row is ``batch.jobs[seg.row]``).
     ``spec_observer(plan, pass_index, out)`` (default None), called after every pass of a speculative step with the
     host ``out = {"a": [32], "m": [32], "logits": [32, V] or None}`` in PHYSICAL-lane order (``observe_logits=True``
-    reads the logits of every pass, ~2 ms each). ``extra_decode_paths``: ``(kind, mode)`` decode paths that
-    :meth:`warmup_decode` prepares and captures next to the serving path (set before the warmup; e.g. the plain
-    ``("plain", "all")`` trace next to the spec trace, for comparisons in one session). Tests only: serving captures
-    the serving path alone. With two captured traces, prefills after a ``release_traces`` / new-program compile /
-    re-capture cycle returned garbage tiles (2026-10-03, ``tests/test_resumed_prefill.py`` ``MULTI_TRACE_NOTE``);
-    :meth:`warmup_decode` logs a warning when it captures more than one trace.
+    reads the logits of every pass, ~2 ms each); a T64 step calls it once with ``plan`` = its
+    ``verify_plan.WideStepPlan``, ``pass_index`` 0 and ``out = {"a": [64], "m": [64], "logits": [32, V] or None}`` in
+    split order. ``extra_decode_paths``: ``(kind, mode)`` decode paths that :meth:`warmup_decode` prepares and captures
+    next to the serving paths (set before the warmup; e.g. the plain ``("plain", "all")`` trace next to the spec trace,
+    for comparisons in one session). Tests only: serving captures :attr:`serving_paths` (one trace, two in
+    ``spec_verify="auto"``). Several captured traces are safe under F3N rules R1-R5 (``docs/p5_t64/f3.md`` §6-§7: the
+    garbage prefill tiles once blamed on a second trace, ``tests/test_resumed_prefill.py`` ``MULTI_TRACE_NOTE``, were
+    the TP-ring all-gather race that ``ring_gather="safe"`` closes); :meth:`warmup_decode` logs the traces it holds and
+    warns when ``ring_gather`` is not ``"safe"``. A launch whose ring gather is not ``"safe"`` is refused with a T64
+    path and warned about otherwise, once, at construction (:meth:`_ring_gather_warning`, design X3).
+
+    Speculative verify mode (module docstring "T64 verify"): :attr:`spec_verify` = ``cfg.spec_verify`` (``packed`` /
+    ``wide`` / ``auto``; the modules' 64-row constants follow the config, so ``settings.spec_verify`` must agree).
+    :meth:`verify_kind` names the trace a step runs on; :attr:`last_verify_kind` the one the last step ran on;
+    :attr:`last_spec` is that step's plan (``SpecStepPlan`` on T32, ``verify_plan.WideStepPlan`` on T64).
 
     Args beyond the model: ``decode_kv_mode`` / ``spec_kv_mode`` override the KV-write mode of the plain / spec path
     (default ``generator_api.kv_write_mode(cfg.kv_replicated_decode, False / True)``: ``row`` / ``row_split``, or
     ``all`` / ``all_split`` with KV-R).
+
+    Packed prefill (module docstring): :attr:`packed_prefill` (default ``settings.packed_prefill``, else off) switches
+    it per call; the segment sizes and pass cap are the config's (``cfg.pack_seg_buckets``,
+    ``cfg.pack_sp1_seg_buckets``, ``cfg.pack_tokens_cap``). :meth:`warmup_prefill` warms the packed shapes only while
+    the switch is on; turned on after a capture without them, every packed pass runs as solo chunks.
+    ``packed_warmup`` (default ``settings.packed_warmup``): ``"attention"`` (per shape the attention of one global and
+    one SWA layer on zeros, ``model.warm_attention``) or ``"full"`` (one full warm-up pass per shape).
 
     Device sampling (module docstring): :meth:`enable_device_sampling` builds ``self.sampler`` before the decode
     warmup; ``sampling_observer(kind, positions, res, logits)`` (tests; default None) is called after every
@@ -518,8 +662,16 @@ class MotifGenerator(api.MotifGenerator):
             raise ValueError(f"the generator runs a prefix model (layers 0..N-1), got layers {model.layer_ids}")
         if cfg.max_batch != api.NUM_LANES:
             raise ValueError(f"cfg.max_batch must be {api.NUM_LANES} (the decode trace runs all lanes)")
-        if settings is not None and settings.spec_verify != "packed":
-            raise ValueError(f"spec_verify={settings.spec_verify!r} (the 64-row verify trace, S3) is not implemented")
+        # the verify mode is the config's: the modules' 64-row constants (MoE top-k pads, LM-head argmax) follow
+        # cfg.wide_rows_per_dp, so settings that disagree would stage a T64 path the model cannot run
+        self.spec_verify = str(getattr(cfg, "spec_verify", "packed") or "packed")
+        if self.spec_verify not in api.SPEC_VERIFY_MODES:
+            raise ValueError(f"cfg.spec_verify must be one of {api.SPEC_VERIFY_MODES}, got {self.spec_verify!r}")
+        if settings is not None and settings.spec_verify != self.spec_verify:
+            raise ValueError(
+                f"settings.spec_verify={settings.spec_verify!r} but cfg.spec_verify={self.spec_verify!r}: build the "
+                f"config from the settings (MotifTTConfig.from_settings), its 64-row module constants follow it"
+            )
         self.mesh_device = mesh_device
         self.cfg = cfg
         self.model = model
@@ -527,7 +679,17 @@ class MotifGenerator(api.MotifGenerator):
         self.log = log or (lambda m: None)
         self._pool: Optional[MotifKVPool] = None
         self._paths: Dict[DecodeKey, DecodePath] = {}  # staged decode paths: persistent inputs (+ trace once captured)
-        self._warmed: Set[PrefillShape] = set()  # (path, bucket) compiled by warmup_prefill
+        # prefill shapes compiled by warmup_prefill: solo (path, bucket) and packed ("pk0", T, S) / ("pk1", T, S, tails)
+        self._warmed: Set[PrefillShape] = set()
+        # packed prefill (P5): the per-call switch and the warm-up mode (module docstring)
+        self.packed_prefill = bool(getattr(settings, "packed_prefill", False))
+        warm = getattr(settings, "packed_warmup", None) or api.DEFAULT_PACKED_WARMUP
+        if warm not in api.PACKED_WARMUP_MODES:
+            raise ValueError(f"packed_warmup must be one of {api.PACKED_WARMUP_MODES}, got {warm!r}")
+        self.packed_warmup = warm
+        self._packed_mtp_warmed: Set[int] = set()  # pass rows T whose packed MTP fill (gathered RoPE at T) compiled
+        self._fallback_logged: Set[PrefillShape] = set()  # unwarmed packed shapes already logged (once per shape)
+        self._pack_cost = PP.prefill_cost_model(cfg.prefill_cost_table, sp1_s_per_row_key=cfg.prefill_sp1_s_per_row_key)
         kvr = bool(cfg.kv_replicated_decode)
         # plain decode steps: "row" (draft 1) or "all" (KV-R); speculative steps: "row_split" or "all_split" (KV-R)
         self.decode_kv_mode = _check_mode(decode_kv_mode or api.kv_write_mode(kvr, False))
@@ -537,19 +699,37 @@ class MotifGenerator(api.MotifGenerator):
                 f"warning: KV-R is on (prefix caching) but a decode path writes without it (plain "
                 f"{self.decode_kv_mode!r}, spec {self.spec_kv_mode!r}): only for measurements, never for serving"
             )
-        # A speculating launch (spec_tokens = 1 and the MTP layer) runs EVERY decode step through the spec trace.
-        self.serving_path: DecodeKey = (
-            (SPEC, self.spec_kv_mode)
-            if (model.mtp is not None and int(cfg.spec_tokens) > 0)
-            else (PLAIN, self.decode_kv_mode)
+        # A speculating launch (spec_tokens = 1 and the MTP layer) runs EVERY decode step through decode_forward_spec:
+        # the T32-spec trace ("packed", "auto") or the T64 trace ("wide"); "auto" also captures the T64 trace for the
+        # verify steps whose drafts do not fit idle lanes (serving_paths).
+        spec = model.mtp is not None and int(cfg.spec_tokens) > 0
+        if not spec:
+            self.serving_path: DecodeKey = (PLAIN, self.decode_kv_mode)
+        elif self.spec_verify == "wide":
+            self.serving_path = (WIDE, self.spec_kv_mode)
+        else:
+            self.serving_path = (SPEC, self.spec_kv_mode)
+        # the T64 path of this launch ("wide" / "auto" with speculation), else None
+        self.wide_path: Optional[DecodeKey] = (
+            (WIDE, self.spec_kv_mode) if spec and self.spec_verify in api.WIDE_SPEC_VERIFY_MODES else None
         )
+        if self.wide_path is not None:
+            self._check_wide_launch()  # refuses ring_gather "native" / "lean" (R1, R-E5)
+        else:
+            warn = self._ring_gather_warning()  # design X3: the other launches only warn
+            if warn is not None:
+                self.log(warn)
         self.extra_decode_paths: List[DecodeKey] = []
         self.chunk_observer: Optional[Callable[[PrefillRowJob, PP.ChunkPlan, Any], None]] = None
+        self.pass_observer: Optional[Callable[[PrefillBatchPlan, PP.PrefillPass, Any], None]] = None
         self.spec_observer: Optional[Callable[[SpecStepPlan, int, Dict[str, Any]], None]] = None
         self.sampling_observer: Optional[Callable[..., None]] = None
         self.observe_logits = False
         self.last_prefill: Optional[PrefillBatchPlan] = None
-        self.last_spec: Optional[SpecStepPlan] = None
+        self.last_spec: Optional[Any] = None  # the last decode_forward_spec step's plan: SpecStepPlan | WideStepPlan
+        self.last_verify_kind: Optional[str] = None  # the trace kind it ran on: "spec" (T32) | "wide" (T64)
+        # F3N rule R4: the decode path whose replayed outputs are not read yet (cleared by the step's blocking read)
+        self._unread: Optional[DecodeKey] = None
         # device sampling (enable_device_sampling): the sampler and the outputs of the step that ran last (eager runs
         # and captures hand them over through _take_so)
         self.sampler: Optional[MotifDeviceSampler] = None
@@ -561,6 +741,16 @@ class MotifGenerator(api.MotifGenerator):
             "sp1_chunks": 0,
             "recomputed_rows": 0,
             "mtp_fills": 0,
+            # packed prefill (P5): device runs of a prefill call are solo chunks or packed passes
+            "solo_passes": 0,  # solo chunks (packing off: every chunk)
+            "packed_calls": 0,  # calls with at least one packed pass
+            "packed_passes": 0,  # pk0 + pk1 passes
+            "packed_pk1_passes": 0,  # ... of which pk1 (resumed segments at one start)
+            "packed_segments": 0,  # real segments (chunks) run in packed passes
+            "packed_dummy_segments": 0,  # dummy segments that filled B
+            "packed_padding_rows": 0,  # rows of packed passes without a real token (segment padding + dummies)
+            "packed_solo_fallbacks": 0,  # chunks run solo because their packed shape was not warmed (after capture)
+            "packed_plan_errors": 0,  # packing-on calls whose packed plan failed (a planner bug): run per row instead
             "decode_steps": 0,  # device runs of a decode step (trace replays + eager steps), every path and pass
             "spec_steps": 0,  # decode_forward_spec calls
             "verify_steps": 0,  # ... with at least one draft
@@ -569,6 +759,11 @@ class MotifGenerator(api.MotifGenerator):
             "cross_row_partners": 0,  # ... on another DP row than their owner (KV-R)
             "overflow_drafts": 0,  # drafts evaluated in pass 2 on their own lane
             "overflow_passes": 0,
+            # T64 (spec_verify "wide" / "auto"): drafts = packed_drafts + overflow_drafts + wide_drafts
+            "wide_steps": 0,  # decode_forward_spec steps run on the T64 trace (one device run each)
+            "wide_verify_steps": 0,  # ... with at least one draft
+            "wide_drafts": 0,  # drafts evaluated on their owners' draft rows (T64)
+            "auto_t32_verifies": 0,  # verify steps of an "auto" launch that ran on T32 (every draft fit an idle lane)
             "sampled_steps": 0,  # device-sampled decode steps (plain or spec)
             "sampled_lanes": 0,  # ... active lanes they sampled
             "gumbel_lanes": 0,  # ... of which full-vocab (top_p = 1) Gumbel lanes
@@ -589,9 +784,10 @@ class MotifGenerator(api.MotifGenerator):
         """Build the runtime on the plugin's open mesh (``generator_api.MotifGenerator.create``). ``model_kwargs`` go
         to :class:`MotifModel` (``cache``, ``vocab_split``, ``layer_kwargs``, ``source``, ``mtp``)."""
         log = model_kwargs.pop("log", _log_default)
-        if settings.spec_verify != "packed":
-            raise ValueError(f"spec_verify={settings.spec_verify!r} (the 64-row verify trace, S3) is not implemented")
         l1s = require_l1_small(mesh_device)
+        # spec_verify "wide" / "auto": MotifTTConfig.validate refuses ring_gather != "safe" (F3N R1, R-E5) and "auto"
+        # with the exact-fp32 router at an unsupported row count (R-E7) before any weight loads; the constructor
+        # re-checks them against the built model (its MotifCCL, its MoE)
         cfg = MotifTTConfig.from_settings(settings, mesh_device=mesh_device, hf_config=hf_config)
         log(
             f"create: {cfg.describe()} (mesh L1_SMALL {l1s} B per core; weights {settings.weights_path} "
@@ -599,9 +795,13 @@ class MotifGenerator(api.MotifGenerator):
         )
         if settings.packed_prefill:
             log(
-                "create: MOTIF3_PACKED_PREFILL is set, but packed multi-row prefill (design §3.12.1, gate G15) is not "
-                "implemented: rows run one after another"
+                f"create: packed prefill on (P5): pk0 S {'/'.join(map(str, cfg.pack_seg_buckets)) or 'off'}, pk1 S "
+                f"{'/'.join(map(str, cfg.pack_sp1_seg_buckets)) or 'off'}, T <= {cfg.pack_tokens_cap}; "
+                f"{len(cfg.packed_prefill_shapes())} packed shapes warmed before the decode capture "
+                f"({settings.packed_warmup!r} warm-up); after it an unwarmed packed shape runs as solo chunks"
             )
+        else:
+            log("create: packed prefill off (MOTIF3_PACKED_PREFILL): the rows of a prefill call run one after another")
         if "source" not in model_kwargs:
             if settings.weights_are_local:
                 model_kwargs["source"] = LazySource(settings.weights_path, log=log)
@@ -618,6 +818,8 @@ class MotifGenerator(api.MotifGenerator):
             f"{time.time() - t0:.1f} s"
         )
         gen = cls(mesh_device, cfg, model, settings=settings, log=log)
+        if gen.spec_launch:
+            log(f"create: {gen.describe_spec_verify()}")
         if gen.spec_launch and os.environ.get("OMP_WAIT_POLICY", "").strip().upper() != "PASSIVE":
             log(
                 "warning: speculative decoding without OMP_WAIT_POLICY=PASSIVE (features design §1.1): torch's "
@@ -679,8 +881,181 @@ class MotifGenerator(api.MotifGenerator):
 
     @property
     def spec_launch(self) -> bool:
-        """Every decode step runs through the spec trace (``spec_tokens = 1`` with the MTP layer)."""
-        return self.serving_path[0] == SPEC
+        """Every decode step runs through :meth:`decode_forward_spec` (``spec_tokens = 1`` with the MTP layer): the
+        T32-spec trace, and / or the T64 trace (:attr:`spec_verify`)."""
+        return self.serving_path[0] in SPEC_KINDS
+
+    @property
+    def serving_paths(self) -> List[DecodeKey]:
+        """The decode paths a serving launch stages and captures, in capture order: :attr:`serving_path`, and with
+        ``spec_verify="auto"`` the T64 path after it (``[("spec", m), ("wide", m)]``: the T32-spec trace is captured
+        first); one path otherwise."""
+        out = [self.serving_path]
+        if self.wide_path is not None and self.wide_path not in out:
+            out.append(self.wide_path)
+        return out
+
+    @property
+    def wide_has_logits(self) -> bool:
+        """The T64 path also untilizes the anchors' logits and, with device sampling, runs the sampler on them:
+        ``spec_verify="wide"`` only (its ordinary steps run on T64). In ``auto`` the T64 trace is argmax-only (ordinary
+        and sampled steps run on T32)."""
+        return self.spec_verify == "wide"
+
+    def _ring_gather(self) -> str:
+        """The ring-gather mode the decode traces are built with: the model's ``MotifCCL`` (tests may switch it at run
+        time), else the config's."""
+        ccl = getattr(self.model, "ccl", None)
+        return str(getattr(ccl, "ring_gather", None) or getattr(self.cfg, "ring_gather", "safe"))
+
+    def _check_wide_launch(self, kv_mode: Optional[str] = None) -> None:
+        """The preconditions of a launch that stages the T64 path (``spec_verify`` "wide" / "auto"; design X3, §2.3);
+        raises ``ValueError``. Runs in the constructor (``create``), when a T64 path is staged (``kv_mode``: its
+        KV-write mode, default :attr:`spec_kv_mode`) and before the decode capture.
+
+        * F3N rule R1 / review edit R-E5: ``ring_gather="safe"`` on the config AND on the model's ``MotifCCL`` (every
+          race-prone TP-ring all-gather rerouted). ``native`` races; ``lean`` keeps the decode-sized gathers native and
+          needs its own G-X run first.
+        * A T64 config and model: ``cfg.wide_rows_per_dp`` = 16 (the modules' 64-row constants exist), a split KV-write
+          mode (call A anchors, call B drafts), the LM head's "mesh" vocab split (the split-order head).
+        * Review edit R-E7: ``auto`` with ``router_logits="exact_fp32"`` only when the MoE runs its exact router at the
+          T64 step's gathered row count (``moe.EXACT_ROUTER_DECODE_ROWS``) and the config lists it
+          (``model_config.ROUTER_EXACT_FP32_DECODE_ROWS``); otherwise T64 rows would take the composite router, differ
+          from the T32 rows, and ``auto`` would not be lossless. The message names the list that lacks the row count
+          (:func:`_exact_router_refusal`).
+
+        A launch without a T64 path is not refused for its ring gather; the constructor logs
+        :meth:`_ring_gather_warning` instead (design X3)."""
+        cfg, mode = self.cfg, self.spec_verify
+        rows = 2 * int(cfg.lanes_per_row)
+        if int(getattr(cfg, "wide_rows_per_dp", 0) or 0) != rows:
+            raise ValueError(
+                f"a T64 decode path needs a T64 config (cfg.wide_rows_per_dp = {rows}: spec_tokens > 0 and spec_verify "
+                f"'wide' / 'auto', so the modules hold their 64-row constants); this one has spec_verify={mode!r}, "
+                f"wide_rows_per_dp {getattr(cfg, 'wide_rows_per_dp', None)}"
+            )
+        ring = sorted({str(getattr(cfg, "ring_gather", "safe")), self._ring_gather()})
+        if ring != ["safe"]:
+            raise ValueError(
+                f"spec_verify={mode!r} needs ring_gather='safe' on the config and on the model's MotifCCL, got {ring}: "
+                f"the T64 trace and a second decode trace rely on every race-prone TP-ring all-gather being rerouted "
+                f"(F3N rule R1, docs/p5_t64/f3.md §6; P5_T64_DESIGN.md X3, review edit R-E5: 'lean' keeps the decode "
+                f"gathers native and needs its own G-X run first)"
+            )
+        kv = self.spec_kv_mode if kv_mode is None else _check_mode(kv_mode)
+        if not is_split(kv):
+            raise ValueError(
+                f"spec_verify={mode!r}: the T64 step writes the drafts in call B, so it needs a split KV-write mode "
+                f"(row_split / all_split), got {kv!r}"
+            )
+        vs = getattr(self.model.head, "vocab_split", "mesh")
+        if vs != "mesh":
+            raise ValueError(f"spec_verify={mode!r} needs the LM head's 'mesh' vocab split (the split-order head), got "
+                             f"{vs!r}")  # fmt: skip
+        if mode == "auto" and str(getattr(cfg, "router_logits", "composite")) == "exact_fp32":
+            reason = _exact_router_refusal(int(cfg.dp) * rows)
+            if reason is not None:
+                raise ValueError(
+                    f"spec_verify='auto' with router_logits='exact_fp32' is refused: {reason}. Use "
+                    f"MOTIF3_ROUTER_LOGITS=composite, or MOTIF3_SPEC_VERIFY=packed / wide (one decode trace)"
+                )
+
+    def _ring_gather_warning(self) -> Optional[str]:
+        """The launch warning (design X3) of a generator whose TP-ring all-gathers are not all rerouted: ``ring_gather``
+        "native" or "lean" on the config or on the model's ``MotifCCL``; None under "safe". A launch with a T64 path
+        refuses those modes instead (:meth:`_check_wide_launch`, F3N rule R1, review edit R-E5); every other launch
+        (``packed``, no speculation) runs with them and the constructor logs this line once."""
+        cfg_ring, ccl_ring = str(getattr(self.cfg, "ring_gather", "safe")), self._ring_gather()
+        modes = sorted({cfg_ring, ccl_ring})
+        if modes == ["safe"]:
+            return None
+        if "native" in modes:
+            why = (
+                "'native' leaves every race-prone TP-ring all-gather on ttnn's multicast factory, whose completion "
+                "can precede its alternate-route pages: prefill is not run-to-run reproducible and a stale tile can "
+                "reach the logits (the F3 garbage prefills, docs/p5_t64/f3.md §2; docs/determinism/INVESTIGATION.md)"
+            )
+        else:
+            why = (
+                "'lean' keeps the single-page decode gathers native, which race about once per 10^4 decode steps "
+                "(silent stale tiles, docs/determinism/FIX.md)"
+            )
+        return (
+            f"warning: ring_gather {cfg_ring!r} on the config, {ccl_ring!r} on the model's MotifCCL: {why}. Serve "
+            f"with the default 'safe' (MOTIF3_RING_GATHER; P5_T64_DESIGN.md X3: spec_verify 'wide' / 'auto' refuse "
+            f"anything else)"
+        )
+
+    def describe_spec_verify(self) -> str:
+        """One line for the logs: the verify mode, its decode traces and routing, and when every live lane drafts."""
+        if not self.spec_launch:
+            return "no speculation: one plain decode trace"
+        m, kv = self.spec_verify, self.spec_kv_mode
+        if m == "packed":
+            return (
+                f"spec_verify='packed': one T32-spec decode trace (KV write {kv!r}); drafts run on idle lanes, drafts "
+                f"without one in a second replay (overflow pass)"
+            )
+        s = self.settings
+        if m == "wide":
+            drafting = "every live lane may draft"
+            traces = "the T64 trace alone serves every step (the anchors' logits and the device sampler on them)"
+        else:
+            prior = float(getattr(s, "spec_alpha_prior", api.DEFAULT_SPEC_ALPHA_PRIOR))
+            fixed = getattr(s, "wide_min_lanes", None)
+            if fixed is not None:
+                drafting = f"every live lane drafts from {fixed} live lanes (MOTIF3_WIDE_MIN_LANES)"
+            else:
+                c = VP.crossover_lanes(prior, float(self.cfg.wide_step_ratio))
+                drafting = (
+                    f"every live lane drafts from c*={'never' if c >= api.WIDE_MIN_LANES_NEVER else c} live lanes at "
+                    f"the acceptance prior {prior:g} (r {float(self.cfg.wide_step_ratio):g}; the bridge passes its "
+                    f"running estimate)"
+                )
+            traces = (
+                "the T32-spec trace (ordinary and sampled steps, verify steps whose drafts fit idle lanes) and the T64 "
+                "trace (the other verify steps, argmax only), each captured once at warmup"
+            )
+        return (
+            f"spec_verify={m!r}: {traces}; T64 = DecodeKVWrite(rows=64, KV write {kv!r}), FlashMLA A'' (rows bitwise "
+            f"the T32 rows); ring_gather 'safe' (F3N R1); {drafting}"
+        )
+
+    def drafts_all_lanes(self, live_lanes: Sequence[int], acceptance: Optional[float] = None) -> bool:
+        """``generator_api.MotifGenerator.drafts_all_lanes`` (design T7, §4.7; review edits R-E3, R-E9): may the bridge
+        propose a draft for EVERY live lane of the next step? Host only, no state change:
+        ``verify_plan.drafts_all_lanes`` with this launch's mode. False without speculation and in ``packed`` (the
+        bridge keeps its idle-lane budget, so every draft fits the 32-lane trace); True in ``wide``; in ``auto`` True
+        iff the distinct live lanes reach ``settings.wide_min_lanes`` when set, else ``c* =
+        verify_plan.crossover_lanes(acceptance, cfg.wide_step_ratio)`` (17..33, 33 = never; ``acceptance=None``: the
+        prior ``settings.spec_alpha_prior`` = 0.85, c* = 19 at r = 1.13). Raises on a live lane outside ``[0, 32)`` or
+        an acceptance outside ``[0, 1]``."""
+        s = self.settings
+        mode = self.spec_verify if (self.spec_launch and self.wide_path is not None) else "packed"
+        return VP.drafts_all_lanes(
+            live_lanes,
+            spec_verify=mode,
+            ratio=float(self.cfg.wide_step_ratio),
+            acceptance=acceptance,
+            min_lanes=getattr(s, "wide_min_lanes", None),
+            prior=float(getattr(s, "spec_alpha_prior", api.DEFAULT_SPEC_ALPHA_PRIOR)),
+        )
+
+    def verify_kind(self, batch: api.SpecDecodeBatch, *, want_logits: bool = False, sampling: Any = None) -> str:
+        """The trace a :meth:`decode_forward_spec` step of ``batch`` runs on when no ``path`` is given: ``"spec"`` (the
+        T32-spec trace) or ``"wide"`` (the T64 trace); ``verify_plan.choose_verify_kind`` with :attr:`spec_verify` and
+        the T32 path's partner rule (host only). ``packed`` / no T64 path: always ``"spec"``; ``wide``: always
+        ``"wide"``; ``auto``: ``"wide"`` only for a verify step whose drafts do not all fit idle lanes and that wants
+        neither logits nor sampling."""
+        mode = self.spec_verify if self.wide_path is not None else "packed"
+        return VP.choose_verify_kind(
+            batch,
+            mode,
+            bool(want_logits),
+            sampling,
+            kv_mode=self.spec_kv_mode,
+            lanes_per_row=int(self.cfg.lanes_per_row),
+        )
 
     # ==============================================================================================================
     # device sampling (docs/sampling/DEVICE_SAMPLER.md §6)
@@ -792,12 +1167,13 @@ class MotifGenerator(api.MotifGenerator):
 
     @property
     def warmed_shapes(self) -> Set[PrefillShape]:
-        """The ``(path, bucket)`` prefill shapes ``warmup_prefill`` compiled."""
+        """The prefill shapes ``warmup_prefill`` compiled: solo ``(path, bucket)`` and packed shapes."""
         return set(self._warmed)
 
     def prefill_shapes(self) -> List[PrefillShape]:
-        """Every ``(path, bucket)`` a prefill chunk can have (what ``warmup_prefill`` compiles): sp0 for every bucket of
-        ``cfg.prefill_span_buckets``, sp1 for those ``<= max_sp1_bucket``; ascending buckets, sp0 first."""
+        """Every solo ``(path, bucket)`` a prefill chunk can have (what ``warmup_prefill`` compiles first): sp0 for
+        every bucket of ``cfg.prefill_span_buckets``, sp1 for those ``<= max_sp1_bucket``; ascending buckets, sp0
+        first."""
         top = self.max_sp1_bucket
         out: List[PrefillShape] = []
         for b in self.cfg.prefill_span_buckets:
@@ -805,6 +1181,17 @@ class MotifGenerator(api.MotifGenerator):
             if int(b) <= top:
                 out.append((PP.SP1, int(b)))
         return out
+
+    def packed_shapes(self) -> List[PrefillShape]:
+        """Every packed pass shape (P5; ``cfg.packed_prefill_shapes()``: ``("pk0", T, S)``, then ``("pk1", T, S,
+        tails)`` with both SWA tail variants, review edit R-E2) the planner can emit with the config's segment sizes
+        and pass cap: what ``warmup_prefill`` compiles after the solo shapes while :attr:`packed_prefill` is on."""
+        return [tuple(s) for s in self.cfg.packed_prefill_shapes()]
+
+    def required_prefill_shapes(self) -> List[PrefillShape]:
+        """The shapes the decode capture requires warmed: :meth:`prefill_shapes`, plus :meth:`packed_shapes` while
+        :attr:`packed_prefill` is on."""
+        return self.prefill_shapes() + (self.packed_shapes() if self.packed_prefill else [])
 
     # ==============================================================================================================
     # KV pool (GEN-2)
@@ -859,12 +1246,23 @@ class MotifGenerator(api.MotifGenerator):
 
     def plan_prefill_batch(self, requests: Sequence[api.PrefillRequest]) -> PrefillBatchPlan:
         """Every host check and table of one ``prefill_forward_batch`` call, before any device op (module docstring):
-        raises ``ValueError`` (bad rows) or ``RuntimeError`` (a shape the warmup did not compile, after the capture)."""
+        raises ``ValueError`` (bad rows) or ``RuntimeError`` (a solo shape the warmup did not compile, after the
+        capture). The passes: with :attr:`packed_prefill`, ``prefill_plan.plan_prefill_passes`` with the config's
+        segment sizes / pass cap and, once a decode trace is captured, the warmed shapes as ``allowed`` (a packed pass
+        of another shape becomes solo chunks); without it, one solo pass per chunk in writer-first row order. Every
+        pass's tables are built here (packed: ``attention.packed_host_tables``, which checks every segment's slice).
+
+        Packing never refuses a call: the rows were already checked (``order_prefill_requests`` accepted them), so a
+        packed planner or packed-table check that still fails (``AssertionError`` / ``ValueError``: a planner bug, e.g.
+        ``prefill_plan._check_passes``) runs the call as with packing off, one solo pass per chunk in writer-first
+        order; :attr:`PrefillBatchPlan.plan_error` names the failure and executing the call counts
+        ``packed_plan_errors`` and logs it (P5 review, finding 6)."""
         reqs = api.check_prefill_batch(requests)
         cfg, bs = self.cfg, int(self.cfg.kv_block_size)
         num_blocks = None if self._pool is None else int(self._pool.num_blocks)
+        captured = self.trace_captured
         jobs: List[PrefillRowJob] = []
-        shapes: Set[PrefillShape] = set()
+        chunk_shapes: Set[PrefillShape] = set()
         for i, r in enumerate(reqs):
             e = r.end
             if e > self.max_prefill_len:
@@ -874,15 +1272,60 @@ class MotifGenerator(api.MotifGenerator):
             plan = self.plan_row(int(r.start), e)
             tables = [chunk_host_tables(cfg, plan, c, r.page_table) for c in plan.chunks]
             for c in plan.chunks:
-                shapes.add((c.path, int(c.bucket)))
+                chunk_shapes.add((c.path, int(c.bucket)))
             jobs.append(PrefillRowJob(index=i, request=r, plan=plan, tables=tables))
-        if self.trace_captured:
-            missing = sorted(s for s in shapes if s not in self._warmed)
-            if missing:
-                # compiling a new prefill program after the decode capture can corrupt the trace (plugin contract)
-                raise RuntimeError(f"prefill shapes {missing} were not compiled before the decode trace capture")
-        order = PP.order_prefill_requests(reqs, [j.plan for j in jobs], bs)
-        return PrefillBatchPlan(jobs=jobs, order=order, shapes=shapes)
+        packed = bool(self.packed_prefill)
+        if captured and not packed:
+            self._refuse_unwarmed(chunk_shapes)
+        plans = [j.plan for j in jobs]
+        order = PP.order_prefill_requests(reqs, plans, bs)
+        passes: Optional[List[PP.PrefillPass]] = None
+        packed_tables: Dict[int, PackedHostTables] = {}
+        plan_error: Optional[str] = None
+        if packed:
+            try:
+                passes = PP.plan_prefill_passes(
+                    reqs,
+                    plans,
+                    block_size=bs,
+                    max_seg=cfg.pack_max_seg,
+                    max_tokens=cfg.pack_tokens_cap,
+                    pk1=cfg.pack_pk1,
+                    allowed=self._warmed if captured else None,
+                    cost=self._pack_cost,
+                    seg_buckets=cfg.pack_seg_buckets,
+                    sp1_seg_buckets=cfg.pack_sp1_seg_buckets,
+                    swa_tail=cfg.prefill_swa_tail,
+                )
+                packed_tables = {
+                    n: packed_host_tables(cfg, p, reqs, plans) for n, p in enumerate(passes) if p.is_packed
+                }
+            except (AssertionError, ValueError) as e:  # a packed-planner bug: the rows themselves passed every check
+                plan_error = f"{type(e).__name__}: {e}"
+                passes, packed_tables = None, {}
+        if passes is None:  # packing off, or the packed plan failed: one solo pass per chunk, writer-first rows
+            if captured and packed:
+                self._refuse_unwarmed(chunk_shapes)
+            passes = PP.solo_prefill_passes(plans, order)
+        elif captured:  # solo passes (fallbacks included) still need their warmed (path, bucket)
+            self._refuse_unwarmed({p.shape for p in passes if not p.is_packed})
+        tables: List[Any] = []
+        for n, p in enumerate(passes):
+            if p.is_packed:
+                tables.append(packed_tables[n])
+            else:
+                g = p.segments[0]
+                tables.append(jobs[g.row].tables[g.chunk_index])
+        return PrefillBatchPlan(
+            jobs=jobs, order=order, shapes={p.shape for p in passes}, passes=passes, tables=tables, packed=packed,
+            plan_error=plan_error,
+        )  # fmt: skip
+
+    def _refuse_unwarmed(self, shapes: Set[PrefillShape]) -> None:
+        missing = sorted(s for s in shapes if s not in self._warmed)
+        if missing:
+            # compiling a new prefill program after the decode capture can corrupt the trace (plugin contract)
+            raise RuntimeError(f"prefill shapes {missing} were not compiled before the decode trace capture")
 
     # ==============================================================================================================
     # prefill (GEN-4; features design §3.7)
@@ -911,32 +1354,66 @@ class MotifGenerator(api.MotifGenerator):
         self, requests: Sequence[api.PrefillRequest], *, kv_cache: Any, enable_trace: bool = False
     ) -> torch.Tensor:
         """All rows of one plugin step (module docstring): ``[B, vocab]`` host logits of each row's ``end - 1``, in
-        input order. ``enable_trace`` (plugin ``trace_mode="all"``) is ignored: prefill is eager."""
+        input order. ``enable_trace`` (plugin ``trace_mode="all"``) is ignored: prefill is eager. Timings:
+        ``last_prefill_plan_s`` (host checks, plan and tables), ``last_prefill_s`` (the passes: device work and host
+        reads, from the first upload to the last logits row)."""
         pool = self._check_pool(kv_cache)
+        t0 = time.time()
         batch = self.plan_prefill_batch(requests)
         self.last_prefill = batch
         out: List[Optional[torch.Tensor]] = [None] * len(batch.jobs)
-        t0 = time.time()
-        for i in batch.order:
-            out[i] = self._run_row(batch.jobs[i], pool)
-        self.stats["prefill_calls"] += 1
-        self.stats["prefill_rows"] += len(batch.jobs)
-        self.timings["last_prefill_s"] = time.time() - t0
-        return torch.stack(out)
-
-    def _run_row(self, job: PrefillRowJob, pool: MotifKVPool) -> torch.Tensor:
-        """Every chunk of one row, in order; returns the host logits of the row's last position."""
-        logits = None
-        for ch, host in zip(job.plan.chunks, job.tables):
+        t1 = time.time()
+        for p, host in zip(batch.passes, batch.tables):
+            if p.is_packed:
+                for row, lg in self._run_packed(batch, p, host, pool).items():
+                    out[row] = lg
+                continue
+            g = p.segments[0]
+            job = batch.jobs[g.row]
+            ch = job.plan.chunks[g.chunk_index]
             lg = self._run_chunk(job, ch, host, pool)
             if ch.last:
-                logits = lg
-        self.stats["prefill_chunks"] += len(job.plan.chunks)
-        self.stats["sp1_chunks"] += sum(c.is_sp1 for c in job.plan.chunks)
-        self.stats["recomputed_rows"] += job.plan.recompute
-        if logits is None:
-            raise AssertionError("a row plan without a last chunk")
-        return logits
+                out[g.row] = lg
+        t2 = time.time()
+        missing = [i for i, lg in enumerate(out) if lg is None]
+        if missing:
+            raise AssertionError(f"prefill rows {missing} got no logits (a plan without their last chunk)")
+        self._count_prefill(batch)
+        self.timings["last_prefill_plan_s"] = t1 - t0
+        self.timings["last_prefill_s"] = t2 - t1
+        return torch.stack(out)
+
+    def _count_prefill(self, batch: PrefillBatchPlan) -> None:
+        st = self.stats
+        st["prefill_calls"] += 1
+        st["prefill_rows"] += len(batch.jobs)
+        st["prefill_chunks"] += batch.chunks
+        st["sp1_chunks"] += sum(c.is_sp1 for j in batch.jobs for c in j.plan.chunks)
+        st["recomputed_rows"] += sum(j.plan.recompute for j in batch.jobs)
+        packed = batch.packed_passes
+        st["solo_passes"] += len(batch.passes) - len(packed)
+        st["packed_calls"] += int(bool(packed))
+        st["packed_passes"] += len(packed)
+        st["packed_pk1_passes"] += sum(p.kind == PP.PK1 for p in packed)
+        st["packed_segments"] += sum(len(p.segments) for p in packed)
+        st["packed_dummy_segments"] += sum(p.dummies for p in packed)
+        st["packed_padding_rows"] += sum(p.padding_rows for p in packed)
+        if batch.plan_error is not None:
+            st["packed_plan_errors"] += 1
+            self.log(
+                f"error: the packed prefill plan of a {len(batch.jobs)}-row call failed ({batch.plan_error}); the call "
+                f"ran per row in writer-first order instead (a packed-planner bug: please report; rows (start, end) "
+                f"{[(int(j.request.start), int(j.request.end)) for j in batch.jobs][:8]}"
+                f"{' ...' if len(batch.jobs) > 8 else ''})"
+            )
+        fallbacks = batch.fallbacks
+        st["packed_solo_fallbacks"] += len(fallbacks)
+        for shape in sorted({p.fallback for p in fallbacks} - self._fallback_logged):
+            self._fallback_logged.add(shape)
+            self.log(
+                f"packed prefill: pass shape {shape} was not warmed before the decode capture (packing was off at the "
+                "warm-up?): its segments run as solo chunks (logged once per shape)"
+            )
 
     def _run_chunk(self, job: PrefillRowJob, ch: PP.ChunkPlan, host: ChunkHostTables, pool: MotifKVPool):
         """One chunk: inputs -> layers -> (last chunk) head + host logits -> (MTP) KV-only fill. Returns the logits of
@@ -971,41 +1448,100 @@ class MotifGenerator(api.MotifGenerator):
                 inp.free()
         return logits
 
+    def _run_packed(
+        self, batch: PrefillBatchPlan, p: PP.PrefillPass, host: PackedHostTables, pool: MotifKVPool
+    ) -> Dict[int, torch.Tensor]:
+        """One packed pass (module docstring): inputs -> layers at ``T`` -> the LM head per segment that ends its row
+        -> (MTP) one KV-only fill of the pass. Returns ``{row index: host logits of its last position}``. Every tensor
+        of the pass is freed on return."""
+        model, cfg = self.model, self.cfg
+        reqs = batch.requests
+        T = int(p.tokens)
+        inp = tok = X = tile = hn = nxt = None
+        logits: Dict[int, torch.Tensor] = {}
+        try:
+            inp = model.chunk_inputs(host)
+            tok = model.embed.prefill_tokens_device(PP.pass_tokens(p, reqs, cfg.pad_token_id), T)
+            X = model.prefill_chunk(tok, chunk=inp, kv_caches=pool)
+            _free(tok)
+            tok = None
+            if self.pass_observer is not None:
+                self.pass_observer(batch, p, X)
+            for k, row in p.head_rows():  # packed row k S + end - 1 - start of each segment that ends its row
+                tile = model.head.forward_prefill(X, row)
+                logits[int(p.segments[k].row)] = model.head.prefill_logits_to_host(tile, row)
+                _free(tile)
+                tile = None
+            if model.mtp is not None:
+                # t_{p+1} of every segment row; a row's last known position takes the host argmax (design §3.4 "MTP")
+                ids = []
+                for g in p.segments:
+                    req = reqs[g.row]
+                    stand_in = int(torch.argmax(logits[g.row])) if g.end == req.end else None
+                    ids.append(mtp_next_tokens(req.tokens, g.start, g.end, stand_in))
+                nxt = model.embed.rows_tokens_device(PP.pass_rows(p, ids, cfg.pad_token_id), T)
+                hn = model.head.stream_mean_norm(X)
+                model.mtp.fill_kv_prefill(hn, nxt, kv_cache=pool.mtp, chunk=inp)
+                self.stats["mtp_fills"] += 1
+        finally:
+            _free(tok, X, tile, hn, nxt)
+            if inp is not None:
+                inp.free()
+        return logits
+
     # ==============================================================================================================
     # decode paths (GEN-3; features design §3.8, §3.11)
     # ==============================================================================================================
     def decode_paths(self) -> List[DecodeKey]:
-        """The ``(kind, mode)`` decode paths :meth:`warmup_decode` prepares and captures: the serving path first, then
-        :attr:`extra_decode_paths` (deduplicated)."""
-        out = [self.serving_path]
+        """The ``(kind, mode)`` decode paths :meth:`warmup_decode` prepares and captures, in capture order:
+        :attr:`serving_paths` first (in ``auto`` the T32-spec path, then the T64 path), then :attr:`extra_decode_paths`
+        (deduplicated)."""
+        out = list(self.serving_paths)
         for kind, mode in self.extra_decode_paths:
             key = (str(kind), _check_mode(str(mode)))
             if key[0] not in DECODE_KINDS:
                 raise ValueError(f"decode path kind must be one of {DECODE_KINDS}, got {key[0]!r}")
-            if key[0] == SPEC and self.model.mtp is None:
-                raise ValueError("a spec decode path needs the MTP layer")
+            if key[0] in SPEC_KINDS and self.model.mtp is None:
+                raise ValueError(f"a {key[0]} decode path needs the MTP layer")
             if key not in out:
                 out.append(key)
         return out
 
-    def _resolve_key(self, kind: Optional[str], path: Optional[DecodeKey]) -> DecodeKey:
+    def _resolve_key(self, kind: Any, path: Optional[DecodeKey]) -> DecodeKey:
+        """The decode path of a call: ``path`` when given (its kind must be ``kind``: one kind or a tuple of kinds;
+        None = any), else :attr:`serving_path` (``kind=None``) or the default path of the first kind."""
+        kinds = DECODE_KINDS if kind is None else ((kind,) if isinstance(kind, str) else tuple(kind))
         if path is not None:
             key = (str(path[0]), _check_mode(str(path[1])))
-            if key[0] not in DECODE_KINDS or (kind is not None and key[0] != kind):
-                raise ValueError(f"decode path {path!r} is not a {kind or 'plain / spec'} path")
+            if key[0] not in DECODE_KINDS or key[0] not in kinds:
+                raise ValueError(f"decode path {path!r} is not a {' / '.join(kinds)} path")
             return key
         if kind is None:
             return self.serving_path
-        return (kind, self.decode_kv_mode if kind == PLAIN else self.spec_kv_mode)
+        k = kinds[0]
+        return (k, self.decode_kv_mode if k == PLAIN else self.spec_kv_mode)
+
+    @property
+    def wide_rows_per_dp(self) -> int:
+        """Rows per DP row of the T64 step: ``2 * cfg.lanes_per_row`` = 16 (``[8 anchors | 8 drafts]``)."""
+        return 2 * int(self.cfg.lanes_per_row)
 
     def _path_host_inputs(self, kind: str, mode: str, tokens: torch.Tensor, positions: torch.Tensor, page_table=None):
-        """Host mesh tensors of a path's own persistent inputs: ``tokens`` (lane order, 0 on inactive lanes), the RoPE
-        rows ``rot`` of ``positions``, and for the draft-1 plain ``row`` path its ``cur`` / ``pt`` (every other path
-        keeps FlashMLA's inputs in its ``DecodeKVWrite``)."""
+        """Host mesh tensors of a path's own persistent inputs: ``tokens`` (0 on inactive rows), the RoPE rows ``rot``
+        of ``positions``, and for the draft-1 plain ``row`` path its ``cur`` / ``pt`` (every other path keeps FlashMLA's
+        inputs in its ``DecodeKVWrite``). ``tokens`` / ``positions``: the 32 lanes, or on the wide path the T64 step's
+        64 physical rows (``16 r + j``: 16 per DP row, ``verify_plan.WideStepPlan.tokens`` / ``.positions``)."""
         cfg, mesh = self.cfg, self.mesh_device
         pos = positions.to(torch.int32)
         active = pos >= 0
         tok = torch.where(active, tokens.to(torch.int32), torch.zeros_like(pos))
+        if kind == WIDE:
+            rpd = self.wide_rows_per_dp
+            return {
+                "tokens": self.model.embed.decode_tokens_host(tok, rows_per_dp=rpd),
+                "rot": shard_lanes(positions_to_rot_idxs(pos, cfg, rows_per_dp=rpd), cfg, mesh, dtype=ttnn.uint32,
+                                   device=None),  # fmt: skip
+            }
         out = {
             "tokens": self.model.embed.decode_tokens_host(tok),
             "rot": shard_lanes(positions_to_rot_idxs(pos, cfg), cfg, mesh, dtype=ttnn.uint32, device=None),
@@ -1030,18 +1566,25 @@ class MotifGenerator(api.MotifGenerator):
                 f"decode path {key} is {have} and a decode trace exists: stage every path before the capture "
                 f"(extra_decode_paths + warmup_decode), or release_traces() first"
             )
+        if kind in SPEC_KINDS and self.model.mtp is None:
+            raise ValueError(f"the {kind} decode path needs the MTP layer")
+        if kind == WIDE:  # before anything is freed or allocated: a T64 config, a split mode, R1 (ring_gather safe)
+            self._check_wide_launch(mode)
         if p is not None:
             self._free_path(p)
-        if kind == SPEC and self.model.mtp is None:
-            raise ValueError("the spec decode path needs the MTP layer")
-        n = api.NUM_LANES
+        n = api.WIDE_ROWS if kind == WIDE else api.NUM_LANES
         h = self._path_host_inputs(
             kind, mode, torch.zeros(n, dtype=torch.int32), torch.full((n,), -1, dtype=torch.int32),
             torch.zeros(n, int(width), dtype=torch.int32),
         )  # fmt: skip
         p = DecodePath(kind=kind, mode=mode, width=int(width))
         p.inputs = {k: ttnn.to_device(v, self.mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG) for k, v in h.items()}
-        if not (kind == PLAIN and mode == "row"):  # the draft-1 path keeps the attention's own 8-lane update
+        if kind == WIDE:  # 16 rows per DP row; the split-order KV-R gather (all_split); the A'' group inputs
+            p.kv_write = DecodeKVWrite(
+                self.mesh_device, self.cfg, ccl=self.model.ccl, page_table_width=int(width), mode=mode,
+                rows=api.WIDE_ROWS, gather="split",
+            )  # fmt: skip
+        elif not (kind == PLAIN and mode == "row"):  # the draft-1 path keeps the attention's own 8-lane update
             p.kv_write = DecodeKVWrite(
                 self.mesh_device, self.cfg, ccl=self.model.ccl, page_table_width=int(width), mode=mode
             )
@@ -1070,6 +1613,15 @@ class MotifGenerator(api.MotifGenerator):
         for k, v in h.items():
             ttnn.copy_host_to_device_tensor(v, p.inputs[k])
         p.kv_write.write_step(ps.step, validate=False)
+
+    def _write_wide(self, p: DecodePath, plan: VP.WideStepPlan) -> None:
+        """One T64 step's inputs (``verify_plan.plan_wide_step`` ran every check already): the 64 physical rows' tokens
+        (``[4, 16]`` per DP row) and RoPE rows, then the ``DecodeKVWrite(rows=64)`` inputs (``cur_pos [16]`` /
+        ``page_table [16, W]`` per DP row, the call inputs, the A'' group inputs; unchanged inputs are skipped)."""
+        h = self._path_host_inputs(WIDE, p.mode, plan.tokens, plan.positions)
+        for k, v in h.items():
+            ttnn.copy_host_to_device_tensor(v, p.inputs[k])
+        p.kv_write.write_step(plan.step, validate=False)
 
     def _plain_step(self, p: DecodePath, pool: MotifKVPool):
         """One plain decode step on the device (eager or inside a capture): ROW_MAJOR logits ``[1, 1, 32, 6880]``.
@@ -1102,8 +1654,58 @@ class MotifGenerator(api.MotifGenerator):
                 raise
         return out
 
+    def _wide_step(self, p: DecodePath, pool: MotifKVPool):
+        """One T64 step on the device (eager or inside a capture): ``(rm, a, m)`` (``MotifModel.decode_wide``; ``rm``
+        = the anchors' ROW_MAJOR logits only when :attr:`wide_has_logits`, else None). With ``spec_verify="wide"`` and
+        device sampling the step also samples ``rm`` (the 32 anchors, exactly the ``[1, 1, 32, 6880]`` the T32 trace
+        samples); its outputs wait in :meth:`_take_so`. In ``auto`` the T64 trace holds no sampler."""
+        want_rm = self.wide_has_logits
+        out = self.model.decode_wide(
+            p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool, want_rm=want_rm
+        )
+        if self.sampler is not None and want_rm:
+            try:
+                self._pending_so = self.sampler.sample(out[0])
+            except BaseException:
+                _free(*out)
+                raise
+        return out
+
     def _device_step(self, p: DecodePath, pool: MotifKVPool):
-        return self._spec_step(p, pool) if p.kind == SPEC else self._plain_step(p, pool)
+        if p.kind == SPEC:
+            return self._spec_step(p, pool)
+        if p.kind == WIDE:
+            return self._wide_step(p, pool)
+        return self._plain_step(p, pool)
+
+    def _replay(self, p: DecodePath) -> None:
+        """Enqueue one replay of ``p``'s trace (non-blocking). F3N rule R4 (design §2.3): with several traces, a trace's
+        outputs must be read before another trace replays (a later capture may have put its outputs on an earlier
+        trace's intermediates). Every decode step ends in a blocking read of the outputs it replayed
+        (:meth:`_read_done`); a replay of another path while :attr:`_unread` is set raises before anything is
+        enqueued."""
+        if self._unread is not None and self._unread != p.key:
+            raise RuntimeError(
+                f"F3N rule R4: decode trace {p.key} replayed while the outputs of {self._unread} are not read yet "
+                f"(every decode step must end in a blocking read of its outputs)"
+            )
+        ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
+        self._unread = p.key
+
+    def _read_done(self) -> None:
+        """The step's blocking read returned: every output it replayed is on the host (F3N rule R4)."""
+        self._unread = None
+
+    def _abort_step(self) -> None:
+        """A decode step raised after a replay was enqueued: wait for the device before another trace may replay (R4);
+        if even that fails, :attr:`_unread` stays set and a replay of another trace keeps refusing."""
+        if self._unread is None:
+            return
+        try:
+            ttnn.synchronize_device(self.mesh_device)
+        except Exception:
+            return
+        self._unread = None
 
     def _check_trace_use(self, p: Optional[DecodePath], pool, width: int, enable_trace: bool) -> bool:
         use = bool(enable_trace) and p is not None and p.traced
@@ -1120,12 +1722,13 @@ class MotifGenerator(api.MotifGenerator):
         self, batch: api.DecodeBatch, *, kv_cache: Any, enable_trace: bool, path: Optional[DecodeKey] = None
     ) -> torch.Tensor:
         """One decode step for every lane (``generator_api.MotifGenerator.decode_forward``): host logits ``[32,
-        220160]`` (a fresh tensor). On a speculating launch the serving path is the spec trace: the step is an
-        ordinary spec step (``decode_forward_spec`` without drafts, the same logits; the MTP layer also writes its
-        cache, design G8). ``path`` (tests): run a specific ``(kind, mode)`` path instead of the serving one."""
+        220160]`` (a fresh tensor). On a speculating launch the serving path is the spec trace (``spec_verify`` "wide":
+        the T64 trace): the step is an ordinary spec step (``decode_forward_spec`` without drafts, the same logits; the
+        MTP layer also writes its cache, design G8). ``path`` (tests): run a specific ``(kind, mode)`` path instead of
+        the serving one."""
         pool = self._check_pool(kv_cache)
         key = self._resolve_key(None, path)
-        if key[0] == SPEC:
+        if key[0] in SPEC_KINDS:
             res = self.decode_forward_spec(
                 api.SpecDecodeBatch.from_decode_batch(batch), kv_cache=pool, enable_trace=enable_trace,
                 want_logits=True, path=key,
@@ -1140,8 +1743,14 @@ class MotifGenerator(api.MotifGenerator):
         self.stats["decode_steps"] += 1
         head = self.model.head
         if use_trace:
-            ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
-            return head.logits_to_host(p.out)  # blocking read of the trace output (fresh host tensor)
+            self._replay(p)
+            try:
+                lg = head.logits_to_host(p.out)  # blocking read of the trace output (fresh host tensor)
+            except BaseException:
+                self._abort_step()
+                raise
+            self._read_done()
+            return lg
         out = self._plain_step(p, pool)
         so = self._take_so()  # a host-sampled step on a device-sampling launch: the sampler's outputs are not used
         try:
@@ -1174,11 +1783,11 @@ class MotifGenerator(api.MotifGenerator):
         exact host fallback of the flagged active lanes (logits read only then). Returns the lane-order
         :class:`SampleResult` (``tokens`` int64 ``[32]``, raw ``logprobs``; inactive lanes are don't-care). On a
         speculating launch this is the ordinary step of the spec trace (:meth:`decode_forward_spec` with
-        ``sampling``)."""
+        ``sampling``; ``spec_verify="wide"``: of the T64 trace, sampling its anchor rows)."""
         smp = self._require_sampler()
         pool = self._check_pool(kv_cache)
         key = self._resolve_key(None, path)
-        if key[0] == SPEC:
+        if key[0] in SPEC_KINDS:
             res = self.decode_forward_spec(
                 api.SpecDecodeBatch.from_decode_batch(batch), kv_cache=pool, enable_trace=enable_trace,
                 want_logits=False, path=key, sampling=sampling,
@@ -1197,13 +1806,17 @@ class MotifGenerator(api.MotifGenerator):
         dev = so = None
         try:
             if use_trace:
-                ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
+                self._replay(p)
                 rm, so_read = p.out, p.so
             else:
                 rm = dev = self._plain_step(p, pool)
                 so = so_read = self._take_so()
             res = smp.read(so_read)  # blocking (chip 0, 1 KB): waits for the step
             res = self._finish_sampled("plain", batch.positions, res, rm)
+            self._read_done()
+        except BaseException:
+            self._abort_step()
+            raise
         finally:
             _free(dev, so)
         self.timings["last_sampled_step_ms"] = (time.perf_counter() - t0) * 1e3
@@ -1211,7 +1824,7 @@ class MotifGenerator(api.MotifGenerator):
 
     def plan_spec_step(self, batch: api.SpecDecodeBatch, *, path: Optional[DecodeKey] = None) -> SpecStepPlan:
         """:func:`plan_spec_step` with this generator's config, pool and (once traced) trace width: every host check
-        and the packing of one speculative step, before any device op."""
+        and the packing of one speculative step on the T32-spec trace, before any device op."""
         key = self._resolve_key(SPEC, path)
         p = self._paths.get(key)
         return plan_spec_step(
@@ -1221,6 +1834,23 @@ class MotifGenerator(api.MotifGenerator):
             num_blocks=None if self._pool is None else int(self._pool.num_blocks),
             width=p.width if (p is not None and p.traced) else None,
             lanes_per_call=None if (p is None or p.kv_write is None) else p.kv_write.lanes_per_call,
+        )
+
+    def plan_wide_step(self, batch: api.SpecDecodeBatch, *, path: Optional[DecodeKey] = None) -> VP.WideStepPlan:
+        """``verify_plan.plan_wide_step`` with this generator's config and pool, and the T64 path's geometry (once
+        staged: its ``DecodeKVWrite(rows=64)``'s users per call and gather order; once traced: its width): every host
+        check and the 64-row layout of one T64 step, before any device op. Raises ``ValueError`` on a bad batch."""
+        key = self._resolve_key(WIDE, path)
+        p = self._paths.get(key)
+        w = None if p is None else p.kv_write
+        return VP.plan_wide_step(
+            batch,
+            cfg=self.cfg,
+            width=p.width if (p is not None and p.traced) else None,
+            mode=key[1],
+            num_blocks=None if self._pool is None else int(self._pool.num_blocks),
+            lanes_per_call=None if w is None else w.lanes_per_call,
+            gather="split" if w is None else w.gather,
         )
 
     def decode_forward_spec(
@@ -1234,24 +1864,49 @@ class MotifGenerator(api.MotifGenerator):
         sampling: Optional[LaneSampling] = None,
     ) -> api.SpecDecodeResult:
         """One decode step of a speculating launch (``generator_api.MotifGenerator.decode_forward_spec``; features
-        design §3.8; module docstring "Speculative decode"): the plan (host checks, packing), then one replay of the
-        T32-spec trace (pass 1: anchors on their lanes at ``n``, packed drafts on idle partner lanes at ``n + 1``) and,
-        only when some draft found no idle lane, a second replay (pass 2: those drafts on their own lanes at ``n +
-        1``). Returns ``SpecDecodeResult`` in owner-lane order: ``argmax = (a0, a1)``, ``mtp_argmax = (m0, m1)``,
-        logits of the anchor rows when ``want_logits`` (pass 1's owner lanes). ``path`` (tests): a non-default spec
-        path ``("spec", mode)``.
+        design §3.8; module docstrings "Speculative decode" and "T64 verify"). Returns ``SpecDecodeResult`` in
+        owner-lane order: ``argmax = (a0, a1)``, ``mtp_argmax = (m0, m1)``, the anchors' logits when ``want_logits``.
+
+        Routing (host, before any device op): ``path`` when given (tests: ``("spec", mode)`` or ``("wide", mode)``),
+        else :meth:`verify_kind` (``verify_plan.choose_verify_kind`` with :attr:`spec_verify`).
+
+        * **T32** (``"spec"``): the plan (host checks, packing), then one replay of the T32-spec trace (pass 1: anchors
+          on their lanes at ``n``, packed drafts on idle partner lanes at ``n + 1``) and, only when some draft found no
+          idle lane, a second replay (pass 2: those drafts on their own lanes at ``n + 1``). Logits: pass 1's owner
+          lanes.
+        * **T64** (``"wide"``): ``plan_wide_step`` (host checks, the 64-row layout), then ONE replay of the T64 trace:
+          every lane's anchor at ``n`` and its draft at ``n + 1`` on its own DP row (no idle lane needed, no overflow
+          pass). Logits (``spec_verify="wide"`` only; in ``auto`` the T64 trace is argmax-only and a step that wants
+          logits or sampling runs on T32): the anchor rows.
 
         ``sampling`` (device sampling; an ORDINARY step only -- a verify step returns argmax ids and PS-1 keeps sampled
         rows out of it): the lane-ordered ``(temperature, top_p, top_k, seeds)`` of :meth:`decode_forward_sampled`;
         the step samples every lane on device (the anchors' positions key the RNG) and returns a
         :class:`SampledSpecDecodeResult` whose ``sample`` holds the tokens (flagged active lanes resolved on the
-        host); ``a`` / ``m`` are still returned for the bridge's speculation bookkeeping."""
+        host); ``a`` / ``m`` are still returned for the bridge's speculation bookkeeping.
+
+        Every step ends in one blocking read of the outputs it replayed (F3N rule R4: a replay of the other trace while
+        outputs are unread is refused, :meth:`_replay`)."""
         pool = self._check_pool(kv_cache)
         if self.model.mtp is None:
             raise NotImplementedError("decode_forward_spec needs the MTP layer (the generator was built without it)")
         t0 = time.perf_counter()
-        key = self._resolve_key(SPEC, path)
-        plan = self.plan_spec_step(batch, path=key)
+        if path is not None:
+            key = self._resolve_key(SPEC_KINDS, path)
+        else:
+            key = (self.verify_kind(batch, want_logits=want_logits, sampling=sampling), self.spec_kv_mode)
+        wide = key[0] == WIDE
+        if wide:
+            plan = self.plan_wide_step(batch, path=key)
+            passes: Sequence[Any] = (plan,)
+            if want_logits and not self.wide_has_logits:
+                raise ValueError(
+                    f"want_logits on the T64 trace of a spec_verify={self.spec_verify!r} launch: it is argmax-only "
+                    f"(steps that want logits run on the T32-spec trace)"
+                )
+        else:
+            plan = self.plan_spec_step(batch, path=key)
+            passes = plan.passes
         smp = None
         if sampling is not None:
             smp = self._require_sampler()
@@ -1260,11 +1915,17 @@ class MotifGenerator(api.MotifGenerator):
                     "device sampling on a verify step: a verify returns the target argmax ids (PS-1 keeps sampled "
                     "rows out of verify steps); sample on ordinary steps only"
                 )
+            if wide and not self.wide_has_logits:
+                raise ValueError(
+                    f"device sampling on the T64 trace of a spec_verify={self.spec_verify!r} launch: it holds no "
+                    f"sampler (sampled steps run on the T32-spec trace)"
+                )
         use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
         if smp is not None and use_trace and self._paths[key].so is None:
             raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
         p = self._stage_path(key, batch.page_table_width)
         head, outs, logits = self.model.head, [], None
+        n_ids = api.WIDE_ROWS if wide else api.NUM_LANES  # a / m: 32 lane-ordered ids (T32), 64 split-order (T64)
         prof = self.spec_profile
         t_prev = time.perf_counter()
         prof["plan"] += (t_prev - t0) * 1e3
@@ -1279,23 +1940,28 @@ class MotifGenerator(api.MotifGenerator):
         # order pass 1's reads complete before pass 2 overwrites the trace outputs.
         fast = use_trace and head.vocab_split == "mesh" and self.spec_observer is None
         staged = []
-        n_pass = len(plan.passes)
+        n_pass = len(passes)
         res_s = None
         keep_dev = None  # an eager device-sampled step keeps its outputs until the host fallback ran
         rm_s = None
         try:
-            for i, ps in enumerate(plan.passes):
-                self._write_spec(p, ps)
-                read_logits = (bool(want_logits) and i == 0) or (self.spec_observer is not None and self.observe_logits)
+            for i, ps in enumerate(passes):
+                if wide:
+                    self._write_wide(p, ps)
+                else:
+                    self._write_spec(p, ps)
                 dev = so = None
                 t1 = time.perf_counter()
                 if use_trace:
-                    ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
+                    self._replay(p)
                     rm, a_t, m_t = p.out
                     so_read = p.so
                 else:
-                    rm, a_t, m_t = dev = self._spec_step(p, pool)
+                    rm, a_t, m_t = dev = self._device_step(p, pool)
                     so = so_read = self._take_so()
+                read_logits = rm is not None and (
+                    (bool(want_logits) and i == 0) or (self.spec_observer is not None and self.observe_logits)
+                )
                 t2 = time.perf_counter()
                 lg = None
                 sample_here = smp is not None and i == 0
@@ -1342,13 +2008,20 @@ class MotifGenerator(api.MotifGenerator):
                     self.spec_observer(plan, i, {"a": outs[-1][0], "m": outs[-1][1], "logits": lg})
                     t_prev = time.perf_counter()
             for ra, rmm in staged:  # every staging buffer landed with the step's last (blocking) read
-                outs.append((_ids_from_staging(ra), _ids_from_staging(rmm)))
-            res = plan.result(outs, logits=logits)
+                outs.append((_ids_from_staging(ra, n_ids), _ids_from_staging(rmm, n_ids)))
+            if wide:
+                res = plan.result(outs[0][0], outs[0][1], logits=logits)
+            else:
+                res = plan.result(outs, logits=logits)
             if smp is not None:
-                res_s = self._finish_sampled("spec", batch.positions, res_s, rm_s)
+                res_s = self._finish_sampled(key[0], batch.positions, res_s, rm_s)
                 res = SampledSpecDecodeResult(
                     logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=res_s
                 )
+            self._read_done()
+        except BaseException:
+            self._abort_step()
+            raise
         finally:
             if keep_dev is not None:
                 _free(*keep_dev[0], keep_dev[1])
@@ -1356,14 +2029,22 @@ class MotifGenerator(api.MotifGenerator):
         st["spec_steps"] += 1
         st["verify_steps"] += int(plan.is_verify)
         st["drafts"] += plan.num_drafts
-        st["packed_drafts"] += len(plan.partner_of)
-        st["cross_row_partners"] += plan.cross_row_partners
-        st["overflow_drafts"] += len(plan.overflow)
-        st["overflow_passes"] += int(len(plan.passes) > 1)
+        if wide:
+            st["wide_steps"] += 1
+            st["wide_verify_steps"] += int(plan.is_verify)
+            st["wide_drafts"] += plan.num_drafts
+        else:
+            st["packed_drafts"] += len(plan.partner_of)
+            st["cross_row_partners"] += plan.cross_row_partners
+            st["overflow_drafts"] += len(plan.overflow)
+            st["overflow_passes"] += int(len(plan.passes) > 1)
+            st["auto_t32_verifies"] += int(plan.is_verify and self.spec_verify == "auto")
         self.last_spec = plan
+        self.last_verify_kind = key[0]
         t5 = time.perf_counter()
         prof["result"] += (t5 - t_prev) * 1e3
         prof["steps"] += 1
+        prof["wide"] += int(wide)
         prof["total"] += (t5 - t0) * 1e3
         self.timings["last_spec_step_ms"] = (t5 - t0) * 1e3
         return res
@@ -1396,19 +2077,24 @@ class MotifGenerator(api.MotifGenerator):
         ``-1``, an sp1 chunk sits at ``warmup_start`` with an all-zero SDPA table and null tail blocks), so nothing is
         written and only the null block is read; the LM head and, with the MTP layer, its KV-only fill run as in
         serving. Compiles every program of the shape."""
+        self._warm_full(warmup_chunk_host_tables(self.cfg, path, bucket), pool)
+
+    def _warm_full(self, host: Any, pool: MotifKVPool) -> None:
+        """One full warm-up run of ``host`` (warm-up chunk or packed-pass tables: nothing written, only the null block
+        read): embedding, every layer, the LM head on the first segment's last row, the MTP KV-only fill."""
         model, cfg = self.model, self.cfg
-        host = warmup_chunk_host_tables(cfg, path, bucket)
-        pad = torch.full((int(bucket),), int(cfg.pad_token_id), dtype=torch.int32)
+        rows = int(host.bucket)
+        pad = torch.full((rows,), int(cfg.pad_token_id), dtype=torch.int32)
         inp = tok = X = tile = hn = nxt = None
         try:
             inp = model.chunk_inputs(host)
-            tok = model.embed.prefill_tokens_device(pad, bucket)
+            tok = model.embed.prefill_tokens_device(pad, rows)
             X = model.prefill_chunk(tok, chunk=inp, kv_caches=pool)
-            row = int(host.end) - 1 - int(host.start)
+            row = host.head_row(0) if host.is_packed else int(host.end) - 1 - int(host.start)
             tile = model.head.forward_prefill(X, row)
             model.head.prefill_logits_to_host(tile, row)
             if model.mtp is not None:
-                nxt = model.embed.rows_tokens_device(pad, bucket)
+                nxt = model.embed.rows_tokens_device(pad, rows)
                 hn = model.head.stream_mean_norm(X)
                 model.mtp.fill_kv_prefill(hn, nxt, kv_cache=pool.mtp, chunk=inp)
         finally:
@@ -1416,7 +2102,34 @@ class MotifGenerator(api.MotifGenerator):
             if inp is not None:
                 inp.free()
 
+    def _warm_packed(self, shape: PrefillShape, pool: MotifKVPool) -> str:
+        """Compile the programs of one packed pass shape (design §3.5; ``warmup_packed_host_tables``: nothing written,
+        only the null block read). ``packed_warmup="attention"``: the attention of one global and one SWA layer
+        (``model.warm_attention``; every other program of a pass of ``T`` rows is the solo bucket-``T`` chunk's), plus
+        the MTP layer's packed fill once per ``T`` (gathered RoPE rows at ``T``; the sp1 bucket-``T`` warm-up compiles
+        it too, unless ``T`` exceeds ``max_sp1_bucket``). ``"full"``: one full warm-up pass. Returns what ran."""
+        model = self.model
+        path, T, S = str(shape[0]), int(shape[1]), int(shape[2])
+        tails = shape[3] if len(shape) > 3 else None
+        host = warmup_packed_host_tables(self.cfg, path, T, S, tails)
+        if self.packed_warmup == "full":
+            self._warm_full(host, pool)
+            self._packed_mtp_warmed.add(T)
+            return "full pass"
+        mtp = model.mtp is not None and T not in self._packed_mtp_warmed
+        inp = model.chunk_inputs(host)
+        try:
+            layers = model.warm_attention(inp, pool, mtp=mtp)
+        finally:
+            inp.free()
+        if mtp:
+            self._packed_mtp_warmed.add(T)
+        return f"attention L{'/L'.join(map(str, layers))}{' + MTP fill' if mtp else ''}"
+
     def warmup_prefill(self, *, kv_cache: Any, enable_trace: bool) -> None:
+        """Compile every prefill shape before the decode capture (module docstring, step 3): one warm-up chunk per solo
+        ``(path, bucket)`` (:meth:`prefill_shapes`), then, while :attr:`packed_prefill` is on, every packed shape
+        (:meth:`packed_shapes`, :meth:`_warm_packed`). Writes nothing. Shapes already warmed are skipped."""
         pool = self._check_pool(kv_cache)
         if enable_trace:  # plugin trace_mode="all": prefill is eager
             return
@@ -1435,6 +2148,26 @@ class MotifGenerator(api.MotifGenerator):
                 f"warmup prefill {path} bucket {b}{' (+ MTP fill)' if self.mtp_enabled else ''}: "
                 f"{self.timings[key]:.1f} s"
             )
+        if self.packed_prefill:
+            t_pk = time.time()
+            todo = [s for s in self.packed_shapes() if s not in self._warmed]
+            per_t: Dict[int, List[str]] = {}
+            for shape in todo:
+                t0 = time.time()
+                what = self._warm_packed(shape, pool)
+                self._warmed.add(shape)
+                tails = "/" + shape[3] if len(shape) > 3 else ""
+                per_t.setdefault(int(shape[1]), []).append(
+                    f"{shape[0]} S{shape[2]}{tails} {time.time() - t0:.2f} s ({what})"
+                )
+            for T, lines in sorted(per_t.items()):
+                self.log(f"warmup packed prefill T={T}: {'; '.join(lines)}")
+            self.timings["warmup_packed_s"] = time.time() - t_pk
+            if todo:
+                self.log(
+                    f"warmup packed prefill: {len(todo)} shapes ({self.packed_warmup!r}) in "
+                    f"{self.timings['warmup_packed_s']:.1f} s"
+                )
         self.timings["warmup_prefill_s"] = time.time() - t_all
 
     def _inactive_step(self, p: DecodePath, pool: MotifKVPool) -> None:
@@ -1444,14 +2177,19 @@ class MotifGenerator(api.MotifGenerator):
         tokens, pos = torch.zeros(n, dtype=torch.int32), torch.full((n,), -1, dtype=torch.int32)
         pt = torch.zeros(n, p.width, dtype=torch.int32)
         head = self.model.head
-        if p.kind == SPEC:
-            self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
-            rm, a, m = outs = self._spec_step(p, pool)
+        if p.kind in SPEC_KINDS:
+            if p.kind == WIDE:
+                self._write_wide(p, self._inactive_wide_plan(p))
+                rm, a, m = outs = self._wide_step(p, pool)
+            else:
+                self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
+                rm, a, m = outs = self._spec_step(p, pool)
             so = self._take_so()
             try:
                 head.tokens_to_host(a)
                 head.tokens_to_host(m)
-                head.logits_to_host(rm)
+                if rm is not None:
+                    head.logits_to_host(rm)
                 if so is not None:  # the sampler's reads (chip 0 and the staged every-chip read) before the capture
                     self.sampler.read(so, count=False)
                     self.sampler.read(so, mesh_sync=True, count=False)
@@ -1469,27 +2207,47 @@ class MotifGenerator(api.MotifGenerator):
                 _free(out, so)
         self.stats["decode_steps"] += 1
 
+    def _inactive_wide_plan(self, p: DecodePath) -> VP.WideStepPlan:
+        """The T64 step with every row inactive (warm-up and capture steps: nothing written), planned with ``p``'s
+        geometry."""
+        n = api.NUM_LANES
+        batch = api.SpecDecodeBatch(
+            tokens=torch.zeros(n, dtype=torch.int32), positions=torch.full((n,), -1, dtype=torch.int32),
+            draft_tokens=torch.full((n,), -1, dtype=torch.int32), page_table=torch.zeros(n, p.width, dtype=torch.int32),
+        )  # fmt: skip
+        w = p.kv_write
+        return VP.plan_wide_step(batch, cfg=self.cfg, mode=p.mode, lanes_per_call=w.lanes_per_call, gather=w.gather)
+
     def _write_inactive(self, p: DecodePath) -> None:
         n = api.NUM_LANES
         tokens, pos = torch.zeros(n, dtype=torch.int32), torch.full((n,), -1, dtype=torch.int32)
         pt = torch.zeros(n, p.width, dtype=torch.int32)
-        if p.kind == SPEC:
+        if p.kind == WIDE:
+            self._write_wide(p, self._inactive_wide_plan(p))
+        elif p.kind == SPEC:
             self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
         else:
             self._write_plain(p, api.DecodeBatch(tokens=tokens, positions=pos, page_table=pt))
 
     def warmup_decode(self, *, kv_cache: Any, enable_trace: bool, page_table_width: int) -> None:
-        """``enable_trace=False``: stage every decode path (:meth:`decode_paths`: the serving path, plus
+        """``enable_trace=False``: stage every decode path (:meth:`decode_paths`: the serving paths, plus
         :attr:`extra_decode_paths`) for width ``W`` and run one eager all-inactive step of each (compiles every decode
-        program). ``enable_trace=True``: capture each path's trace (after the prefill warmup and the eager decode
-        warmup, which it runs first when needed); then one replay with every lane inactive. On a speculating launch the
-        serving path is the T32-spec step (``("spec", "all_split")`` with prefix caching), the one trace that serves
-        ordinary, verify and overflow steps."""
+        program and allocates every persistent input: F3N rules R2 / R3). ``enable_trace=True``: capture each path's
+        trace once (after the prefill warmup and the eager decode warmup of EVERY path, which it runs first when
+        needed), in :meth:`decode_paths` order; then one replay of each with every lane inactive. On a speculating
+        launch the serving path is the T32-spec step (``("spec", "all_split")`` with prefix caching), the one trace
+        that serves ordinary, verify and overflow steps; ``spec_verify="auto"`` adds the T64 trace (``("wide",
+        "all_split")``, captured second); ``"wide"`` captures the T64 trace alone. A T64 path is staged and captured
+        only under ``ring_gather="safe"`` (F3N R1, checked here again: tests may switch ``MotifCCL.ring_gather`` at run
+        time)."""
         pool = self._check_pool(kv_cache)
         W = int(page_table_width)
         if W < 1:
             raise ValueError(f"page_table_width must be >= 1, got {W}")
         keys = self.decode_paths()
+        for key in keys:
+            if key[0] == WIDE:  # F3N R1 / R-E5 / R-E7 before any T64 staging or capture
+                self._check_wide_launch(key[1])
         if not enable_trace:
             t0 = time.time()
             for key in keys:
@@ -1501,13 +2259,17 @@ class MotifGenerator(api.MotifGenerator):
             self.timings["warmup_decode_eager_s"] = time.time() - t0
             self.log(f"warmup decode (eager, W={W}): paths {keys} in {self.timings['warmup_decode_eager_s']:.1f} s")
             return
-        missing = [s for s in self.prefill_shapes() if s not in self._warmed]
+        missing = [s for s in self.required_prefill_shapes() if s not in self._warmed]
         if missing:
-            raise RuntimeError(f"decode trace capture before the prefill warmup: shapes {missing} not compiled")
+            raise RuntimeError(
+                f"decode trace capture before the prefill warmup: {len(missing)} shapes not compiled: {missing[:6]}"
+                f"{' ...' if len(missing) > 6 else ''}"
+            )
         for key in keys:
             p = self._paths.get(key)
             if p is not None and p.traced and p.width != W:
                 raise RuntimeError(f"a decode trace for width {p.width} exists; release_traces() first")
+        # F3N R2: every path compiled (one eager step each) before the FIRST capture
         if any(key not in self._paths or not self._paths[key].warmed or self._paths[key].width != W for key in keys):
             self.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
         t_all = time.time()
@@ -1520,21 +2282,53 @@ class MotifGenerator(api.MotifGenerator):
             ttnn.synchronize_device(self.mesh_device)
             p.trace_id, p.out = self._capture_path(p, pool)
             p.pool = pool
+            self._acknowledge_trace_outputs(p)
             ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=True)  # one replay: all lanes inactive
             dt = time.time() - t0
             self.timings[f"capture_decode_{key[0]}_{key[1]}_s"] = dt
+            what = {PLAIN: "plain", SPEC: "T32-spec", WIDE: "T64 (16 rows per DP row)"}[key[0]]
             self.log(
-                f"decode trace captured: {key[0]} path (W={W}, {self.num_layers} layers"
-                f"{' + the MTP layer' if key[0] == SPEC else ''}, KV write {key[1]!r}) in {dt:.1f} s"
+                f"decode trace captured: {what} path (W={W}, {self.num_layers} layers"
+                f"{' + the MTP layer' if key[0] in SPEC_KINDS else ''}, KV write {key[1]!r}"
+                f"{', device sampler' if p.so is not None else ''}) in {dt:.1f} s"
             )
         self.timings["capture_decode_s"] = time.time() - t_all
         traced = [k for k, q in self._paths.items() if q.traced]
         if len(traced) > 1:
-            self.log(
-                f"warning: {len(traced)} decode traces captured ({traced}): a test configuration (serving captures "
-                "one). With two traces, prefills after a release_traces / new-program compile / re-capture cycle "
-                "returned garbage tiles (2026-10-03; tests/test_resumed_prefill.py MULTI_TRACE_NOTE)"
+            ring = self._ring_gather()
+            who = (
+                "the serving paths" if set(traced) <= set(self.serving_paths)
+                else f"a test configuration: serving captures {self.serving_paths}"
+            )  # fmt: skip
+            msg = (
+                f"{len(traced)} decode traces captured ({traced}; {who}). F3N rules (docs/p5_t64/f3.md §6): R1 "
+                f"ring_gather={ring!r} (every race-prone TP-ring all-gather rerouted: {ring == 'safe'}), R2 every "
+                f"decode path compiled before the first capture, R3 persistent inputs allocated before it, R4 every "
+                f"step reads its outputs before another trace replays, R5 no re-capture while serving"
             )
+            if ring != "safe":
+                msg = f"warning: {msg}. With native TP-ring gathers a prefill can read stale tiles (F3, f3.md §2)"
+            self.log(msg)
+
+    def _acknowledge_trace_outputs(self, p: DecodePath) -> None:
+        """F3N rule R6 (trace-allocation tracker runs only, ``TT_METAL_TRACE_ALLOC_TRACKING=1``; a no-op otherwise):
+        the outputs of a trace captured while another trace exists live on memory that the other trace's replays may
+        overwrite, which ``ttnn.execute_trace`` would report on every replay. They are read before the other trace
+        replays (R4), so they are acknowledged as corruptible right after the capture."""
+        try:
+            from ttnn.tools import trace_allocation_tracker as tat
+        except Exception:
+            return
+        if not getattr(tat, "TRACE_ALLOC_TRACKING", False):
+            return
+        if not any(q.traced for q in self._paths.values() if q is not p):
+            return
+        outs = list(p.out if isinstance(p.out, tuple) else (p.out,))
+        if p.so is not None:
+            outs += list(p.so.tensors())
+        for t in outs:
+            if t is not None:
+                tat.acknowledge_corruptible(t)
 
     def _capture_path(self, p: DecodePath, pool: MotifKVPool):
         """Exception-safe capture of one decode step of ``p`` (a dangling capture hung close_mesh_device once,
@@ -1675,6 +2469,7 @@ __all__ = [
     "PrefillBatchPlan",
     "PrefillRowJob",
     "SPEC",
+    "SPEC_KINDS",
     "SampledSpecDecodeResult",
     "SpecPass",
     "SpecStepPlan",
@@ -1682,4 +2477,5 @@ __all__ = [
     "check_prefill_page_table",
     "plan_spec_step",
     "prefill_page_table_host",
+    "WIDE",
 ]
