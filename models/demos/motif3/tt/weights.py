@@ -513,6 +513,14 @@ def local_expert_ids(cfg: MotifTTConfig) -> torch.Tensor:
     return ep_layout(torch.arange(cfg.num_experts, dtype=torch.float32).reshape(-1, 1, 1), cfg)
 
 
+def local_expert_mask(cfg: MotifTTConfig) -> torch.Tensor:
+    """``[dp, 96, 1, 384]`` fp32 one-hot rows in EP layout (chip gets ``[1, 12, 1, 384]``: row ``j`` is 1.0 at the global
+    id of its local expert ``j``): the A5 router mask's local extraction ``sum(ws * mask, -1)`` (``moe.MotifRouter.
+    route_local``). Built on the host at every start (not cached: 590 KB per layer per chip once tile-padded)."""
+    E = cfg.num_experts
+    return ep_layout(torch.eye(E, dtype=torch.float32).reshape(E, 1, E), cfg)
+
+
 def expert_polynorm_tensors(weight: torch.Tensor, bias: torch.Tensor, cfg: MotifTTConfig) -> Dict[str, torch.Tensor]:
     """Per-expert PolyNorm constants in EP layout, each ``[dp, 96, 1, 1]`` fp32 (chip gets ``[1, 12, 1, 1]``):
     ``c0, c1, c2`` = sigmoid(w) of the x^3 / x^2 / x terms and ``b`` = clamp(bias, +-0.5) (routed only)."""
@@ -734,6 +742,7 @@ __all__ = [
     "layer_cache_marker",
     "lm_head_for_chip",
     "local_expert_ids",
+    "local_expert_mask",
     "mapping_tag",
     "mark_layer_cached",
     "mesh_mapper",

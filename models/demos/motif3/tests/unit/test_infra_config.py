@@ -96,6 +96,7 @@ _ENV = (
     # Phase A (docs/OPTIMIZATION_PLAN.md §4.3): chunk budget, FlashMLA SWA cores, router mask
     "MOTIF3_CHUNK_BUDGET",
     "MOTIF3_FLASH_MLA_SWA_MCPH",
+    "MOTIF3_ROUTER_MASK",
 )
 
 
@@ -757,6 +758,26 @@ def test_flash_mla_swa_mcph_knob(monkeypatch):
     assert _cfg(flash_mla_swa_mcph=8).flash_mla_decode_pc("swa").max_cores_per_head_batch == 8
     with pytest.raises(ValueError):
         mc.flash_mla_decode_pc((12, 10), "swa", swa_mcph=32)
+
+
+def test_router_mask_knob(monkeypatch):
+    """A5 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/A5): ``MOTIF3_ROUTER_MASK`` selects the decode routing-weight
+    path, ``gather`` (default: the release) or ``scatter`` (``MotifRouter.route_local``; not bitwise equal to the
+    release, so off until the Validate gates); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES
+
+    assert ROUTER_MASK_MODES == ("gather", "scatter")
+    assert _cfg().router_mask == "gather" and "router_mask=gather" in _cfg().describe()
+    for v, want in (("scatter", "scatter"), (" Scatter ", "scatter"), ("gather", "gather"), ("", "gather")):
+        monkeypatch.setenv("MOTIF3_ROUTER_MASK", v)
+        assert _cfg().router_mask == want, v
+    monkeypatch.setenv("MOTIF3_ROUTER_MASK", "threshold")
+    with pytest.raises(ValueError, match="MOTIF3_ROUTER_MASK"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_ROUTER_MASK")
+    assert _cfg(router_mask="scatter").router_mask == "scatter"
+    with pytest.raises(ValueError, match="router_mask"):
+        _cfg(router_mask="ge")
 
 
 def test_module_defaults(monkeypatch):

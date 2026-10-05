@@ -20,6 +20,9 @@ Host (CPU only; never touches the chips)::
   configs == ``model_config.router_decode_pc(m_tiles=)``, the config each decode M selects, the exact-fp32 logits at
   M = 32 / 64 only, the experts' M = 64 configs (gate_up 10 x 8, down 8 x 8, per_core_M 2), ``wide_decode_rows``, and
   ``forward_decode`` refusing a row count the module was not built for before any device op.
+* ``test_moe_host_router_mask_scatter`` (A5): ``MotifRouter.route_local`` / ``local_partial`` with the ttnn ops
+  emulated in torch: topk's sets (exact ties included) on every chip, weights equal to the gather path to fp32
+  rounding, no ``ttnn.gather``, no leak or double free, the scatter path only at decode row counts with constants.
 * ``test_moe_host_import_clean``: importing ``tt.moe`` loads no other ``models/demos`` package.
 
 Real router inputs (CPU capture, ~5 min, 270 MB; the device tests skip without it)::
@@ -677,6 +680,156 @@ def test_moe_host_t64_decode_configs(monkeypatch):
     for rows in (4, 12, 24, 32):
         with pytest.raises(ValueError, match="gathers"):
             moe.forward_decode(SimpleNamespace(shape=[1, 1, rows, H]))
+
+
+class _TT:
+    """A torch tensor posing as a ttnn tensor in the A5 host emulation (shape / dtype / layout like ttnn's)."""
+
+    def __init__(self, t, dtype=None, layout=None):
+        self.t = t
+        self.shape = tuple(t.shape)
+        self.dtype = dtype if dtype is not None else (ttnn.float32 if t.dtype == torch.float32 else ttnn.bfloat16)
+        self.layout = layout if layout is not None else ttnn.TILE_LAYOUT
+
+
+@torch.no_grad()
+def test_moe_host_router_mask_scatter(monkeypatch):
+    """A5 (docs/OPTIMIZATION_PLAN.md §3.3; ``router_mask="scatter"``, ``MOTIF3_ROUTER_MASK``), host side:
+    ``MotifRouter.route_local`` and ``MotifMoE.local_partial`` with the ttnn ops emulated in torch (same op sequence,
+    fp32 math). On random scores with exact 8th / 9th ties, on every chip of the (4, 8) mesh: the scatter path selects
+    exactly topk's experts (the union over the 32 chips is topk's set, 8 per token, ties included), its weights match
+    the gather path (router + ``local_weights``) to fp32 rounding, it never calls ``ttnn.gather``, frees every
+    intermediate once and leaks nothing; ``local_partial`` takes it only at decode row counts that have constants
+    (prefill and other M keep the gather path); taps carry ``idx`` / ``sel`` / ``w_loc``."""
+    import models.demos.motif3.tt.moe as M
+    import models.demos.motif3.tt.weights as W
+    from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES, MotifTTConfig
+
+    assert ROUTER_MASK_MODES == ("gather", "scatter")
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert cfg.router_mask == "gather"  # default off: the scatter weights are not bitwise equal to the release
+    E, K, Mrows = cfg.num_experts, cfg.top_k, 32
+    g = torch.Generator().manual_seed(5)
+    scores = torch.rand(1, 1, Mrows, E, generator=g)
+    bias = (torch.rand(1, 1, 1, E, generator=g) - 0.5) * 0.1
+    biased = scores + bias
+    for r in (3, 11, 20):  # exact fp32 ties at the 8th / 9th biased value: copy the 8th onto the 9th expert
+        order = torch.argsort(biased[0, 0, r], descending=True)
+        a, b = int(order[7]), int(order[8])
+        scores[0, 0, r, b] = scores[0, 0, r, a] + bias[0, 0, 0, a] - bias[0, 0, 0, b]
+        biased[0, 0, r, b] = biased[0, 0, r, a]
+    # topk's choice on ties is the device's; emulate it as "the higher id wins" (not torch's), which the mask must follow
+    idx = torch.stack([torch.tensor(sorted(range(E), key=lambda j: (-float(biased[0, 0, i, j]), -j))[:K])
+                       for i in range(Mrows)]).reshape(1, 1, Mrows, K)
+    tie_rows = [r for r in range(Mrows) if (torch.sort(biased[0, 0, r], descending=True).values[7:9].diff() == 0).any()]
+    assert tie_rows == [3, 11, 20]
+
+    created, freed, calls = [], [], []
+
+    def new(t, **kw):
+        x = _TT(t, **kw)
+        created.append(x)
+        return x
+
+    def rec(name):
+        calls.append(name)
+
+    def mul(a, b, *, input_tensor_b_activations=None, dtype=None, memory_config=None):
+        rec("multiply")
+        bt = b.t if isinstance(b, _TT) else torch.tensor(float(b))
+        if input_tensor_b_activations:
+            bt = 1.0 / (bt + 1e-20)
+        return new(a.t.float() * bt.float())
+
+    def tsum(a, dim, keepdim=True, **kw):
+        rec("sum")
+        return new(a.t.sum(dim=dim, keepdim=keepdim))
+
+    def scatter(z, dim, i, src, **kw):
+        rec("scatter")
+        return new(z.t.clone().scatter_(dim, i.t.long(), src.t), dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda t, *a, **k: freed.append(t))
+    monkeypatch.setattr(M.ttnn, "multiply", mul)
+    monkeypatch.setattr(M.ttnn, "sum", tsum)
+    monkeypatch.setattr(M.ttnn, "scatter", scatter)
+    monkeypatch.setattr(M.ttnn, "to_layout", lambda a, layout, **k: rec("to_layout") or new(a.t.clone(), layout=layout))
+    monkeypatch.setattr(M.ttnn, "gather", lambda a, dim, i, **k: rec("gather") or new(torch.gather(a.t, dim, i.t.long())))
+    monkeypatch.setattr(M.ttnn, "typecast", lambda a, dt, **k: rec("typecast") or new(a.t.float()))
+    monkeypatch.setattr(M.ttnn, "eq", lambda a, b, **k: rec("eq") or new((a.t == b.t).float()))
+
+    r = object.__new__(M.MotifRouter)
+    r.route_scale, r.ckc_eltwise, r.dram, r.fuse_normalize = 2.0, "ckc", "dram", True
+    r._scores_topk = lambda f, mc: (new(scores.clone()), new(biased.clone()), new(idx.clone(), dtype=ttnn.uint32))
+    lmask_all, ids_all = W.local_expert_mask(cfg), W.local_expert_ids(cfg)  # [dp, 96, 1, 384], [dp, 96, 1, 1]
+    consts = (_TT(torch.zeros(1, 1, Mrows, E, dtype=torch.bfloat16)), _TT(torch.ones(1, 1, Mrows, K, dtype=torch.bfloat16)))
+    f = _TT(torch.zeros(1, 1, Mrows, H, dtype=torch.bfloat16))
+    union = torch.zeros(Mrows, E, dtype=torch.bool)
+    for dp in range(cfg.dp):
+        for tp in range(cfg.tp):
+            sl = slice(cfg.experts_per_chip * tp, cfg.experts_per_chip * (tp + 1))
+            lmask = _TT(lmask_all[dp, sl].unsqueeze(0).contiguous())
+            moe = object.__new__(M.MotifMoE)
+            moe.router, moe.dram, moe.ckc_eltwise, moe.internal_route_scale = r, "dram", "ckc", 1.0
+            moe.local_ids = _TT(ids_all[dp, sl].unsqueeze(0).contiguous())
+            # scatter path
+            created.clear(), freed.clear(), calls.clear()
+            w_new = r.route_local(f, lmask, consts, scale=1.0, memory_config="L1")
+            assert "gather" not in calls and calls.count("scatter") == 1, calls
+            ids = [id(t) for t in freed]
+            assert len(ids) == len(set(ids)) and not any(t is w_new for t in freed), "double free / freed the result"
+            leaked = [t for t in created if t is not w_new and not any(t is q for q in freed)]
+            assert not leaked, leaked
+            # gather path (today's router tail + local_weights)
+            created.clear(), freed.clear(), calls.clear()
+            i_old, w_old = M.MotifRouter.__call__(r, f, scale=1.0, memory_config="L1")
+            wl_old = M.MotifMoE.local_weights(moe, i_old, w_old, memory_config="L1")
+            assert "gather" in calls
+            a, b = w_new.t.reshape(-1, Mrows).t(), wl_old.t.reshape(-1, Mrows).t()  # [M, 12]
+            assert torch.equal(a != 0, b != 0), (dp, tp)
+            torch.testing.assert_close(a, b, rtol=2e-6, atol=0.0)
+            k0 = cfg.experts_per_chip * (cfg.tp * dp + tp)
+            union[:, k0:k0 + cfg.experts_per_chip] |= a != 0
+    want = torch.zeros(Mrows, E, dtype=torch.bool).scatter_(1, idx.reshape(Mrows, K), True)
+    assert torch.equal(union, want) and (union.sum(-1) == K).all()
+    # taps of the scatter path: idx and sel stay alive for the caller
+    created.clear(), freed.clear()
+    taps = {}
+    w_t = r.route_local(f, lmask, consts, scale=2.0, taps=taps, memory_config="L1")
+    assert set(taps) == {"idx", "sel"} and not any(t is v for t in freed for v in taps.values())
+    assert torch.equal(taps["sel"].t.reshape(Mrows, E) != 0, want)
+    # local_partial: the scatter path only at decode row counts with constants
+    seen = []
+    moe = object.__new__(M.MotifMoE)
+    moe.dram, moe.internal_route_scale, moe.combine_mode, moe.local_mask = "dram", 1.0, "fold", "LMASK"
+    moe.scatter_consts = {32: "C32", 64: "C64"}
+    moe.experts = lambda f, **kw: "Y"
+    moe.reduce_experts = lambda y, **kw: "PART"
+
+    class _R:
+        def route_local(self, f, lm, c, **kw):
+            seen.append(("scatter", c))
+            return "WLOC"
+
+        def __call__(self, f, **kw):
+            seen.append(("gather", int(f.shape[-2])))
+            return "IDX", "W"
+
+    moe.router = _R()
+    moe.local_weights = lambda i, w, **kw: "WLOC_G"
+    monkeypatch.setattr(M, "_free", lambda *a: None)
+    for m, decode, want_path in ((32, True, ("scatter", "C32")), (64, True, ("scatter", "C64")),
+                                 (96, True, ("gather", 96)), (32, False, ("gather", 32)), (4096, False, ("gather", 4096))):
+        seen.clear()
+        t = {}
+        assert M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, m, H]), polynorm="fp32", decode=decode,
+                                        taps=t) == "PART"
+        assert seen == [want_path], (m, decode, seen)
+        assert t["w_loc"] in ("WLOC", "WLOC_G") and (("w" in t) == (want_path[0] == "gather")), t
+    moe.scatter_consts = {}  # router_mask="gather": no constants, every decode call takes the gather path
+    seen.clear()
+    M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 32, H]), polynorm="fp32", decode=True)
+    assert seen == [("gather", 32)]
 
 
 def test_moe_host_import_clean():
@@ -2058,6 +2211,103 @@ def test_moe_device_t64_rows(mesh_device, device_params, router_logits):
     _free([x32, x16, pin])
     moe.deallocate()
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.parametrize("router_logits", ["composite", "exact_fp32"])
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_router_mask_scatter(mesh_device, device_params, router_logits):
+    """A5 (docs/OPTIMIZATION_PLAN.md §3.3; ``router_mask="scatter"``; probe logs/opt/phaseA/A5), real weights from the
+    serving TT cache, both routers, on the T64 config (32 and 64 decode rows):
+
+    * the top-8 contract: on every real router input (2971 tokens; all 11 captured layers with the composite router,
+      layer 2 with the exact one) the experts the scatter path weights (union of ``w_loc`` over the 32 chips) are
+      exactly the gather path's, 8 per token, and the weights agree to <= 1e-6 relative (measured: 1-4 fp32 ulp);
+    * the module output at M = 32 vs the gather module: PCC >= 0.99999, max |d| <= 2 bf16 ulp of the row's scale;
+    * T64: the 16-row step's rows bitwise equal the two 32-lane steps' rows (scatter module), and a rerun is bitwise.
+    Prefill is not affected (decode only)."""
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+
+    cfg = t64_cfg(mesh_device)
+    log_fabric(mesh_device, f"moe_router_mask_{router_logits}")
+    ccl = MotifCCL(mesh_device, cfg)
+    data = load_real_inputs()
+    layers = list(data["meta"]["layers"]) if router_logits == "composite" else [2]
+    L1 = ttnn.L1_MEMORY_CONFIG
+    E_loc = cfg.experts_per_chip
+    failures = []
+
+    def full_wloc(t, M):
+        a = device_tensors_to_torch(t, mesh_device)  # [R, C, 1, 12, M, 1]
+        out = torch.zeros(M, E, dtype=torch.float32)
+        for dp in range(cfg.dp):
+            for tp in range(cfg.tp):
+                k0 = E_loc * (cfg.tp * dp + tp)
+                out[:, k0:k0 + E_loc] = a[cfg.axes.coord(dp, tp)].reshape(E_loc, M).t().float()
+        return out
+
+    for layer in layers:
+        old = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits)
+        new = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits, router_mask="scatter")
+        assert old.router_mask == "gather" and new.router_mask == "scatter" and sorted(new.scatter_consts) == [32, 64]
+        xs = data["layers"][layer]["x"]
+        n = xs.shape[0]
+        blocks = _decode_blocks(xs, mesh_device)
+        set_eq, max_rel = 0, 0.0
+        for bi, bt in enumerate(blocks):
+            nv = min(32, n - 32 * bi)
+            got = {}
+            for tag, m in (("old", old), ("new", new)):
+                taps = {}
+                part = m.local_partial(bt, polynorm=m.decode_polynorm, decode=True, taps=taps, memory_config=L1)
+                got[tag] = full_wloc(taps["w_loc"], 32)[:nv]
+                _free([taps, part])
+            a, b = got["old"], got["new"]
+            ok = ((a != 0) == (b != 0)).all(-1) & ((b != 0).sum(-1) == K)
+            set_eq += int(ok.sum())
+            nz = a != 0
+            if nz.any():
+                max_rel = max(max_rel, float(((a - b).abs()[nz] / a.abs()[nz]).max()))
+        _free(blocks)
+        print(f"[moe] A5 L{layer} {router_logits}: top-8 sets equal {set_eq}/{n}, max rel |dw| {max_rel:.2e}")
+        if set_eq != n or max_rel > 1e-6:
+            failures.append(f"L{layer} {router_logits}: sets {set_eq}/{n}, max rel {max_rel:.2e}")
+        if layer == layers[0]:
+            sel = spread_tokens(n, 64)
+            x64 = xs[sel]
+            outs = {}
+            for tag, m in (("old", old), ("new", new)):
+                x_tt = upload_lanes(x64[:32], cfg, mesh_device)
+                o = m.forward_decode(x_tt)
+                outs[tag] = device_tensors_to_torch(o, mesh_device).float()
+                _free([o, x_tt])
+            p = pcc(outs["old"].flatten(), outs["new"].flatten())
+            scale = outs["old"].abs().amax(-1, keepdim=True).clamp_min(1e-30)
+            rel = float(((outs["old"] - outs["new"]).abs() / scale).max())
+            print(f"[moe] A5 L{layer} {router_logits}: output vs gather PCC {p:.10f}, max |d| / row max {rel:.2e}")
+            if p < 0.99999 or rel > 2 * 2.0 ** -7:
+                failures.append(f"L{layer} {router_logits}: output PCC {p} rel {rel}")
+            halves = []
+            for half in (x64[:32], x64[32:]):
+                x_tt = upload_lanes(half, cfg, mesh_device)
+                o = new.forward_decode(x_tt)
+                halves.append(device_tensors_to_torch(o, mesh_device))
+                _free([o, x_tt])
+            reps = []
+            for _ in range(2):
+                x16 = upload_rows16(x64, cfg, mesh_device)
+                o = new.forward_decode(x16)
+                reps.append(device_tensors_to_torch(o, mesh_device))
+                _free([o, x16])
+            anchors, drafts = rows16_to_halves(reps[0], cfg)
+            t64_eq = bool(torch.equal(anchors, halves[0])) and bool(torch.equal(drafts, halves[1]))
+            rerun_eq = bool(torch.equal(reps[0], reps[1]))
+            print(f"[moe] A5 L{layer} {router_logits}: T64 rows == T32 rows bitwise {t64_eq}, rerun bitwise {rerun_eq}")
+            if not (t64_eq and rerun_eq):
+                failures.append(f"L{layer} {router_logits}: T64 rows {t64_eq} rerun {rerun_eq}")
+        old.deallocate()
+        new.deallocate()
+    assert not failures, failures
 
 
 @pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)

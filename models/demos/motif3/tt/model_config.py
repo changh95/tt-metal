@@ -107,6 +107,10 @@ TILE = 32
 KV_CACHE_DTYPE_BY_NAME = {"bfp8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16}
 MHC_SINKHORN_IMPLS = ("motif", "stock")  # MHCSite(sinkhorn=...)
 ROUTER_LOGITS_IMPLS = ("composite", "exact_fp32")  # MotifMoE(router_logits=...)
+# Decode routing-weight path (A5, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(router_mask=...)): "gather" (the release:
+# ttnn.gather of the top-8 scores + idx-based local mask) | "scatter" (MotifRouter.route_local: top-8 0/1 mask scattered
+# from topk's idx, local one-hot extraction; same top-8 sets, weights within 1-4 fp32 ulp, -1.7 to -2.0 ms per step).
+ROUTER_MASK_MODES = ("gather", "scatter")
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -1298,6 +1302,9 @@ class MotifTTConfig:
     # FlashMLA decode max_cores_per_head_batch on SWA layers (A2, docs/OPTIMIZATION_PLAN.md §3.3): 4 (bitwise equal to
     # the release's 16 on SWA, -0.2 ms per step); 16 restores the release config. Global layers keep 16.
     flash_mla_swa_mcph: int = FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA  # MOTIF3_FLASH_MLA_SWA_MCPH
+    # Decode routing weights (A5): "gather" (default, the release) | "scatter" (not bitwise equal to the release: off
+    # until the Validate gates decide, ROUTER_MASK_MODES). Prefill always takes the gather path.
+    router_mask: str = "gather"  # MOTIF3_ROUTER_MASK
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1348,7 +1355,7 @@ class MotifTTConfig:
           INFRA-6) come from the device.
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
-          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``,
+          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
@@ -1452,6 +1459,7 @@ class MotifTTConfig:
             router_logits=(os.environ.get("MOTIF3_ROUTER_LOGITS") or "composite").strip(),
             ring_gather=(os.environ.get("MOTIF3_RING_GATHER") or "safe").strip(),
             flash_mla_swa_mcph=_env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA),
+            router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
@@ -1592,6 +1600,10 @@ class MotifTTConfig:
         if self.mhc_sinkhorn not in MHC_SINKHORN_IMPLS:
             raise ValueError(f"mhc_sinkhorn must be one of {MHC_SINKHORN_IMPLS}, got {self.mhc_sinkhorn!r}")
         check_flash_mla_mcph(self.flash_mla_swa_mcph)
+        if self.router_mask not in ROUTER_MASK_MODES:
+            raise ValueError(
+                f"router_mask (MOTIF3_ROUTER_MASK) must be one of {ROUTER_MASK_MODES}, got {self.router_mask!r}"
+            )
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
         if self.ring_gather not in RING_GATHER_MODES:
@@ -2321,7 +2333,8 @@ class MotifTTConfig:
             f"kv blocks={self.kv_num_blocks}x{self.kv_block_size} ({kv_src}, {self.dtypes.kv_cache_name}) "
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
-            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} ring_gather={self.ring_gather} "
+            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
+            f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
             f"spec={self.spec_tokens} spec_verify={self.spec_verify}{wide}; "
@@ -2362,6 +2375,7 @@ __all__ = [
     "RING_GATHER_MODES",
     "ROUTER_EXACT_FP32_DECODE_ROWS",
     "ROUTER_LOGITS_IMPLS",
+    "ROUTER_MASK_MODES",
     "SDPA_PREFILL_CHUNKS",
     "SP1_GLOBAL_CHUNKS",
     "SP1_GLOBAL_CHUNKS_BF16_KV",

@@ -37,6 +37,11 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
 2. Router on all 32 tokens -> ``idx [1,1,32,8]`` uint32, ``w [1,1,32,8]`` fp32 (identical on every chip).
 3. ``w_loc [1,12,32,1]`` fp32 = ``sum_k w[t,k] (idx[t,k] == e)`` for this chip's 12 experts (``local_expert_ids`` in
    fp32; exactly 0 for experts a token did not select; MOE-3).
+   A5 (``router_mask="scatter"``, ``MOTIF3_ROUTER_MASK``; off by default, docs/OPTIMIZATION_PLAN.md §3.3): steps 2-3
+   without ``ttnn.gather`` -- :meth:`MotifRouter.route_local` scatters topk's idx into a 0/1 mask, normalizes over
+   the 384 columns and extracts this chip's 12 weights with a constant one-hot (same top-8 sets incl. exact ties;
+   weights within 1-4 fp32 ulp of the gather path; router + local mask 140 -> 104 us traced at M = 32,
+   logs/opt/phaseA/A5).
 4. Experts (MOE-4, G6): ``repeat(f_all) [1,12,32,4096] @ W_gate_up [1,12,4096,2560]`` (bfp8, ``experts_gate_up_pc``,
    ``experts`` role HiFi4 + fp32 acc, fp32 output) -> grouped PolyNorm from ``tt/polynorm.py`` (exact fp32 moments +
    Horner ``mac``, fp32 intermediates) with the routing weights folded into ``up`` (``h = poly(g) * (w_loc * u)``,
@@ -112,7 +117,7 @@ import ttnn
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL
-from .model_config import TILE, MotifTTConfig, mcast1d_matmul_pc
+from .model_config import ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -434,35 +439,7 @@ class MotifRouter:
         and ``biased``."""
         mc = memory_config or self.dram
         scale = self.route_scale if scale is None else float(scale)
-        M = int(f.shape[-2])
-        exact = self._use_logits_fn(f)
-        pc, pc_sigmoid = self._decode_pcs(M)
-        if not exact and self.sigmoid_in_pc and pc_sigmoid is not None:
-            # decode shape (M = 32 or 64): sigmoid fused into the linear's program config (no separate op); a replaced
-            # decode_pc (diagnostics) falls through to the separate sigmoid with that config
-            scores = ttnn.linear(
-                f, self.weight, dtype=ttnn.float32, compute_kernel_config=self.ckc,
-                program_config=pc_sigmoid, memory_config=mc,
-            )
-        elif self.fuse_sigmoid and not exact:
-            # ttnn runs ``activation=`` as a separate unary_chain op here (no core_grid): same as the plain composite
-            scores = ttnn.linear(
-                f, self.weight, dtype=ttnn.float32, compute_kernel_config=self.ckc, activation="sigmoid",
-                program_config=pc, memory_config=mc,
-            )
-        else:
-            logits = self.route_logits(f, memory_config=mc)
-            scores = ttnn.sigmoid(logits, memory_config=mc)
-            _free(logits)
-        biased = ttnn.add(scores, self.bias, memory_config=mc)
-        pad = self._pads.get(M)
-        if pad is not None:  # power-of-two width -> multi-core topk (pads are -inf: never selected)
-            wide = ttnn.concat([biased, pad], dim=-1, memory_config=mc)
-            vals, idx = ttnn.topk(wide, k=self.top_k, dim=-1, largest=True, sorted=self.topk_sorted, memory_config=mc)
-            _free(wide)
-        else:
-            vals, idx = ttnn.topk(biased, k=self.top_k, dim=-1, largest=True, sorted=self.topk_sorted, memory_config=mc)
-        _free(vals)
+        scores, biased, idx = self._scores_topk(f, mc)
         if taps is not None:
             taps["scores"], taps["biased"] = scores, biased
         else:
@@ -494,6 +471,108 @@ class MotifRouter:
             _free(wn)
             wn = ws
         return idx, wn
+
+    def _scores_topk(self, f, mc) -> Tuple[object, object, object]:
+        """The router head shared by :meth:`__call__` and :meth:`route_local`: ``f [1, 1, M, 4096]`` ->
+        ``(scores [1, 1, M, 384] fp32 = sigmoid(logits), biased = scores + expert_bias, idx [1, 1, M, 8])``, all in
+        ``mc`` (the top-k values are freed)."""
+        M = int(f.shape[-2])
+        exact = self._use_logits_fn(f)
+        pc, pc_sigmoid = self._decode_pcs(M)
+        if not exact and self.sigmoid_in_pc and pc_sigmoid is not None:
+            # decode shape (M = 32 or 64): sigmoid fused into the linear's program config (no separate op); a replaced
+            # decode_pc (diagnostics) falls through to the separate sigmoid with that config
+            scores = ttnn.linear(
+                f, self.weight, dtype=ttnn.float32, compute_kernel_config=self.ckc,
+                program_config=pc_sigmoid, memory_config=mc,
+            )
+        elif self.fuse_sigmoid and not exact:
+            # ttnn runs ``activation=`` as a separate unary_chain op here (no core_grid): same as the plain composite
+            scores = ttnn.linear(
+                f, self.weight, dtype=ttnn.float32, compute_kernel_config=self.ckc, activation="sigmoid",
+                program_config=pc, memory_config=mc,
+            )
+        else:
+            logits = self.route_logits(f, memory_config=mc)
+            scores = ttnn.sigmoid(logits, memory_config=mc)
+            _free(logits)
+        biased = ttnn.add(scores, self.bias, memory_config=mc)
+        pad = self._pads.get(M)
+        if pad is not None:  # power-of-two width -> multi-core topk (pads are -inf: never selected)
+            wide = ttnn.concat([biased, pad], dim=-1, memory_config=mc)
+            vals, idx = ttnn.topk(wide, k=self.top_k, dim=-1, largest=True, sorted=self.topk_sorted, memory_config=mc)
+            _free(wide)
+        else:
+            vals, idx = ttnn.topk(biased, k=self.top_k, dim=-1, largest=True, sorted=self.topk_sorted, memory_config=mc)
+        _free(vals)
+        return scores, biased, idx
+
+    def route_local(
+        self,
+        f,
+        local_mask,
+        consts: Tuple[object, object],
+        *,
+        scale: Optional[float] = None,
+        taps: Optional[dict] = None,
+        memory_config=None,
+    ):
+        """A5 "scatter" router mask (docs/OPTIMIZATION_PLAN.md §3.3 A5; probe logs/opt/phaseA/A5): this chip's routing
+        weights ``w_loc [1, 12, M, 1]`` fp32 straight from the router, without ``ttnn.gather`` and the idx-based local
+        mask (:meth:`MotifMoE.local_weights`). Decode shapes only (``consts`` exist per gathered row count).
+
+        The head (linear + sigmoid, bias, padded top-k) is :meth:`__call__`'s. Then
+        ``sel = to_layout(scatter(zeros [1,1,M,384], -1, idx, ones [1,1,M,8]))`` is today's top-8 set as a 0/1 mask
+        (built from topk's own indices, so exact fp32 ties select what topk selected: a plain ``biased >= 8th value``
+        threshold selects 9 experts on such a tie, 1 in 32,681 real token-layers), ``ws = scores * sel`` (fp32),
+        ``den = sum(ws)`` over the 384 columns, ``w_loc = sum(ws * local_mask) * 1 / (den + 1e-20)`` with
+        ``local_mask [1, 12, 1, 384]`` the one-hot of this chip's 12 experts (``weights.local_expert_mask``), times
+        ``scale`` unless it is 1.0. Same top-8 sets as :meth:`__call__` + ``local_weights``; the weights differ from
+        them by 1-4 fp32 ulp on ~27 % of rows (the normalizing sum runs over 384 columns, not the 8 gathered ones), so
+        decode outputs are not bitwise equal to the gather path (MoE output <= 1 bf16 ulp, PCC 0.9999999998 on real
+        L2 tokens). Rows stay independent: T64 rows equal T32 rows bitwise, reruns and trace replays are bitwise.
+        Measured (traced, L1): router + local mask 140.1 -> 103.9 us at M = 32, 166.9 -> 131.9 us at M = 64; -1.7 to
+        -2.0 ms per 53-layer decode step.
+
+        ``taps`` (tests, eager) receives ``idx`` and ``sel`` (not freed)."""
+        mc = memory_config or self.dram
+        scale = self.route_scale if scale is None else float(scale)
+        zeros, ones = consts
+        scores, biased, idx = self._scores_topk(f, mc)
+        _free(biased)
+        m_rm = ttnn.scatter(zeros, -1, idx, ones, memory_config=mc)  # bf16 ROW_MAJOR (scatter refuses fp32 TILE)
+        if taps is not None:
+            taps["idx"] = idx
+        else:
+            _free(idx)
+        sel = ttnn.to_layout(m_rm, ttnn.TILE_LAYOUT, memory_config=mc)
+        _free(m_rm)
+        ws = ttnn.multiply(scores, sel, dtype=ttnn.float32, memory_config=mc)  # A = fp32 scores
+        if taps is not None:
+            taps["sel"] = sel
+        else:
+            _free(sel)
+        _free(scores)
+        den = ttnn.sum(ws, dim=-1, keepdim=True, compute_kernel_config=self.ckc_eltwise, memory_config=mc)
+        wl = ttnn.multiply(ws, local_mask, memory_config=mc)  # [1, 12, M, 384]
+        _free(ws)
+        wu = ttnn.sum(wl, dim=-1, keepdim=True, compute_kernel_config=self.ckc_eltwise, memory_config=mc)
+        _free(wl)
+        w_loc = ttnn.multiply(
+            wu,
+            den,
+            input_tensor_b_activations=[
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.ADD_UNARY_SFPU, 1e-20),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.RECIP),
+            ],
+            memory_config=mc,
+        )
+        _free(wu, den)
+        if scale != 1.0:
+            t = ttnn.multiply(w_loc, scale, memory_config=mc)
+            _free(w_loc)
+            w_loc = t
+        return w_loc
 
     def deallocate(self) -> None:
         _free(self.weight, self.bias, *self._pads.values())
@@ -551,6 +630,11 @@ class MotifMoE:
         prefill_pc: in1-multicast program configs for the prefill expert matmuls when the chunk has >= 2048 rows
             (:func:`prefill_experts_pc`; 2x faster than the auto config, bitwise identical); False = auto config.
         prefill_chunk: rows per masked-dense prefill chunk (default ``cfg.moe_prefill_chunk`` = 4096).
+        router_mask: decode routing weights (A5; ``None`` = ``cfg.router_mask``, ``MOTIF3_ROUTER_MASK``): "gather"
+            (the release: router ``(idx, w)`` + :meth:`local_weights`) | "scatter" (:meth:`MotifRouter.route_local`:
+            no ``ttnn.gather``, same top-8 sets, weights within 1-4 fp32 ulp; about -35 us per layer). Prefill always
+            takes the gather path. "scatter" builds its constants here (the local one-hot ``[1, 12, 1, 384]`` fp32 and,
+            per decode row count, the scatter's zeros / ones), before any trace capture (F3N rule R3).
     """
 
     def __init__(
@@ -576,6 +660,7 @@ class MotifMoE:
         router_logits: str = "composite",
         prefill_pc: bool = True,
         prefill_chunk: Optional[int] = None,
+        router_mask: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -678,6 +763,26 @@ class MotifMoE:
         wide = wide_decode_rows(cfg)
         self.decode_rows: Tuple[int, ...] = (TILE,) + ((wide,) if wide else ())
         self.dram = ttnn.DRAM_MEMORY_CONFIG
+
+        # ---- A5 router mask (decode only): constants before any trace capture (F3N rule R3) -------------------------
+        self.router_mask = str(router_mask if router_mask is not None else getattr(cfg, "router_mask", "gather"))
+        if self.router_mask not in ROUTER_MASK_MODES:
+            raise ValueError(f"router_mask must be one of {ROUTER_MASK_MODES}, got {self.router_mask!r}")
+        self.local_mask = None  # [1, 12, 1, 384] fp32 one-hot of this chip's experts
+        self.scatter_consts: Dict[int, Tuple[object, object]] = {}  # M -> (zeros [1,1,M,384], ones [1,1,M,8]) bf16 RM
+        if self.router_mask == "scatter":
+            import torch
+
+            self.local_mask = as_t(lambda: W.local_expert_mask(cfg), ttnn.float32, None, **ep)
+
+            def rm(t):
+                return ttnn.from_torch(
+                    t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                )  # fmt: skip
+
+            for m in self.decode_rows:
+                self.scatter_consts[m] = (rm(torch.zeros(1, 1, m, self.n_experts)), rm(torch.ones(1, 1, m, self.top_k)))
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
@@ -801,14 +906,23 @@ class MotifMoE:
         """This chip's routed partial for the tokens ``f [1, 1, M, 4096]`` (identical on all chips): route, mask,
         experts, combine -> ``[1, 1, M, 4096]`` in ``combine_dtype``, DRAM (still to be summed over all 32 chips).
         ``memory_config``: intermediates (decode: L1). ``taps`` (tests) receives ``idx``, ``w`` (unscaled when
-        ``route_scale`` is folded: multiply by ``route_scale / internal_route_scale`` to compare), ``w_loc``."""
+        ``route_scale`` is folded: multiply by ``route_scale / internal_route_scale`` to compare), ``w_loc``; with
+        ``router_mask="scatter"`` at a decode row count ``idx``, ``sel`` (the top-8 0/1 mask) and ``w_loc`` instead."""
         mc = memory_config or self.dram
-        idx, w = self.router(f, scale=self.internal_route_scale, memory_config=mc)
-        w_loc = self.local_weights(idx, w, memory_config=mc)
-        if taps is not None:
-            taps["idx"], taps["w"], taps["w_loc"] = idx, w, w_loc
+        consts = getattr(self, "scatter_consts", {}).get(int(f.shape[-2])) if decode else None
+        if consts is not None:  # A5 "scatter" router mask at a decode row count (taps get idx, sel, w_loc; no "w")
+            w_loc = self.router.route_local(
+                f, self.local_mask, consts, scale=self.internal_route_scale, taps=taps, memory_config=mc
+            )
+            if taps is not None:
+                taps["w_loc"] = w_loc
         else:
-            _free(idx, w)
+            idx, w = self.router(f, scale=self.internal_route_scale, memory_config=mc)
+            w_loc = self.local_weights(idx, w, memory_config=mc)
+            if taps is not None:
+                taps["idx"], taps["w"], taps["w_loc"] = idx, w, w_loc
+            else:
+                _free(idx, w)
         if self.combine_mode == "fold":
             y = self.experts(f, polynorm=polynorm, decode=decode, row_scale=w_loc, memory_config=mc)
             part = self.reduce_experts(y, memory_config=self.dram)
@@ -961,7 +1075,10 @@ class MotifMoE:
     def deallocate(self) -> None:
         self.router.deallocate()
         self.pn_consts.deallocate()
-        _free(self.w_gate_up, self.w_down, self.local_ids)
+        _free(self.w_gate_up, self.w_down, self.local_ids, getattr(self, "local_mask", None))
+        for z, o in getattr(self, "scatter_consts", {}).values():
+            _free(z, o)
+        self.local_mask, self.scatter_consts = None, {}
 
 
 __all__ = ["COMBINE_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS",
