@@ -38,7 +38,9 @@ and EngineCore alike: ``--enable-chunked-prefill --max-num-batched-tokens 8064 -
 --enable-prefix-caching --no-async-scheduling`` plus ``"tt": {..., "decode_interleave_prefill_steps": 1,
 "decode_interleave_decode_steps": 1, "sample_on_device_mode": "decode_only"}`` (:data:`DEVICE_SAMPLING_TT_CONFIG`) and
 ``OMP_WAIT_POLICY=PASSIVE``. The budget and the threshold are ``prefill_plan.recommended_budget(span cap 8192, A)`` =
-8064 (A = 128: gate G9's per-bucket sp1 q/k, lead decision F5). MTP speculation is an OPT-IN launch for
+8064 (A = 128: gate G9's per-bucket sp1 q/k, lead decision F5); ``MOTIF3_CHUNK_BUDGET`` (OPTIMIZATION_PLAN.md A1a,
+e.g. 4096) asks for a smaller one, aligned by ``recommended_budget`` (:func:`launch_chunk_budget`,
+:func:`feature_vllm_args`; ``check_serving_config`` warns when vLLM's flags differ from it). MTP speculation is an OPT-IN launch for
 greedy / agentic / low-concurrency serving (and the TIS greedy benchmark variant): add ``--speculative-config
 '{"method": "custom_class", "model": "vllm_tt_plugin.model_owned_drafter", "num_speculative_tokens": 1}'``
 (``MOTIF3_SPEC_DECODE`` unset or 1); sampled rows of such a launch decode without speculation (the plugin's PS-1,
@@ -188,6 +190,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     check_prefill_batch,
     check_spec_result,
     check_tt_config,
+    chunk_budget_from_env,
     feature_switch_from_env,
     kv_cache_bytes_per_chip,
     kv_cache_dtype_from_env,
@@ -246,17 +249,36 @@ SAMPLING_LOG_EVERY = 2000
 # prefill, prefix caching and the model-owned MTP drafter. They are NOT the production default launch (lead decision
 # 1), which is these flags WITHOUT the "--speculative-config" pair, plus DEVICE_SAMPLING_TT_CONFIG in
 # --additional-config "tt" (module docstring).
-FEATURE_VLLM_ARGS = (
-    "--enable-chunked-prefill",
-    "--max-num-batched-tokens",
-    str(prefill_plan.recommended_budget(DEFAULT_PREFILL_SPAN_CAP, DEFAULT_PREFILL_ALIGNMENT)),
-    "--long-prefill-token-threshold",
-    str(prefill_plan.recommended_budget(DEFAULT_PREFILL_SPAN_CAP, DEFAULT_PREFILL_ALIGNMENT)),
-    "--enable-prefix-caching",
-    "--speculative-config",
-    json.dumps(SPECULATIVE_CONFIG),
-    "--no-async-scheduling",
-)
+def launch_chunk_budget(
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    span_cap: int = DEFAULT_PREFILL_SPAN_CAP,
+    align: int = DEFAULT_PREFILL_ALIGNMENT,
+) -> int:
+    """The chunk budget (= threshold) a launch passes vLLM (OPTIMIZATION_PLAN.md §3.3 A1a):
+    ``prefill_plan.recommended_budget(span_cap, align, MOTIF3_CHUNK_BUDGET)``. Unset knob: 8064 (span cap 8192 - A,
+    the code default); ``MOTIF3_CHUNK_BUDGET=4096``: 4096. ``environ`` defaults to ``os.environ``."""
+    return prefill_plan.recommended_budget(span_cap, align, chunk_budget_from_env(environ))
+
+
+def feature_vllm_args(environ: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+    """The vLLM flags of the opt-in MTP launch with the chunk budget of :func:`launch_chunk_budget` (``environ``
+    defaults to ``os.environ``); :data:`FEATURE_VLLM_ARGS` is this for an empty environment (budget 8064)."""
+    b = str(launch_chunk_budget(environ))
+    return (
+        "--enable-chunked-prefill",
+        "--max-num-batched-tokens",
+        b,
+        "--long-prefill-token-threshold",
+        b,
+        "--enable-prefix-caching",
+        "--speculative-config",
+        json.dumps(SPECULATIVE_CONFIG),
+        "--no-async-scheduling",
+    )
+
+
+FEATURE_VLLM_ARGS = feature_vllm_args({})
 
 # The scheduler config of the VllmConfig this process serves, as seen by ``get_max_tokens_all_users`` (which the plugin
 # calls in ``init_device`` inside ``set_current_vllm_config``). ``initialize_vllm_model`` runs later, in
@@ -517,10 +539,12 @@ def check_serving_config(
         if max_model_len is not None:
             span_cap = min(int(span_cap), int(max_model_len))
     budget = serving.get("max_num_batched_tokens")
-    return prefill_plan.check_scheduler_config(
-        chunked=bool(serving.get("enable_chunked_prefill")),
+    chunked = bool(serving.get("enable_chunked_prefill"))
+    threshold = int(serving.get("long_prefill_token_threshold") or 0)
+    warnings = prefill_plan.check_scheduler_config(
+        chunked=chunked,
         budget=None if budget is None else int(budget),
-        threshold=int(serving.get("long_prefill_token_threshold") or 0),
+        threshold=threshold,
         align=int(align),
         span_cap=int(span_cap),
         prefix_caching=prefix,
@@ -528,6 +552,17 @@ def check_serving_config(
         block_size=int(serving["block_size"]),
         kv_replicated=kv_replicated,
     )
+    # A1a: MOTIF3_CHUNK_BUDGET names the budget this launch means to run; vLLM's flags decide, so say when they differ
+    target = chunk_budget_from_env(env)
+    if chunked and target is not None and int(span_cap) > int(align):
+        want = prefill_plan.recommended_budget(int(span_cap), int(align), target)
+        if budget is None or int(budget) != want or threshold != want:
+            warnings.append(
+                f"MOTIF3_CHUNK_BUDGET={target} asks for a chunk budget of {want} (alignment-aware), but vLLM runs "
+                f"max_num_batched_tokens {budget} / long_prefill_token_threshold {threshold}: pass "
+                f"--max-num-batched-tokens {want} --long-prefill-token-threshold {want}"
+            )
+    return warnings
 
 
 def check_sample_on_device_mode(mode: Any) -> Optional[str]:
@@ -2213,7 +2248,9 @@ __all__ = [
     "check_serving_config",
     "device_sampling_switch",
     "feature_switches",
+    "feature_vllm_args",
     "lane_sampling_lists",
+    "launch_chunk_budget",
     "wants_logprobs",
     "kv_max_bytes_per_chip",
     "kv_pool_tokens_from_env",

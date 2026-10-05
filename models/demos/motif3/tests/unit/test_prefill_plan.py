@@ -304,6 +304,34 @@ def test_lone_request_chunks_need_no_recompute():
     assert p.c0 == 0 and _chunks(p) == [(0, 8192, "sp0")]
 
 
+def test_chunk_budget_target_a1a():
+    """OPTIMIZATION_PLAN.md §3.3 A1a: ``recommended_budget(cap, A, target)`` makes a requested budget alignment-aware
+    (down to a multiple of A, at most cap - A; no target = cap - A = 8064, the code default). At the production geometry
+    the A1a budget 4096 is accepted without warnings, and a lone prompt then runs one 4096 chunk per vLLM step with no
+    recompute: sp0 4096, then sp1 4096 (and a smaller tail bucket), all shapes of the 8192-cap compile set."""
+    rb = pp.recommended_budget
+    assert rb(8192, 128) == rb(8192, 128, None) == 8064 == PROD_BUDGET
+    assert rb(8192, 128, 4096) == 4096 and rb(8192, 128, 4000) == 3968 and rb(8192, 128, 8192) == 8064
+    assert rb(8192, 128, 32768) == 8064 and rb(8192, 128, 128) == 128 and rb(8192, 64, 4100) == 4096
+    assert rb(4096, 128, 4096) == 3968  # a smaller span cap still caps the budget at cap - A
+    with pytest.raises(ValueError, match="below the resume alignment"):
+        rb(8192, 128, 100)
+    budget = rb(api.DEFAULT_PREFILL_SPAN_CAP, api.DEFAULT_PREFILL_ALIGNMENT, 4096)
+    assert pp.check_scheduler_config(
+        chunked=True, budget=budget, threshold=budget, align=PROD_A, span_cap=8192, prefix_caching=True,
+        prefix_match_unit=None, block_size=64, kv_replicated=True,
+    ) == []  # fmt: skip
+    for L in (4096, 10000, 16384, 32768 - 64):
+        for k in range(_cdiv(L, budget)):
+            s, e = k * budget, min((k + 1) * budget, L)
+            p = _plan(s, e, A=PROD_A)
+            assert p.recompute == 0 and p.chunks[0].start == s, (L, k, _chunks(p))
+            assert p.chunks[0].path == (pp.SP0 if s == 0 else pp.SP1)
+            assert all(c.bucket in SPAN_BUCKETS for c in p.chunks)
+            if e - s == 4096:
+                assert _chunks(p) == [(s, 4096, pp.SP0 if s == 0 else pp.SP1)]
+
+
 # ================================================================================================================
 # production geometry: gate G9's per-bucket sp1 global chunks (lead decision F5)
 # ================================================================================================================

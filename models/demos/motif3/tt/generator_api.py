@@ -307,6 +307,12 @@ DEFAULT_PREFILL_SPAN_CAP = 8192
 # the vLLM budget = threshold = 8192 - 128 = 8064. Only for checks that run before the generator exists (and
 # FEATURE_VLLM_ARGS); the generator's ``prefill_alignment`` is authoritative (test_prefill_plan checks they agree).
 DEFAULT_PREFILL_ALIGNMENT = 128
+# Chunk budget target (MOTIF3_CHUNK_BUDGET; OPTIMIZATION_PLAN.md §3.3 A1a): None = the span cap's own budget
+# (prefill_plan.recommended_budget: span cap - A = 8064, the code default until the TIS A/B decides); an integer asks
+# for that budget, made alignment-aware by recommended_budget (rounded down to a multiple of A, at most cap - A).
+# vLLM's --max-num-batched-tokens / --long-prefill-token-threshold set the real budget: the knob only derives the
+# flags (generator_vllm.feature_vllm_args, the launch scripts) and makes check_serving_config warn when they differ.
+DEFAULT_CHUNK_BUDGET: Optional[int] = None
 SUPPORTED_SPEC_TOKENS = (0, 1)  # MTP draft tokens per step (num_speculative_tokens): K = 1 only
 MTP_LAYER_IDX = NUM_HIDDEN_LAYERS  # the MTP layer is reference layer 53 (TT-cache part "L53")
 # Decode KV-write modes (tt/kv_write.py): "row" = draft 1 (one 8-lane update per DP row), "row_split" = speculation
@@ -416,6 +422,29 @@ def prefill_span_cap_from_env(environ: Optional[Mapping[str, str]] = None) -> Op
     env = os.environ if environ is None else environ
     v = _env_int(env, "MOTIF3_PREFILL_MAX_BUCKET")
     return None if v is None else check_prefill_span_cap(v, MAX_CONTEXT)
+
+
+def check_chunk_budget(budget: int) -> int:
+    """``budget`` if it is an integer in ``[MIN_PREFILL_BUCKET, MAX_CONTEXT]`` (the A1a chunk-budget target), else
+    ``ValueError``. Alignment is applied later (``prefill_plan.recommended_budget``), not required here."""
+    n = int(budget)
+    if not MIN_PREFILL_BUCKET <= n <= MAX_CONTEXT:
+        raise ValueError(
+            f"the chunk budget (MOTIF3_CHUNK_BUDGET) must be 'auto' or a token count in [{MIN_PREFILL_BUCKET}, "
+            f"{MAX_CONTEXT}], got {budget!r}"
+        )
+    return n
+
+
+def chunk_budget_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """``MOTIF3_CHUNK_BUDGET``: unset, empty or ``auto`` = None (:data:`DEFAULT_CHUNK_BUDGET`: the span cap's own
+    budget, 8064), else the requested per-step token budget (:func:`check_chunk_budget`; e.g. 4096 for A1a)."""
+    env = os.environ if environ is None else environ
+    raw = env.get("MOTIF3_CHUNK_BUDGET")
+    if raw is None or raw.strip().lower() in ("", "auto"):
+        return DEFAULT_CHUNK_BUDGET
+    v = _env_int(env, "MOTIF3_CHUNK_BUDGET")
+    return check_chunk_budget(v)
 
 
 def packed_prefill_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -1669,6 +1698,7 @@ __all__ = [
     "DEFAULT_PACKED_PREFILL_MAX_SEG",
     "DEFAULT_PACKED_PREFILL_MAX_TOKENS",
     "DEFAULT_PACKED_WARMUP",
+    "DEFAULT_CHUNK_BUDGET",
     "DEFAULT_PREFILL_ALIGNMENT",
     "DEFAULT_PREFILL_SPAN_CAP",
     "DEFAULT_SPEC_ALPHA_PRIOR",
@@ -1724,6 +1754,7 @@ __all__ = [
     "check_max_model_len",
     "check_packed_prefill_max_seg",
     "check_packed_prefill_max_tokens",
+    "check_chunk_budget",
     "check_prefill_batch",
     "check_prefill_span_cap",
     "check_spec_alpha_prior",
@@ -1732,6 +1763,7 @@ __all__ = [
     "check_tt_config",
     "check_wide_min_lanes",
     "check_wide_step_ratio",
+    "chunk_budget_from_env",
     "expected_num_blocks",
     "feature_switch_from_env",
     "hf_cache_snapshot",

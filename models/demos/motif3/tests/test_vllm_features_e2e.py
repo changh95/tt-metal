@@ -30,8 +30,9 @@ Environment:
     packed prefill OFF = the per-row reference path), ``dsamp_pk`` (+ ``MOTIF3_PACKED_PREFILL=1``), ``mtp_auto``
     (``dsamp_pk`` + the opt-in MTP launch with ``MOTIF3_SPEC_VERIFY=auto``: everything on, E2E-X), ``mtp_packed`` (MTP
     with today's idle-lane verify), ``mtp_wide`` (MTP with the one-trace T64 fallback).
-* ``MOTIF3_E2E_BUDGET`` (default 8064 = ``prefill_plan.recommended_budget(8192, A = 128)``): the chunk budget =
-  long-prefill threshold the features line must show on a chunked launch.
+* ``MOTIF3_E2E_BUDGET`` (default 8064 = ``prefill_plan.recommended_budget(8192, A = 128)``, or the aligned
+  ``MOTIF3_CHUNK_BUDGET`` when that is set, e.g. 4096 for the A1a launch): the chunk budget = long-prefill threshold
+  the features line must show on a chunked launch.
 * ``MOTIF3_E2E_OUT``: directory for one JSON per test (raw results and summaries).
 * ``MOTIF3_E2E_REFERENCE``: the ``MOTIF3_E2E_OUT`` of a run on another server. The ``test_9*`` comparison tests read
   both directories; they need no server, except that a non-speculating live server answers the near-tie probes.
@@ -163,7 +164,12 @@ BLOCK = 64
 # --max-num-batched-tokens = --long-prefill-token-threshold of the chunked launches: prefill_plan.recommended_budget(
 # span cap 8192, A) = 8064 with A = 128 (gate G9's per-bucket sp1 q / k, lead decision F5); the launchers derive it
 # from the tree they serve. The features track's FEATURES_RESULTS runs (A = 64) used 8128.
-BUDGET = int(os.environ.get("MOTIF3_E2E_BUDGET", "8064"))
+# A1a (OPTIMIZATION_PLAN.md §3.3): a launch run with MOTIF3_CHUNK_BUDGET (e.g. 4096) passes that budget made
+# alignment-aware (generator_vllm.launch_chunk_budget: rounded down to a multiple of A = 128, at most 8064); unset or
+# "auto" keeps 8064. MOTIF3_E2E_BUDGET, when set, wins.
+_CHUNK_TARGET = (os.environ.get("MOTIF3_CHUNK_BUDGET") or "auto").strip().lower()
+_DEFAULT_BUDGET = 8064 if _CHUNK_TARGET == "auto" else min(int(_CHUNK_TARGET) // 128 * 128, 8064)
+BUDGET = int(os.environ.get("MOTIF3_E2E_BUDGET") or _DEFAULT_BUDGET)
 GATE_TOKENS = int(os.environ.get("MOTIF3_E2E_GATE_TOKENS", "4000"))
 # the largest margin of a packed-vs-per-row flip: the packing floor measured between packed passes of different T
 # (1.125 = 9 bf16 ulps of a |logit| in 16-32) + one ulp (module docstring, "Comparisons")

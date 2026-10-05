@@ -135,6 +135,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_WIDE_MIN_LANES",
         "MOTIF3_TT_CACHE_POLICY",
         "MOTIF3_WIDE_STEP_RATIO",
+        "MOTIF3_CHUNK_BUDGET",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -2603,6 +2604,34 @@ def test_serving_config_fail_fast():
     with set_current_vllm_config(_serving_vllm_config(budget=2048, threshold=2048)), loguru_messages() as seen:
         f(num_devices=32, max_model_len=32768, max_num_seqs=32)
     assert any("pin 8064" in m for m in seen), seen
+
+
+def test_chunk_budget_knob_a1a():
+    """OPTIMIZATION_PLAN.md §3.3 A1a: ``MOTIF3_CHUNK_BUDGET`` derives the launch's chunk budget (= threshold) through
+    ``prefill_plan.recommended_budget`` (alignment-aware) and only warns: vLLM's flags decide. Unset / ``auto`` keeps
+    8064 (the code default and ``FEATURE_VLLM_ARGS``); 4096 is clean when the flags match and warns when they do not."""
+    assert gv.launch_chunk_budget({}) == gv.launch_chunk_budget({"MOTIF3_CHUNK_BUDGET": "auto"}) == 8064
+    assert gv.launch_chunk_budget({"MOTIF3_CHUNK_BUDGET": "4096"}) == 4096
+    assert gv.launch_chunk_budget({"MOTIF3_CHUNK_BUDGET": "4000"}) == 3968  # aligned down to A = 128
+    assert gv.launch_chunk_budget({"MOTIF3_CHUNK_BUDGET": "16384"}) == 8064  # capped at span cap - A
+    for bad in ("64", "4k", "-1", "40000"):
+        with pytest.raises(ValueError, match="MOTIF3_CHUNK_BUDGET"):
+            gv.launch_chunk_budget({"MOTIF3_CHUNK_BUDGET": bad})
+    assert gv.FEATURE_VLLM_ARGS == gv.feature_vllm_args({})
+    a = gv.feature_vllm_args({"MOTIF3_CHUNK_BUDGET": "4096"})
+    assert a[a.index("--max-num-batched-tokens") + 1] == a[a.index("--long-prefill-token-threshold") + 1] == "4096"
+    assert [x for x in a if x not in ("4096",)] == [x for x in gv.FEATURE_VLLM_ARGS if x != "8064"]
+    env = {"MOTIF3_CHUNK_BUDGET": "4096"}
+    b4096 = gv.serving_config_of(_serving_vllm_config(budget=4096, threshold=4096))
+    assert gv.check_serving_config(b4096, max_model_len=32768, environ=env) == []
+    assert gv.check_serving_config(b4096, max_model_len=32768) == []  # 4096 is a valid budget without the knob too
+    prod = gv.serving_config_of(_serving_vllm_config())
+    warn = gv.check_serving_config(prod, max_model_len=32768, environ=env)
+    assert len(warn) == 1 and "MOTIF3_CHUNK_BUDGET=4096" in warn[0] and "--max-num-batched-tokens 4096" in warn[0]
+    half = gv.serving_config_of(_serving_vllm_config(budget=4096, threshold=8064))
+    assert any("MOTIF3_CHUNK_BUDGET" in w for w in gv.check_serving_config(half, max_model_len=32768, environ=env))
+    off = gv.serving_config_of(_serving_vllm_config(chunked=False, prefix=False, spec_k=None))
+    assert gv.check_serving_config(off, max_model_len=32768, environ=env) == []  # nothing to check without chunking
 
 
 # ================================================================================================================

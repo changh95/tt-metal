@@ -93,6 +93,8 @@ _ENV = (
     # C1: TT weight-cache policy and the T64 / T32 step ratio
     "MOTIF3_TT_CACHE_POLICY",
     "MOTIF3_WIDE_STEP_RATIO",
+    # Phase A (docs/OPTIMIZATION_PLAN.md §4.3): chunk budget, FlashMLA SWA cores, router mask
+    "MOTIF3_CHUNK_BUDGET",
 )
 
 

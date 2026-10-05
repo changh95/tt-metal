@@ -1623,14 +1623,27 @@ def check_scheduler_config(
     return warnings
 
 
-def recommended_budget(span_cap: int, align: int) -> int:
+def recommended_budget(span_cap: int, align: int, target: Optional[int] = None) -> int:
     """The chunk budget that keeps every lone-request span inside one ``span_cap`` bucket: ``span_cap - A``
     (8064 for the production 8192 / 128 of gate G9's per-bucket chunks; 8128 for an all-64/64 table, A = 64). Also the
-    recommended ``--long-prefill-token-threshold`` (lead decision: threshold = budget)."""
+    recommended ``--long-prefill-token-threshold`` (lead decision: threshold = budget).
+
+    ``target`` (``generator_api.chunk_budget_from_env``, ``MOTIF3_CHUNK_BUDGET``; OPTIMIZATION_PLAN.md §3.3 A1a) asks
+    for a smaller per-step budget, e.g. 4096: the result is ``target`` made alignment-aware, i.e. rounded down to a
+    multiple of ``A`` (chunk ends of a lone prompt stay aligned, so no continuation recomputes) and capped at
+    ``span_cap - A`` (a span plus its recompute fits one bucket). 4096 at A = 128 stays 4096, and every chunk of a lone
+    prompt is then one 4096 bucket (sp0, then sp1): shapes ``warmup_prefill`` already compiles for the 8192 cap, so
+    the budget adds no program after the decode capture (rule R2). Raises when ``target`` is below ``A``."""
     cap, A = int(span_cap), int(align)
     if A < 1 or cap <= A:
         raise ValueError(f"span cap {cap} must exceed the alignment {A}")
-    return (cap - A) // A * A
+    top = (cap - A) // A * A
+    if target is None:
+        return top
+    t = int(target)
+    if t < A:
+        raise ValueError(f"chunk budget target {t} is below the resume alignment {A}")
+    return min(t // A * A, top)
 
 
 __all__ = [

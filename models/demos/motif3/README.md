@@ -614,7 +614,7 @@ checks that the default generator class imports device-free (`test_real_generato
 ## 14. Environment
 
 Every environment variable `tt/*.py` reads (`os.environ`; grep of B1 `d3597ae4977`, plus `MOTIF3_TT_CACHE_POLICY`
-and `MOTIF3_WIDE_STEP_RATIO`, added after it). "Validated" names the function that refuses a bad value. Under TIS,
+and `MOTIF3_WIDE_STEP_RATIO`, added after it, and the Phase A knobs of branch `motif3-opt`: `MOTIF3_CHUNK_BUDGET`). "Validated" names the function that refuses a bad value. Under TIS,
 the specs set `MESH_DEVICE`, `MOTIF3_KV_POOL_TOKENS`, `OMP_WAIT_POLICY`, `MOTIF3_PACKED_PREFILL`,
 `MOTIF3_TT_CACHE_POLICY` (both specs) and `MOTIF3_SPEC_VERIFY` (MTP spec), and a spec value beats a shell export; TIS
 itself sets `HF_MODEL` and `TT_CACHE_PATH`; every other variable reaches the server from the shell
@@ -645,6 +645,7 @@ itself sets `HF_MODEL` and `TT_CACHE_PATH`; every other variable reaches the ser
 | `MOTIF3_SAMPLING_LOG_EVERY` | 2000 | decode steps between the bridge's `Motif-3 device sampling: {...}` JSON lines; `0` = only at shutdown | none: a value that is not a decimal integer falls back to 2000 (`MotifForCausalLM.__init__`) |
 | `MOTIF3_KV_REPLICATED_DECODE` | `auto` | KV-R (§16): `auto` (on iff prefix caching), `1` (forced on), `0` | `kv_replicated_decode_from_env`; `GeneratorSettings` refuses `0` with prefix caching |
 | `MOTIF3_PREFILL_MAX_BUCKET` | 8192 | span cap (§15): largest prefill bucket of a resumed-prefill generator; longer spans are split into chunks. `32768` restores the draft-1 single-shot buckets (rollback, with `MOTIF3_*=0`) | `check_prefill_span_cap`: a power of two in [128, 32768] |
+| `MOTIF3_CHUNK_BUDGET` | unset (= `auto`: 8064) | A1a (`docs/OPTIMIZATION_PLAN.md` §3.3; branch `motif3-opt`): the chunk budget (= long-prefill threshold) the launch means to run. `generator_vllm.launch_chunk_budget` = `prefill_plan.recommended_budget(span cap, A, target)`: the target rounded down to a multiple of A = 128 and capped at span cap - A (`4096` stays 4096: every chunk of a lone prompt is one 4096 bucket, already in the warm-up compile set; `4000` -> 3968). It does **not** change vLLM's budget: the launcher passes `--max-num-batched-tokens` / `--long-prefill-token-threshold` (`generator_vllm.feature_vllm_args`, `P5T64_BUDGET` of `p5t64_hold.sh`, the TIS spec `vllm_args`), and `check_serving_config` warns at boot when those differ from it. 8064 stays the code default until the TIS A/B (plan §6 M2) decides | `generator_api.chunk_budget_from_env` / `check_chunk_budget`: `auto` or an integer in [128, 32768]; `recommended_budget` refuses a target below A |
 | `MOTIF3_PACKED_PREFILL` | `0` in the code; **`1` in both TIS specs** (`motif3_galaxy`, `motif3_galaxy_mtp`; TIS `f0484e96`) | packed multi-row prefill (P5, §18): the short chunks of one prefill call run as packed passes. With it on, a request's greedy and seeded tokens depend on which requests share its pass (near-tie flips at the bucket floor; the lead signed this contract off on 2026-10-04, `docs/P5_T64_REVIEW.md` §8, I-1). `0` restores per-row prefill (under TIS only through a runtime spec JSON, `docs/TIS_RUNBOOK.md` §4.2) | `generator_api.packed_prefill_from_env`: `1/true/yes/on` or `0/false/no/off`, a typo raises |
 | `MOTIF3_PACKED_PREFILL_MAX_SEG` | 1024 | P5: the largest packed segment S (one of 64 / 128 / 256 / 512 / 1024; caps the pk0 and pk1 segment sizes); a chunk of more rows runs solo | `check_packed_prefill_max_seg` (`GeneratorSettings`, `MotifTTConfig`) |
 | `MOTIF3_PACKED_PREFILL_MAX_TOKENS` | 8192 | P5: the largest packed pass T = B × S (also bounded by the span cap) | `check_packed_prefill_max_tokens`: a power of two in [128, 32768] |
@@ -677,6 +678,8 @@ throughput: greedy, thinking on, 256 tokens):
 
 The budget is `prefill_plan.recommended_budget(8192, A)` = 8064 for A = 128 (§15); the bridge's `FEATURE_VLLM_ARGS`
 derives from `generator_api.DEFAULT_PREFILL_ALIGNMENT` (128) and re-checks against the generator's real A at init.
+`MOTIF3_CHUNK_BUDGET=4096` (A1a) gives 4096 / 4096 through `generator_vllm.feature_vllm_args` (TIS: a runtime spec
+JSON with the two `vllm_args` overridden, `logs/opt/phaseA/tis/`).
 
 ## 15. Resumed and chunked prefill (`tt/prefill_plan.py`; `docs/features/FEATURES_DESIGN.md` §2, §3.1-§3.3, §3.7)
 
