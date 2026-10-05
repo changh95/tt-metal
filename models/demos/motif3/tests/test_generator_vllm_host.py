@@ -136,6 +136,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_TT_CACHE_POLICY",
         "MOTIF3_WIDE_STEP_RATIO",
         "MOTIF3_CHUNK_BUDGET",
+        "MOTIF3_FLASH_MLA_SWA_MCPH",
     ):
         monkeypatch.delenv(var, raising=False)
 

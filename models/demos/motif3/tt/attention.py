@@ -1491,7 +1491,9 @@ class MotifAttention:
         # bf16-dest role accumulates the 576-wide QK^T in bf16: PCC 0.998, fails everywhere); the op has no window.
         self.ckc_sdpa_sp1_global = cfg.compute_config("sdpa_prefill_fp32")
         self.ckc_rope = rope.ckc if rope is not None else cfg.compute_config("rope")
-        self.decode_pc = cfg.flash_mla_decode_pc()  # G1: k_chunk 128, mandatory (ATTN-2)
+        # G1: k_chunk 128, mandatory (ATTN-2); SWA layers use cfg.flash_mla_swa_mcph cores per head batch (A2: 4,
+        # bitwise equal to the global layers' 16 on a 129-key window), global layers 16
+        self.decode_pc = cfg.flash_mla_decode_pc("swa" if self.window is not None else "global")
         self.dtype = cfg.dtypes.activations
 
         # ---- weights (ATTN-1) -----------------------------------------------------------------------------------

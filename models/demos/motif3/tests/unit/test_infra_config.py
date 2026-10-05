@@ -95,6 +95,7 @@ _ENV = (
     "MOTIF3_WIDE_STEP_RATIO",
     # Phase A (docs/OPTIMIZATION_PLAN.md §4.3): chunk budget, FlashMLA SWA cores, router mask
     "MOTIF3_CHUNK_BUDGET",
+    "MOTIF3_FLASH_MLA_SWA_MCPH",
 )
 
 
@@ -458,6 +459,10 @@ def test_program_config_builders_match_gates():
     for pc in (flash_mla_decode_pc(mesh), flash_mla_decode_pc((12, 10)), cfg.flash_mla_decode_pc()):
         assert repr(pc) == repr(g1.program_config(mesh, 128))
         assert pc.k_chunk_size == 128 and pc.q_chunk_size == 0 and pc.max_cores_per_head_batch == 16
+    # A2: SWA layers 4 cores per head batch (bitwise equal to 16 on the 129-key window), global layers keep 16
+    for pc in (flash_mla_decode_pc(mesh, "swa"), cfg.flash_mla_decode_pc("swa"), cfg.flash_mla_decode_pc(1)):
+        assert pc.max_cores_per_head_batch == 4 and pc.k_chunk_size == 128 and pc.q_chunk_size == 0
+    assert repr(cfg.flash_mla_decode_pc(0)) == repr(cfg.flash_mla_decode_pc("global")) == repr(g1.program_config(mesh, 128))
     # G2: 128/128 on SWA, 256/256 on global, exp approx off (the HiFi4 configuration)
     assert repr(sdpa_prefill_pc("swa", mesh)) == repr(g2.sdpa_pc(mesh, 128, 128, exp_approx=False))
     assert repr(sdpa_prefill_pc("global", mesh)) == repr(g2.sdpa_pc(mesh, 256, 256, exp_approx=False))
@@ -722,6 +727,36 @@ def test_polynorm_semantics_fields():
         MotifTTConfig.from_hf_config(d, mesh_shape=(4, 8))
     with pytest.raises(ValueError):
         MotifTTConfig.from_hf_config(HF_META, polynorm_output_scale_per_layer={60: 0.5})
+
+
+def test_flash_mla_swa_mcph_knob(monkeypatch):
+    """A2 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/A2): ``MOTIF3_FLASH_MLA_SWA_MCPH`` sets the FlashMLA decode
+    ``max_cores_per_head_batch`` of the SWA layers (default 4; 16 = the release config); the global layers keep 16 at
+    every setting, and a value outside [1, 16] is refused when the config is built."""
+    import models.demos.motif3.tt.model_config as mc
+
+    assert mc.FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH == 16 and mc.FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA == 4
+    cfg = _cfg()
+    assert cfg.flash_mla_swa_mcph == 4
+    swa = [l for l in range(cfg.num_layers) if cfg.layer(l).attn_kind == "swa"]
+    glo = [l for l in range(cfg.num_layers) if cfg.layer(l).attn_kind == "global"]
+    assert len(swa) == 39 and len(glo) == 14
+    assert {cfg.flash_mla_decode_pc(cfg.layer(l)).max_cores_per_head_batch for l in swa} == {4}
+    assert {cfg.flash_mla_decode_pc(l).max_cores_per_head_batch for l in glo} == {16}
+    assert "mla_mcph swa=4/global=16" in cfg.describe()
+    for v, want in (("16", 16), ("2", 2), ("", 4)):
+        monkeypatch.setenv("MOTIF3_FLASH_MLA_SWA_MCPH", v)
+        c = _cfg()
+        assert c.flash_mla_swa_mcph == want and c.flash_mla_decode_pc("swa").max_cores_per_head_batch == want
+        assert c.flash_mla_decode_pc("global").max_cores_per_head_batch == 16
+    for bad in ("0", "17"):
+        monkeypatch.setenv("MOTIF3_FLASH_MLA_SWA_MCPH", bad)
+        with pytest.raises(ValueError, match="MOTIF3_FLASH_MLA_SWA_MCPH"):
+            _cfg()
+    monkeypatch.delenv("MOTIF3_FLASH_MLA_SWA_MCPH")
+    assert _cfg(flash_mla_swa_mcph=8).flash_mla_decode_pc("swa").max_cores_per_head_batch == 8
+    with pytest.raises(ValueError):
+        mc.flash_mla_decode_pc((12, 10), "swa", swa_mcph=32)
 
 
 def test_module_defaults(monkeypatch):

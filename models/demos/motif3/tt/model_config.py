@@ -618,7 +618,15 @@ _RENAMED_ROLES = {"sdpa": "split into 'sdpa_decode' (FlashMLA decode, G1) and 's
 # without a program config) drops the causal mask under a sliding window (upstream bug); 256 clashes with a
 # height-sharded Q's L1 buffer; 512 overflows L1 (static CBs 1.70-1.75 MB > 1.5 MB).
 FLASH_MLA_DECODE_K_CHUNK = 128
+# max_cores_per_head_batch (mcph): the cores the op spreads one head batch's k-chunks over. Global layers keep G1's 16.
 FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH = 16
+# SWA layers (A2, docs/OPTIMIZATION_PLAN.md §3.3; probe logs/opt/phaseA/A2): 4 (cfg.flash_mla_swa_mcph,
+# MOTIF3_FLASH_MLA_SWA_MCPH; 16 restores the release config). The 129-key window always spans exactly 2 k-chunks of 128,
+# so every mcph >= 2 places them alike and the output is bitwise equal to mcph 16 (measured in situ, 53-layer T32
+# trace, row / sampled paths, B32 and B1, P = 128-16384 incl. unaligned: logits sha1 and tokens equal), while the op
+# uses fewer cores: 30.2 -> 23.3 us per SWA call, -0.18 to -0.26 ms per decode step (39 SWA calls). Lowering the
+# GLOBAL value is not neutral (uniform 8: logits differ at P >= 4K) and uniform 4 is slower at 16K (+0.9 ms).
+FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA = 4
 # G2: SDPA prefill q/k chunks per layer kind (q512/k512 overflows L1 at S=4096).
 SDPA_PREFILL_CHUNKS: Dict[str, Tuple[int, int]] = {"swa": (128, 128), "global": (256, 256)}
 # G6: 1D-multicast expert matmuls (the auto config reaches only ~12 cores: 983 / 289 us instead of 426 / 222 us).
@@ -642,18 +650,35 @@ def _grid_xy(grid) -> Tuple[int, int]:
     return int(x), int(y)
 
 
-def flash_mla_decode_pc(grid=(12, 10)):
+def check_flash_mla_mcph(n) -> int:
+    """``n`` if it is an integer in ``[1, 16]`` (FlashMLA decode ``max_cores_per_head_batch``), else ``ValueError``."""
+    v = int(n)
+    if not 1 <= v <= FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH:
+        raise ValueError(
+            f"FlashMLA max_cores_per_head_batch (MOTIF3_FLASH_MLA_SWA_MCPH) must be in "
+            f"[1, {FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}], got {n!r}"
+        )
+    return v
+
+
+def flash_mla_decode_pc(grid=(12, 10), kind="global", swa_mcph: Optional[int] = None):
     """G1 program config for ``ttnn.transformer.paged_flash_multi_latent_attention_decode`` (mandatory):
-    ``SDPAProgramConfig(grid, q_chunk_size=0, k_chunk_size=128, exp_approx_mode=False, max_cores_per_head_batch=16)``.
+    ``SDPAProgramConfig(grid, q_chunk_size=0, k_chunk_size=128, exp_approx_mode=False, max_cores_per_head_batch=m)``
+    with ``m`` = 16 on global layers and, on SWA layers (``kind`` "swa" or a SWA ``LayerSpec``), ``swa_mcph``
+    (default :data:`FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA` = 4; A2, bitwise equal to 16 there).
     ``grid``: the chip compute grid (mesh device, CoreCoord or ``(x, y)``; 12 x 10 here). Pair it with the
     ``sdpa_decode`` compute role."""
     x, y = _grid_xy(grid)
+    if _attn_kind(kind) == "swa":
+        m = check_flash_mla_mcph(FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA if swa_mcph is None else swa_mcph)
+    else:
+        m = FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH
     return ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(x, y),
         q_chunk_size=0,
         k_chunk_size=FLASH_MLA_DECODE_K_CHUNK,
         exp_approx_mode=False,
-        max_cores_per_head_batch=FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH,
+        max_cores_per_head_batch=m,
     )
 
 
@@ -1270,6 +1295,9 @@ class MotifTTConfig:
     # Ring all-gathers of the TP axis (tt/ccl.py MotifCCL, P1 determinism fix): "safe" (default) | "lean" | "native".
     # spec_verify "wide" / "auto" (T64) require "safe" (validate(); F3N rule R1, review edit R-E5).
     ring_gather: str = "safe"  # MOTIF3_RING_GATHER
+    # FlashMLA decode max_cores_per_head_batch on SWA layers (A2, docs/OPTIMIZATION_PLAN.md §3.3): 4 (bitwise equal to
+    # the release's 16 on SWA, -0.2 ms per step); 16 restores the release config. Global layers keep 16.
+    flash_mla_swa_mcph: int = FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA  # MOTIF3_FLASH_MLA_SWA_MCPH
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1320,7 +1348,8 @@ class MotifTTConfig:
           INFRA-6) come from the device.
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
-          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_PREFILL_MAX_BUCKET``,
+          ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``,
+          ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
         * Explicit ``overrides`` win (any field, plus ``kv_cache_dtype="bfp8"|"bf16"`` mapped onto ``dtypes``).
@@ -1422,6 +1451,7 @@ class MotifTTConfig:
             l1_small_size=_env_int("MOTIF3_L1_SMALL_SIZE", DEFAULT_L1_SMALL_SIZE),
             router_logits=(os.environ.get("MOTIF3_ROUTER_LOGITS") or "composite").strip(),
             ring_gather=(os.environ.get("MOTIF3_RING_GATHER") or "safe").strip(),
+            flash_mla_swa_mcph=_env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
@@ -1561,6 +1591,7 @@ class MotifTTConfig:
             raise ValueError(f"l1_small_size must be >= 0, got {self.l1_small_size}")
         if self.mhc_sinkhorn not in MHC_SINKHORN_IMPLS:
             raise ValueError(f"mhc_sinkhorn must be one of {MHC_SINKHORN_IMPLS}, got {self.mhc_sinkhorn!r}")
+        check_flash_mla_mcph(self.flash_mla_swa_mcph)
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
         if self.ring_gather not in RING_GATHER_MODES:
@@ -2103,9 +2134,12 @@ class MotifTTConfig:
             )
         return self._ckc[role]
 
-    def flash_mla_decode_pc(self):
-        """G1 FlashMLA decode program config on this chip's compute grid (:func:`flash_mla_decode_pc`)."""
-        return flash_mla_decode_pc(self.compute_grid)
+    def flash_mla_decode_pc(self, kind="global"):
+        """G1 FlashMLA decode program config on this chip's compute grid (:func:`flash_mla_decode_pc`); ``kind`` =
+        "global" (default, mcph 16) | "swa" (mcph ``flash_mla_swa_mcph``, A2) | a ``LayerSpec`` | a layer index."""
+        if isinstance(kind, int) and not isinstance(kind, bool):
+            kind = self.layer(kind)
+        return flash_mla_decode_pc(self.compute_grid, kind, swa_mcph=self.flash_mla_swa_mcph)
 
     def sdpa_prefill_pc(self, kind, seq_len: Optional[int] = None):
         """G2 SDPA prefill program config; ``kind`` = "swa" | "global" | a ``LayerSpec`` | a layer index."""
@@ -2287,7 +2321,8 @@ class MotifTTConfig:
             f"kv blocks={self.kv_num_blocks}x{self.kv_block_size} ({kv_src}, {self.dtypes.kv_cache_name}) "
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
-            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} ring_gather={self.ring_gather}; "
+            f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} ring_gather={self.ring_gather} "
+            f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
             f"spec={self.spec_tokens} spec_verify={self.spec_verify}{wide}; "
             f"pack S={segs(self.pack_seg_buckets)} pk1 S={segs(self.pack_sp1_seg_buckets)} T<={self.pack_tokens_cap}; "
@@ -2312,6 +2347,8 @@ __all__ = [
     "EXPERTS_GATE_UP_GRID",
     "EXPERTS_PREFILL_OUT_BLOCK_W",
     "FLASH_MLA_DECODE_K_CHUNK",
+    "FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH",
+    "FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA",
     "FP32_ACC_OFF_ROLES",
     "KV_CACHE_DTYPE_BY_NAME",
     "LM_HEAD_PC",
@@ -2340,6 +2377,7 @@ __all__ = [
     "experts_gate_up_pc",
     "experts_prefill_pc",
     "fabric_config_from_name",
+    "check_flash_mla_mcph",
     "flash_mla_decode_pc",
     "kv_cache_dtype_from_name",
     "kv_cache_dtype_name",
