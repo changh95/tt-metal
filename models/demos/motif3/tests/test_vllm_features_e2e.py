@@ -17,7 +17,7 @@ tt-metal root conftest opens the UMD cluster even for collection, which would di
 
 Environment:
 
-* ``MOTIF3_E2E_URL`` (default ``http://127.0.0.1:8000``): the server. Live tests skip when it does not answer.
+* ``MOTIF3_E2E_URL`` (required, no default): the server. Live tests skip when it is unset or does not answer.
 * ``MOTIF3_E2E_PROFILE``: what the server under test enables; the assertions follow it.
 
   - The features track's launches (``logs/serve/features/features_hold.sh``, host sampling): ``all`` = the opt-in MTP
@@ -128,7 +128,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 PROJECT = Path(__file__).resolve().parents[5]  # .../motif-3 (tests -> motif3 -> demos -> models -> tt-metal -> root)
-BASE = os.environ.get("MOTIF3_E2E_URL", "http://127.0.0.1:8000").rstrip("/")
+# No default server (OPT_PHASE_A_REVIEW I-8): a bare host suite once reached the TIS server on :8000 and disturbed a
+# benchmark session. The live tests skip unless MOTIF3_E2E_URL names the server under test.
+BASE = (os.environ.get("MOTIF3_E2E_URL") or "").strip().rstrip("/")
 PROFILE = os.environ.get("MOTIF3_E2E_PROFILE", "all").strip().lower()
 OUT_DIR = os.environ.get("MOTIF3_E2E_OUT")
 REF_DIR = os.environ.get("MOTIF3_E2E_REFERENCE")
@@ -601,6 +603,8 @@ def server_log_text() -> Optional[str]:
 def _server_up() -> bool:
     import urllib.request
 
+    if not BASE:
+        return False
     try:
         with urllib.request.urlopen(BASE + "/health", timeout=5) as r:
             return r.status == 200
@@ -610,6 +614,8 @@ def _server_up() -> bool:
 
 @pytest.fixture(scope="module")
 def server():
+    if not BASE:
+        pytest.skip("MOTIF3_E2E_URL is not set: the live tests need an explicit server URL (no default)")
     if not _server_up():
         pytest.skip(f"no Motif-3 vLLM server answers at {BASE}/health")
     return BASE

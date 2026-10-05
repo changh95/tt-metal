@@ -44,7 +44,8 @@ The suite never guesses the mode. ``test_00`` (with a server log), ``test_10``, 
 shows no packed-prefill state (neither the generator's ``create: packed prefill on|off`` line nor ``packed_prefill=`` in
 the bridge's ``Motif-3 features:`` line), or when the log disagrees with ``MOTIF3_DS_PACKED``.
 
-Environment: ``MOTIF3_DS_URL`` (default ``http://127.0.0.1:8013``), ``MOTIF3_DS_PROFILE`` (``dsamp`` | ``dsamp_mtp``),
+Environment: ``MOTIF3_DS_URL`` (required, no default: the live tests skip when it is unset), ``MOTIF3_DS_PROFILE``
+(``dsamp`` | ``dsamp_mtp``),
 ``MOTIF3_DS_PACKED`` (``1`` | ``0``, above), ``MOTIF3_DS_OUT`` (one JSON per test), ``MOTIF3_DS_SERVER_LOG`` (the
 packed-prefill state above, and the bridge's ``Motif-3 device sampling:`` counter lines, logged every
 ``MOTIF3_SAMPLING_LOG_EVERY`` device steps), ``MOTIF3_DS_BUDGET`` (the expected chunk budget = threshold, e.g. 8064:
@@ -103,7 +104,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 import pytest
 
 PROJECT = Path(__file__).resolve().parents[5]
-BASE = os.environ.get("MOTIF3_DS_URL", "http://127.0.0.1:8013").rstrip("/")
+# No default server (OPT_PHASE_A_REVIEW I-8): a bare host suite once reached the TIS server on :8000 and disturbed a
+# benchmark session. The live tests skip unless MOTIF3_DS_URL names the server under test.
+BASE = (os.environ.get("MOTIF3_DS_URL") or "").strip().rstrip("/")
 PROFILE = os.environ.get("MOTIF3_DS_PROFILE", "dsamp").strip().lower()
 if PROFILE not in ("dsamp", "dsamp_mtp"):
     raise ValueError(f"MOTIF3_DS_PROFILE must be dsamp or dsamp_mtp, got {PROFILE!r}")
@@ -430,6 +433,8 @@ def packed_mode() -> bool:
 def _server_up() -> bool:
     import urllib.request
 
+    if not BASE:
+        return False
     try:
         with urllib.request.urlopen(BASE + "/health", timeout=5) as r:
             return r.status == 200
@@ -439,6 +444,8 @@ def _server_up() -> bool:
 
 @pytest.fixture(scope="module")
 def server():
+    if not BASE:
+        pytest.skip("MOTIF3_DS_URL is not set: the live tests need an explicit server URL (no default)")
     if not _server_up():
         pytest.skip(f"no Motif-3 vLLM server answers at {BASE}/health")
     return BASE
