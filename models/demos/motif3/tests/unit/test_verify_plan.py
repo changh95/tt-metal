@@ -31,6 +31,7 @@ import ast
 import math
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -452,6 +453,35 @@ def test_choose_verify_kind_cases():
         VP.choose_verify_kind(ordinary, "auto", kv_mode="deferred")
     with pytest.raises(TypeError):
         VP.choose_verify_kind(ordinary.anchors(), "auto", kv_mode="all_split")
+
+
+def test_wide_min_lanes_sweep_a4prime():
+    """A4' (docs/OPTIMIZATION_PLAN.md §3.3, §6 M14): the c* sweep is a pure ``MOTIF3_WIDE_MIN_LANES`` change, and the
+    knob does what the sweep assumes, end to end on the host: the env reaches ``GeneratorSettings.wide_min_lanes``; on
+    an ``auto`` launch every live lane drafts from that many live lanes on (below the prior's c* = 19 too), never below
+    it; and a verify step whose drafts do not fit idle lanes then runs on the T64 trace instead of dropping drafts. The
+    8-user case of FINAL_BENCHMARKS anomaly 1: 8 users packed in one DP row of the honest launch (``row_split``, no KV-R)
+    have no idle lane in their row, so under the idle-lane budget they cannot draft at all; with the knob at <= 8 they
+    all draft and the step goes to T64. With KV-R (``all_split``) the same drafts fit idle lanes of other rows: T32."""
+    hf = SimpleNamespace(num_hidden_layers=53)
+    kw = dict(max_batch_size=32, max_seq_len=32768)
+    c_star = VP.crossover_lanes(DEFAULT_SPEC_ALPHA_PRIOR, R)
+    assert c_star == 19
+    for raw, want in ((None, None), ("8", 8), ("16", 16), ("1", 1), ("33", 33)):
+        env = {"MOTIF3_SPEC_VERIFY": "auto"} | ({} if raw is None else {"MOTIF3_WIDE_MIN_LANES": raw})
+        s = GeneratorSettings.from_env(hf, environ=env, serving=dict(spec_tokens=1), **kw)
+        assert s.spec_verify == "auto" and s.wide_min_lanes == want, raw
+        for live in (1, 7, 8, 15, 16, 18, 19, 32):
+            got = VP.drafts_all_lanes(range(live), spec_verify="auto", ratio=R, min_lanes=s.wide_min_lanes)
+            assert got is (live >= (c_star if want is None else want)), (raw, live)
+    one_row = _batch_with(range(8), range(8))  # 8 live lanes on DP row 0, all drafted: row 0 has no idle lane
+    assert VP.choose_verify_kind(one_row, "auto", kv_mode="row_split") == "wide"
+    assert VP.choose_verify_kind(one_row, "auto", kv_mode="all_split") == "spec"
+    spread = _batch_with([0, 1, 8, 9, 16, 17, 24, 25], [0, 1, 8, 9, 16, 17, 24, 25])  # 2 per row: fits own row
+    assert VP.choose_verify_kind(spread, "auto", kv_mode="row_split") == "spec"
+    for bad in ("0", "34", "x"):
+        with pytest.raises(ValueError, match="MOTIF3_WIDE_MIN_LANES"):
+            GeneratorSettings.from_env(hf, environ={"MOTIF3_WIDE_MIN_LANES": bad}, **kw)
 
 
 def test_choose_verify_kind_matches_the_t32_pass_count():
