@@ -290,9 +290,18 @@ def deferred_tail(st: Step):
     st.staged.clear()
 
 
-def mla_pc(mesh_device):
-    return ttnn.SDPAProgramConfig(compute_with_storage_grid_size=gu.grid_size(mesh_device), q_chunk_size=0,
-                                  k_chunk_size=128, exp_approx_mode=False, max_cores_per_head_batch=16)
+def mla_pc(mesh_device, window=None):
+    """The serving FlashMLA decode program config of the layer kind (review I-7): SWA (``window`` set) takes the shipped
+    SWA ``max_cores_per_head_batch`` (A2: ``MOTIF3_FLASH_MLA_SWA_MCPH``, default 4; 16 = the release), global 16.
+    Imported lazily (gate import rule)."""
+    from models.demos.motif3.tt.model_config import (
+        FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA,
+        _env_int,
+        flash_mla_decode_pc,
+    )
+
+    swa_mcph = _env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA)
+    return flash_mla_decode_pc(gu.grid_size(mesh_device), "global" if window is None else "swa", swa_mcph=swa_mcph)
 
 
 MLA_CKC = None
@@ -304,7 +313,7 @@ def flash(mesh_device, q, cache, st: Step, window):
         MLA_CKC = gu.compute_cfg("HiFi4", fp32_acc=True, approx=False)  # sdpa_decode role
     return ttnn.transformer.paged_flash_multi_latent_attention_decode(
         q, cache, None, head_dim_v=DV, page_table_tensor=st.pt8, cur_pos_tensor=st.cur8, scale=1.0,
-        sliding_window_size=window, program_config=mla_pc(mesh_device), compute_kernel_config=MLA_CKC,
+        sliding_window_size=window, program_config=mla_pc(mesh_device, window), compute_kernel_config=MLA_CKC,
         memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
