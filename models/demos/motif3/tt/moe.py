@@ -42,6 +42,10 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    the 384 columns and extracts this chip's 12 weights with a constant one-hot (same top-8 sets incl. exact ties;
    weights within 1-4 fp32 ulp of the gather path; router + local mask 140 -> 104 us traced at M = 32,
    logs/opt/phaseA/A5).
+   B1 (``decode_experts="sparse"``, ``MOTIF3_DECODE_EXPERTS``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, probe
+   logs/opt/phaseA/M6): ``w_loc *= lane_mask`` (the step's gathered ``[1, 1, M, 1]`` fp32 0/1 mask of the live rows,
+   :meth:`MotifMoE.decode_lane_mask`, built once per step by the model) so inactive lanes route nothing, then the
+   sparsity ``s = max_M(w_loc)`` -> bf16 -> ROW_MAJOR ``[1, 1, 1, 12]`` (nonzero = some live row routes to the expert).
 4. Experts (MOE-4, G6): ``repeat(f_all) [1,12,32,4096] @ W_gate_up [1,12,4096,2560]`` (bfp8, ``experts_gate_up_pc``,
    ``experts`` role HiFi4 + fp32 acc, fp32 output) -> grouped PolyNorm from ``tt/polynorm.py`` (exact fp32 moments +
    Horner ``mac``, fp32 intermediates) with the routing weights folded into ``up`` (``h = poly(g) * (w_loc * u)``,
@@ -54,6 +58,17 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    ``[1,1,8,4096]`` bf16 DRAM: the full routed MoE output, replicated in the row.
    All decode intermediates live in L1 (freed inside the call; ~220 us faster than DRAM); CCL payloads and the output
    are DRAM.
+
+   B1 sparse experts (``decode_experts="sparse"``): step 4 runs ``ttnn.sparse_matmul(f_all, W_gate_up, s)`` (no
+   repeat; ``is_input_b_sparse``: the experts with ``s == 0`` are skipped and their output slices zero-filled) ->
+   the same PolyNorm (zero rows give exactly 0: ``row_scale`` is 0 there) -> ``sparse_matmul(h, W_down, s)``
+   (``is_input_a_sparse`` and ``is_input_b_sparse``) with the same program configs, compute config and dtypes as
+   the dense matmuls. ``nnz`` is always ``None`` (counted on device at run time): a static ``nnz`` that differs from
+   the real count deadlocks the op on BH (tt-metal #45943 / #45052), and the count is data dependent. The live rows
+   are bitwise equal to the dense path (an expert no live row routes to adds exactly 0 there: its weight is 0); the
+   rows of inactive lanes come out as 0 + the shared expert instead of garbage (nothing reads them). Measured
+   (M6, real L2 routes, traced, TORUS_XY): 1035 -> 524 / 631 / 904 us per layer at 1 / 8 / 32 live lanes, T64
+   1211 -> 687 / 911 / 1183 us at 2 / 16 / 64 live rows; sparsity 20 us per layer, lane mask 37 us per step.
 
 Measured on this Galaxy (TORUS_Y fabric, 4x8, real layer-2/4 weights; ``tests/unit/test_moe.py``): decode **1036 /
 1041 us traced** per call at L2 / L4 (eager 4.6 ms, dispatch bound). Per stage at L2 (each traced alone; small stages
@@ -117,7 +132,7 @@ import ttnn
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL
-from .model_config import ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc
+from .model_config import DECODE_EXPERTS_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -154,6 +169,42 @@ class _Keep:
         if old is None or old is new or id(old) in self.ids:
             return
         ttnn.deallocate(old)
+
+
+def _same_buffer(a, b) -> bool:
+    try:
+        return a.buffer_address() == b.buffer_address()
+    except Exception:  # host tensors / stand-ins: no buffer
+        return False
+
+
+def _reshape(t, shape):
+    """``ttnn.reshape`` that keeps exactly one live handle: frees the input when the op copied (a view shares the
+    buffer, and then the input handle must not be freed)."""
+    r = ttnn.reshape(t, ttnn.Shape(list(shape)))
+    if r is not t and not _same_buffer(r, t):
+        _free(t)
+    return r
+
+
+def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str) -> str:
+    """B1: the decode-experts mode a :class:`MotifMoE` runs. ``decode_experts`` (explicit) or ``cfg.decode_experts``
+    (``MOTIF3_DECODE_EXPERTS``; ``None`` = "dense") must be in :data:`DECODE_EXPERTS_MODES`. "sparse" needs
+    ``combine_mode="fold"`` (the routing weights folded into the PolyNorm output, so a skipped expert's zero slice is
+    its exact contribution): an explicit request raises, the config default falls back to "dense" for the HF-order
+    ``multiply_sum`` diagnostic module."""
+    explicit = decode_experts is not None
+    mode = str(decode_experts if explicit else (getattr(cfg, "decode_experts", None) or "dense"))
+    if mode not in DECODE_EXPERTS_MODES:
+        raise ValueError(f"decode_experts must be one of {DECODE_EXPERTS_MODES}, got {mode!r}")
+    if mode == "sparse" and combine_mode != "fold":
+        if explicit:
+            raise ValueError(
+                f"decode_experts='sparse' needs combine_mode='fold' (the routing weights folded into the PolyNorm "
+                f"output, so a skipped expert's zero slice is its exact contribution), got {combine_mode!r}"
+            )
+        return "dense"
+    return mode
 
 
 # Local program-config helper (README §10 rule 1 wants ``cfg.*_pc()`` builders): requested shared change -- move it
@@ -635,6 +686,10 @@ class MotifMoE:
             no ``ttnn.gather``, same top-8 sets, weights within 1-4 fp32 ulp; about -35 us per layer). Prefill always
             takes the gather path. "scatter" builds its constants here (the local one-hot ``[1, 12, 1, 384]`` fp32 and,
             per decode row count, the scatter's zeros / ones), before any trace capture (F3N rule R3).
+        decode_experts: decode routed experts (B1; ``None`` = ``cfg.decode_experts``, ``MOTIF3_DECODE_EXPERTS``):
+            "dense" (the release) | "sparse" (``ttnn.sparse_matmul`` skips the local experts no live row routes to;
+            live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
+            constants: the sparsity tensor is built per call, the lane mask per step (:meth:`decode_lane_mask`).
     """
 
     def __init__(
@@ -661,6 +716,7 @@ class MotifMoE:
         prefill_pc: bool = True,
         prefill_chunk: Optional[int] = None,
         router_mask: Optional[str] = None,
+        decode_experts: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -784,6 +840,9 @@ class MotifMoE:
             for m in self.decode_rows:
                 self.scatter_consts[m] = (rm(torch.zeros(1, 1, m, self.n_experts)), rm(torch.ones(1, 1, m, self.top_k)))
 
+        # ---- B1 decode experts: "dense" | "sparse" (no device constants) ----------------------------------------------
+        self.decode_experts = resolve_decode_experts(decode_experts, cfg, self.combine_mode)
+
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
     # ==========================================================================================================
@@ -902,28 +961,49 @@ class MotifMoE:
             part = p2
         return part
 
-    def local_partial(self, f, *, polynorm: str, decode: bool, taps: Optional[dict] = None, memory_config=None):
+    def local_partial(self, f, *, polynorm: str, decode: bool, taps: Optional[dict] = None, memory_config=None,
+                      lane_mask=None):
         """This chip's routed partial for the tokens ``f [1, 1, M, 4096]`` (identical on all chips): route, mask,
         experts, combine -> ``[1, 1, M, 4096]`` in ``combine_dtype``, DRAM (still to be summed over all 32 chips).
         ``memory_config``: intermediates (decode: L1). ``taps`` (tests) receives ``idx``, ``w`` (unscaled when
         ``route_scale`` is folded: multiply by ``route_scale / internal_route_scale`` to compare), ``w_loc``; with
-        ``router_mask="scatter"`` at a decode row count ``idx``, ``sel`` (the top-8 0/1 mask) and ``w_loc`` instead."""
+        ``router_mask="scatter"`` at a decode row count ``idx``, ``sel`` (the top-8 0/1 mask) and ``w_loc`` instead.
+
+        B1 (``decode_experts="sparse"``, decode row counts only): ``lane_mask`` (``[1, 1, M, 1]`` fp32 0/1, the
+        step's live rows in gathered order; :meth:`decode_lane_mask`) zeroes the routing weights of inactive rows
+        first (``None``: no masking -- still exact on every row, only fewer experts are skipped), then
+        :meth:`sparse_experts` skips the local experts with no routed row. ``taps`` then also get ``sparsity`` and
+        ``w_loc`` is the masked one. ``lane_mask`` is ignored on the dense path (it is the caller's; never freed)."""
         mc = memory_config or self.dram
-        consts = getattr(self, "scatter_consts", {}).get(int(f.shape[-2])) if decode else None
+        M = int(f.shape[-2])
+        consts = getattr(self, "scatter_consts", {}).get(M) if decode else None
         if consts is not None:  # A5 "scatter" router mask at a decode row count (taps get idx, sel, w_loc; no "w")
             w_loc = self.router.route_local(
                 f, self.local_mask, consts, scale=self.internal_route_scale, taps=taps, memory_config=mc
             )
-            if taps is not None:
-                taps["w_loc"] = w_loc
         else:
             idx, w = self.router(f, scale=self.internal_route_scale, memory_config=mc)
             w_loc = self.local_weights(idx, w, memory_config=mc)
             if taps is not None:
-                taps["idx"], taps["w"], taps["w_loc"] = idx, w, w_loc
+                taps["idx"], taps["w"] = idx, w
             else:
                 _free(idx, w)
-        if self.combine_mode == "fold":
+        sparse = decode and getattr(self, "decode_experts", "dense") == "sparse" and M in self.decode_rows
+        if sparse and lane_mask is not None:
+            wm = ttnn.multiply(w_loc, lane_mask, memory_config=mc)  # [1, 12, M, 1] * [1, 1, M, 1]: exact (x 0 / x 1)
+            _free(w_loc)
+            w_loc = wm
+        if taps is not None:
+            taps["w_loc"] = w_loc
+        if sparse:
+            s = self.decode_sparsity(w_loc, memory_config=mc)
+            if taps is not None:
+                taps["sparsity"] = s
+            y = self.sparse_experts(f, s, polynorm=polynorm, row_scale=w_loc, memory_config=mc)
+            if taps is None:
+                _free(s)
+            part = self.reduce_experts(y, memory_config=self.dram)
+        elif self.combine_mode == "fold":
             y = self.experts(f, polynorm=polynorm, decode=decode, row_scale=w_loc, memory_config=mc)
             part = self.reduce_experts(y, memory_config=self.dram)
         else:
@@ -935,9 +1015,74 @@ class MotifMoE:
         return part
 
     # ==========================================================================================================
+    # B1: sparse decode experts
+    # ==========================================================================================================
+    def decode_sparsity(self, w_loc, *, memory_config=None):
+        """``w_loc [1, 12, M, 1]`` fp32 TILE (lane-masked) -> the ``sparse_matmul`` sparsity ``[1, 1, 1, 12]`` bf16
+        ROW_MAJOR (one stick): ``max`` over the rows (weights are >= 0, exactly 0 where no row routes), bf16, untilize,
+        view. 4 ops, ~20 us traced per layer (M6). A weight too small for bf16 (below ~1e-38) would read as 0 and
+        skip the expert; real routing weights are normalized top-8 sigmoid scores, orders of magnitude above that."""
+        mc = memory_config or self.dram
+        m = ttnn.max(w_loc, dim=2, keepdim=True, memory_config=mc)  # [1, 12, 1, 1] fp32
+        b = ttnn.typecast(m, ttnn.bfloat16, memory_config=mc)
+        _free(m)
+        r = ttnn.to_layout(b, ttnn.ROW_MAJOR_LAYOUT, memory_config=mc)
+        _free(b)
+        return _reshape(r, (1, 1, 1, self.e_loc))
+
+    def sparse_experts(self, f, sparsity, *, polynorm: str, row_scale, memory_config=None):
+        """:meth:`experts` at a decode row count with the local experts whose ``sparsity`` entry is 0 skipped:
+        ``f [1, 1, M, 4096]`` -> ``y [1, 12, M, 4096]`` (skipped experts' slices exactly 0). The same program configs,
+        compute config and dtypes as the dense decode matmuls (bitwise equal on the computed slices; M6, and
+        ``sparsity`` all ones == dense on every row). ``nnz=None`` always (a static count deadlocks on BH: tt-metal
+        #45943 / #45052)."""
+        mc = memory_config or self.dram
+        M = int(f.shape[-2])
+        gu_dtype = self.gate_up_dtype
+        if gu_dtype is None:
+            gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
+        pc_gu, pc_dn = (self.pc_gate_up, self.pc_down) if M == TILE else self.pc_wide[M]
+        gu = ttnn.sparse_matmul(
+            f, self.w_gate_up, sparsity=sparsity, program_config=pc_gu, nnz=None, is_input_a_sparse=False,
+            is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=gu_dtype,
+        )  # [1, 1, 1, 12, M, 2560]
+        gu = _reshape(gu, (1, self.e_loc, M, 2 * self.inter))
+        h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc, impl=self.polynorm_impl)
+        _free(gu)
+        y = ttnn.sparse_matmul(
+            h, self.w_down, sparsity=sparsity, program_config=pc_dn, nnz=None, is_input_a_sparse=True,
+            is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype,
+        )
+        _free(h)
+        if len(y.shape) != 4:
+            y = _reshape(y, (1, self.e_loc, M, self.hidden))
+        return y
+
+    @staticmethod
+    def decode_lane_mask(ccl: MotifCCL, active, rows_per_dp: int):
+        """The step's MoE lane mask for B1: the live rows of all DP rows in the MoE's gathered order (row ``L dp + j``,
+        L = ``rows_per_dp``: 8 lanes, or 16 rows in the T64 step), ``[1, 1, 4 L, 1]`` fp32 0/1 DRAM, identical on every
+        chip. From the step's ``active`` mask (``MotifAttention.active_mask_from_cur_pos(cur_pos, L)``,
+        ``[1, 1, L, width]`` bf16 TILE, width >= 32; not consumed): its first 32 columns gathered over DP. Build it
+        once per step (trace-safe: fixed shapes, ~37 us) and pass it to every MoE layer's :meth:`forward_decode`;
+        the caller frees it."""
+        L = int(rows_per_dp)
+        a32 = ttnn.slice(active, [0, 0, 0, 0], [1, 1, L, TILE], memory_config=ttnn.L1_MEMORY_CONFIG)
+        g = ccl.ag_dp_rows(a32, memory_config=ttnn.L1_MEMORY_CONFIG)  # [1, 1, 4 L, 32] bf16 TILE
+        if g is not a32:
+            _free(a32)
+        M = int(g.shape[-2])
+        c = ttnn.slice(g, [0, 0, 0, 0], [1, 1, M, 1], memory_config=ttnn.L1_MEMORY_CONFIG)
+        _free(g)
+        m = ttnn.typecast(c, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _free(c)
+        return m
+
+    # ==========================================================================================================
     # decode (MOE-1, MOE-5)
     # ==========================================================================================================
-    def forward_decode(self, x, *, add_partial=None, reduce_tp: bool = True, taps: Optional[dict] = None):
+    def forward_decode(self, x, *, add_partial=None, reduce_tp: bool = True, taps: Optional[dict] = None,
+                       lane_mask=None):
         """Decode MoE for this DP row's rows: its 8 lanes, or the T64 verify step's 16 rows (``[8 anchors | 8
         drafts]``, still one tile row; docs/p5_t64/P5_T64_DESIGN.md §4.2).
 
@@ -950,6 +1095,9 @@ class MotifMoE:
             reduce_tp: False returns the column partial ``[1, 1, L, 4096]`` (``combine_dtype``) without the final
                 ``all_reduce(tp)`` (the caller closes it).
             taps: tests only (eager): receives ``f_all``, ``idx``, ``w``, ``w_loc``, ``part`` (not freed).
+            lane_mask: B1 (``decode_experts="sparse"``): the step's ``[1, 1, 4 L, 1]`` fp32 live-row mask
+                (:meth:`decode_lane_mask`; not consumed). ``None`` = no masking (exact, fewer experts skipped);
+                ignored by the dense path.
 
         Returns ``[1, 1, L, 4096]`` bf16 TILE DRAM: the routed MoE output (+ ``add_partial``), replicated in the row.
         Row ``j`` depends on input row ``j`` only, bitwise the same at L = 8 and 16 (the per-M configs keep every row's
@@ -967,11 +1115,11 @@ class MotifMoE:
             )
         f_all = self.ccl.ag_dp_rows(x, memory_config=self.decode_mc)  # [1, 1, 4 L, 4096], natural order L dp + j
         part = self.local_partial(f_all, polynorm=self.decode_polynorm, decode=True, taps=taps,
-                                  memory_config=self.decode_mc)
+                                  memory_config=self.decode_mc, lane_mask=lane_mask)
         if taps is not None:
             taps["f_all"] = f_all
             taps["part"] = part
-        keep = _Keep(x, add_partial, *(taps.values() if taps is not None else ()))
+        keep = _Keep(x, add_partial, lane_mask, *(taps.values() if taps is not None else ()))
         keep.drop(f_all)  # (is x itself when the DP axis has size 1)
         red = self.ccl.ar_dp(part)  # sum over the 4 chips of this column (all 4 L tokens)
         keep.drop(part, red)
@@ -1081,5 +1229,6 @@ class MotifMoE:
         self.local_mask, self.scatter_consts = None, {}
 
 
-__all__ = ["COMBINE_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS",
-           "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc", "wide_decode_rows"]
+__all__ = ["COMBINE_MODES", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MotifMoE",
+           "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc",
+           "resolve_decode_experts", "wide_decode_rows"]

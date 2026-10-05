@@ -23,6 +23,12 @@ Host (CPU only; never touches the chips)::
 * ``test_moe_host_router_mask_scatter`` (A5): ``MotifRouter.route_local`` / ``local_partial`` with the ttnn ops
   emulated in torch: topk's sets (exact ties included) on every chip, weights equal to the gather path to fp32
   rounding, no ``ttnn.gather``, no leak or double free, the scatter path only at decode row counts with constants.
+* ``test_moe_host_sparse_decode_experts`` (B1): ``local_partial`` with ``decode_experts="sparse"`` and the ttnn ops
+  emulated in torch: live rows bitwise == dense, inactive rows 0, the sparsity = the experts live rows route to,
+  ``sparse_matmul`` with ``nnz=None`` and the dense program configs, no leak / double free, the dense path kept for
+  prefill / other row counts / the dense mode; ``resolve_decode_experts``.
+* ``test_moe_host_sparse_lane_mask_wiring`` (B1): ``decode_lane_mask`` (order, frees, size-1 DP axis), the model's
+  per-step build and free, decoder -> MoE -> ``local_partial`` hand-over.
 * ``test_moe_host_import_clean``: importing ``tt.moe`` loads no other ``models/demos`` package.
 
 Real router inputs (CPU capture, ~5 min, 270 MB; the device tests skip without it)::
@@ -66,6 +72,10 @@ token below 0.999 against the reference routes must be a route flip.
       $S/devrun.sh -t 1500 -n moe_t64 -- python -m pytest models/demos/motif3/tests/unit/test_moe.py -s \
           -p no:cacheprovider -k t64_rows
 
+* ``test_moe_device_sparse_decode_experts`` (B1, ``decode_experts="sparse"``): real L2 / L35 weights and routes at
+  M = 32 (1 / 8 / 32 live lanes) and M = 64 (2 / 16 / 64 live rows): live rows bitwise == dense, inactive rows exactly
+  ``add_partial``, unmasked == dense on every row, the device lane mask == host, T64 rows == T32 rows, trace replays
+  with new tokens and live sets == eager and deterministic, traced cost dense vs sparse.
 * ``test_moe_device_prefill``: real layer-2 weights, S = 128 / 2048 real tokens and S = 4096 / 32768 (real tokens
   tiled) vs the reference (and on the device's routes), replicas identical, ``add_partial`` / ``reduce_tp=False``
   contracts (S = 128), ``prefill_polynorm="fp32"`` and ``prefill_pc=False`` (bitwise equal to the default), eager latency
@@ -545,7 +555,7 @@ def test_moe_host_size1_axis_never_frees_inputs(monkeypatch, dp1, tp1, part_dtyp
     moe.cfg = SimpleNamespace(dp=1 if dp1 else 4)
     moe.decode_rows = M.DECODE_ROWS  # a module built with a T64 config: 32 and 64 gathered decode rows
 
-    def local_partial(f, *, polynorm, decode, taps=None, memory_config=None):
+    def local_partial(f, *, polynorm, decode, taps=None, memory_config=None, lane_mask=None):
         if taps is not None:
             taps["idx"], taps["w"], taps["w_loc"] = new("idx", f), new("w", f), new("w_loc", f)
         return new("part", f, dtype=pdt)
@@ -831,6 +841,332 @@ def test_moe_host_router_mask_scatter(monkeypatch):
     seen.clear()
     M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 32, H]), polynorm="fp32", decode=True)
     assert seen == [("gather", 32)]
+
+
+@torch.no_grad()
+def test_moe_host_sparse_decode_experts(monkeypatch):
+    """B1 (docs/OPTIMIZATION_PLAN.md §3.3; ``decode_experts="sparse"``, ``MOTIF3_DECODE_EXPERTS``; probe
+    logs/opt/phaseA/M6), host side with the ttnn ops emulated in torch (small dims, fp32 math):
+
+    * ``local_partial`` at M = 32 / 64 with 1 / 8 / all live lanes: the masked routing weights are 0 on inactive rows,
+      the sparsity holds exactly the local experts some *live* row routes to (an expert routed only by inactive rows
+      is skipped), the partial equals the dense path's on every live row bitwise and is 0 on inactive rows;
+    * ``sparse_matmul``: ``nnz=None`` always (a static count deadlocks on BH), ``(a, b)`` sparse flags ``(False,
+      True)`` then ``(True, True)``, the dense decode program configs of that M, the same compute config and dtypes;
+      no ``repeat`` / ``matmul``;
+    * ``lane_mask=None``: still exact on every row (inactive rows' experts are then computed too);
+    * every intermediate freed once, nothing leaks, the caller's ``f`` / ``lane_mask`` never freed; taps keep the
+      masked ``w_loc`` and ``sparsity``;
+    * the dense mode, prefill (``decode=False``) and a row count outside ``decode_rows`` keep the dense path and
+      ignore the lane mask;
+    * ``resolve_decode_experts``: the config default, an explicit mode, bad modes, and "sparse" needs the "fold"
+      combine (explicit raises, the config default falls back to "dense")."""
+    import models.demos.motif3.tt.moe as M
+    from models.demos.motif3.tt.model_config import DECODE_EXPERTS_MODES, MotifTTConfig
+
+    assert DECODE_EXPERTS_MODES == ("dense", "sparse")
+    monkeypatch.delenv("MOTIF3_DECODE_EXPERTS", raising=False)
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert cfg.decode_experts == "dense"  # default off until the B1 gates decide
+    # ---- resolve_decode_experts ----
+    R = M.resolve_decode_experts
+    assert R(None, cfg, "fold") == "dense" and R("sparse", cfg, "fold") == "sparse" and R("dense", cfg, "fold") == "dense"
+    sp = SimpleNamespace(decode_experts="sparse")
+    assert R(None, sp, "fold") == "sparse" and R(None, sp, "multiply_sum") == "dense" and R("dense", sp, "fold") == "dense"
+    assert R(None, SimpleNamespace(), "fold") == "dense"
+    with pytest.raises(ValueError, match="combine_mode"):
+        R("sparse", cfg, "multiply_sum")
+    with pytest.raises(ValueError, match="decode_experts"):
+        R("skip", cfg, "fold")
+
+    Hs, Is, El = 64, 16, 12
+    created, freed, calls = [], [], []
+
+    def new(t, **kw):
+        x = _TT(t, **kw)
+        created.append(x)
+        return x
+
+    def mul(a, b, *, memory_config=None, **kw):
+        calls.append(("multiply",))
+        return new(a.t.float() * b.t.float())
+
+    def tmax(a, dim, keepdim=True, memory_config=None):
+        calls.append(("max",))
+        return new(a.t.amax(dim=dim, keepdim=keepdim))
+
+    def typecast(a, dt, memory_config=None, **kw):
+        calls.append(("typecast", dt))
+        return new(a.t.to(torch.bfloat16) if dt == ttnn.bfloat16 else a.t.float(), dtype=dt, layout=a.layout)
+
+    def to_layout(a, layout, memory_config=None, **kw):
+        calls.append(("to_layout", layout))
+        return new(a.t.clone(), dtype=a.dtype, layout=layout)
+
+    def reshape(a, shape, **kw):
+        calls.append(("reshape",))
+        # a copy (stand-ins have no buffer address): moe._reshape frees the input, the copy is tracked
+        return new(a.t.reshape(tuple(int(v) for v in shape)).clone(), dtype=a.dtype, layout=a.layout)
+
+    def sparse_matmul(a, b, *, sparsity, program_config, nnz, is_input_a_sparse, is_input_b_sparse, memory_config,
+                      compute_kernel_config, dtype):
+        calls.append(("sparse_matmul", program_config, nnz, is_input_a_sparse, is_input_b_sparse,
+                      compute_kernel_config, dtype))
+        on = sparsity.t.reshape(-1).float() != 0
+        assert sparsity.layout == ttnn.ROW_MAJOR_LAYOUT and tuple(sparsity.shape) == (1, 1, 1, El)
+        Mr = a.shape[-2]
+        out = torch.zeros(El, Mr, b.shape[-1])
+        for e in range(El):
+            if on[e]:
+                ae = a.t[0, e] if is_input_a_sparse else a.t[0, 0]
+                out[e] = ae.float() @ b.t[0, e].float()
+        if dtype == ttnn.bfloat16:
+            out = out.to(torch.bfloat16)
+        return new(out.reshape(1, El, Mr, -1) if is_input_a_sparse else out.reshape(1, 1, 1, El, Mr, -1), dtype=dtype)
+
+    def repeat(a, shape, memory_config=None):
+        calls.append(("repeat",))
+        return new(a.t.expand(1, El, -1, -1).clone())
+
+    def matmul(a, b, *, program_config, compute_kernel_config, dtype, memory_config):
+        calls.append(("matmul", program_config, compute_kernel_config, dtype))
+        out = torch.stack([a.t[0, e].float() @ b.t[0, e].float() for e in range(El)]).unsqueeze(0)  # per expert
+        return new(out.to(torch.bfloat16) if dtype == ttnn.bfloat16 else out, dtype=dtype)
+
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda t, *a, **k: freed.append(t))
+    for name, fn in (("multiply", mul), ("max", tmax), ("typecast", typecast), ("to_layout", to_layout),
+                     ("reshape", reshape), ("sparse_matmul", sparse_matmul), ("repeat", repeat), ("matmul", matmul)):
+        monkeypatch.setattr(M.ttnn, name, fn)
+    monkeypatch.setattr(M.ttnn, "Shape", lambda v: list(v))
+
+    g = torch.Generator().manual_seed(11)
+    w_gu = _TT(torch.randn(1, El, Hs, 2 * Is, generator=g).to(torch.bfloat16))
+    w_dn = _TT(torch.randn(1, El, Is, Hs, generator=g).to(torch.bfloat16))
+
+    def make_moe(mode, M_rows_w_loc):
+        moe = object.__new__(M.MotifMoE)
+        moe.dram, moe.internal_route_scale, moe.combine_mode, moe.decode_experts = "dram", 1.0, "fold", mode
+        moe.decode_rows, moe.e_loc, moe.inter, moe.hidden = (32, 64), El, Is, Hs
+        moe.pc_gate_up, moe.pc_down, moe.pc_wide = "PC_GU32", "PC_DN32", {64: ("PC_GU64", "PC_DN64")}
+        moe.prefill_pc, moe.ckc_experts, moe.gate_up_dtype, moe.down_dtype = False, "CKC", None, ttnn.bfloat16
+        moe.polynorm_impl = moe.prefill_polynorm_impl = "horner"
+        moe.w_gate_up, moe.w_down = w_gu, w_dn
+        moe.scatter_consts = {}
+        moe.router = lambda f, **kw: (new(torch.zeros(1)), new(torch.zeros(1)))
+        moe.local_weights = lambda i, w, **kw: new(M_rows_w_loc.clone())
+
+        def polynorm(gu, *, mode, row_scale=None, memory_config=None, impl=None):
+            calls.append(("polynorm", impl))
+            gg, uu = gu.t[..., :Is].float(), gu.t[..., Is:].float()
+            return new((torch.tanh(gg) * (row_scale.t.float() * uu)).to(torch.bfloat16))
+
+        moe.polynorm = polynorm
+        moe.reduce_experts = lambda y, **kw: calls.append(("reduce",)) or new(y.t.float().sum(1, keepdim=True))
+        return moe
+
+    def routes(Mr, live, seed):
+        """w_loc [1, 12, Mr, 1]: every row routes to ~2 local experts (0 elsewhere); expert 11 only by inactive rows."""
+        gg = torch.Generator().manual_seed(seed)
+        w = torch.zeros(1, El, Mr, 1)
+        for r in range(Mr):
+            for e in torch.randperm(El - 1, generator=gg)[:2].tolist():
+                w[0, e, r, 0] = 0.05 + 0.4 * float(torch.rand(1, generator=gg))
+        dead = [r for r in range(Mr) if r not in live]
+        if dead:
+            w[0, El - 1, dead[0], 0] = 0.3
+        return w
+
+    for Mr in (32, 64):
+        for nlive in (1, 8, Mr):
+            live = sorted(torch.randperm(Mr, generator=g)[:nlive].tolist())
+            w_loc = routes(Mr, live, 100 * Mr + nlive)
+            mask = torch.zeros(1, 1, Mr, 1)
+            mask[0, 0, live, 0] = 1.0
+            lm = _TT(mask)
+            f = _TT(torch.randn(1, 1, Mr, Hs, generator=g).to(torch.bfloat16))
+            # dense reference (today's path)
+            calls.clear()
+            dense = M.MotifMoE.local_partial(make_moe("dense", w_loc), f, polynorm="fp32", decode=True, lane_mask=lm)
+            assert not any(c[0] in ("sparse_matmul", "multiply", "max") for c in calls), calls  # mask ignored
+            assert [c[1] for c in calls if c[0] == "matmul"] == (["PC_GU32", "PC_DN32"] if Mr == 32 else
+                                                                 ["PC_GU64", "PC_DN64"])
+            dense_mm = [c for c in calls if c[0] == "matmul"]
+            for use_mask in (True, False):
+                moe = make_moe("sparse", w_loc)
+                created.clear(), freed.clear(), calls.clear()
+                part = M.MotifMoE.local_partial(moe, f, polynorm="fp32", decode=True, lane_mask=lm if use_mask else None)
+                tag = (Mr, nlive, use_mask)
+                assert not any(c[0] in ("repeat", "matmul") for c in calls), (tag, calls)
+                smm = [c for c in calls if c[0] == "sparse_matmul"]
+                assert len(smm) == 2 and all(c[2] is None for c in smm), (tag, smm)  # nnz=None always
+                assert [(c[3], c[4]) for c in smm] == [(False, True), (True, True)], tag
+                assert [c[1] for c in smm] == [c[1] for c in dense_mm], tag  # the dense program configs of this M
+                assert [(c[5], c[6]) for c in smm] == [(c[2], c[3]) for c in dense_mm], tag  # compute config, dtypes
+                assert ("polynorm", "horner") in calls
+                # live rows bitwise == dense; inactive rows 0 with the mask
+                assert torch.equal(part.t[0, 0, live], dense.t[0, 0, live]), tag
+                if use_mask and nlive < Mr:
+                    dead = [r for r in range(Mr) if r not in live]
+                    assert float(part.t[0, 0, dead].abs().max()) == 0.0, tag
+                if not use_mask:
+                    assert torch.equal(part.t, dense.t), tag  # unmasked: exact on every row
+                # memory: only the partial survives; caller's tensors never freed; nothing freed twice
+                ids = [id(t) for t in freed]
+                assert len(ids) == len(set(ids)), tag
+                assert not any(t is f or t is lm or t is part for t in freed), tag
+                leaked = [t for t in created if t is not part and not any(t is q for q in freed)]
+                assert not leaked, (tag, [x.shape for x in leaked])
+            # taps: masked w_loc and the sparsity stay alive; sparsity = experts some live row routes to
+            moe = make_moe("sparse", w_loc)
+            created.clear(), freed.clear()
+            taps = {}
+            part = M.MotifMoE.local_partial(moe, f, polynorm="fp32", decode=True, lane_mask=lm, taps=taps)
+            assert set(taps) == {"idx", "w", "w_loc", "sparsity"}
+            assert not any(t is v for t in freed for v in taps.values())
+            want_w = w_loc * mask
+            assert torch.equal(taps["w_loc"].t, want_w)
+            want_on = (want_w[0, :, :, 0] != 0).any(-1)
+            got_on = taps["sparsity"].t.reshape(-1).float() != 0
+            assert torch.equal(got_on, want_on), (Mr, nlive, got_on, want_on)
+            if nlive < Mr:
+                assert not bool(got_on[El - 1])  # routed only by an inactive row: skipped
+    # dense path kept: prefill, and a row count the decode configs do not cover
+    w_loc = routes(96, list(range(96)), 1)
+    for decode, Mr in ((False, 32), (True, 96)):
+        moe = make_moe("sparse", w_loc[:, :, :Mr])
+        calls.clear()
+        f = _TT(torch.randn(1, 1, Mr, Hs, generator=g).to(torch.bfloat16))
+        M.MotifMoE.local_partial(moe, f, polynorm="bf16", decode=decode, lane_mask=_TT(torch.ones(1, 1, Mr, 1)))
+        assert not any(c[0] in ("sparse_matmul", "multiply", "max") for c in calls), (decode, Mr, calls)
+        assert sum(c[0] == "matmul" for c in calls) == 2
+
+
+def test_moe_host_sparse_lane_mask_wiring(monkeypatch):
+    """B1 wiring: ``MotifMoE.decode_lane_mask`` (slice the step's ``active`` to 32 columns -> ``ag_dp_rows`` -> the
+    first column -> fp32 DRAM; gathered natural order ``L dp + j`` for L = 8 and 16; frees every intermediate once,
+    never the caller's ``active``; a size-1 DP axis that hands the input back is not freed twice), the model builds it
+    once per step only when a built layer (up to ``stop_after``) runs sparse experts, every decode step function
+    (``decode`` / ``decode_spec`` / ``decode_wide``) passes it to every layer and frees it with ``act``, the decoder
+    layer hands it to the MoE, and ``forward_decode`` passes it to ``local_partial`` without freeing it."""
+    import models.demos.motif3.tt.decoder as D
+    import models.demos.motif3.tt.model as MD
+    import models.demos.motif3.tt.moe as M
+
+    created, freed = [], []
+
+    def new(t, **kw):
+        x = _TT(t, **kw)
+        created.append(x)
+        return x
+
+    def slc(a, start, end, memory_config=None):
+        return new(a.t[tuple(slice(s, e) for s, e in zip(start, end))].clone(), dtype=a.dtype)
+
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda t, *a, **k: freed.append(t))
+    monkeypatch.setattr(M.ttnn, "slice", slc)
+    monkeypatch.setattr(M.ttnn, "typecast", lambda a, dt, memory_config=None: new(a.t.float(), dtype=dt))
+    for L in (8, 16):
+        for dp in (4, 1):
+            pos = [[(r * 7 + j) % 3 - 1 for j in range(L)] for r in range(dp)]  # -1 = inactive
+            acts = [torch.tensor([1.0 if p >= 0 else 0.0 for p in row]).reshape(1, 1, L, 1).expand(1, 1, L, 1024)
+                    for row in pos]
+
+            class CCL:
+                def ag_dp_rows(self, a, memory_config=None):
+                    if dp == 1:
+                        return a  # size-1 axis: the input handed back
+                    rows = [a.t] + [acts[r][..., :32].to(a.t.dtype) for r in range(1, dp)]  # a = DP row 0's
+                    return new(torch.cat(rows, dim=2), dtype=a.dtype)
+
+            act = _TT(acts[0].to(torch.bfloat16))
+            created.clear(), freed.clear()
+            m = M.MotifMoE.decode_lane_mask(CCL(), act, L)
+            want = torch.tensor([1.0 if p >= 0 else 0.0 for row in pos for p in row]).reshape(1, 1, dp * L, 1)
+            assert m.dtype == ttnn.float32 and torch.equal(m.t, want), (L, dp)
+            ids = [id(t) for t in freed]
+            assert len(ids) == len(set(ids)) and not any(t is act or t is m for t in freed), (L, dp)
+            assert not [t for t in created if t is not m and not any(t is q for q in freed)], (L, dp)
+    # model: built only when a layer (up to stop_after) is sparse
+    built = []
+    monkeypatch.setattr(MD.MotifMoE, "decode_lane_mask", staticmethod(lambda ccl, act, r: built.append(r) or "LM"))
+    model = object.__new__(MD.MotifModel)
+    model.ccl = "CCL"
+    lay = lambda mode: SimpleNamespace(moe=None if mode is None else SimpleNamespace(decode_experts=mode))  # noqa: E731
+    model.layers = [lay(None), lay(None), lay("dense"), lay("sparse")]
+    assert model._moe_lane_mask("ACT", 8, 3) is None and built == []
+    assert model._moe_lane_mask("ACT", 16, 4) == "LM" and built == [16]
+    model.layers = [lay(None), lay("dense")]
+    assert model._moe_lane_mask("ACT", 8, 2) is None
+    # every decode step function: the mask goes to every layer (only when built) and is freed with act
+    got, freed_m = [], []
+
+    class Lay:
+        def __init__(self, i, mode):
+            self.i, self.moe = i, SimpleNamespace(decode_experts=mode)
+
+        def forward_decode(self, X, **kw):
+            got.append(kw)
+            return f"X{self.i}"
+
+    model.embed = SimpleNamespace(forward_decode=lambda t: "X")
+    model.head = SimpleNamespace(
+        vocab_split="mesh", forward_decode=lambda X, **kw: "LG", stream_mean_norm=lambda X: "hn",
+        decode_logits=lambda hn, **kw: "lg", logits_rm=lambda lg, **kw: "rm", argmax_decode=lambda lg: "a")
+    model.mtp = SimpleNamespace(forward_decode=lambda hn, a, **kw: "m")
+    model.rope, model._rope_kinds = None, ("yarn",)
+    model.cfg = SimpleNamespace(lanes_per_row=8, wide_rows_per_dp=16, max_batch=32)
+    monkeypatch.setattr(MD, "_free", lambda *a: freed_m.extend(a))
+    monkeypatch.setattr(MD.MotifAttention, "decode_rope_tables", staticmethod(lambda rope, idx, kinds: {"yarn": ("c",)}))
+    monkeypatch.setattr(MD.MotifAttention, "active_mask_from_cur_pos", staticmethod(lambda c, lanes: "ACT"))
+    caches = MD.MotifKVPool(["k0", "k1"], (0, 1), 10, 64, "bfp8", mtp="mtp-cache")
+    kvw = SimpleNamespace(cur_pos="cur", page_table="pt", lanes_per_row=8, end_step=lambda: None,
+                          check_flash_inputs=lambda c, p: None)
+    kvw16 = SimpleNamespace(cur_pos="cur", page_table="pt", lanes_per_row=16, end_step=lambda: None)
+    steps = {
+        "decode": lambda: model.decode("tok", rot_idxs="ri", cur_pos="cur", page_table="pt", kv_caches=caches),
+        "decode_kvw": lambda: model.decode("tok", rot_idxs="ri", cur_pos="cur", page_table="pt", kv_caches=caches,
+                                           kv_write=kvw),
+        "decode_spec": lambda: model.decode_spec("tok", rot_idxs="ri", kv_write=kvw, kv_caches=caches),
+        "decode_wide": lambda: model.decode_wide(SimpleNamespace(shape=(4, 16)), rot_idxs="ri", kv_write=kvw16,
+                                                 kv_caches=caches),
+    }
+    for mode in ("dense", "sparse"):
+        model.layers = [Lay(0, mode), Lay(1, mode)]
+        for name, step in steps.items():
+            got.clear(), freed_m.clear(), built.clear()
+            step()
+            assert len(got) == 2, name
+            if mode == "sparse":
+                assert all(kw.get("moe_lane_mask") == "LM" for kw in got), (name, got)
+                assert built == [16 if name == "decode_wide" else 8] and "LM" in freed_m and "ACT" in freed_m, name
+            else:
+                assert not any("moe_lane_mask" in kw for kw in got) and built == [], (name, got)  # release calls
+    # decoder layer -> MoE
+    seen = {}
+    layer = object.__new__(D.MotifDecoderLayer)
+    layer.is_moe = True
+    layer.mhc_attn = layer.mhc_ffn = SimpleNamespace(pre=lambda X: ("R", "C"), post=lambda X, o, c: "X1")
+    layer._norm_decode = lambda x, g: "N"
+    layer.input_norm = layer.post_attn_norm = None
+    layer.attn = SimpleNamespace(forward_decode=lambda a, **kw: "O")
+    layer.shared = SimpleNamespace(forward_decode=lambda f, all_reduce: "SP")
+    layer.moe = SimpleNamespace(forward_decode=lambda f, add_partial, lane_mask=None: seen.update(lm=lane_mask) or "U")
+    monkeypatch.setattr(D, "_free", lambda *a: None, raising=False)
+    monkeypatch.setattr(D.ttnn, "deallocate", lambda *a, **k: None)
+    D.MotifDecoderLayer.forward_decode(layer, "X", rot=None, cur_pos=None, page_table=None, kv_cache=None,
+                                       active="ACT", moe_lane_mask="LM")
+    assert seen == {"lm": "LM"}
+    # forward_decode -> local_partial, never freeing the mask
+    got = {}
+    moe = object.__new__(M.MotifMoE)
+    moe.cfg, moe.decode_rows, moe.decode_mc, moe.decode_polynorm, moe.dram = SimpleNamespace(dp=4), (32, 64), "L1", "fp32", "dram"
+    moe.ccl = SimpleNamespace(ag_dp_rows=lambda x, **k: _TT(torch.zeros(1, 1, 32, 8)), ar_dp=lambda p: p,
+                              partition=lambda t, d, a: t, ar_tp=lambda p: p)
+    moe.local_partial = lambda f, **kw: got.update(kw) or _TT(torch.zeros(1, 1, 32, 8))
+    freed.clear()
+    lm = _TT(torch.ones(1, 1, 32, 1))
+    moe.forward_decode(_TT(torch.zeros(1, 1, 8, 8)), lane_mask=lm)
+    assert got["lane_mask"] is lm and not any(t is lm for t in freed)
 
 
 def test_moe_host_import_clean():
@@ -2335,6 +2671,217 @@ def test_moe_device_router_mask_scatter(mesh_device, device_params, router_logit
                 failures.append(f"L{layer} {router_logits}: T64 rows {t64_eq} rerun {rerun_eq}")
         old.deallocate()
         new.deallocate()
+    assert not failures, failures
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_sparse_decode_experts(mesh_device, device_params):
+    """B1 (docs/OPTIMIZATION_PLAN.md §3.3; ``decode_experts="sparse"``; probe logs/opt/phaseA/M6), real layer-2 /
+    layer-35 weights from the serving TT cache on the T64 config, real router inputs:
+
+    * the lane mask: ``MotifMoE.decode_lane_mask`` from ``MotifAttention.active_mask_host`` == the live rows in the
+      gathered order (M = 32 and 64), on every chip;
+    * M = 32 with 1 / 8 / 32 live lanes and M = 64 with 2 / 16 / 64 live rows (3 batches each): the sparse output's live
+      rows bitwise == the dense module's (``add_partial`` included), inactive rows exactly the closed ``add_partial``
+      (the all-inactive output; 0 without it),
+      no NaN / Inf, replicas identical; the sparsity = the experts the live rows route to (busiest chip reported);
+      ``lane_mask=None``: every row bitwise == dense;
+    * T64: the 16-row step's rows bitwise == the two 32-lane steps' rows (sparse, all rows live);
+    * trace: one capture with persistent ``x`` / lane-mask inputs, replays with new tokens *and* new live sets ==
+      eager bitwise, and two replays are bitwise equal (determinism);
+    * traced cost per call (informational): dense vs sparse at 1 / 8 / 32 live lanes."""
+    from models.demos.motif3.tt.attention import MotifAttention
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+    from models.demos.motif3.tt.moe import MotifMoE
+
+    cfg = t64_cfg(mesh_device)
+    fab = log_fabric(mesh_device, "moe_sparse_decode_experts")
+    assert str(fab.get("committed")) == "TORUS_XY", fab
+    ccl = MotifCCL(mesh_device, cfg)
+    data = load_real_inputs()
+    L = cfg.lanes_per_row
+    failures = []
+    g = torch.Generator().manual_seed(2024)
+    REP = ttnn.ReplicateTensorToMesh(mesh_device)
+
+    def mask_host(live_nat, M):
+        m = torch.zeros(1, 1, M, 1)
+        m[0, 0, live_nat, 0] = 1.0
+        return ttnn.from_torch(m, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=REP)
+
+    def lanes_of(t, M):
+        """forward_decode output -> rows in lane order ([32, H]; M = 64: anchors of lanes 0..31 | drafts), replicas."""
+        full = device_tensors_to_torch(t, mesh_device)  # [R, C, 1, 1, Lr, H]
+        same, rows = True, []
+        for dp in range(cfg.dp):
+            r0 = full[cfg.axes.coord(dp, 0)]
+            for tp in range(cfg.tp):
+                same &= bool(torch.equal(full[cfg.axes.coord(dp, tp)], r0))
+            rows.append(r0.reshape(-1, H))
+        rows = torch.stack(rows)  # [dp, Lr, H]
+        if M == 32:
+            return rows.reshape(32, H).float(), same
+        return torch.cat([rows[:, :L].reshape(32, H), rows[:, L:].reshape(32, H)]).float(), same
+
+    def nat_of_lane_rows(M, lane_rows):
+        """lane-order row ids (M = 64: anchors 0..31, drafts 32..63) -> natural gathered ids (Lr dp + j)."""
+        if M == 32:
+            return sorted(lane_rows)
+        out = []
+        for r in lane_rows:
+            lane, draft = r % 32, r // 32
+            dp, j = divmod(lane, L)
+            out.append(2 * L * dp + L * draft + j)
+        return sorted(out)
+
+    for layer in (2, 35):
+        if layer not in data["layers"]:
+            continue
+        moe = moe_from_tt_cache(mesh_device, cfg, ccl, layer)
+        assert moe.decode_experts in ("dense", "sparse") and moe.decode_rows == (32, 64)
+        xs = data["layers"][layer]["x"].float()
+        n = xs.shape[0]
+
+        # ---- the lane mask builder vs host (gathered natural order), M = 32 and 64 ----
+        for M, Lr in ((32, L), (64, 2 * L)):
+            pos = torch.full((cfg.dp * Lr,), -1, dtype=torch.int32)
+            live = torch.randperm(cfg.dp * Lr, generator=g)[: max(1, M // 3)]
+            pos[live] = 100
+            act = MotifAttention.active_mask_host(pos, cfg, mesh_device, device=mesh_device, rows_per_dp=Lr)
+            lm = MotifMoE.decode_lane_mask(ccl, act, Lr)
+            got, same = read_replicated(lm, mesh_device)
+            want = (pos >= 0).float().reshape(1, 1, M, 1)
+            ok = bool(same) and torch.equal(got.float().reshape(1, 1, M, 1), want) and lm.dtype == ttnn.float32
+            print(f"[moe] B1 L{layer} decode_lane_mask M={M}: == host {ok}")
+            if not ok:
+                failures.append(f"L{layer} lane mask M={M}")
+            _free([act, lm])
+
+        # ---- eager: sparse vs dense at real routes ----
+        for M, cs in ((32, (1, 8, 32)), (64, (2, 16, 64))):
+            for c in cs:
+                for b in range(3):
+                    tok = torch.randperm(n, generator=g)[:M]
+                    x = xs[0].expand(M, H).clone()  # inactive rows: some real hidden state (token 0)
+                    if M == 32:
+                        lane_rows = sorted(torch.randperm(32, generator=g)[:c].tolist())
+                    else:
+                        lanes = sorted(torch.randperm(32, generator=g)[: c // 2].tolist())
+                        lane_rows = lanes + [32 + l for l in lanes]  # anchor + draft of each live lane
+                    x[lane_rows] = xs[tok[: len(lane_rows)]]
+                    x_tt = upload_lanes(x, cfg, mesh_device) if M == 32 else upload_rows16(x, cfg, mesh_device)
+                    add = upload_lanes(xs[tok[:32]] * 0.01, cfg, mesh_device) if M == 32 else None
+                    nat = nat_of_lane_rows(M, lane_rows)
+                    lm = ttnn.to_device(mask_host(nat, M), mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                    outs = {}
+                    for mode, mask in (("dense", lm), ("sparse", lm), ("sparse_nomask", None)):
+                        moe.decode_experts = "dense" if mode == "dense" else "sparse"
+                        taps = {} if mode == "sparse" else None
+                        o = moe.forward_decode(x_tt, add_partial=add, lane_mask=mask, taps=taps)
+                        outs[mode], same = lanes_of(o, M)
+                        if not same:
+                            failures.append(f"L{layer} M{M} c{c} {mode}: replicas differ")
+                        if taps is not None:
+                            act_k = torch.stack([ttnn.to_torch(t).float().reshape(-1)
+                                                 for t in ttnn.get_device_tensors(taps["sparsity"])]) != 0
+                            if b == 0:
+                                print(f"[moe] B1 L{layer} M={M} c={c}: experts on the busiest chip "
+                                      f"{int(act_k.sum(1).max())}, mean {float(act_k.sum(1).float().mean()):.2f}")
+                            _free(taps)
+                        _free(o)
+                    # every row inactive: the output is the closed add_partial alone (0 without it)
+                    z = ttnn.to_device(mask_host([], M), mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                    o = moe.forward_decode(x_tt, add_partial=add, lane_mask=z)
+                    zero_ref = lanes_of(o, M)[0]
+                    _free([o, z])
+                    d, s_, s0 = outs["dense"], outs["sparse"], outs["sparse_nomask"]
+                    dead = [r for r in range(M) if r not in lane_rows]
+                    ok_live = bool(torch.equal(s_[lane_rows], d[lane_rows]))
+                    ok_dead = (not dead) or bool(torch.equal(s_[dead], zero_ref[dead]))
+                    if add is None:
+                        ok_dead = ok_dead and float(zero_ref.abs().max()) == 0.0
+                    ok_nm = bool(torch.equal(s0, d))
+                    finite = bool(torch.isfinite(s_).all())
+                    if b == 0 or not (ok_live and ok_dead and ok_nm and finite):
+                        print(f"[moe] B1 L{layer} M={M} c={c} b{b}: live == dense {ok_live}, inactive == add_partial "
+                              f"{ok_dead}, unmasked == dense {ok_nm}, finite {finite}")
+                    if not (ok_live and ok_dead and ok_nm and finite):
+                        failures.append(f"L{layer} M{M} c{c} b{b}: live {ok_live} dead {ok_dead} nomask {ok_nm} "
+                                        f"finite {finite}")
+                    _free([x_tt, add, lm])
+
+        # ---- T64 rows == T32 rows (sparse, all live) ----
+        moe.decode_experts = "sparse"
+        x64 = xs[torch.randperm(n, generator=g)[:64]]
+        halves = []
+        for half in (x64[:32], x64[32:]):
+            x_tt = upload_lanes(half, cfg, mesh_device)
+            o = moe.forward_decode(x_tt)
+            halves.append(lanes_of(o, 32)[0])
+            _free([o, x_tt])
+        x16 = upload_rows16(x64, cfg, mesh_device)
+        o = moe.forward_decode(x16)
+        r64 = lanes_of(o, 64)[0]
+        _free([o, x16])
+        t64_eq = bool(torch.equal(r64[:32], halves[0])) and bool(torch.equal(r64[32:], halves[1]))
+        print(f"[moe] B1 L{layer}: T64 rows == T32 rows bitwise {t64_eq}")
+        if not t64_eq:
+            failures.append(f"L{layer}: T64 rows != T32 rows")
+
+        # ---- trace: persistent x / lane mask, new tokens and live sets per replay ----
+        if layer == 2:
+            x_dev = upload_lanes(xs[:32], cfg, mesh_device)
+            lm_dev = ttnn.to_device(mask_host(list(range(32)), 32), mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            o_e = moe.forward_decode(x_dev, lane_mask=lm_dev)  # eager warm (compiles)
+            _free(o_e)
+            with _Capture(mesh_device) as cap:
+                out_t = moe.forward_decode(x_dev, lane_mask=lm_dev)
+            try:
+                for it, c in enumerate((1, 8, 32, 3)):
+                    live = sorted(torch.randperm(32, generator=g)[:c].tolist())
+                    x = xs[0].expand(32, H).clone()
+                    x[live] = xs[torch.randperm(n, generator=g)[:c]]
+                    ttnn.copy_host_to_device_tensor(upload_lanes(x, cfg, mesh_device, device=False), x_dev)
+                    ttnn.copy_host_to_device_tensor(mask_host(live, 32), lm_dev)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t1 = device_tensors_to_torch(out_t, mesh_device)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t2 = device_tensors_to_torch(out_t, mesh_device)
+                    o_e = moe.forward_decode(x_dev, lane_mask=lm_dev)
+                    te = device_tensors_to_torch(o_e, mesh_device)
+                    _free(o_e)
+                    moe.decode_experts = "dense"
+                    o_d = moe.forward_decode(x_dev)
+                    td = lanes_of(o_d, 32)[0]
+                    _free(o_d)
+                    moe.decode_experts = "sparse"
+                    eq_e, det = bool(torch.equal(t1, te)), bool(torch.equal(t1, t2))
+                    t1l = lanes_of(out_t, 32)[0]
+                    eq_d = bool(torch.equal(t1l[live], td[live]))
+                    print(f"[moe] B1 trace replay {it} (c={c}): traced == eager {eq_e}, 2 replays equal {det}, "
+                          f"live == dense {eq_d}")
+                    if not (eq_e and det and eq_d):
+                        failures.append(f"trace replay {it}: eager {eq_e} det {det} dense {eq_d}")
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+                _free(out_t)
+            # traced cost (informational): dense vs sparse, same tokens, 1 / 8 / 32 live lanes
+            for c in (1, 8, 32):
+                live = list(range(c))
+                x = xs[0].expand(32, H).clone()
+                x[live] = xs[torch.randperm(n, generator=g)[:c]]
+                ttnn.copy_host_to_device_tensor(upload_lanes(x, cfg, mesh_device, device=False), x_dev)
+                ttnn.copy_host_to_device_tensor(mask_host(live, 32), lm_dev)
+                st = {}
+                for mode in ("dense", "sparse"):
+                    moe.decode_experts = mode
+                    st[mode] = traced_stats(mesh_device, lambda: moe.forward_decode(x_dev, lane_mask=lm_dev), n=8,
+                                            reps=5, adapt_to=16)
+                print(f"[moe] B1 L{layer} traced c={c}: dense {fmt_traced(st['dense'])} us, sparse "
+                      f"{fmt_traced(st['sparse'])} us per call (M6: 1035 / 524 / 631 / 904)")
+            _free([x_dev, lm_dev])
+        moe.deallocate()
     assert not failures, failures
 
 

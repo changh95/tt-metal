@@ -97,6 +97,8 @@ _ENV = (
     "MOTIF3_CHUNK_BUDGET",
     "MOTIF3_FLASH_MLA_SWA_MCPH",
     "MOTIF3_ROUTER_MASK",
+    # Phase B (docs/OPT_PHASE_A_REVIEW.md §7.2): B1 sparse decode experts
+    "MOTIF3_DECODE_EXPERTS",
 )
 
 
@@ -785,6 +787,26 @@ def test_router_mask_knob(monkeypatch):
     assert _cfg(router_mask="scatter").router_mask == "scatter"
     with pytest.raises(ValueError, match="router_mask"):
         _cfg(router_mask="ge")
+
+
+def test_decode_experts_knob(monkeypatch):
+    """B1 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/M6): ``MOTIF3_DECODE_EXPERTS`` selects the decode routed
+    experts, ``dense`` (default: the release) or ``sparse`` (``ttnn.sparse_matmul`` skips the local experts no live row
+    routes to); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.model_config import DECODE_EXPERTS_MODES
+
+    assert DECODE_EXPERTS_MODES == ("dense", "sparse")
+    assert _cfg().decode_experts == "dense" and "decode_experts=dense" in _cfg().describe()
+    for v, want in (("sparse", "sparse"), (" Sparse ", "sparse"), ("dense", "dense"), ("", "dense")):
+        monkeypatch.setenv("MOTIF3_DECODE_EXPERTS", v)
+        assert _cfg().decode_experts == want, v
+    monkeypatch.setenv("MOTIF3_DECODE_EXPERTS", "indices")
+    with pytest.raises(ValueError, match="MOTIF3_DECODE_EXPERTS"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_DECODE_EXPERTS")
+    assert _cfg(decode_experts="sparse").decode_experts == "sparse"
+    with pytest.raises(ValueError, match="decode_experts"):
+        _cfg(decode_experts="skip")
 
 
 def test_module_defaults(monkeypatch):

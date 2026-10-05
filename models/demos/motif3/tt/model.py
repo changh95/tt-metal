@@ -109,6 +109,7 @@ from .decoder import MotifDecoderLayer, free_tensors
 from .embedding import MotifEmbedding
 from .lm_head import MotifLMHead
 from .model_config import DEFAULT_HF_META_DIR, MotifTTConfig
+from .moe import MotifMoE
 from .mtp import MotifMTP
 from .rope import MotifRope
 
@@ -600,6 +601,14 @@ class MotifModel:
             raise ValueError(f"stop_after {stop_after} outside [1, {len(self.layers)}]")
         return n
 
+    def _moe_lane_mask(self, act, rows_per_dp: int, n: int):
+        """B1: the step's MoE live-row mask (``MotifMoE.decode_lane_mask`` from the step's ``act``), built once per
+        step when one of the first ``n`` layers runs sparse decode experts (``decode_experts="sparse"``), else
+        ``None`` (no op: the dense step is unchanged). The step frees it with ``act``."""
+        if not any(getattr(getattr(l, "moe", None), "decode_experts", "dense") == "sparse" for l in self.layers[:n]):
+            return None
+        return MotifMoE.decode_lane_mask(self.ccl, act, rows_per_dp)
+
     def decode(self, tokens, *, rot_idxs, cur_pos, page_table, kv_caches, return_streams: bool = False,
                stop_after: Optional[int] = None, kv_write=None):
         """One decode step for all 32 lanes (trace-safe).
@@ -621,7 +630,10 @@ class MotifModel:
         X = self.embed.forward_decode(tokens)
         rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
         act = MotifAttention.active_mask_from_cur_pos(cur_pos, self.cfg.lanes_per_row)
+        lm = self._moe_lane_mask(act, self.cfg.lanes_per_row, n)
         kw = {} if kv_write is None else {"kv_write": kv_write}
+        if lm is not None:
+            kw["moe_lane_mask"] = lm
         try:
             for layer, kv in zip(self.layers[:n], kvs):
                 Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
@@ -631,7 +643,7 @@ class MotifModel:
             if kv_write is not None:
                 kv_write.end_step()
         finally:
-            _free(act, *[t for cs in rot.values() for t in cs])
+            _free(act, lm, *[t for cs in rot.values() for t in cs])
         if return_streams:
             return X
         logits = self.head.forward_decode(X, row_major=True)
@@ -678,10 +690,12 @@ class MotifModel:
         X = self.embed.forward_decode(tokens)
         rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
         act = MotifAttention.active_mask_from_cur_pos(cur_pos, self.cfg.lanes_per_row)
+        lm = self._moe_lane_mask(act, self.cfg.lanes_per_row, n)
+        lkw = {} if lm is None else {"moe_lane_mask": lm}  # the dense step's layer calls stay the release's
         try:
             for layer, kv in zip(self.layers[:n], kvs):
                 Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
-                                          kv_write=kv_write)
+                                          kv_write=kv_write, **lkw)
                 _free(X)
                 X = Xn
             hn = self.head.stream_mean_norm(X)
@@ -695,7 +709,7 @@ class MotifModel:
                                         active=act, kv_write=kv_write)
             kv_write.end_step()
         finally:
-            _free(act, *[t for cs in rot.values() for t in cs])
+            _free(act, lm, *[t for cs in rot.values() for t in cs])
         if keep_hidden:
             return rm, a, m, hn
         _free(hn)
@@ -783,11 +797,13 @@ class MotifModel:
         X = self.embed.forward_decode(tokens)  # [1, 4, 16, 4096]: rows from the token shape
         rot = MotifAttention.decode_rope_tables(self.rope, rot_idxs, kinds=self._rope_kinds)
         act = MotifAttention.active_mask_from_cur_pos(cur_pos, rows)
+        lm = self._moe_lane_mask(act, rows, n)
+        lkw = {} if lm is None else {"moe_lane_mask": lm}  # the dense step's layer calls stay the release's
         rm = None
         try:
             for layer, kv in zip(self.layers[:n], kvs):
                 Xn = layer.forward_decode(X, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=kv, active=act,
-                                          kv_write=kv_write)  # fmt: skip
+                                          kv_write=kv_write, **lkw)  # fmt: skip
                 _free(X)
                 X = Xn
             hn = self.head.stream_mean_norm(X)  # [1, 1, 16, 4096]
@@ -802,7 +818,7 @@ class MotifModel:
                                         active=act, kv_write=kv_write)  # fmt: skip
             kv_write.end_step()
         finally:
-            _free(act, *[t for cs in rot.values() for t in cs])
+            _free(act, lm, *[t for cs in rot.values() for t in cs])
         if keep_hidden:
             return rm, a, m, hn
         _free(hn)

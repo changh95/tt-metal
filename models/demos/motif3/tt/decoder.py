@@ -195,13 +195,16 @@ class MotifDecoderLayer:
     # forwards
     # ------------------------------------------------------------------------------------------------------------
     def forward_decode(
-        self, X, *, rot, cur_pos, page_table, kv_cache, active, taps: Optional[dict] = None, kv_write=None
+        self, X, *, rot, cur_pos, page_table, kv_cache, active, taps: Optional[dict] = None, kv_write=None,
+        moe_lane_mask=None,
     ):
         """One decode step of this layer for the 8 lanes of each DP row (trace-safe; see the module docstring).
         ``taps`` (eager debugging only) receives the intermediates ``x_red``, ``attn_in``, ``attn_out``, ``x_mid``,
         ``ffn_in``, ``ffn_out`` (not freed). ``kv_write``: the step's ``tt.kv_write.DecodeKVWrite`` (KV-R / the
         speculative split, README §16), passed to the attention unchanged; ``None`` = the draft-1 8-lane update (bitwise
-        draft 1). With it, ``cur_pos`` / ``page_table`` must be ``kv_write.cur_pos`` / ``kv_write.page_table``."""
+        draft 1). With it, ``cur_pos`` / ``page_table`` must be ``kv_write.cur_pos`` / ``kv_write.page_table``.
+        ``moe_lane_mask``: the step's MoE live-row mask (B1 sparse decode experts; ``MotifMoE.decode_lane_mask``, built
+        once per step by the model; not consumed), handed to the MoE; dense layers and the dense MoE ignore it."""
         x_red, c1 = self.mhc_attn.pre(X)
         a = self._norm_decode(x_red, self.input_norm)
         kw = {} if kv_write is None else {"kv_write": kv_write}
@@ -212,7 +215,7 @@ class MotifDecoderLayer:
         f = self._norm_decode(y_red, self.post_attn_norm)
         if self.is_moe:
             part = self.shared.forward_decode(f, all_reduce=False)  # this chip's TP partial (bf16)
-            u = self.moe.forward_decode(f, add_partial=part)  # routed + shared, one AR(tp)
+            u = self.moe.forward_decode(f, add_partial=part, lane_mask=moe_lane_mask)  # routed + shared, one AR(tp)
             _free(part)
         else:
             u = self.mlp.forward_decode(f)
