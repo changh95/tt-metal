@@ -706,6 +706,7 @@ def test_moe_host_router_mask_scatter(monkeypatch):
     from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES, MotifTTConfig
 
     assert ROUTER_MASK_MODES == ("gather", "scatter")
+    monkeypatch.delenv("MOTIF3_ROUTER_MASK", raising=False)  # the default, whatever the caller exported (review I-2)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
     assert cfg.router_mask == "gather"  # default off: the scatter weights are not bitwise equal to the release
     E, K, Mrows = cfg.num_experts, cfg.top_k, 32
@@ -1002,6 +1003,37 @@ def read_replicated(t, mesh_device, chips=None):
     return ref, same
 
 
+def read_routes(taps, moe, mesh_device, chips=None):
+    """``forward_decode`` / ``local_partial`` taps -> ``(idx [M, K] long, w [M, K] fp32, ok)``: the top-8 ids and
+    their routing weights at the module's internal route scale, as the gather path's ``taps["w"]`` holds them.
+
+    With ``router_mask="scatter"`` (A5, ``MOTIF3_ROUTER_MASK=scatter``) the module taps no ``"w"``: ``w`` is then read
+    back from every chip's ``w_loc [1, E_loc, M, 1]`` through the module's ``local_ids`` (each expert lives on exactly
+    one chip). ``ok``: ``idx`` (and ``w``) identical on the chips read (gather path), or, on the scatter path, ``idx``
+    identical on all chips, every selected expert found once and every unselected local weight exactly 0. ``chips``
+    limits the replicated reads (gather path only; the scatter path needs every chip)."""
+    idx, i_same = read_replicated(taps["idx"], mesh_device, chips=chips)
+    idx = idx.reshape(-1, K).long()
+    if "w" in taps:
+        w, w_same = read_replicated(taps["w"], mesh_device, chips=chips)
+        return idx, w.reshape(-1, K).float(), bool(i_same and w_same)
+    if chips is not None:
+        i_same = read_replicated(taps["idx"], mesh_device)[1]
+    M = idx.shape[0]
+    dense = torch.full((M, moe.n_experts), float("nan"), dtype=torch.float32)
+    seen = torch.zeros(moe.n_experts, dtype=torch.long)
+    for s_ids, s_w in zip(ttnn.get_device_tensors(moe.local_ids), ttnn.get_device_tensors(taps["w_loc"])):
+        e = ttnn.to_torch(s_ids).reshape(-1).long()
+        v = ttnn.to_torch(s_w).float().reshape(len(e), -1)[:, :M]
+        dense[:, e] = v.t()
+        seen[e] += 1
+    w = dense.gather(1, idx)
+    unsel = torch.ones_like(dense, dtype=torch.bool).scatter_(1, idx, False)
+    ok = bool(i_same) and bool((seen == 1).all()) and bool(torch.isfinite(w).all()) and bool(
+        (dense[unsel] == 0).all())
+    return idx, w, ok
+
+
 def upload_replicated(x: torch.Tensor, mesh_device, dtype=ttnn.bfloat16, device=True):
     return ttnn.from_torch(
         x.reshape(1, 1, *x.shape[-2:]) if x.dim() == 2 else x,
@@ -1042,15 +1074,13 @@ def _check_decode(moe, x32, cfg, mesh_device, ref, tag, *, idx_ref=None, w_ref=N
     out = moe.forward_decode(x_tt, taps=taps)
     got, same_tp = read_rows(out, cfg, mesh)
     f_all, f_same = read_replicated(taps["f_all"], mesh)
-    idx_dev, idx_same = read_replicated(taps["idx"], mesh)
-    w_dev, w_same = read_replicated(taps["w"], mesh)
-    idx_dev = idx_dev.reshape(-1, K).long()
-    w_dev = w_dev.reshape(-1, K).double() * (moe.route_scale / moe.internal_route_scale)
+    idx_dev, w_dev, routes_same = read_routes(taps, moe, mesh)
+    w_dev = w_dev.double() * (moe.route_scale / moe.internal_route_scale)
     res = {
         "tag": tag,
         "replicas_identical_tp": same_tp,
         "gathered_exact": bool(torch.equal(f_all.reshape(-1, H).float(), x32.float())) and f_same,
-        "routes_identical_32": idx_same and w_same,
+        "routes_identical_32": routes_same,
     }
     if inspect is not None:
         res.update(inspect(taps))
@@ -2106,11 +2136,9 @@ def test_moe_device_t64_rows(mesh_device, device_params, router_logits):
         out = moe.forward_decode(x_tt, taps=taps)
         t = device_tensors_to_torch(out, mesh_device)  # [R, C, 1, 1, L, H]
         f_all, f_same = read_replicated(taps["f_all"], mesh_device)
-        idx, i_same = read_replicated(taps["idx"], mesh_device)
-        w, w_same = read_replicated(taps["w"], mesh_device)
+        idx, w, r_same = read_routes(taps, moe, mesh_device)
         _free([taps, out])
-        return t, f_all.reshape(-1, H).float(), idx.reshape(-1, K).long(), w.reshape(-1, K).float(), (
-            f_same and i_same and w_same)
+        return t, f_all.reshape(-1, H).float(), idx, w, f_same and r_same
 
     # the 32-lane module: anchors, then drafts
     ref32 = []
@@ -2124,8 +2152,7 @@ def test_moe_device_t64_rows(mesh_device, device_params, router_logits):
     taps = {}
     o = moe_b0.forward_decode(x_tt, taps=taps)
     b0_out = device_tensors_to_torch(o, mesh_device)
-    b0_idx = read_replicated(taps["idx"], mesh_device, chips=[0])[0].reshape(-1, K).long()
-    b0_w = read_replicated(taps["w"], mesh_device, chips=[0])[0].reshape(-1, K).float()
+    b0_idx, b0_w, _ = read_routes(taps, moe_b0, mesh_device, chips=[0])
     _free([taps, o, x_tt])
     moe_b0.deallocate()
     same_b0 = bool(torch.equal(b0_out, ref32[0][0])) and bool(torch.equal(b0_idx, ref32[0][2])) and bool(
@@ -2247,7 +2274,8 @@ def test_moe_device_router_mask_scatter(mesh_device, device_params, router_logit
         return out
 
     for layer in layers:
-        old = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits)
+        # explicit "gather": the reference module must not follow MOTIF3_ROUTER_MASK (review I-2)
+        old = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits, router_mask="gather")
         new = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits, router_mask="scatter")
         assert old.router_mask == "gather" and new.router_mask == "scatter" and sorted(new.scatter_consts) == [32, 64]
         xs = data["layers"][layer]["x"]
@@ -2445,9 +2473,8 @@ def test_moe_device_block_shared_real(mesh_device, device_params):
     taps = {}
     out = moe.forward_decode(x_tt, add_partial=part, taps=taps)
     got, same = read_rows(out, cfg, mesh_device)
-    idx_d = read_replicated(taps["idx"], mesh_device, chips=[0])[0].reshape(-1, K).long()
-    w_d = read_replicated(taps["w"], mesh_device, chips=[0])[0].reshape(-1, K).double() * (
-        moe.route_scale / moe.internal_route_scale)
+    idx_d, w_d, _ = read_routes(taps, moe, mesh_device, chips=[0])
+    w_d = w_d.double() * (moe.route_scale / moe.internal_route_scale)
     want_dev = ref(x32, idx_d, w_d.float())[0] + sh
     s, s_dev = stats(want, got), stats(want_dev, got)
     alive = x_tt.is_allocated() and part.is_allocated()
