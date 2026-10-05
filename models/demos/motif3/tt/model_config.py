@@ -654,13 +654,22 @@ def _grid_xy(grid) -> Tuple[int, int]:
     return int(x), int(y)
 
 
+# The smallest SWA mcph accepted: the bitwise argument above (the 129-key window spans exactly 2 k-chunks, placed alike
+# by every mcph >= 2) does not cover 1, and mcph 1 was never measured (OPT_PHASE_A_REVIEW I-5).
+FLASH_MLA_DECODE_MIN_CORES_PER_HEAD_BATCH_SWA = 2
+
+
 def check_flash_mla_mcph(n) -> int:
-    """``n`` if it is an integer in ``[1, 16]`` (FlashMLA decode ``max_cores_per_head_batch``), else ``ValueError``."""
+    """``n`` if it is an integer in ``[2, 16]`` (FlashMLA decode ``max_cores_per_head_batch`` on SWA layers; 1 is
+    refused, see :data:`FLASH_MLA_DECODE_MIN_CORES_PER_HEAD_BATCH_SWA`), else ``ValueError``."""
     v = int(n)
-    if not 1 <= v <= FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH:
+    if float(n) != v:
+        raise ValueError(f"FlashMLA max_cores_per_head_batch (MOTIF3_FLASH_MLA_SWA_MCPH) must be an integer, got {n!r}")
+    lo, hi = FLASH_MLA_DECODE_MIN_CORES_PER_HEAD_BATCH_SWA, FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH
+    if not lo <= v <= hi:
         raise ValueError(
-            f"FlashMLA max_cores_per_head_batch (MOTIF3_FLASH_MLA_SWA_MCPH) must be in "
-            f"[1, {FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}], got {n!r}"
+            f"FlashMLA max_cores_per_head_batch (MOTIF3_FLASH_MLA_SWA_MCPH) must be in [{lo}, {hi}] (the bitwise "
+            f"equality with 16 holds only for >= {lo}; 1 is untested), got {n!r}"
         )
     return v
 
@@ -2362,6 +2371,7 @@ __all__ = [
     "FLASH_MLA_DECODE_K_CHUNK",
     "FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH",
     "FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA",
+    "FLASH_MLA_DECODE_MIN_CORES_PER_HEAD_BATCH_SWA",
     "FP32_ACC_OFF_ROLES",
     "KV_CACHE_DTYPE_BY_NAME",
     "LM_HEAD_PC",

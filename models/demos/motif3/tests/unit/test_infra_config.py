@@ -733,7 +733,8 @@ def test_polynorm_semantics_fields():
 def test_flash_mla_swa_mcph_knob(monkeypatch):
     """A2 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/A2): ``MOTIF3_FLASH_MLA_SWA_MCPH`` sets the FlashMLA decode
     ``max_cores_per_head_batch`` of the SWA layers (default 4; 16 = the release config); the global layers keep 16 at
-    every setting, and a value outside [1, 16] is refused when the config is built."""
+    every setting, and a value outside [2, 16] (1 included: the bitwise argument needs >= 2 k-chunk cores; review I-5)
+    is refused when the config is built."""
     import models.demos.motif3.tt.model_config as mc
 
     assert mc.FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH == 16 and mc.FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA == 4
@@ -750,7 +751,8 @@ def test_flash_mla_swa_mcph_knob(monkeypatch):
         c = _cfg()
         assert c.flash_mla_swa_mcph == want and c.flash_mla_decode_pc("swa").max_cores_per_head_batch == want
         assert c.flash_mla_decode_pc("global").max_cores_per_head_batch == 16
-    for bad in ("0", "17"):
+    assert mc.FLASH_MLA_DECODE_MIN_CORES_PER_HEAD_BATCH_SWA == 2
+    for bad in ("0", "1", "17"):
         monkeypatch.setenv("MOTIF3_FLASH_MLA_SWA_MCPH", bad)
         with pytest.raises(ValueError, match="MOTIF3_FLASH_MLA_SWA_MCPH"):
             _cfg()
@@ -758,6 +760,11 @@ def test_flash_mla_swa_mcph_knob(monkeypatch):
     assert _cfg(flash_mla_swa_mcph=8).flash_mla_decode_pc("swa").max_cores_per_head_batch == 8
     with pytest.raises(ValueError):
         mc.flash_mla_decode_pc((12, 10), "swa", swa_mcph=32)
+    for bad in (1, 2.5):
+        with pytest.raises(ValueError):
+            mc.flash_mla_decode_pc((12, 10), "swa", swa_mcph=bad)
+    with pytest.raises(ValueError):
+        _cfg(flash_mla_swa_mcph=1)
 
 
 def test_router_mask_knob(monkeypatch):
