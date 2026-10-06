@@ -11,6 +11,8 @@
 * ``shared_polynorm`` -- fused decode PolyNorm of the MoE shared expert (B5, ``MOTIF3_SHARED_POLYNORM=fused``; a
   moments kernel + the release's TP all-gather + an apply kernel, bitwise equal to the composite); kernel sources in
   ``shared_polynorm/``.
+* ``moe_compact`` -- the compacted prefill MoE's on-device row dispatch (B2b, ``MOTIF3_PREFILL_MOE_DISPATCH=device``;
+  ``moe_dispatch/``) and gather combine (``MOTIF3_PREFILL_MOE_COMBINE=gather``; ``moe_combine/``), both exact.
 
 Kernel sources are compiled from their absolute paths at first use (JIT cache ``~/.cache/tt-metal-cache``;
 ``sinkhorn_motif`` also passes a content hash of its sources as a define, so an edited kernel always rebuilds). This

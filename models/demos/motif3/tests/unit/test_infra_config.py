@@ -112,6 +112,9 @@ _ENV = (
     "MOTIF3_PREFILL_MOE",
     "MOTIF3_PREFILL_MOE_BLOCK",
     "MOTIF3_PREFILL_MOE_MIN_ROWS",
+    # B2b prefill MoE dispatch / combine kernels
+    "MOTIF3_PREFILL_MOE_DISPATCH",
+    "MOTIF3_PREFILL_MOE_COMBINE",
     # the capture thread (E3)
     "MOTIF3_CAPTURE_THREAD",
     # B7 traced prefill
@@ -909,6 +912,36 @@ def test_prefill_moe_knobs(monkeypatch):
     with pytest.raises(ValueError, match="prefill_moe"):
         _cfg(prefill_moe="fast")
 
+
+
+def test_prefill_moe_kernel_knobs(monkeypatch):
+    """B2b (docs/OPTIMIZATION_PLAN.md §3.3 B2; logs/opt/phaseB/B2b): ``MOTIF3_PREFILL_MOE_DISPATCH`` (``host`` = B2a /
+    ``device``) and ``MOTIF3_PREFILL_MOE_COMBINE`` (``matmul`` = B2a / ``gather``) of the compacted prefill MoE. Case
+    and blanks ignored, anything else refused; ``describe`` shows them after the B2a fields."""
+    from models.demos.motif3.tt.model_config import PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES
+
+    assert PREFILL_MOE_DISPATCH_MODES == ("host", "device") and PREFILL_MOE_COMBINE_MODES == ("matmul", "gather")
+    c = _cfg()
+    assert (c.prefill_moe_dispatch, c.prefill_moe_combine) == ("host", "matmul")
+    assert "prefill_moe=compact/auto/1024/host/matmul" in c.describe()
+    for v, want in ((" Device ", "device"), ("host", "host"), ("", "host")):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE_DISPATCH", v)
+        assert _cfg().prefill_moe_dispatch == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE_DISPATCH", "gpu")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_DISPATCH"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE_DISPATCH")
+    for v, want in (("GATHER", "gather"), (" matmul", "matmul"), ("", "matmul")):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE_COMBINE", v)
+        assert _cfg().prefill_moe_combine == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE_COMBINE", "scatter")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_COMBINE"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE_COMBINE")
+    c = _cfg(prefill_moe_dispatch="device", prefill_moe_combine="gather")
+    assert "prefill_moe=compact/auto/1024/device/gather" in c.describe()
+    with pytest.raises(ValueError, match="prefill_moe_dispatch"):
+        _cfg(prefill_moe_dispatch="fast")
 
 def test_host_staging_and_wait_knobs(monkeypatch):
     """B6a (docs/OPT_PHASE_A_REVIEW.md §7.1; logs/opt/phaseB/B6a): ``MOTIF3_HOST_STAGING`` (``fast`` default |

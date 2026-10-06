@@ -142,6 +142,14 @@ PREFILL_MOE_MODES = ("dense", "compact")
 PREFILL_MOE_BLOCKS = ("auto", "32", "64", "128")
 # Chunks with fewer rows keep the dense prefill MoE (MOTIF3_PREFILL_MOE_MIN_ROWS; a multiple of 32, >= 32).
 DEFAULT_PREFILL_MOE_MIN_ROWS = 1024
+# Who builds the compacted rows (B2b, MOTIF3_PREFILL_MOE_DISPATCH): "host" (B2a: a blocking read of the routes, numpy
+# row lists, one upload) | "device" (tt/kernels/moe_compact.py CompactDispatch: one generic_op builds the same lists on
+# device from the routes; the host reads only the 32-byte block count). Bitwise the same rows either way.
+PREFILL_MOE_DISPATCH_MODES = ("host", "device")
+# How the compacted rows are summed back per token (B2b, MOTIF3_PREFILL_MOE_COMBINE): "matmul" (B2a: one-hot P^T @ y)
+# | "gather" (tt/kernels/moe_compact.py GatherCombine: each token's rows gathered and added in an fp32 dest with
+# fast_reduce_nc's ops). Bitwise equal to each other and to the dense path.
+PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -1362,6 +1370,10 @@ class MotifTTConfig:
     prefill_moe: str = "compact"  # MOTIF3_PREFILL_MOE
     prefill_moe_block: str = "auto"  # MOTIF3_PREFILL_MOE_BLOCK
     prefill_moe_min_rows: int = DEFAULT_PREFILL_MOE_MIN_ROWS  # MOTIF3_PREFILL_MOE_MIN_ROWS
+    # B2b: who builds the compacted rows ("host" | "device"; PREFILL_MOE_DISPATCH_MODES) and how they are combined
+    # ("matmul" | "gather"; PREFILL_MOE_COMBINE_MODES). Defaults: B2a's.
+    prefill_moe_dispatch: str = "host"  # MOTIF3_PREFILL_MOE_DISPATCH
+    prefill_moe_combine: str = "matmul"  # MOTIF3_PREFILL_MOE_COMBINE
     # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
     # "release" (the release code); generator_api.HOST_STAGING_MODES. Host only: device programs and inputs unchanged.
     host_staging: str = "fast"  # MOTIF3_HOST_STAGING
@@ -1429,7 +1441,7 @@ class MotifTTConfig:
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
           ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
-          ``MOTIF3_PREFILL_MOE_MIN_ROWS``,
+          ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
@@ -1540,6 +1552,8 @@ class MotifTTConfig:
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
+            prefill_moe_dispatch=(os.environ.get("MOTIF3_PREFILL_MOE_DISPATCH") or "host").strip().lower(),
+            prefill_moe_combine=(os.environ.get("MOTIF3_PREFILL_MOE_COMBINE") or "matmul").strip().lower(),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "128",
@@ -1718,6 +1732,16 @@ class MotifTTConfig:
             raise ValueError(
                 f"prefill_moe_block (MOTIF3_PREFILL_MOE_BLOCK) must be one of {PREFILL_MOE_BLOCKS}, got "
                 f"{self.prefill_moe_block!r}"
+            )
+        if self.prefill_moe_dispatch not in PREFILL_MOE_DISPATCH_MODES:
+            raise ValueError(
+                f"prefill_moe_dispatch (MOTIF3_PREFILL_MOE_DISPATCH) must be one of {PREFILL_MOE_DISPATCH_MODES}, got "
+                f"{self.prefill_moe_dispatch!r}"
+            )
+        if self.prefill_moe_combine not in PREFILL_MOE_COMBINE_MODES:
+            raise ValueError(
+                f"prefill_moe_combine (MOTIF3_PREFILL_MOE_COMBINE) must be one of {PREFILL_MOE_COMBINE_MODES}, got "
+                f"{self.prefill_moe_combine!r}"
             )
         mr = self.prefill_moe_min_rows
         if isinstance(mr, bool) or not isinstance(mr, int) or mr < TILE or mr % TILE:
@@ -2455,7 +2479,7 @@ class MotifTTConfig:
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
             f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} "
-            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows} host_staging={self.host_staging} host_wait={self.host_wait} "
+            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
@@ -2503,6 +2527,8 @@ __all__ = [
     "DECODE_EXPERTS_MODES",
     "PREFILL_MOE_MODES",
     "PREFILL_MOE_BLOCKS",
+    "PREFILL_MOE_COMBINE_MODES",
+    "PREFILL_MOE_DISPATCH_MODES",
     "DEFAULT_PREFILL_MOE_MIN_ROWS",
     "MOE_POLYNORM_MODES",
     "SHARED_POLYNORM_MODES",

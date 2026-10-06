@@ -147,6 +147,8 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_PREFILL_MOE",
         "MOTIF3_PREFILL_MOE_BLOCK",
         "MOTIF3_PREFILL_MOE_MIN_ROWS",
+        "MOTIF3_PREFILL_MOE_DISPATCH",
+        "MOTIF3_PREFILL_MOE_COMBINE",
         "MOTIF3_CAPTURE_THREAD",
         "MOTIF3_PREFILL_TRACE",
     ):

@@ -127,6 +127,14 @@ the RS(dp) / AR(tp) / AG(dp) that follow are unchanged. Every (chunk size, block
 :meth:`MotifMoE.warm_compact` (the generator's ``warmup_prefill``); a chunk beyond the ladder's cap, or (after the decode
 capture, :class:`CompactPrefillState`) a shape not warmed, runs the dense path on the same routes.
 
+B2b kernels (logs/opt/phaseB/B2b; ``prefill_moe_dispatch`` / ``prefill_moe_combine``, ``MOTIF3_PREFILL_MOE_DISPATCH`` /
+``MOTIF3_PREFILL_MOE_COMBINE``): "device" builds the same rows with one ``generic_op`` from the router's ``idx`` and
+``w`` into capacity buffers (:class:`~models.demos.motif3.tt.kernels.moe_compact.CompactDispatch`); the host reads only
+the 32-byte block count and slices the first NB blocks (:meth:`MotifMoE._compact_partial_device`), so the routes are
+never read and no upload is made. "gather" sums each token's rows with
+:class:`~models.demos.motif3.tt.kernels.moe_compact.GatherCombine` (fast_reduce_nc's fp32-dest adds) instead of the
+one-hot matmul. Every combination is bitwise equal to the dense path.
+
 Weights (``tt/weights.py``): ``router_weights`` (``[4096, 384]`` bf16 + fp32 bias), ``experts_gate_up`` /
 ``experts_down`` + ``ep_layout`` with ``as_tensor(dp_dim=0, tp_dim=1)`` (chip ``k = 8 dp + tp`` holds experts
 ``[12k, 12k+12)``), ``local_expert_ids``; PolyNorm constants ``polynorm.GroupedPolyNormConsts``. Cache names
@@ -157,8 +165,9 @@ import ttnn
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL, device_tensors_to_torch
-from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, PREFILL_MOE_MODES, ROUTER_MASK_MODES, TILE,
-                           MotifTTConfig, mcast1d_matmul_pc)
+from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, PREFILL_MOE_COMBINE_MODES,
+                           PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig,
+                           mcast1d_matmul_pc)
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -284,6 +293,25 @@ def resolve_prefill_moe(prefill_moe: Optional[str], cfg, *, combine_mode: str, p
                 raise ValueError(f"prefill_moe='compact' needs {why}")
             return "dense"
     return mode
+
+
+def resolve_prefill_moe_kernels(dispatch: Optional[str], combine: Optional[str], cfg) -> Tuple[str, str]:
+    """B2b: ``(prefill_moe_dispatch, prefill_moe_combine)`` of a compacted :class:`MotifMoE`: explicit values or
+    ``cfg.prefill_moe_dispatch`` / ``cfg.prefill_moe_combine`` (``MOTIF3_PREFILL_MOE_DISPATCH`` / ``_COMBINE``; a config
+    without the fields = B2a's "host" / "matmul"); each must be in :data:`PREFILL_MOE_DISPATCH_MODES` /
+    :data:`PREFILL_MOE_COMBINE_MODES`."""
+    d = str(dispatch if dispatch is not None else (getattr(cfg, "prefill_moe_dispatch", None) or "host"))
+    c = str(combine if combine is not None else (getattr(cfg, "prefill_moe_combine", None) or "matmul"))
+    if d not in PREFILL_MOE_DISPATCH_MODES:
+        raise ValueError(f"prefill_moe_dispatch must be one of {PREFILL_MOE_DISPATCH_MODES}, got {d!r}")
+    if c not in PREFILL_MOE_COMBINE_MODES:
+        raise ValueError(f"prefill_moe_combine must be one of {PREFILL_MOE_COMBINE_MODES}, got {c!r}")
+    return d, c
+
+
+# B2b device dispatch: the largest chunk the kernel serves (its L1 holds the chunk's routes and weights: ~0.6 MB per core
+# at 4096 rows); a larger compacted chunk builds its rows on the host (B2a).
+PREFILL_MOE_DISPATCH_MAX_ROWS = 4096
 
 
 # ==============================================================================================================
@@ -488,6 +516,9 @@ class CompactPrefillState:
         self.blocks: Dict[Tuple[int, int, int], int] = {}  # (rows, mb, nb) -> calls
         self.host_bufs: Dict[tuple, object] = {}  # (shape, dtype, layout) -> host staging tensor of the routes read
         self.g2s = None  # numpy global expert id -> slot p * E + e
+        self.dispatch = None  # B2b: kernels.moe_compact.CompactDispatch (device dispatch; owns the slot table)
+        self.combine = None  # B2b: kernels.moe_compact.GatherCombine (gather combine)
+        self.stats["device_dispatch"] = 0
 
     def allows(self, rows: int, mb: int, nb: int) -> bool:
         return (int(rows), int(mb), int(nb)) in self.warmed or not self.frozen()
@@ -497,6 +528,12 @@ class CompactPrefillState:
             _free(t)
         self.iota = {}
         self.host_bufs = {}
+        if self.dispatch is not None:
+            self.dispatch.deallocate()
+            self.dispatch = None
+        if self.combine is not None:
+            self.combine.deallocate()
+            self.combine = None
 
 
 # Local program-config helper (README §10 rule 1 wants ``cfg.*_pc()`` builders): requested shared change -- move it
@@ -1019,6 +1056,12 @@ class MotifMoE:
             submesh, raises when explicit and falls back to "composite" from the config). Prefill and other row counts
             keep the composite. No device constants beyond
             the layer's PolyNorm constants; the program compiles on the first eager decode call (before any capture).
+        prefill_moe_dispatch / prefill_moe_combine: the compacted prefill's row builder and combine (B2b; ``None`` =
+            ``cfg.prefill_moe_dispatch`` / ``cfg.prefill_moe_combine``): "host" (B2a: blocking read of the routes, numpy
+            lists, one upload) | "device" (one ``generic_op`` builds the same rows from the routes; the host reads only
+            the 32-byte block count); "matmul" (B2a: one-hot ``P^T @ y``) | "gather" (each token's rows added in an
+            fp32 dest, :class:`~models.demos.motif3.tt.kernels.moe_compact.GatherCombine`). Every combination is
+            bitwise equal to the dense path.
         decode_experts: decode routed experts (B1; ``None`` = ``cfg.decode_experts``, ``MOTIF3_DECODE_EXPERTS``):
             "dense" (the release) | "sparse" (``ttnn.sparse_matmul`` skips the local experts no live row routes to;
             live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
@@ -1052,6 +1095,8 @@ class MotifMoE:
         decode_experts: Optional[str] = None,
         moe_polynorm: Optional[str] = None,
         prefill_moe: Optional[str] = None,
+        prefill_moe_dispatch: Optional[str] = None,
+        prefill_moe_combine: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -1208,6 +1253,9 @@ class MotifMoE:
                                                prefill_polynorm_impl=self.prefill_polynorm_impl)
         self.prefill_moe_block = str(getattr(cfg, "prefill_moe_block", "auto"))
         self.prefill_moe_min_rows = int(getattr(cfg, "prefill_moe_min_rows", 1024))
+        self.prefill_moe_dispatch, self.prefill_moe_combine = resolve_prefill_moe_kernels(
+            prefill_moe_dispatch, prefill_moe_combine, cfg)
+        self._disp_meta = None  # B2b: this layer's per-chip dispatch constants (ids + PolyNorm bits), device
         self.compact_state = CompactPrefillState(owner=self)  # MotifModel hands every layer one shared state
         self._pn_host = None  # [P, 12, 4] fp32 (bf16 values): this layer's c0, c1, c2, b per chip
         self._pn_bits = None  # the same as int32 bf16 bit patterns (numpy), for compact_upload_fast
@@ -1442,6 +1490,18 @@ class MotifMoE:
                  for k in ("c0", "c1", "c2", "b")], dim=-1)  # fmt: skip
         if getattr(self, "_pn_bits", None) is None:
             self._pn_bits = (self._pn_host.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF).numpy()
+        if getattr(self, "prefill_moe_dispatch", "host") == "device":
+            from .kernels.moe_compact import CompactDispatch
+
+            if st.dispatch is None:
+                st.dispatch = CompactDispatch(self.mesh_device, st.local_ids, mapper=st.mapper, top_k=self.top_k,
+                                              memory_config=self.dram)
+            if self._disp_meta is None:
+                self._disp_meta = st.dispatch.make_meta(self._pn_bits)
+        if getattr(self, "prefill_moe_combine", "matmul") == "gather" and st.combine is None:
+            from .kernels.moe_compact import GatherCombine
+
+            st.combine = GatherCombine(self.mesh_device, top_k=self.top_k)
 
     def _iota(self, rows: int):
         """The combine's token-index column ``[1, 1, rows, 1]`` fp32 (0 .. rows-1), one per chunk size (shared)."""
@@ -1483,6 +1543,8 @@ class MotifMoE:
         M = int(f.shape[-2])
         mb = compact_block(M, self.prefill_moe_block)
         self.prepare_compact()
+        if getattr(self, "prefill_moe_dispatch", "host") == "device" and M <= PREFILL_MOE_DISPATCH_MAX_ROWS:
+            return self._compact_partial_device(f, idx, w, M, mb)
         hi = self._read_routes(idx, M)
         R, C = self._mesh_rc()
         need, nb, u = compact_upload_fast(hi, st.g2s, R * C, self.e_loc, mb, compact_ladder(M, mb, self.e_loc),
@@ -1496,6 +1558,129 @@ class MotifMoE:
         part = self._compact_device(f, idx, w, u, mb, nb)
         st.stats["compact"] += 1
         st.blocks[(M, mb, nb)] = st.blocks.get((M, mb, nb), 0) + 1
+        return part
+
+    def _read_need(self, need) -> Tuple[int, int]:
+        """The dispatch kernel's ``need [1, 1, 1, 8]`` -> ``(need, NB)`` of chip 0 (every chip computes the same):
+        one blocking copy into a host staging tensor allocated once."""
+        st = self.compact_state
+        key = (tuple(need.shape), need.dtype, need.layout)
+        h = st.host_bufs.get(key)
+        if h is None:
+            h = st.host_bufs[key] = ttnn.allocate_tensor_on_host(need.spec, self.mesh_device)
+        ttnn.copy_device_to_host_tensor(need, h, blocking=True)
+        v = ttnn.to_torch(ttnn.get_device_tensors(h)[0]).reshape(-1)
+        return int(v[0]), int(v[1])
+
+    def _compact_partial_device(self, f, idx, w, M: int, mb: int):
+        """B2b: ``_compact_partial`` with the rows built on device (:class:`CompactDispatch` from ``idx`` and the
+        router's ``w``, whose routed values are bitwise this chip's ``w_loc`` (``local_weights`` adds exact zeros to
+        one product by 1.0; checked on device, logs/opt/phaseB/B2b), then the host reads only the block count NB.
+        None (the dense path on the same routes) beyond the ladder's cap or for an unwarmed shape, as B2a."""
+        st = self.compact_state
+        ladder = compact_ladder(M, mb, self.e_loc)
+        rows = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
+        need, nb = self._read_need(rows.need)
+        if nb == 0:
+            rows.free()
+            st.stats["dense_cap"] += 1
+            return None
+        if not st.allows(M, mb, nb) or (st.frozen() and getattr(self, "prefill_moe_combine", "matmul") == "matmul"
+                                            and M not in st.iota):
+            rows.free()
+            st.stats["dense_unwarmed"] += 1
+            return None
+        part = self._compact_rows_device(f, rows, mb, nb)
+        rows.free()
+        st.stats["compact"] += 1
+        st.stats["device_dispatch"] += 1
+        st.blocks[(M, mb, nb)] = st.blocks.get((M, mb, nb), 0) + 1
+        return part
+
+    def _compact_rows_device(self, f, rows, mb: int, nb: int):
+        """Device half of the compacted prefill experts from the dispatch kernel's capacity buffers ``rows``
+        (:class:`CompactRows`, not consumed): slice the first ``nb`` blocks, then :meth:`_compact_experts` -- the same
+        ops on the same values as :meth:`_compact_device` (B2a's upload) -- bitwise equal to the dense path."""
+        M = int(f.shape[-2])
+        E = self.e_loc
+        R = int(nb) * int(mb)
+        dram = self.dram
+        tix = ttnn.slice(rows.rows, [0, 0, 0, 0], [1, 1, 1, R], memory_config=dram)  # uint32 ROW_MAJOR
+        x_rm = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        X = ttnn.embedding(tix, x_rm, layout=ttnn.TILE_LAYOUT, memory_config=dram)
+        _free(x_rm, tix)
+        X = _reshape(X, (1, nb, mb, self.hidden))
+        sp = ttnn.slice(rows.sp, [0, 0, 0, 0], [1, nb, 1, E], memory_config=dram)  # [1, nb, 1, 12] bf16 ROW_MAJOR
+        cblk = {k: ttnn.slice(rows.blk, [0, 0, 0, 16 + i], [1, nb, 1, 17 + i], memory_config=dram)
+                for i, k in enumerate(("c0", "c1", "c2", "b"))}  # fmt: skip
+        wcol = ttnn.slice(rows.wcol, [0, 0, 0, 0], [1, nb, mb, 1], memory_config=dram)
+        y = self._compact_experts(X, sp, cblk, wcol, mb, nb)  # consumes X, sp, cblk, wcol
+        return self._compact_combine(y, M, keys=rows.rows, key_page=1)
+
+    def _compact_experts(self, X, sp, cblk, wcol, mb: int, nb: int):
+        """The compacted experts on ``X [1, nb, mb, 4096]`` (consumes ``X``, ``sp``, ``cblk``, ``wcol``) -> ``y [1, 1,
+        nb mb, 4096]``: gate_up with ``ttnn.sparse_matmul`` (one expert per block, ``nnz = nb``) at the decode experts'
+        program configs for ``mb`` rows; the grouped PolyNorm with per-block constants and the routing weights folded into
+        ``up``; down with ``sparse_matmul``."""
+        H, I = self.hidden, self.inter
+        dram = self.dram
+        m_tiles = int(mb) // TILE
+        pc_gu = self.cfg.experts_gate_up_pc(m_tiles=m_tiles)
+        pc_dn = self.cfg.experts_down_pc(m_tiles=m_tiles)
+        gu_dtype = self.gate_up_dtype or ttnn.bfloat16
+        gu = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, 2 * I]), gu_dtype, ttnn.TILE_LAYOUT,
+                                            self.mesh_device, dram)
+        gu = ttnn.sparse_matmul(
+            X, self.w_gate_up, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
+            program_config=pc_gu, compute_kernel_config=self.ckc_experts, dtype=gu_dtype, memory_config=dram,
+            optional_output_tensor=gu,
+        )  # fmt: skip
+        _free(X)
+        g = ttnn.slice(gu, [0, 0, 0, 0], [1, nb, mb, I], memory_config=dram)
+        up = ttnn.slice(gu, [0, 0, 0, I], [1, nb, mb, 2 * I], memory_config=dram)
+        _free(gu)
+        us = ttnn.multiply(wcol, up, memory_config=dram)  # A = w (fp32): fp32 product, broadcast over cols
+        _free(up, wcol)
+        h = _pn.grouped_polynorm(g, cblk, inter=I, mode="bf16", eps=self.cfg.polynorm_eps,
+                                 compute_kernel_config=self.ckc_polynorm, memory_config=dram, up=us, impl="rms",
+                                 intermediate_memory_config=dram)
+        _free(g, us, *cblk.values())
+        y = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, H]), self.down_dtype, ttnn.TILE_LAYOUT,
+                                           self.mesh_device, dram)
+        y = ttnn.sparse_matmul(
+            h, self.w_down, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
+            program_config=pc_dn, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype, memory_config=dram,
+            optional_output_tensor=y,
+        )  # fmt: skip
+        _free(h, sp)
+        return _reshape(y, (1, 1, int(nb) * int(mb), H))
+
+    def _compact_combine(self, y, M: int, *, keys, key_page: int, keys_f32=None):
+        """``y [1, 1, R, 4096]`` (consumed) -> this chip's partial ``[1, 1, M, 4096]`` in ``combine_dtype``. ``keys``:
+        a uint32 ROW_MAJOR tensor whose page ``key_page`` holds every row's token (pad rows M; not consumed).
+        "gather" (B2b): :class:`GatherCombine` on ``y`` untilized. "matmul" (B2a): ``P^T [M, R] @ y`` with ``P^T[t, j] =
+        (key[j] == t)`` (``keys_f32 [1, 1, 1, R]`` fp32 TILE when the caller has it, consumed; else built from
+        ``keys``)."""
+        dram = self.dram
+        R = int(y.shape[-2])
+        if getattr(self, "prefill_moe_combine", "matmul") == "gather":
+            y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+            _free(y)
+            part = self.compact_state.combine(y_rm, keys, M=M, key_page=key_page, out_dtype=self.combine_dtype,
+                                              memory_config=dram)
+            _free(y_rm, keys_f32)
+            return part
+        if keys_f32 is None:
+            k_rm = ttnn.slice(keys, [0, 0, key_page, 0], [1, 1, key_page + 1, R], memory_config=dram)
+            k_t = ttnn.to_layout(k_rm, ttnn.TILE_LAYOUT, memory_config=dram)
+            _free(k_rm)
+            keys_f32 = ttnn.typecast(k_t, ttnn.float32, memory_config=dram)  # exact: integers <= M
+            _free(k_t)
+        PT = ttnn.eq(keys_f32, self._iota(M), dtype=ttnn.bfloat16, memory_config=dram)
+        _free(keys_f32)
+        part = ttnn.matmul(PT, y, compute_kernel_config=self.ckc_experts, dtype=self.combine_dtype,
+                           memory_config=dram)
+        _free(PT, y)
         return part
 
     @staticmethod
@@ -1545,7 +1730,8 @@ class MotifMoE:
         decode experts' program configs for ``mb`` rows; the grouped PolyNorm on the blocks with per-block constants and
         the routing weights folded into ``up`` (the dense path's ops on the same values); down with ``sparse_matmul``;
         combine ``P^T [M, R] @ y [R, 4096]`` with ``P^T[t, j] = (key[j] == t)`` (rows in expert order, so a token's
-        expert terms add in the dense order; pad rows have key ``M``, which matches no token)."""
+        expert terms add in the dense order; pad rows have key ``M``, which matches no token), or with
+        ``prefill_moe_combine="gather"`` :class:`GatherCombine` on the same keys (B2b)."""
         import numpy as np
         import torch
 
@@ -1584,14 +1770,16 @@ class MotifMoE:
         _free(bb)
         sp = ttnn.slice(brm, [0, 0, 0, 0], [1, nb, 1, E], memory_config=dram)  # [1, nb, 1, 12] bf16 ROW_MAJOR
         _free(brm)
-        # combine keys (integers -> fp32) and the rows' routing weights (gathered from w_loc)
+        # combine keys (integers -> fp32; the matmul combine only) and the rows' routing weights (gathered from w_loc)
+        gather = getattr(self, "prefill_moe_combine", "matmul") == "gather"
         Ut = ttnn.to_layout(U, ttnn.TILE_LAYOUT, memory_config=dram)
-        _free(U)
-        k32 = ttnn.slice(Ut, [0, 0, 1, 0], [1, 1, 2, rows], memory_config=dram)
+        keys = None
+        if not gather:
+            k32 = ttnn.slice(Ut, [0, 0, 1, 0], [1, 1, 2, rows], memory_config=dram)
+            keys = ttnn.typecast(k32, ttnn.float32, memory_config=dram)  # exact: integers <= M
+            _free(k32)
         gi = ttnn.slice(Ut, [0, 0, 2, 0], [1, 1, 3, rows], memory_config=dram)
         _free(Ut)
-        keys = ttnn.typecast(k32, ttnn.float32, memory_config=dram)  # exact: integers <= M
-        _free(k32)
         w_loc = self.local_weights(idx, w, memory_config=dram)  # [1, 12, M, 1] fp32, as the dense path
         wT = ttnn.transpose(w_loc, -2, -1, memory_config=dram)  # [1, 12, 1, M] (exact)
         _free(w_loc)
@@ -1602,44 +1790,9 @@ class MotifMoE:
         _free(wrow)
         wcol = _reshape(wcol, (1, nb, mb, 1))
 
-        # experts on the blocks
-        m_tiles = int(mb) // TILE
-        pc_gu = self.cfg.experts_gate_up_pc(m_tiles=m_tiles)
-        pc_dn = self.cfg.experts_down_pc(m_tiles=m_tiles)
-        gu_dtype = self.gate_up_dtype or ttnn.bfloat16
-        gu = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, 2 * I]), gu_dtype, ttnn.TILE_LAYOUT,
-                                            self.mesh_device, dram)
-        gu = ttnn.sparse_matmul(
-            X, self.w_gate_up, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
-            program_config=pc_gu, compute_kernel_config=self.ckc_experts, dtype=gu_dtype, memory_config=dram,
-            optional_output_tensor=gu,
-        )  # fmt: skip
-        _free(X)
-        g = ttnn.slice(gu, [0, 0, 0, 0], [1, nb, mb, I], memory_config=dram)
-        up = ttnn.slice(gu, [0, 0, 0, I], [1, nb, mb, 2 * I], memory_config=dram)
-        _free(gu)
-        us = ttnn.multiply(wcol, up, memory_config=dram)  # A = w (fp32): fp32 product, broadcast over cols
-        _free(up, wcol)
-        h = _pn.grouped_polynorm(g, cblk, inter=I, mode="bf16", eps=self.cfg.polynorm_eps,
-                                 compute_kernel_config=self.ckc_polynorm, memory_config=dram, up=us, impl="rms",
-                                 intermediate_memory_config=dram)
-        _free(g, us, *cblk.values())
-        y = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, H]), self.down_dtype, ttnn.TILE_LAYOUT,
-                                           self.mesh_device, dram)
-        y = ttnn.sparse_matmul(
-            h, self.w_down, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
-            program_config=pc_dn, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype, memory_config=dram,
-            optional_output_tensor=y,
-        )  # fmt: skip
-        _free(h, sp)
-        y = _reshape(y, (1, 1, rows, H))
-
-        # combine: P^T [M, rows] (one-hot of each row's token) @ y
-        PT = ttnn.eq(keys, self._iota(M), dtype=ttnn.bfloat16, memory_config=dram)
-        _free(keys)
-        part = ttnn.matmul(PT, y, compute_kernel_config=self.ckc_experts, dtype=self.combine_dtype,
-                           memory_config=dram)
-        _free(PT, y)
+        y = self._compact_experts(X, sp, cblk, wcol, mb, nb)
+        part = self._compact_combine(y, M, keys=U, key_page=1, keys_f32=keys)
+        _free(U)
         return part
 
     def warm_compact(self, rows: int) -> Tuple[int, ...]:
@@ -1667,6 +1820,19 @@ class MotifMoE:
             y = self.experts(x, polynorm=self.prefill_polynorm, decode=False, row_scale=w_loc, memory_config=self.dram)
             _free(w_loc)
             _free(self.reduce_experts(y, memory_config=self.dram), y)
+            if getattr(self, "prefill_moe_dispatch", "host") == "device" and M <= PREFILL_MOE_DISPATCH_MAX_ROWS:
+                # the dispatch program (one per chunk size) on the warm routes, then the post-dispatch programs of
+                # every ladder entry on synthetic capacity buffers (pad rows only: nothing is combined)
+                rows_d = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
+                self._read_need(rows_d.need)
+                rows_d.free()
+                for nb in ladder:
+                    rows_s = self._synthetic_rows(M, mb, ladder[-1])
+                    _free(self._compact_rows_device(x, rows_s, mb, int(nb)))
+                    rows_s.free()
+                    st.warmed.add((M, mb, int(nb)))
+                _free(idx, w)
+                return ladder
             for nb in ladder:
                 eblk = (torch.arange(nb) % self.e_loc).unsqueeze(0).expand(P, nb)
                 meta = dict(
@@ -1681,6 +1847,30 @@ class MotifMoE:
         finally:
             _free(x)
         return ladder
+
+    def _synthetic_rows(self, M: int, mb: int, cap: int):
+        """Warm-up only: :class:`CompactRows` capacity buffers with the dispatch kernel's specs holding pad rows only
+        (token 0, key M, weight 0; block b one-hot at expert ``b % 12`` with its PolyNorm constants of chip 0)."""
+        import torch
+
+        from .kernels.moe_compact import CompactRows
+
+        rep = ttnn.ReplicateTensorToMesh(self.mesh_device)
+        dev, dram, E = self.mesh_device, self.dram, self.e_loc
+
+        def up(t, dtype, layout):
+            return ttnn.from_torch(t, dtype=dtype, layout=layout, device=dev, memory_config=dram, mesh_mapper=rep)
+
+        rr = torch.zeros(1, 1, 2, cap * mb, dtype=torch.int32)
+        rr[0, 0, 1] = int(M)
+        e = torch.arange(cap) % E
+        sp = torch.zeros(1, cap, 1, 32)
+        sp[0, torch.arange(cap), 0, e] = 1.0
+        blk = sp.clone()
+        blk[0, :, 0, 16:20] = self._pn_host[0][e].float()
+        return CompactRows(up(rr, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT), up(torch.zeros(1, cap, mb, 1), ttnn.float32,
+                           ttnn.TILE_LAYOUT), up(sp, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+                           up(blk, ttnn.bfloat16, ttnn.TILE_LAYOUT), None)
 
     # ==========================================================================================================
     # B1: sparse decode experts
@@ -1903,6 +2093,8 @@ class MotifMoE:
         if getattr(self, "router_fused", None) is not None:
             self.router_fused.deallocate()
             self.router_fused = None
+        _free(getattr(self, "_disp_meta", None))
+        self._disp_meta = None
         st = getattr(self, "compact_state", None)
         if st is not None and getattr(st, "owner", None) is self:
             st.deallocate()
@@ -1911,6 +2103,7 @@ class MotifMoE:
 __all__ = ["COMBINE_MODES", "CompactPrefillState", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS",
            "MOE_POLYNORM_MODES", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "compact_block",
            "compact_bucket", "compact_ladder", "compact_need_blocks", "compact_prefill_meta", "compact_upload_fast",
+           "PREFILL_MOE_DISPATCH_MAX_ROWS", "resolve_prefill_moe_kernels",
            "grouped_polynorm",
            "prefill_experts_pc", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
            "wide_decode_rows"]
