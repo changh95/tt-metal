@@ -20,7 +20,9 @@ Lifecycle (vllm-tt-plugin call order, ``generator_api.MotifGenerator`` docstring
    ``warmup_decode(enable_trace=False)`` (stages the persistent inputs of every decode path for width W, one eager
    all-inactive step each) -> ``warmup_decode(enable_trace=True)`` (captures each path's trace, exception-safe; with
    ``spec_verify="auto"`` the T32-spec trace, then the T64 trace).
-   ``MOTIF3_CAPTURE_THREAD=worker`` runs every capture on a worker thread (its own malloc arena).
+   With ``MOTIF3_PREFILL_TRACE`` (B7, ``cfg.prefill_trace``) the eager decode warmup also stages the persistent
+   inputs of the traced prefill shapes and the trace warmup captures them after the decode traces (section "Traced
+   prefill" below); ``MOTIF3_CAPTURE_THREAD=worker`` runs every capture on a worker thread (its own malloc arena).
    Capture refuses to run before every prefill shape was compiled, and after the capture a prefill chunk of a shape the
    warmup did not compile is refused (a program compiled after capture can corrupt the trace: plugin
    ``model_runner.py:3735-3745``; features design D12 / G7); a packed pass of an unwarmed shape runs as solo chunks
@@ -55,6 +57,14 @@ Prefill (resumed / chunked; ``supports_resumed_prefill``). One call per plugin s
   ``pool.mtp`` through the same fill table. Every chunk tensor is freed before the next chunk.
 * Returns ``[B, vocab]`` host logits (position ``end - 1`` of each row) in input order. ``prefill_forward(r)`` is
   ``prefill_forward_batch([r])[0]``.
+
+Traced prefill (B7, ``MOTIF3_PREFILL_TRACE``; :class:`PrefillTrace`): a solo chunk whose ``(path, bucket)`` has a
+captured trace runs ``_run_chunk_traced`` instead of ``_run_chunk``: its tables (``PrefillChunkInputs.write`` with
+``regather=False``: the sp1 trace gathers its own RoPE rows), tokens and the LM head's slice position are written into
+the shape's persistent inputs, the trace replays (embedding -> layers -> head tile row [-> ``stream_mean_norm``]), the
+last chunk's logits are read (F3N R4), and with the MTP layer the next tokens (the row's last position takes the host
+argmax) are written and the KV-only fill trace replays. Bitwise the eager chunk. Packed passes, other shapes and calls
+with a ``chunk_observer`` stay eager.
 
 Packed prefill (P5, ``settings.packed_prefill`` / ``MOTIF3_PACKED_PREFILL``; docs/p5_t64/P5_T64_DESIGN.md §3; the
 switch :attr:`MotifGenerator.packed_prefill`). The call runs as **passes** (``PrefillBatchPlan.passes``, in order;
@@ -174,6 +184,7 @@ module device-free: ``test_real_generator_class_imports_device_free``).
 
 from __future__ import annotations
 
+import copy
 import os
 import threading
 import time
@@ -622,6 +633,48 @@ class DecodePath:
         return self.trace_id is not None
 
 
+# B7 (MOTIF3_PREFILL_TRACE): the trace-region estimate of one traced prefill shape, per chip, checked before each
+# capture (a capture that overflows the region is a fatal error in tt-metal, not a recoverable one). M8 measured 42.6 /
+# 43.3 MiB for sp0 / sp1 128 at 53 layers (0.80-0.82 MiB per layer) and 50.2 MiB for sp0 1024; the estimate keeps a
+# margin: 1 MiB per decoder layer (the MTP layer counts as one) + 4 MiB (embedding, LM head, RoPE gathers).
+PREFILL_TRACE_EST_BYTES_PER_LAYER = 1 << 20
+PREFILL_TRACE_EST_BYTES_FIXED = 4 << 20
+
+
+@dataclass(eq=False)
+class PrefillTrace:
+    """B7 (``MOTIF3_PREFILL_TRACE``, ``cfg.prefill_trace``): one traced solo prefill shape ``(path, bucket)`` with its
+    persistent inputs (allocated with the decode paths' inputs, before the first capture: F3N R3) and, once captured,
+    its trace(s) (captured once, after the decode traces: R5).
+
+    ``inp``: the chunk's ``PrefillChunkInputs`` (rewritten per chunk with ``write(regather=False)``; ``rot`` stays
+    None, the trace gathers the RoPE rows of sp1 from ``rot_idx`` itself); ``tok``: the ``[1 | 4, bucket]`` uint32
+    tokens; ``nxt``: the MTP layer's next tokens ``[1, bucket]`` (speculating launch only). ``trace_id``: embedding ->
+    layers -> LM-head tile row (position from the head's persistent slice bounds) [-> ``stream_mean_norm`` for the
+    MTP layer]; outputs ``tile`` (``[1, 1, 32, Vc]`` ROW_MAJOR) and ``hn``. ``mtp_trace_id``: the MTP layer's KV-only
+    fill from ``hn`` and ``nxt`` (a second trace: its last next token is the host argmax of this chunk's logits)."""
+
+    path: str
+    bucket: int
+    inp: Any = None
+    tok: Any = None
+    nxt: Any = None
+    trace_id: Any = None
+    mtp_trace_id: Any = None
+    tile: Any = None
+    hn: Any = None
+    pool: Any = None
+    trace_bytes: int = 0  # per chip, measured at the capture (both traces)
+
+    @property
+    def key(self) -> Tuple[str, int]:
+        return (self.path, int(self.bucket))
+
+    @property
+    def traced(self) -> bool:
+        return self.trace_id is not None
+
+
 @dataclass(eq=False)
 class SampledSubmission:
     """B6b (``MOTIF3_ASYNC_DECODE=on``): one device-sampled plain decode step submitted by
@@ -898,8 +951,15 @@ class MotifGenerator(api.MotifGenerator):
         self.stats["fed_steps"] = 0  # ... whose tokens came from the previous step's read (feed)
         self.stats["prestaged_steps"] = 0  # ... whose other inputs were written before that read
         self.stats["settled_reads"] = 0  # outstanding steps read by another call (settle_decode)
-        # E3: the thread trace captures run on (MOTIF3_CAPTURE_THREAD; _on_capture_thread)
+        # B7 (MOTIF3_PREFILL_TRACE): traced solo prefill shapes (staged with the decode paths, captured after them)
+        # E3 / B7: the thread trace captures run on (MOTIF3_CAPTURE_THREAD; _on_capture_thread)
         self.capture_thread = api.check_capture_thread(getattr(cfg, "capture_thread", None), name="cfg.capture_thread")
+        self.prefill_trace_buckets: Tuple[int, ...] = api.prefill_trace_buckets(
+            getattr(cfg, "prefill_trace", None), name="cfg.prefill_trace"
+        )
+        self._prefill_traces: Dict[Tuple[str, int], PrefillTrace] = {}
+        self.stats["traced_prefill_chunks"] = 0  # solo chunks run by a prefill trace replay
+        self.stats["prefill_traces_skipped"] = 0  # traced shapes not captured (trace-region estimate)
 
     # ==============================================================================================================
     # construction (GEN-1)
@@ -1506,7 +1566,11 @@ class MotifGenerator(api.MotifGenerator):
             g = p.segments[0]
             job = batch.jobs[g.row]
             ch = job.plan.chunks[g.chunk_index]
-            lg = self._run_chunk(job, ch, host, pool)
+            t = self._prefill_trace_for(ch)
+            if t is not None:
+                lg = self._run_chunk_traced(job, ch, host, t, pool)
+            else:
+                lg = self._run_chunk(job, ch, host, pool)
             if ch.last:
                 out[g.row] = lg
         t2 = time.time()
@@ -1624,6 +1688,223 @@ class MotifGenerator(api.MotifGenerator):
                 inp.free()
         return logits
 
+    # ==============================================================================================================
+    # traced prefill (B7, MOTIF3_PREFILL_TRACE; docs/OPTIMIZATION_PLAN.md §3.3 B7, logs/opt/phaseB/B7)
+    # ==============================================================================================================
+    def prefill_trace_shapes(self) -> List[Tuple[str, int]]:
+        """The solo shapes :attr:`prefill_trace_buckets` traces: ``(sp0, b)`` for every bucket of the config's span
+        buckets, ``(sp1, b)`` when ``b <= max_sp1_bucket``; in :meth:`prefill_shapes` order."""
+        want = set(self.prefill_trace_buckets)
+        return [(p, int(b)) for p, b in self.prefill_shapes() if int(b) in want]
+
+    @property
+    def prefill_traces(self) -> Dict[Tuple[str, int], PrefillTrace]:
+        """The staged traced prefill shapes (captured ones have ``traced``)."""
+        return dict(self._prefill_traces)
+
+    def _prefill_trace_for(self, ch: PP.ChunkPlan) -> Optional[PrefillTrace]:
+        """The captured trace that runs solo chunk ``ch``, or None (eager): none for its shape, or a test hook that
+        needs the chunk's eager streams (``chunk_observer``)."""
+        if not self._prefill_traces or self.chunk_observer is not None:
+            return None
+        t = self._prefill_traces.get((ch.path, int(ch.bucket)))
+        return t if t is not None and t.traced else None
+
+    def _stage_prefill_traces(self) -> None:
+        """F3N R3 for the traced prefill shapes: allocate every persistent input (warm-up tables: the fill table is
+        all ``-1``) before the first capture. A shape whose MoE chunk would run the compacted prefill MoE (B2a: a
+        blocking host read of the routes inside the pass) cannot be traced and is refused."""
+        shapes = [k for k in self.prefill_trace_shapes() if k not in self._prefill_traces]
+        if not shapes:
+            return
+        if self.trace_captured:
+            raise RuntimeError(
+                f"traced prefill shapes {shapes} staged after a decode capture (F3N R3: every persistent input is "
+                f"allocated before the first capture): run warmup_decode(enable_trace=False) first"
+            )
+        model, cfg = self.model, self.cfg
+        rows_of = getattr(model, "prefill_moe_rows", None)
+        for path, b in shapes:
+            compact = rows_of([b]) if rows_of is not None else []
+            if compact:
+                raise RuntimeError(
+                    f"MOTIF3_PREFILL_TRACE: bucket {b} runs the compacted prefill MoE (MoE chunks {compact}: a host "
+                    f"read inside the pass), which cannot be traced; raise MOTIF3_PREFILL_MOE_MIN_ROWS above {b} or "
+                    f"drop the bucket"
+                )
+            t = PrefillTrace(path=path, bucket=int(b))
+            pad = torch.full((int(b),), int(cfg.pad_token_id), dtype=torch.int32)
+            try:
+                t.inp = model.chunk_inputs(warmup_chunk_host_tables(cfg, path, int(b)))
+                for cs in (t.inp.rot or {}).values():  # the trace gathers its own RoPE rows from rot_idx
+                    for x in cs:
+                        ttnn.deallocate(x)
+                t.inp.rot = None
+                t.tok = model.embed.prefill_tokens_device(pad, int(b))
+                if model.mtp is not None:
+                    t.nxt = model.embed.rows_tokens_device(pad, int(b))
+            except BaseException:
+                self._free_prefill_trace(t)
+                raise
+            self._prefill_traces[t.key] = t
+
+    def _traced_chunk(self, t: PrefillTrace):
+        """The chunk inputs a prefill trace body passes to the layers: sp1 (``rot_idx``) with RoPE rows gathered inside
+        the trace (freed by the caller), sp0 as staged."""
+        if t.inp.rot_idx is None:
+            return t.inp, None
+        rot = self.model.rope.chunk_rope_tables(t.inp.rot_idx)
+        ch = copy.copy(t.inp)  # the persistent inputs keep rot None (PrefillChunkInputs.write(regather=False))
+        ch.rot = rot
+        return ch, rot
+
+    @staticmethod
+    def _free_rot(rot) -> None:
+        for cs in (rot or {}).values():
+            for x in cs:
+                ttnn.deallocate(x)
+
+    def _prefill_trace_body(self, t: PrefillTrace, pool: MotifKVPool):
+        """Embedding -> layers -> LM-head tile row (and ``stream_mean_norm`` with the MTP layer): the device ops of
+        ``_run_chunk`` before the host logits, the head at the position written last (``head.set_prefill_position``)."""
+        model = self.model
+        ch, rot = self._traced_chunk(t)
+        X = None
+        try:
+            X = model.prefill_chunk(t.tok, chunk=ch, kv_caches=pool)
+            tile = model.head.forward_prefill(X)
+            hn = model.head.stream_mean_norm(X) if model.mtp is not None else None
+        finally:
+            _free(X)
+            self._free_rot(rot)
+        return tile, hn
+
+    def _prefill_mtp_body(self, t: PrefillTrace, pool: MotifKVPool) -> None:
+        """The MTP layer's KV-only fill of the chunk (``_run_chunk``'s, from the main trace's ``hn``)."""
+        ch, rot = self._traced_chunk(t)
+        try:
+            self.model.mtp.fill_kv_prefill(t.hn, t.nxt, kv_cache=pool.mtp, chunk=ch)
+        finally:
+            self._free_rot(rot)
+
+    def _num_programs(self) -> int:
+        try:
+            return int(self.mesh_device.num_program_cache_entries())
+        except Exception:
+            return -1
+
+    def _trace_region_free(self) -> Optional[int]:
+        """Free bytes of the trace region per chip (``None`` if the memory view is unavailable)."""
+        try:
+            v = ttnn.get_memory_view(self.mesh_device, ttnn.BufferType.TRACE)
+            return int(v.total_bytes_free_per_bank) * int(v.num_banks)
+        except Exception:
+            return None
+
+    def _trace_region_used(self) -> Optional[int]:
+        try:
+            v = ttnn.get_memory_view(self.mesh_device, ttnn.BufferType.TRACE)
+            return int(v.total_bytes_allocated_per_bank) * int(v.num_banks)
+        except Exception:
+            return None
+
+    def prefill_trace_estimate(self) -> int:
+        """Trace-region bytes per chip one traced prefill shape is assumed to need (:data:`PREFILL_TRACE_EST_*`)."""
+        layers = self.num_layers + (1 if self.model.mtp is not None else 0)
+        return PREFILL_TRACE_EST_BYTES_PER_LAYER * layers + PREFILL_TRACE_EST_BYTES_FIXED
+
+    def _end_capture(self, tid) -> None:
+        try:
+            ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        except Exception:
+            pass
+        try:
+            ttnn.release_trace(self.mesh_device, tid)
+        except Exception:
+            pass
+
+    def _capture_prefill_traces(self, pool: MotifKVPool) -> None:
+        """Capture every staged traced prefill shape once (after the decode traces, so they always fit; F3N R5). A
+        shape is skipped (logged, ``prefill_traces_skipped``) when the trace region's free bytes are below
+        :meth:`prefill_trace_estimate`. Every capture must compile nothing (R2): it raises otherwise. Each capture is
+        replayed once with the warm-up tables (writes nothing)."""
+        mesh, model = self.mesh_device, self.model
+        for key, t in self._prefill_traces.items():
+            if t.traced:
+                continue
+            if key not in self._warmed:
+                raise RuntimeError(f"traced prefill shape {key} was not compiled by warmup_prefill (F3N R2)")
+            free, need = self._trace_region_free(), self.prefill_trace_estimate()
+            if free is not None and free < need:
+                self.stats["prefill_traces_skipped"] += 1
+                self.log(
+                    f"warning: traced prefill {key[0]} bucket {key[1]} not captured: the trace region has "
+                    f"{free / 2**20:.1f} MiB free per chip, the estimate is {need / 2**20:.1f} MiB "
+                    f"(raise trace_region_size; the shape runs eagerly)"
+                )
+                continue
+            t0, used0, n0 = time.time(), self._trace_region_used(), self._num_programs()
+            model.head.set_prefill_position(int(t.inp.end) - 1 - int(t.inp.start), t.bucket)
+            ttnn.synchronize_device(mesh)
+            self._on_capture_thread(lambda: self._capture_prefill(t, pool))
+            compiled = self._num_programs() - n0
+            if compiled:
+                self._release_prefill_trace(t)
+                raise RuntimeError(
+                    f"F3N R2: the traced prefill capture of {key} compiled {compiled} programs (every program must "
+                    f"be compiled by warmup_prefill before the first capture)"
+                )
+            self._acknowledge_outputs([t.tile, t.hn])
+            ttnn.execute_trace(mesh, t.trace_id, cq_id=0, blocking=False)  # warm-up tables: writes nothing
+            if t.mtp_trace_id is not None:
+                ttnn.execute_trace(mesh, t.mtp_trace_id, cq_id=0, blocking=False)
+            ttnn.synchronize_device(mesh)
+            used1 = self._trace_region_used()
+            t.trace_bytes = (used1 - used0) if used0 is not None and used1 is not None else 0
+            dt = time.time() - t0
+            self.timings[f"capture_prefill_{key[0]}_{key[1]}_s"] = dt
+            self.log(
+                f"prefill trace captured: {key[0]} bucket {key[1]} ({self.num_layers} layers"
+                f"{' + the MTP KV fill (second trace)' if t.mtp_trace_id is not None else ''}; "
+                f"{t.trace_bytes / 2**20:.1f} MiB per chip of the trace region, "
+                f"{(used1 or 0) / 2**20:.1f} MiB used in all) in {dt:.1f} s"
+            )
+
+    def _capture_prefill(self, t: PrefillTrace, pool: MotifKVPool) -> None:
+        """Exception-safe capture of ``t``'s trace(s) (no replay): the main trace, then with the MTP layer the fill
+        trace. On any error every trace begun here is ended and released before the error propagates."""
+        mesh, model = self.mesh_device, self.model
+        tid = ttnn.begin_trace_capture(mesh, cq_id=0)
+        try:
+            tile, hn = self._prefill_trace_body(t, pool)
+        except BaseException:
+            self._end_capture(tid)
+            raise
+        try:
+            ttnn.end_trace_capture(mesh, tid, cq_id=0)
+        except BaseException:
+            try:
+                ttnn.release_trace(mesh, tid)
+            except Exception:
+                pass
+            _free(tile, hn)
+            raise
+        t.trace_id, t.tile, t.hn, t.pool = tid, tile, hn, pool
+        if model.mtp is None:
+            return
+        try:
+            tid2 = ttnn.begin_trace_capture(mesh, cq_id=0)
+            try:
+                self._prefill_mtp_body(t, pool)
+            except BaseException:
+                self._end_capture(tid2)
+                raise
+            ttnn.end_trace_capture(mesh, tid2, cq_id=0)
+            t.mtp_trace_id = tid2
+        except BaseException:
+            self._release_prefill_trace(t)
+            raise
+
     def _on_capture_thread(self, fn: Callable[[], Any]) -> Any:
         """Run one trace capture (``fn``) on the thread :attr:`capture_thread` names and return its result (its error
         re-raised here). ``"worker"``: a short-lived worker thread, joined before returning. A capture keeps
@@ -1648,6 +1929,72 @@ class MotifGenerator(api.MotifGenerator):
         if "error" in box:
             raise box["error"]
         return box.get("result")
+
+    def _acknowledge_outputs(self, outs) -> None:
+        """F3N R6 for prefill trace outputs captured while a decode trace exists (allocation-tracker runs only)."""
+        try:
+            from ttnn.tools import trace_allocation_tracker as tat
+        except Exception:
+            return
+        if not getattr(tat, "TRACE_ALLOC_TRACKING", False):
+            return
+        for x in outs:
+            if x is not None:
+                tat.acknowledge_corruptible(x)
+
+    def _release_prefill_trace(self, t: PrefillTrace) -> None:
+        err = None
+        for tid in (t.trace_id, t.mtp_trace_id):
+            if tid is None:
+                continue
+            try:
+                ttnn.release_trace(self.mesh_device, tid)
+            except Exception as e:  # keep releasing the others
+                err = err or e
+        _free(t.tile, t.hn)
+        t.trace_id = t.mtp_trace_id = t.tile = t.hn = t.pool = None
+        if err is not None:
+            raise err
+
+    def _free_prefill_trace(self, t: PrefillTrace) -> None:
+        if t.traced:
+            raise RuntimeError(f"traced prefill shape {t.key} holds a trace: release_traces() first")
+        if t.inp is not None:
+            t.inp.free()
+        _free(t.tok, t.nxt)
+        t.inp = t.tok = t.nxt = None
+        self._prefill_traces.pop(t.key, None)
+
+    def _run_chunk_traced(
+        self, job: PrefillRowJob, ch: PP.ChunkPlan, host: ChunkHostTables, t: PrefillTrace, pool: MotifKVPool
+    ):
+        """``_run_chunk`` by replay (B7): write the chunk's tables, tokens and head position into the shape's
+        persistent inputs, replay, read the logits (last chunk); with the MTP layer write its next tokens (the last
+        one the host argmax of those logits) and replay the fill trace. Bitwise the eager chunk."""
+        model, req, mesh = self.model, job.request, self.mesh_device
+        if self._unread is not None:  # F3N R4: a decode step's outputs are read before another trace replays
+            raise RuntimeError(
+                f"F3N rule R4: prefill trace {t.key} replayed while the outputs of decode trace {self._unread} are not "
+                f"read yet"
+            )
+        if t.pool is not pool:
+            raise ValueError("the prefill trace was captured with another KV pool")
+        t.inp.write(mesh, self.cfg, model.rope, host, regather=False)
+        tok = model.embed.prefill_tokens_host(req.tokens[ch.start : ch.end], ch.bucket)
+        ttnn.copy_host_to_device_tensor(tok, t.tok)
+        model.head.set_prefill_position(ch.head_row, ch.bucket)
+        ttnn.execute_trace(mesh, t.trace_id, cq_id=0, blocking=False)
+        logits = None
+        if ch.last:  # R4: the tile row is read before any other trace replays
+            logits = model.head.prefill_logits_to_host(t.tile, ch.head_row)
+        if model.mtp is not None:
+            stand_in = int(torch.argmax(logits)) if ch.end == req.end else None
+            ids = mtp_next_tokens(req.tokens, ch.start, ch.end, stand_in)
+            ttnn.copy_host_to_device_tensor(model.embed.rows_tokens_host(ids, ch.bucket), t.nxt)
+            ttnn.execute_trace(mesh, t.mtp_trace_id, cq_id=0, blocking=False)
+            self.stats["mtp_fills"] += 1
+        self.stats["traced_prefill_chunks"] += 1
+        return logits
 
     # ==============================================================================================================
     # decode paths (GEN-3; features design §3.8, §3.11)
@@ -2689,6 +3036,8 @@ class MotifGenerator(api.MotifGenerator):
                 self.timings[f"warmup_decode_{key[0]}_{key[1]}_s"] = time.time() - t1
             self.timings["warmup_decode_eager_s"] = time.time() - t0
             self.log(f"warmup decode (eager, W={W}): paths {keys} in {self.timings['warmup_decode_eager_s']:.1f} s")
+            if self.prefill_trace_buckets:  # B7: the traced prefill shapes' inputs, before the first capture (R3)
+                self._stage_prefill_traces()
             return
         missing = [s for s in self.required_prefill_shapes() if s not in self._warmed]
         if missing:
@@ -2701,7 +3050,11 @@ class MotifGenerator(api.MotifGenerator):
             if p is not None and p.traced and p.width != W:
                 raise RuntimeError(f"a decode trace for width {p.width} exists; release_traces() first")
         # F3N R2: every path compiled (one eager step each) before the FIRST capture
-        if any(key not in self._paths or not self._paths[key].warmed or self._paths[key].width != W for key in keys):
+        staged = all(k in self._prefill_traces for k in self.prefill_trace_shapes())  # B7 (R3)
+        unwarmed = any(
+            key not in self._paths or not self._paths[key].warmed or self._paths[key].width != W for key in keys
+        )
+        if unwarmed or (not self.trace_captured and not staged):
             self.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
         t_all = time.time()
         for key in keys:
@@ -2724,6 +3077,10 @@ class MotifGenerator(api.MotifGenerator):
                 f"{', device sampler' if p.so is not None else ''}) in {dt:.1f} s"
             )
         self.timings["capture_decode_s"] = time.time() - t_all
+        if self._prefill_traces:  # B7: after the decode traces (they always fit; R5: once)
+            t0 = time.time()
+            self._capture_prefill_traces(pool)
+            self.timings["capture_prefill_s"] = time.time() - t0
         traced = [k for k, q in self._paths.items() if q.traced]
         if len(traced) > 1:
             ring = self._ring_gather()
@@ -2877,6 +3234,11 @@ class MotifGenerator(api.MotifGenerator):
                 f"{w['blocked_ms'] / max(1, w['spins']):.2f} ms blocked per replay, {int(w['overshoots'])} overshoots"
             )
         err = None
+        for t in getattr(self, "_prefill_traces", {}).values():  # B7
+            try:
+                self._release_prefill_trace(t)
+            except Exception as e:
+                err = err or e
         for p in self._paths.values():
             if p.trace_id is None:
                 continue
@@ -2898,6 +3260,8 @@ class MotifGenerator(api.MotifGenerator):
         """Release the traces, the persistent inputs, the device sampler, the KV pool and the model weights
         (standalone runs)."""
         self.release_traces()
+        for t in list(self._prefill_traces.values()):
+            self._free_prefill_trace(t)
         for p in list(self._paths.values()):
             self._free_path(p)
         if self.sampler is not None:
@@ -2915,6 +3279,7 @@ __all__ = [
     "MotifGenerator",
     "PLAIN",
     "LaneSampling",
+    "PrefillTrace",
     "PrefillBatchPlan",
     "PrefillRowJob",
     "ReplayWaiter",

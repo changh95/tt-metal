@@ -605,6 +605,50 @@ def capture_thread_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     return check_capture_thread(env.get("MOTIF3_CAPTURE_THREAD"))
 
 
+# B7: traced prefill of small solo chunks (OPTIMIZATION_PLAN.md §3.3 B7, OPT_PHASE_A_REVIEW.md §7.1 M8; prototype
+# logs/opt/phaseA/m8; results logs/opt/phaseB/B7). "off" (default) = the release: every prefill chunk runs eagerly
+# (~0.71 s of host dispatch for a 128-row chunk whose device time is ~0.21 s). A comma list of buckets (from
+# PREFILL_TRACE_BUCKETS; "on" = "128") = at the decode capture the generator also captures one trace per (sp0, b) and
+# (sp1, b) of those buckets (embedding -> layers -> LM-head tile row, plus a second small trace for the MTP layer's
+# KV-only fill on a speculating launch) and replays it for every solo chunk of that shape. Traced == eager bitwise.
+# 1024 is not offered: it is device bound (M8: 1.001 -> 0.984 s) and its trace would cost ~50 MiB of the trace region.
+PREFILL_TRACE_BUCKETS = (128, 256, 512)
+DEFAULT_PREFILL_TRACE = "off"
+
+
+def check_prefill_trace(value: Any, *, name: str = "MOTIF3_PREFILL_TRACE") -> str:
+    """The canonical form of a traced-prefill setting: ``"off"`` or an ascending comma list of buckets from
+    :data:`PREFILL_TRACE_BUCKETS` (``"128"``, ``"128,256"``); ``"on"`` = ``"128"``; ``""`` / None = the default. Case
+    and blanks are ignored; anything else raises ``ValueError`` naming ``name``."""
+    v = str(value if value is not None else "").strip().lower() or DEFAULT_PREFILL_TRACE
+    if v == "off":
+        return "off"
+    if v == "on":
+        return str(PREFILL_TRACE_BUCKETS[0])
+    out = set()
+    for part in v.split(","):
+        p = part.strip()
+        if not p.isdigit() or int(p) not in PREFILL_TRACE_BUCKETS:
+            raise ValueError(
+                f"{name} must be 'off', 'on' or a comma list of buckets from {PREFILL_TRACE_BUCKETS}, got {value!r}"
+            )
+        out.add(int(p))
+    return ",".join(str(b) for b in sorted(out))
+
+
+def prefill_trace_buckets(value: Any, *, name: str = "MOTIF3_PREFILL_TRACE") -> Tuple[int, ...]:
+    """The traced prefill buckets of a setting (:func:`check_prefill_trace`): ``()`` for ``"off"``."""
+    v = check_prefill_trace(value, name=name)
+    return () if v == "off" else tuple(int(b) for b in v.split(","))
+
+
+def prefill_trace_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_PREFILL_TRACE`` (B7): ``off`` (default), ``on`` (= ``128``) or a comma list of buckets from
+    :data:`PREFILL_TRACE_BUCKETS`; canonical form of :func:`check_prefill_trace`."""
+    env = os.environ if environ is None else environ
+    return check_prefill_trace(env.get("MOTIF3_PREFILL_TRACE"))
+
+
 def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
     64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
@@ -1894,6 +1938,11 @@ __all__ = [
     "DEFAULT_CAPTURE_THREAD",
     "check_capture_thread",
     "capture_thread_from_env",
+    "PREFILL_TRACE_BUCKETS",
+    "DEFAULT_PREFILL_TRACE",
+    "check_prefill_trace",
+    "prefill_trace_buckets",
+    "prefill_trace_from_env",
     "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
     "wide_step_ratio_from_env",

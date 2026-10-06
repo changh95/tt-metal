@@ -941,6 +941,377 @@ def test_cpu_mtp_part_estimate_and_pool():
     assert M.MotifKVPool([1], (0,), 10, 64, "bfp8").mtp_layers == 0
 
 
+# ======================================================================================================================
+# B7 traced prefill (MOTIF3_PREFILL_TRACE) on the emulated device: a replay re-runs the captured body on the shape's
+# persistent inputs as they are at the replay (what a trace replay with rewritten inputs computes)
+# ======================================================================================================================
+def _copy_into(dst, src) -> None:
+    for k, v in src.__dict__.items():
+        if k != "alive":
+            setattr(dst, k, v)
+
+
+class TraceChunk(FakeChunk):
+    """Persistent ``PrefillChunkInputs`` of a traced shape: ``write`` rebinds the tables (no RoPE gather: the trace
+    gathers from ``rot_idx``); ``rot`` must be None in the persistent object."""
+
+    def __init__(self, host):
+        super().__init__(host)
+        sp1 = host.path == PP.SP1
+        self.rot_idx = FakeT(kind="rot_idx") if sp1 else None
+        self.rot = {"plain": (FakeT(), FakeT())} if sp1 else None  # the eager upload's gather
+        self.writes = 0
+
+    def write(self, mesh, cfg, rope, host, *, regather=True):
+        assert regather is False, "a traced chunk never regathers eagerly"
+        assert (host.path, int(host.bucket)) == (self.path, self.bucket)
+        self.host, self.start, self.end = host, int(host.start), int(host.end)
+        self.writes += 1
+
+
+class TraceMTP(FakeMTP):
+    def fill_kv_prefill(self, hn, nxt, *, kv_cache, chunk):
+        if int(chunk.host.fill.max()) < 0:  # a capture with the warm-up tables: writes nothing
+            self.m.ops.append(("mtp_warm", chunk.bucket))
+            return
+        assert chunk.rot is not None or not chunk.is_sp1, "an sp1 MTP fill needs its RoPE rows (eager or gathered)"
+        return super().fill_kv_prefill(hn, nxt, kv_cache=kv_cache, chunk=chunk)
+
+
+class TraceModel(FakeModel):
+    """:class:`FakeModel` plus what the traced path uses: persistent inputs, host token tensors, the head's persistent
+    position, the RoPE gather, ``prefill_moe_rows``."""
+
+    def __init__(self, cfg, *, mtp=True, compact_rows=()):
+        super().__init__(cfg, mtp=mtp)
+        if mtp:
+            self.mtp = TraceMTP(self)
+        self.compact_rows = list(compact_rows)
+        self.rope = SimpleNamespace(chunk_rope_tables=self._rot)
+        emb, head = self.embed, self.head
+        emb.prefill_tokens_host = emb.prefill_tokens_device
+        emb.rows_tokens_host = emb.rows_tokens_device
+        head.pos = None
+
+        def set_pos(li, seq_len=None):
+            head.pos = int(li)
+            return int(li) % 32
+
+        orig = head.forward_prefill
+        head.set_prefill_position = set_pos
+        head.forward_prefill = lambda X, row=None: orig(X, head.pos if row is None else row)
+
+    def _rot(self, idx):
+        assert idx is not None
+        self.ops.append(("rot",))
+        return {"plain": (FakeT(), FakeT())}
+
+    def chunk_inputs(self, host):
+        ch = TraceChunk(host)
+        self.chunks.append(ch)
+        self.ops.append(("inputs", host.path, int(host.bucket)))
+        return ch
+
+    def prefill_moe_rows(self, rows):
+        return [r for r in rows if r in self.compact_rows]
+
+    def prefill_chunk(self, tok, *, chunk, kv_caches):
+        host = chunk.host
+        if host.path == PP.SP1 and int(host.fill.max()) < 0:  # an sp1 warm-up chunk reads only the null block
+            assert int(host.sdpa.max()) == 0 and tok.bucket == host.bucket
+            self.ops.append(("layers_warm", host.path, int(host.bucket)))
+            hs = prefix_hashes(tok.tokens)
+            return FakeT(h=hs, start=int(host.start), end=int(host.end), tokens=tok.tokens, bucket=int(host.bucket))
+        return super().prefill_chunk(tok, chunk=chunk, kv_caches=kv_caches)
+
+
+class EmuPrefillTrace:
+    """``ttnn`` trace calls for the prefill traces: ``execute`` re-runs the captured body of the trace id on the
+    shape's current persistent inputs and writes the results into the captured outputs."""
+
+    def __init__(self, gen, pool):
+        self.gen, self.pool, self.n = gen, pool, 0
+        self.captures, self.replays, self.released = [], [], []
+        self.capturing = None
+
+    def begin(self, mesh, cq_id=0):
+        assert self.capturing is None, "nested capture"
+        self.n += 1
+        self.capturing = ("trace", self.n)
+        return self.capturing
+
+    def end(self, mesh, tid, cq_id=0):
+        assert tid == self.capturing
+        self.captures.append(tid)
+        self.capturing = None
+
+    def execute(self, mesh, tid, cq_id=0, blocking=False):
+        g = self.gen
+        t = next(x for x in g._prefill_traces.values() if tid in (x.trace_id, x.mtp_trace_id))
+        model = g.model
+        if tid == t.trace_id:
+            req = model.current
+            tile, hn = g._prefill_trace_body(t, t.pool)
+            _copy_into(t.tile, tile)
+            if hn is not None:
+                _copy_into(t.hn, hn)
+            if req is not None:  # FakeMTP keys its next-token check by the token list of the replay's own X
+                model.current = req
+            self.replays.append(("main", t.key))
+        else:
+            g._prefill_mtp_body(t, t.pool)
+            self.replays.append(("mtp", t.key))
+
+    def release(self, mesh, tid):
+        self.released.append(tid)
+
+
+def trace_generator(cfg, monkeypatch, *, mtp=True, num_blocks=20000, packed=False, compact_rows=(), log=None):
+    """``fake_generator`` on a :class:`TraceModel` with the emulated trace calls; every prefill shape warmed."""
+    from models.demos.motif3.tt import generator as G
+
+    freed = []
+    monkeypatch.setattr(G.ttnn, "deallocate", lambda t, *a, **k: freed.append(t), raising=False)
+    monkeypatch.setattr(G.ttnn, "copy_host_to_device_tensor", lambda h, d: _copy_into(d, h), raising=False)
+    monkeypatch.setattr(G.ttnn, "synchronize_device", lambda mesh: None, raising=False)
+    model = TraceModel(cfg, mtp=mtp, compact_rows=compact_rows)
+    gen = G.MotifGenerator(None, cfg, model, log=log)
+    gen.packed_prefill = bool(packed)
+    orig_chunk, orig_traced, orig_packed = gen._run_chunk, gen._run_chunk_traced, gen._run_packed
+
+    def run_chunk(job, ch, host, pool):
+        model.current = job.request
+        return orig_chunk(job, ch, host, pool)
+
+    def run_traced(job, ch, host, t, pool):
+        model.current = job.request
+        return orig_traced(job, ch, host, t, pool)
+
+    def run_packed(batch, p, host, pool):
+        model.current_pass = (p, batch.requests)
+        return orig_packed(batch, p, host, pool)
+
+    gen._run_chunk, gen._run_chunk_traced, gen._run_packed = run_chunk, run_traced, run_packed
+    pool = model.allocate_kv_caches(num_blocks, cfg.kv_block_size)
+    gen._pool = pool
+    gen._warmed = set(gen.required_prefill_shapes())
+    tr = EmuPrefillTrace(gen, pool)
+    monkeypatch.setattr(G.ttnn, "begin_trace_capture", tr.begin, raising=False)
+    monkeypatch.setattr(G.ttnn, "end_trace_capture", tr.end, raising=False)
+    monkeypatch.setattr(G.ttnn, "execute_trace", tr.execute, raising=False)
+    monkeypatch.setattr(G.ttnn, "release_trace", tr.release, raising=False)
+    gen._trace_region_free = lambda: 256 << 20
+    gen._trace_region_used = lambda: 0
+    return gen, model, pool, freed, tr
+
+
+def _b7_rows(rng, width, bs, blocks):
+    """A mixed step: a short cold row (sp0 128, traced), a 300-token cold row (sp0 512), a 4160-token row resumed at
+    4096 behind its own prefix (sp1 128 tail, traced), and a 77-token cold row on another lane."""
+    out = []
+    for n, start in ((100, 0), (300, 0), (4160, 4096), (77, 0)):
+        toks = [rng.randrange(5000) for _ in range(n)]
+        nb = (n + bs - 1) // bs
+        out.append((toks, start, [blocks.pop(0) for _ in range(nb)]))
+    return out
+
+
+@pytest.mark.parametrize("mtp, thread", [(False, "main"), (True, "main"), (True, "worker")],
+                         ids=["plain", "mtp", "mtp-worker"])
+def test_cpu_prefill_trace_equals_eager(monkeypatch, mtp, thread):
+    """B7: with ``MOTIF3_PREFILL_TRACE=128`` the solo sp0 / sp1 chunks of bucket 128 replay their trace (the shape's
+    persistent inputs rewritten per chunk: tables, tokens, head position; with the MTP layer its next tokens, the last
+    one the argmax stand-in, then the fill trace) and every other chunk runs eagerly. Logits, the emulated KV and MTP
+    caches and the per-row checks of the fake model equal the eager generator's (trace off) on the same calls; the
+    captures replay once with the warm-up tables (nothing written). ``MOTIF3_CAPTURE_THREAD=worker``: every capture
+    runs on a worker thread (joined), with the same result."""
+    rng = random.Random(70)
+    W, bs = 512, 64
+    out, pools, models, stats = {}, {}, {}, {}
+    for knob in ("off", "128"):
+        cfg = host_cfg(prefill_trace=knob, capture_thread=thread)
+        gen, model, pool, freed, tr = trace_generator(cfg, monkeypatch, mtp=mtp)
+        threads = []
+        if thread == "worker":
+            import threading
+
+            orig_begin = tr.begin
+
+            def begin(mesh, cq_id=0):
+                threads.append(threading.current_thread() is not threading.main_thread())
+                return orig_begin(mesh, cq_id)
+
+            from models.demos.motif3.tt import generator as G
+
+            monkeypatch.setattr(G.ttnn, "begin_trace_capture", begin, raising=False)
+        assert gen.prefill_trace_buckets == (() if knob == "off" else (128,))
+        if knob == "128":
+            assert gen.prefill_trace_shapes() == [(PP.SP0, 128), (PP.SP1, 128)]
+            gen._stage_prefill_traces()
+            staged = {k: t.inp for k, t in gen.prefill_traces.items()}
+            assert all(t.inp.rot is None for t in gen.prefill_traces.values())
+            ops0 = len(model.ops)
+            gen._capture_prefill_traces(pool)
+            assert all(t.traced for t in gen.prefill_traces.values())
+            assert threads == ([True] * len(tr.captures) if thread == "worker" else []), threads
+            assert (gen.prefill_traces[(PP.SP1, 128)].mtp_trace_id is not None) == mtp
+            assert len(tr.captures) == 2 * (2 if mtp else 1)
+            assert len(tr.replays) == len(tr.captures)  # one replay each after the capture
+            assert not pool.kv and not (pool.mtp_kv or {}), "the warm-up replays write nothing"
+            assert ("rot",) in model.ops[ops0:], "the sp1 trace gathers its RoPE rows inside the trace"
+        r2 = random.Random(71)
+        blocks = list(range(1, 4000))
+        calls = [_b7_rows(r2, W, bs, blocks) for _ in range(3)]
+        res = []
+        for rows in calls:
+            prefix = [_rows_of(t, 0, s, b, width=W, lane=5) for t, s, b in rows if s > 0]
+            if prefix:  # the resumed row's cached prefix (sp0 4096, eager in both runs)
+                gen.prefill_forward_batch(prefix, kv_cache=pool)
+            reqs = [_rows_of(t, s, len(t), b, width=W, lane=2 * i) for i, (t, s, b) in enumerate(rows)]
+            res.append(gen.prefill_forward_batch(reqs, kv_cache=pool))
+        out[knob], pools[knob], models[knob], stats[knob] = res, pool, model, dict(gen.stats)
+        if knob == "128":
+            assert gen.stats["traced_prefill_chunks"] == 3 * 3, gen.stats  # 2 x sp0 128 + 1 sp1 128 per call
+            assert gen.stats["mtp_fills"] == stats["128"]["mtp_fills"]
+            assert {k: t.inp for k, t in gen.prefill_traces.items()} == staged, "the persistent inputs are reused"
+            assert all(t.inp.writes == (6 if k[0] == PP.SP0 else 3) for k, t in gen.prefill_traces.items())
+            tr_keys = [k for kind, k in tr.replays if kind == "main"]
+            assert tr_keys.count((PP.SP1, 128)) == 1 + 3 and tr_keys.count((PP.SP0, 128)) == 1 + 6
+            gen.release_traces()
+            assert not any(t.traced for t in gen.prefill_traces.values())
+            assert len(tr.released) == len(tr.captures)
+            for t in list(gen.prefill_traces.values()):  # what close() does before the pool and the weights
+                gen._free_prefill_trace(t)
+            assert not gen.prefill_traces and all(c.freed == 1 for c in staged.values())
+    for a, b in zip(out["off"], out["128"]):
+        assert torch.equal(a, b), "traced prefill logits differ from eager"
+    assert pools["off"].kv == pools["128"].kv, "traced prefill wrote other KV"
+    assert (pools["off"].mtp_kv or {}) == (pools["128"].mtp_kv or {}), "traced prefill wrote another MTP cache"
+    assert stats["off"]["traced_prefill_chunks"] == 0
+    for k in ("prefill_calls", "prefill_rows", "prefill_chunks", "sp1_chunks", "mtp_fills"):
+        assert stats["off"][k] == stats["128"][k], k
+
+
+def test_cpu_prefill_trace_dispatch_rules(monkeypatch):
+    """B7 dispatch: a chunk_observer (eager streams wanted) or an uncaptured shape runs eagerly; a packed pass runs
+    eagerly while its solo fallbacks / solo 128 chunks replay; a shape the trace-region estimate does not fit is not
+    captured (logged, counted) and runs eagerly; R4 refuses a prefill replay while a decode trace's outputs are
+    unread."""
+    rng = random.Random(72)
+    W = 512
+    logs = []
+    cfg = host_cfg(prefill_trace="on")
+    gen, model, pool, _, tr = trace_generator(cfg, monkeypatch, log=logs.append)
+    gen._stage_prefill_traces()
+    free = {"v": 256 << 20}
+    gen._trace_region_free = lambda: free["v"]
+
+    def capture_one():  # captures until the region "fills": the second shape does not fit
+        gen._capture_prefill_traces(pool)
+
+    est = gen.prefill_trace_estimate()
+    assert est == (cfg.num_layers + 1) * (1 << 20) + (4 << 20) or est == (gen.num_layers + 1) * (1 << 20) + (4 << 20)
+    orig = gen._prefill_trace_body
+
+    def body(t, p):
+        free["v"] = est - 1  # after this capture the region is "full"
+        return orig(t, p)
+
+    gen._prefill_trace_body = body
+    capture_one()
+    gen._prefill_trace_body = orig
+    sp0, sp1 = gen.prefill_traces[(PP.SP0, 128)], gen.prefill_traces[(PP.SP1, 128)]
+    assert sp0.traced and not sp1.traced and gen.stats["prefill_traces_skipped"] == 1
+    assert any("not captured" in m for m in logs)
+    toks = [rng.randrange(5000) for _ in range(100)]
+    a = gen.prefill_forward_batch([_rows_of(toks, 0, 100, [1, 2], width=W, lane=0)], kv_cache=pool)
+    assert gen.stats["traced_prefill_chunks"] == 1
+    seen = []
+    gen.chunk_observer = lambda job, ch, X: seen.append(ch.bucket)
+    b = gen.prefill_forward_batch([_rows_of(toks, 0, 100, [3, 4], width=W, lane=1)], kv_cache=pool)
+    assert seen == [128] and gen.stats["traced_prefill_chunks"] == 1 and torch.equal(a, b)
+    gen.chunk_observer = None
+    long = [rng.randrange(5000) for _ in range(4160)]  # the sp1 tail: not captured -> eager
+    blk = list(range(10, 10 + 66))
+    gen.prefill_forward_batch([_rows_of(long, 0, 4096, blk, width=W, lane=2)], kv_cache=pool)
+    n = gen.stats["traced_prefill_chunks"]
+    gen.prefill_forward_batch([_rows_of(long, 4096, 4160, blk, width=W, lane=2)], kv_cache=pool)
+    assert gen.stats["traced_prefill_chunks"] == n
+    gen._unread = ("plain", "all")
+    with pytest.raises(RuntimeError, match="R4"):
+        gen.prefill_forward_batch([_rows_of(toks, 0, 100, [80, 81], width=W, lane=0)], kv_cache=pool)
+    gen._unread = None
+    # packed prefill: the pk0 pass runs eagerly, a lone 100-token row (solo sp0 128) replays
+    gen.packed_prefill = True
+    short = [[rng.randrange(5000) for _ in range(40)] for _ in range(8)]
+    reqs = [_rows_of(t, 0, 40, [100 + i], width=W, lane=i) for i, t in enumerate(short)]
+    n = gen.stats["traced_prefill_chunks"]
+    gen.prefill_forward_batch(reqs, kv_cache=pool)
+    assert gen.stats["packed_passes"] >= 1 and gen.stats["traced_prefill_chunks"] == n
+
+
+def test_cpu_prefill_trace_refusals(monkeypatch):
+    """B7 rules: a capture that compiles a program raises (F3N R2) and leaves no trace behind; staging after a decode
+    capture raises (R3); a traced bucket whose MoE chunk would run compacted (a host read inside the pass) raises; an
+    unwarmed shape is not captured; the knob's values are checked (``generator_api.check_prefill_trace``)."""
+    from models.demos.motif3.tt import generator as G
+
+    assert api.check_prefill_trace(None) == "off" and api.check_prefill_trace(" ON ") == "128"
+    assert api.check_prefill_trace("512, 128,256 ,128") == "128,256,512"
+    assert api.prefill_trace_buckets("128,256") == (128, 256) and api.prefill_trace_buckets("") == ()
+    for bad in ("1024", "64", "yes", "128;256", "128,", "-128"):
+        with pytest.raises(ValueError, match="MOTIF3_PREFILL_TRACE"):
+            api.check_prefill_trace(bad)
+    assert api.prefill_trace_from_env({"MOTIF3_PREFILL_TRACE": "256"}) == "256"
+    cfg = host_cfg(prefill_trace="128")
+    gen, model, pool, _, tr = trace_generator(cfg, monkeypatch)
+    gen._stage_prefill_traces()
+    n = {"v": 10}
+    gen._num_programs = lambda: n["v"]
+    orig = gen._prefill_trace_body
+
+    def compiling(t, p):
+        n["v"] += 1
+        return orig(t, p)
+
+    gen._prefill_trace_body = compiling
+    with pytest.raises(RuntimeError, match="R2"):
+        gen._capture_prefill_traces(pool)
+    assert not any(t.traced for t in gen.prefill_traces.values()) and tr.released
+    gen._prefill_trace_body = orig
+    gen._warmed.discard((PP.SP1, 128))
+    with pytest.raises(RuntimeError, match="not compiled by warmup_prefill"):
+        gen._capture_prefill_traces(pool)
+    gen._warmed.add((PP.SP1, 128))
+    gen.capture_thread = "worker"  # an error on the capture thread is re-raised on the caller's, the trace released
+    n_rel = len(tr.released)
+
+    def boom(t, p):
+        raise KeyError("device op failed")
+
+    gen._prefill_trace_body = boom
+    with pytest.raises(KeyError, match="device op failed"):
+        gen._capture_prefill_traces(pool)
+    assert len(tr.released) == n_rel + 1 and tr.capturing is None
+    gen._prefill_trace_body = orig
+    gen.release_traces()
+    # R3: staging after a decode capture
+    gen, model, pool, _, tr = trace_generator(cfg, monkeypatch)
+    monkeypatch.setattr(G.MotifGenerator, "trace_captured", property(lambda self: True))
+    with pytest.raises(RuntimeError, match="R3"):
+        gen._stage_prefill_traces()
+    monkeypatch.undo()
+    # B2a: a traced bucket that would run the compacted prefill MoE
+    gen, model, pool, _, tr = trace_generator(host_cfg(prefill_trace="128,256"), monkeypatch, compact_rows=(256,))
+    with pytest.raises(RuntimeError, match="compacted prefill MoE"):
+        gen._stage_prefill_traces()
+    with pytest.raises(ValueError, match="prefill_trace"):
+        host_cfg(prefill_trace="2048")
+    assert host_cfg(prefill_trace=" On").prefill_trace == "128" and "prefill_trace=128" in host_cfg(
+        prefill_trace="on"
+    ).describe()
+
+
 class _Rec:
     """Records calls; returns a fresh sentinel per call."""
 

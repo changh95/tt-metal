@@ -112,6 +112,8 @@ _ENV = (
     "MOTIF3_PREFILL_MOE_MIN_ROWS",
     # the capture thread (E3)
     "MOTIF3_CAPTURE_THREAD",
+    # B7 traced prefill
+    "MOTIF3_PREFILL_TRACE",
 )
 
 
@@ -2069,3 +2071,24 @@ def test_capture_thread_knob(monkeypatch):
     assert "capture_thread=worker" in _cfg(capture_thread="worker").describe()
     with pytest.raises(ValueError, match="capture_thread"):
         _cfg(capture_thread="pool")
+
+
+def test_prefill_trace_knob(monkeypatch):
+    """B7 (docs/OPTIMIZATION_PLAN.md §3.3 B7; logs/opt/phaseB/B7): ``MOTIF3_PREFILL_TRACE`` (``off`` default | ``on`` =
+    ``128`` | a comma list of 128 / 256 / 512, canonical ascending); case and blanks ignored, anything else refused;
+    ``describe`` shows it."""
+    from models.demos.motif3.tt.generator_api import PREFILL_TRACE_BUCKETS
+
+    assert PREFILL_TRACE_BUCKETS == (128, 256, 512)
+    c = _cfg()
+    assert c.prefill_trace == "off" and "prefill_trace=off capture_thread=main" in c.describe()
+    for v, want in (("on", "128"), (" 256,128 ", "128,256"), ("OFF", "off"), ("", "off"), ("512", "512")):
+        monkeypatch.setenv("MOTIF3_PREFILL_TRACE", v)
+        assert _cfg().prefill_trace == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_TRACE", "1024")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_TRACE"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_TRACE")
+    assert "prefill_trace=128 " in _cfg(prefill_trace="128").describe()
+    with pytest.raises(ValueError, match="prefill_trace"):
+        _cfg(prefill_trace="2048")

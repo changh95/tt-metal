@@ -143,6 +143,9 @@ def test_serving_order(mesh_device, device_params):
     try:  # the generator (trace, pool, weights) is released on any outcome (review finding 9)
         failures = _serving_order_body(gen, mesh_device, api, prompts, golden3, head, ids_b, states_b)
     finally:
+        print(f"[serving] prefill: {gen.stats.get('prefill_chunks')} chunks, "
+              f"{gen.stats.get('traced_prefill_chunks', 0)} traced (MOTIF3_PREFILL_TRACE={gen.cfg.prefill_trace}, "
+              f"captures on the {gen.capture_thread} thread)")
         gen.close()
     assert not failures, "\n".join(failures)
 
@@ -293,6 +296,9 @@ def test_serving_order_spec(mesh_device, device_params):
         assert gen.spec_launch and gen.serving_path == ("spec", "all_split")
         failures = _serving_order_spec_body(gen, mesh_device, api, prompts, golden3, head, ids_b, states_b)
     finally:
+        print(f"[serving] prefill: {gen.stats.get('prefill_chunks')} chunks, "
+              f"{gen.stats.get('traced_prefill_chunks', 0)} traced (MOTIF3_PREFILL_TRACE={gen.cfg.prefill_trace}, "
+              f"captures on the {gen.capture_thread} thread)")
         gen.close()
     assert not failures, "\n".join(failures)
 
@@ -472,6 +478,9 @@ def test_serving_order_long_context(mesh_device, device_params):
     try:  # released on any outcome (review finding 9)
         failures = _long_context_body(gen, mesh_device, api, ids)
     finally:
+        print(f"[serving] prefill: {gen.stats.get('prefill_chunks')} chunks, "
+              f"{gen.stats.get('traced_prefill_chunks', 0)} traced (MOTIF3_PREFILL_TRACE={gen.cfg.prefill_trace}, "
+              f"captures on the {gen.capture_thread} thread)")
         gen.close()
     assert not failures, "\n".join(failures)
 
