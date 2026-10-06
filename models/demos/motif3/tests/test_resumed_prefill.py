@@ -1256,9 +1256,11 @@ def test_cpu_prefill_trace_refusals(monkeypatch):
     unwarmed shape is not captured; the knob's values are checked (``generator_api.check_prefill_trace``)."""
     from models.demos.motif3.tt import generator as G
 
-    assert api.check_prefill_trace(None) == "off" and api.check_prefill_trace(" ON ") == "128"
+    assert api.check_prefill_trace(None) == "128" and api.check_prefill_trace(" ON ") == "128"
+    assert api.check_prefill_trace(" Off") == "off"
     assert api.check_prefill_trace("512, 128,256 ,128") == "128,256,512"
-    assert api.prefill_trace_buckets("128,256") == (128, 256) and api.prefill_trace_buckets("") == ()
+    assert api.prefill_trace_buckets("128,256") == (128, 256) and api.prefill_trace_buckets("off") == ()
+    assert api.prefill_trace_buckets("") == (128,)
     for bad in ("1024", "64", "yes", "128;256", "128,", "-128"):
         with pytest.raises(ValueError, match="MOTIF3_PREFILL_TRACE"):
             api.check_prefill_trace(bad)

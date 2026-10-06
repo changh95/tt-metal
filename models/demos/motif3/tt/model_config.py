@@ -1355,10 +1355,10 @@ class MotifTTConfig:
     # How a decode step waits for its trace replay (B6a): "spin" (default: poll until a few ms before the predicted end,
     # then the same blocking read) | "block" (the release); generator_api.HOST_WAIT_MODES. Host only.
     host_wait: str = "spin"  # MOTIF3_HOST_WAIT
-    # Traced prefill (B7): "off" (default, the release: every prefill chunk eager) | an ascending comma list of buckets
-    # ("128", "128,256"; generator_api.check_prefill_trace, "on" = "128") whose solo sp0 / sp1 chunks replay a trace
-    # captured with the decode traces. Traced == eager bitwise.
-    prefill_trace: str = "off"  # MOTIF3_PREFILL_TRACE
+    # Traced prefill (B7): an ascending comma list of buckets ("128" = the default since its gates passed, "128,256";
+    # generator_api.check_prefill_trace, "on" = "128") whose solo sp0 / sp1 chunks replay a trace captured with the
+    # decode traces (traced == eager bitwise) | "off" (the release: every prefill chunk eager).
+    prefill_trace: str = "128"  # MOTIF3_PREFILL_TRACE
     # The host thread every trace capture runs on (E3 / B7): "worker" (default since its gates passed: a short-lived
     # thread with its own malloc arena, so eager prefill after a capture keeps its speed) | "main" (the release);
     # generator_api.CAPTURE_THREAD_MODES
@@ -1528,7 +1528,7 @@ class MotifTTConfig:
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
-            prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "off",
+            prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "128",
             capture_thread=(os.environ.get("MOTIF3_CAPTURE_THREAD") or "worker").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),

@@ -607,14 +607,14 @@ def capture_thread_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
 
 
 # B7: traced prefill of small solo chunks (OPTIMIZATION_PLAN.md §3.3 B7, OPT_PHASE_A_REVIEW.md §7.1 M8; prototype
-# logs/opt/phaseA/m8; results logs/opt/phaseB/B7). "off" (default) = the release: every prefill chunk runs eagerly
-# (~0.71 s of host dispatch for a 128-row chunk whose device time is ~0.21 s). A comma list of buckets (from
-# PREFILL_TRACE_BUCKETS; "on" = "128") = at the decode capture the generator also captures one trace per (sp0, b) and
+# logs/opt/phaseA/m8; results logs/opt/phaseB/B7). "off" = the release: every prefill chunk runs eagerly (~0.71 s of
+# host dispatch for a 128-row chunk whose device time is ~0.21 s). A comma list of buckets (from PREFILL_TRACE_BUCKETS;
+# "on" = "128"; "128" is the default since its gates passed) = at the decode capture the generator also captures one trace per (sp0, b) and
 # (sp1, b) of those buckets (embedding -> layers -> LM-head tile row, plus a second small trace for the MTP layer's
 # KV-only fill on a speculating launch) and replays it for every solo chunk of that shape. Traced == eager bitwise.
 # 1024 is not offered: it is device bound (M8: 1.001 -> 0.984 s) and its trace would cost ~50 MiB of the trace region.
 PREFILL_TRACE_BUCKETS = (128, 256, 512)
-DEFAULT_PREFILL_TRACE = "off"
+DEFAULT_PREFILL_TRACE = "128"
 
 
 def check_prefill_trace(value: Any, *, name: str = "MOTIF3_PREFILL_TRACE") -> str:
@@ -644,7 +644,7 @@ def prefill_trace_buckets(value: Any, *, name: str = "MOTIF3_PREFILL_TRACE") -> 
 
 
 def prefill_trace_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
-    """``MOTIF3_PREFILL_TRACE`` (B7): ``off`` (default), ``on`` (= ``128``) or a comma list of buckets from
+    """``MOTIF3_PREFILL_TRACE`` (B7): ``128`` (default), ``off``, ``on`` (= ``128``) or a comma list of buckets from
     :data:`PREFILL_TRACE_BUCKETS`; canonical form of :func:`check_prefill_trace`."""
     env = os.environ if environ is None else environ
     return check_prefill_trace(env.get("MOTIF3_PREFILL_TRACE"))

@@ -163,6 +163,7 @@ def log(msg: str) -> None:
 
 
 def host_cfg(**kw) -> MotifTTConfig:
+    kw.setdefault("prefill_trace", "off")  # the emulated device runs decode paths only (no B7 prefill traces)
     return MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8), **kw)
 
 
