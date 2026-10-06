@@ -101,6 +101,8 @@ _ENV = (
     "MOTIF3_DECODE_EXPERTS",
     # B3 fused decode MoE PolyNorm
     "MOTIF3_MOE_POLYNORM",
+    # B5 fused decode shared-expert PolyNorm
+    "MOTIF3_SHARED_POLYNORM",
     # B6a host input staging / replay wait
     "MOTIF3_HOST_STAGING",
     "MOTIF3_HOST_WAIT",
@@ -845,6 +847,26 @@ def test_moe_polynorm_knob(monkeypatch):
     assert _cfg(moe_polynorm="fused").moe_polynorm == "fused"
     with pytest.raises(ValueError, match="moe_polynorm"):
         _cfg(moe_polynorm="kernel")
+
+
+def test_shared_polynorm_knob(monkeypatch):
+    """B5 (docs/OPTIMIZATION_PLAN.md §3.3): ``MOTIF3_SHARED_POLYNORM`` selects the decode shared-expert PolyNorm,
+    ``composite`` (default: the release) or ``fused`` (tt/kernels/shared_polynorm.py, bitwise equal by construction);
+    case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.model_config import SHARED_POLYNORM_MODES
+
+    assert SHARED_POLYNORM_MODES == ("composite", "fused")
+    assert _cfg().shared_polynorm == "composite" and "shared_polynorm=composite" in _cfg().describe()
+    for v, want in (("fused", "fused"), (" FUSED ", "fused"), ("composite", "composite"), ("", "composite")):
+        monkeypatch.setenv("MOTIF3_SHARED_POLYNORM", v)
+        assert _cfg().shared_polynorm == want, v
+    monkeypatch.setenv("MOTIF3_SHARED_POLYNORM", "kernel")
+    with pytest.raises(ValueError, match="MOTIF3_SHARED_POLYNORM"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_SHARED_POLYNORM")
+    assert _cfg(shared_polynorm="fused").shared_polynorm == "fused"
+    with pytest.raises(ValueError, match="shared_polynorm"):
+        _cfg(shared_polynorm="horner")
 
 
 def test_prefill_moe_knobs(monkeypatch):

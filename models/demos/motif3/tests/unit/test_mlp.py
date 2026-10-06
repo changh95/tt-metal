@@ -41,6 +41,9 @@ Device tests:
   lever (informational, MLP-1), eager + traced latency, trace replay with new inputs, prefill S = 128 / 1024 (fp32
   and bf16 PolyNorm, exact vs TF32-class moments all-reduce), bf16 weights (fp32-faithful), the replicated-gate
   shared expert (layer 2).
+* ``test_mlp_device_fused_shared_polynorm`` -- B5: the fused decode shared-expert PolyNorm (``shared_polynorm="fused"``)
+  == the composite bitwise on every MoE layer's shared expert (TT cache, real MoE inputs, T32 lanes and T64-shaped
+  rows, with and without the TP all-reduce); determinism, T64 rows, trace replay; traced cost.
 * ``test_mlp_device_variants`` / ``test_mlp_device_sweep`` / ``test_mlp_device_profile`` (opt-in) -- the measurements
   behind the defaults in tt/mlp.py and tt/polynorm.py.
 
@@ -69,7 +72,7 @@ import ttnn
 from models.demos.motif3.tt import weights as W
 from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric, replicas_identical
 from models.demos.motif3.tt.mlp import DECODE_MATMUL_GRIDS, PolyNormMLP, build_decode_program_configs, decode_matmul_pc
-from models.demos.motif3.tt.model_config import DEFAULT_HF_META_DIR, PROJECT_ROOT, MotifTTConfig, device_params
+from models.demos.motif3.tt.model_config import DEFAULT_HF_META_DIR, PROJECT_ROOT, TILE, MotifTTConfig, device_params
 from models.demos.motif3.tt.polynorm import (
     GroupedPolyNormConsts,
     PolyNormCoefficients,
@@ -577,6 +580,142 @@ def test_modules_import_is_self_contained():
     assert out == {"demos": [], "heavy": []}, out
     for marker in ("Opening user mode device driver", "Starting devices in cluster"):
         assert marker not in res.stderr and marker not in res.stdout
+
+
+def _hostdata_heavy(shape, gen, scale=1.0):
+    z = torch.randn(*shape, generator=gen)
+    chi = torch.randn(*shape, 4, generator=gen).pow(2).sum(-1) / 4
+    return (z / chi.sqrt() * scale).clamp(-60, 60)
+
+
+def test_shared_polynorm_host_numerics():
+    """B5 (``tt/kernels/shared_polynorm.py``) on the host: the kernels' algorithm (= the release decode path:
+    tile-sequential fp32 moments per chip, chip partials summed in gather order, ``rsqrt(s D + E)``, Horner, ``* up``,
+    one bf16 rounding; :func:`emulate_fp32`) at the shared expert's real dims (8 chips x 5 tiles, 32 rows) matches the
+    HF PolyNorm in fp64 (:func:`golden_fp64`, synthetic coefficients in the real range and heavy-tailed gates); every
+    row depends only on its own inputs (rows 0..15 of a 32-row call == a call on those rows, the T64 / T32 property);
+    the D / E constants are the module's :func:`horner_scale_constants`; :func:`plan` sizes and refusals."""
+    from models.demos.motif3.tt.kernels import shared_polynorm as SP
+
+    gen = torch.Generator().manual_seed(5)
+    tp, n, T = 8, 5, 32
+    inter = tp * n * 32
+    for case in range(3):
+        c = torch.sigmoid(torch.randn(3, generator=gen))  # c of N(g), N(g^2), N(g^3)
+        b = float(torch.randn(1, generator=gen) * 0.3)
+        D, Ec = horner_scale_constants(c.double(), inter, EPS)
+        g = _hostdata_heavy((T, inter), gen, scale=2.0 + case)
+        u = torch.randn(T, inter, generator=gen)
+        chips = [torch.cat([g[:, k * n * 32:(k + 1) * n * 32], u[:, k * n * 32:(k + 1) * n * 32]], 1) for k in range(tp)]
+        got = torch.cat(SP.emulate_fp32(chips, D.float(), Ec.float(), b), 1).double()
+        want = SP.golden_fp64(g, u, c, b, eps=EPS)
+        st = stats(want, got)
+        assert passes(st, 0.99999), st
+        # within one bf16 rounding of the fp64 value (+ fp32 noise)
+        assert float(((got - want).abs() - (want.abs() * 2.0**-8 + 1e-5)).max()) <= 0, case
+        half = SP.emulate_fp32([x[:16] for x in chips], D.float(), Ec.float(), b)
+        full = SP.emulate_fp32(chips, D.float(), Ec.float(), b)
+        assert all(torch.equal(h, f[:16]) for h, f in zip(half, full))
+    p = SP.plan(5, 8)
+    assert p["n"] == 5 and p["tp"] == 8 and p["moments_l1"] == 8 * 4096
+    assert p["apply_l1"] == (24 + 7 + 5 + 5 + 4) * 4096 + 2 * 2048
+    for bad in ((0, 8), (SP.MAX_TILES + 1, 8), (5, 0), (48, 8)):
+        with pytest.raises(ValueError, match="fused shared PolyNorm"):
+            SP.plan(*bad)
+
+
+def test_shared_polynorm_host_dispatch(monkeypatch):
+    """B5 host side of the MLP wiring (ttnn ops recorded, no device): ``resolve_shared_polynorm`` (config default,
+    explicit modes, bad modes; "fused" needs the shared expert, ``stats="tp"``, the fp32 decode PolyNorm, the release
+    ``moments`` / ``horner`` / ``ar`` knobs and a width the one-core kernels hold: explicit raises, the config default
+    falls back to "composite"); ``_rows`` runs the fused kernels (on the gate_up output, no slices) at decode M = 32 and
+    the composite for prefill, M != 32, the bf16 decode PolyNorm, changed ``pn_kw`` and a module without the kernel
+    (the default); ``gu`` and ``h`` are freed exactly once; ``taps`` still get gate / up slices."""
+    import models.demos.motif3.tt.mlp as MM
+    from models.demos.motif3.tt.model_config import SHARED_POLYNORM_MODES
+
+    assert SHARED_POLYNORM_MODES == ("composite", "fused")
+    monkeypatch.delenv("MOTIF3_SHARED_POLYNORM", raising=False)
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert cfg.shared_polynorm == "composite"
+    R = MM.resolve_shared_polynorm
+    ok = dict(kind="shared", stats="tp", decode_polynorm="fp32", pn_kw=dict(MM.RELEASE_PN_KW), n_local=160)
+    assert R(None, cfg, **ok) == "composite" and R("fused", cfg, **ok) == "fused"
+    assert R("composite", cfg, **ok) == "composite"
+    fz = types.SimpleNamespace(shared_polynorm="fused")
+    assert R(None, fz, **ok) == "fused" and R(None, types.SimpleNamespace(), **ok) == "composite"
+    for bad in (dict(kind="dense"), dict(stats="replicated_gate"), dict(decode_polynorm="bf16"),
+                dict(pn_kw=dict(MM.RELEASE_PN_KW, horner="binary")), dict(pn_kw=dict(MM.RELEASE_PN_KW, ar="all_reduce")),
+                dict(n_local=1536), dict(n_local=100)):
+        kw = dict(ok)
+        kw.update(bad)
+        assert R(None, fz, **kw) == "composite", bad
+        with pytest.raises(ValueError, match="fused"):
+            R("fused", cfg, **kw)
+    with pytest.raises(ValueError, match="shared_polynorm"):
+        R("kernel", cfg, **ok)
+
+    calls, freed = [], []
+
+    def T(tag, shape):
+        return types.SimpleNamespace(tag=tag, shape=list(shape))
+
+    class FakeFused:
+        def __call__(self, gu, *, memory_config=None):
+            calls.append(("fused", gu.tag, memory_config))
+            return T("h_fused", [1, 1, gu.shape[2], 160])
+
+    def linear(a, w, *, dtype=None, **kw):
+        calls.append(("linear", w))
+        if w == "W_gate_up":
+            return T("gu", [1, 1, a.shape[2], 320])
+        return T("y", [1, 1, a.shape[2], 4096])
+
+    def slice_(t, start, end, **kw):
+        calls.append(("slice", t.tag))
+        return T(f"{t.tag}_slice{start[-1]}", [1, 1, end[2] - start[2], end[3] - start[3]])
+
+    def poly(g, u, consts, **kw):
+        calls.append(("composite", kw.get("mode"), kw.get("moments"), kw.get("ar")))
+        return T("h_comp", g.shape)
+
+    monkeypatch.setattr(MM.ttnn, "linear", linear)
+    monkeypatch.setattr(MM.ttnn, "slice", slice_)
+    monkeypatch.setattr(MM.ttnn, "deallocate", lambda t, *a, **k: freed.append(getattr(t, "tag", t)))
+    monkeypatch.setattr(MM, "polynorm_tp", poly)
+    mlp = object.__new__(MM.PolyNormMLP)
+    mlp.n_local, mlp.stats, mlp.pn, mlp.ccl, mlp.ckc_mm, mlp.ckc_pn = 160, "tp", "pn", "ccl", "ckc", "ckcpn"
+    mlp.pn_exact_ar, mlp.pn_kw, mlp.decode_pc = True, dict(MM.RELEASE_PN_KW), {"gate_up": "pc", "down": "pc"}
+    mlp.w_gate_up, mlp.w_down = "W_gate_up", "W_down"
+    x = lambda m: T("x", [1, 1, m, 4096])  # noqa: E731
+    cases = [  # (pn_fused, M, decode, mode, pn_kw change, want)
+        (None, 32, True, "fp32", {}, "composite"),
+        (FakeFused(), 32, True, "fp32", {}, "fused"),
+        (FakeFused(), 32, False, "fp32", {}, "composite"),  # prefill
+        (FakeFused(), 64, True, "fp32", {}, "composite"),  # not one tile row
+        (FakeFused(), 32, True, "bf16", {}, "composite"),
+        (FakeFused(), 32, True, "fp32", {"ar": "all_reduce"}, "composite"),
+    ]
+    for fused, m, decode, mode, kwc, want in cases:
+        mlp.pn_fused = fused
+        mlp.pn_kw = dict(MM.RELEASE_PN_KW, **kwc)
+        for taps in (None, {}):
+            calls.clear(), freed.clear()
+            y = MM.PolyNormMLP._rows(mlp, x(m), mode=mode, decode=decode, all_reduce=False, out_dtype="bf16",
+                                     out_mc="L1o", imc="L1", taps=taps)
+            assert y.tag == "y"
+            kinds = [c[0] for c in calls if c[0] in ("fused", "composite")]
+            assert kinds == [want], (fused, m, decode, mode, kwc, calls)
+            assert freed.count("gu") == 1, freed
+            if want == "fused":
+                assert calls[1] == ("fused", "gu", "L1")
+                assert [c for c in calls if c[0] == "slice"] == ([] if taps is None else [("slice", "gu")] * 2)
+            if taps is None:
+                assert freed.count(f"h_{'fused' if want == 'fused' else 'comp'}") == 1, freed
+            else:
+                assert taps["gate"].tag == "gu_slice0" and taps["up"].tag == "gu_slice160"
+                assert taps["act"].tag == ("h_fused" if want == "fused" else "h_comp")
+                assert not any(t.startswith("h_") for t in freed)
 
 
 # ============================================================================================================
@@ -1192,6 +1331,181 @@ def test_mlp_device_real_weights(mesh_device, device_params):
             _free([y, xp, xd])
             alt.deallocate()
     summary(r0)
+    assert not failures, "\n".join(failures)
+
+
+REAL_MOE_INPUTS = PROJECT_ROOT / "tt_cache" / "test" / "moe" / "real_router_inputs_v1.pt"  # tests/unit/test_moe.py
+
+
+def _shared_from_tt_cache(mesh_device, cfg, ccl, layer, **kw):
+    """The shared expert of MoE layer ``layer`` from the serving TT cache alone (a raising source, nothing written);
+    ``None`` when the layer's cache part is not converted."""
+    from models.demos.motif3.tt.model import layer_cache_complete, read_only_cache
+
+    if not layer_cache_complete(cfg, layer):
+        return None
+    with read_only_cache() as misses:
+        mlp = PolyNormMLP(mesh_device, cfg, layer, source=_NoReadSource(), ccl=ccl, cache=True, kind="shared", **kw)
+    assert misses == [], f"tensors missing from the TT cache: {misses}"
+    return mlp
+
+
+def _rows16_input(x64, mesh_device, cfg, device=True):
+    """T64 shape (``tests/unit/test_moe.py`` ``upload_rows16``): anchors ``x64[:32]``, drafts ``x64[32:]`` (lane order)
+    -> per DP row ``[1, 1, 16, 4096]`` = ``[the row's 8 anchors | their 8 drafts]``."""
+    L = cfg.lanes_per_row
+    a = x64[:32].reshape(cfg.dp, L, -1)
+    d = x64[32:].reshape(cfg.dp, L, -1)
+    rows = torch.cat([a, d], dim=1).reshape(cfg.dp, 1, 2 * L, -1)
+    return to_mesh(rows.bfloat16(), mesh_device, cfg, dtype=ttnn.bfloat16, dp_dim=0, device=device)
+
+
+@pytest.mark.timeout(2400)
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+@torch.no_grad()
+def test_mlp_device_fused_shared_polynorm(mesh_device, device_params):
+    """B5 (``shared_polynorm="fused"``, ``tt/kernels/shared_polynorm.py``; docs/OPTIMIZATION_PLAN.md §3.3), the shared
+    experts of every MoE layer from the serving TT cache, real MoE inputs (``tests/unit/test_moe.py`` capture; layers
+    without a capture take the nearest captured layer's), every chip read back:
+
+    * **bitwise == the composite** (the release decode path): ``forward_decode`` with and without the TP all-reduce,
+      on two 32-lane sets and one 64-row (T64-shaped, 16 rows per DP row) set, every layer 2..52 (env
+      ``MOTIF3_B5_LAYERS`` = a comma list narrows it; ``MOTIF3_B5_SETS`` = extra 32-lane sets per layer, a soak); the
+      PolyNorm output ``h`` (``taps["act"]``) bitwise too (the first build packed fp32 -> bf16 directly and differed
+      from the release's RNE typecast on exact bf16 ties: 1 value in ~1e6);
+    * layer 2: two fused calls bitwise equal; the 16-row call's rows == the two 8-lane calls' rows (bitwise); trace
+      capture with persistent ``x``, replays with new lanes == eager bitwise, two replays equal (no compile after
+      capture: a compile inside the capture would fail it);
+    * traced cost (informational; asserted fused < composite): the PolyNorm alone and ``forward_decode`` (partial)."""
+    if not REAL_MOE_INPUTS.is_file():
+        pytest.skip(f"{REAL_MOE_INPUTS} missing (tests/unit/test_moe.py capture)")
+    data = torch.load(REAL_MOE_INPUTS, weights_only=True)
+    cfg = _cfg(mesh_device)
+    fab = check_fabric(mesh_device, "mlp_b5")
+    assert str(fab.get("committed")) == "TORUS_XY", fab
+    ccl = MotifCCL(mesh_device, cfg)
+    L1 = ttnn.L1_MEMORY_CONFIG
+    env = os.environ.get("MOTIF3_B5_LAYERS", "").strip()
+    layers = [int(v) for v in env.split(",")] if env else [l for l in range(cfg.num_layers) if cfg.layer(l).is_moe]
+    gen = torch.Generator().manual_seed(55)
+    failures, checked, skipped = [], [], []
+
+    def chips(t):
+        return [ttnn.to_torch(c) for c in ttnn.get_device_tensors(t)]
+
+    def same(a, b):
+        return len(a) == len(b) and all(torch.equal(x, y) for x, y in zip(a, b))
+
+    def run(mlp, x, fused, **kw):
+        mlp.pn_fused = fused
+        y = mlp.forward_decode(x, **kw)
+        out = chips(y)
+        _free(y)
+        return out
+
+    for layer in layers:
+        mlp = _shared_from_tt_cache(mesh_device, cfg, ccl, layer, shared_polynorm="fused")
+        if mlp is None:
+            skipped.append(layer)
+            continue
+        assert mlp.shared_polynorm == "fused" and mlp.pn_fused is not None
+        fused = mlp.pn_fused
+        src_l = min(data["layers"], key=lambda l: abs(l - layer))
+        xs = data["layers"][src_l]["x"].float()
+        pick = xs[torch.randperm(xs.shape[0], generator=gen)[:64]]
+        inputs = [("lanes A", _rows_input(pick[:32], mesh_device, cfg)), ("lanes B", _rows_input(pick[32:], mesh_device, cfg)),
+                  ("rows16", _rows16_input(pick, mesh_device, cfg))]
+        for k in range(int(os.environ.get("MOTIF3_B5_SETS", "0") or 0)):
+            extra = xs[torch.randperm(xs.shape[0], generator=gen)[:32]]
+            inputs.append((f"extra {k}", _rows_input(extra, mesh_device, cfg)))
+        bad = []
+        outs = {}
+        for name, x in inputs:
+            for ar in (False, True):
+                yc, yf = run(mlp, x, None, all_reduce=ar), run(mlp, x, fused, all_reduce=ar)
+                if not same(yc, yf):
+                    nd = sum(int((a != b).sum()) for a, b in zip(yc, yf))
+                    bad.append(f"{name} all_reduce={ar}: {nd} values differ")
+                outs[(name, ar)] = yf
+            tc, tf = {}, {}
+            mlp.pn_fused = None
+            _free([mlp.forward_decode(x, taps=tc)])
+            mlp.pn_fused = fused
+            _free([mlp.forward_decode(x, taps=tf)])
+            if not same(chips(tc["act"]), chips(tf["act"])):
+                bad.append(f"{name}: PolyNorm h differs")
+            _free([tc, tf])
+        checked.append(layer)
+        print(f"[mlp] B5 L{layer} (inputs of L{src_l}): fused == composite bitwise "
+              f"{'yes' if not bad else 'NO: ' + '; '.join(bad)}", flush=True)
+        failures += [f"L{layer} {b}" for b in bad]
+        if layer == layers[0]:
+            # determinism, T64 rows == T32 rows
+            again = run(mlp, inputs[0][1], fused, all_reduce=False)
+            det = same(again, outs[("lanes A", False)])
+            L = cfg.lanes_per_row
+            r16 = outs[("rows16", False)]
+            rows_eq = all(torch.equal(c16[..., :L, :], ca) and torch.equal(c16[..., L:, :], cb)
+                          for c16, ca, cb in zip(r16, outs[("lanes A", False)], outs[("lanes B", False)]))
+            print(f"[mlp] B5 L{layer}: 2 fused calls bitwise {det}; 16-row call rows == 8-lane calls {rows_eq}", flush=True)
+            if not (det and rows_eq):
+                failures.append(f"L{layer} determinism {det} / T64 rows {rows_eq}")
+            # trace: persistent x, new lanes per replay
+            x_dev = inputs[0][1]
+            mlp.pn_fused = fused
+            _free(mlp.forward_decode(x_dev, all_reduce=False))
+            ttnn.synchronize_device(mesh_device)
+            with _Capture(mesh_device) as cap:
+                y_t = mlp.forward_decode(x_dev, all_reduce=False)
+            try:
+                for it in range(3):
+                    xn = xs[torch.randperm(xs.shape[0], generator=gen)[:32]]
+                    ttnn.copy_host_to_device_tensor(_rows_input(xn, mesh_device, cfg, device=False), x_dev)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t1 = chips(y_t)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t2 = chips(y_t)
+                    te = run(mlp, x_dev, fused, all_reduce=False)
+                    tcmp = run(mlp, x_dev, None, all_reduce=False)
+                    ok = same(t1, te) and same(t1, t2) and same(t1, tcmp)
+                    print(f"[mlp] B5 L{layer} trace replay {it}: traced == eager {same(t1, te)}, 2 replays equal "
+                          f"{same(t1, t2)}, == composite {same(t1, tcmp)}", flush=True)
+                    if not ok:
+                        failures.append(f"L{layer} trace replay {it}")
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+                _free(y_t)
+            # traced cost
+            gu = ttnn.linear(ttnn.pad(x_dev, [(0, 0), (0, 0), (0, TILE - L), (0, 0)], 0.0, memory_config=L1),
+                             mlp.w_gate_up, dtype=ttnn.float32, memory_config=L1, compute_kernel_config=mlp.ckc_mm,
+                             program_config=mlp.decode_pc.get("gate_up"))
+            n = mlp.n_local
+
+            def comp():
+                a = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, TILE, n], memory_config=L1)
+                b = ttnn.slice(gu, [0, 0, 0, n], [1, 1, TILE, 2 * n], memory_config=L1)
+                h = polynorm_tp(a, b, mlp.pn, ccl=ccl, mode="fp32", memory_config=L1, compute_kernel_config=mlp.ckc_pn,
+                                exact_ar=True, **mlp.pn_kw)
+                _free([a, b])
+                return h
+
+            t_pc, t_pf = traced_us(mesh_device, comp), traced_us(mesh_device, lambda: fused(gu, memory_config=L1))
+            mlp.pn_fused = None
+            t_mc = traced_us(mesh_device, lambda: mlp.forward_decode(x_dev, all_reduce=False))
+            mlp.pn_fused = fused
+            t_mf = traced_us(mesh_device, lambda: mlp.forward_decode(x_dev, all_reduce=False))
+            _free(gu)
+            record("mlp_b5", f"L{layer} traced", polynorm_composite_us=t_pc, polynorm_fused_us=t_pf,
+                   forward_partial_composite_us=t_mc, forward_partial_fused_us=t_mf)
+            print(f"[mlp] B5 L{layer} traced: PolyNorm composite {t_pc:.1f} -> fused {t_pf:.1f} us; forward_decode "
+                  f"(partial) {t_mc:.1f} -> {t_mf:.1f} us", flush=True)
+            if not (t_pf < t_pc and t_mf < t_mc):
+                failures.append(f"L{layer} fused not faster: {t_pf:.1f} / {t_pc:.1f}, {t_mf:.1f} / {t_mc:.1f}")
+        _free([x for _, x in inputs])
+        mlp.deallocate()
+    print(f"[mlp] B5 summary: {len(checked)} layers bitwise-checked {checked}; not converted {skipped}; "
+          f"{len(failures)} failures", flush=True)
+    assert checked, "no layer converted in the TT cache"
     assert not failures, "\n".join(failures)
 
 

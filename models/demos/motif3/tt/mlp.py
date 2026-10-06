@@ -64,6 +64,13 @@ read is lazy (weights, ``act_fn.{weight,bias}``): with all files cached, the mod
 Output scale: ``polynorm.polynorm_output_scale(cfg, l)`` (0.5, folded into ``W_down``; exact for a power of two);
 ``polynorm.check_polynorm_semantics(cfg)`` rejects ``polynorm_sigmoid_weight=False`` once the config parses it.
 
+Fused shared-expert PolyNorm (B5, ``shared_polynorm="fused"``, ``MOTIF3_SHARED_POLYNORM``; docs/OPTIMIZATION_PLAN.md
+§3.3): the decode PolyNorm of the shared expert runs as ``tt/kernels/shared_polynorm.py`` (a one-core moments kernel
+on the gate_up output, the release's moments all-gather, a one-core apply kernel: 3 programs instead of 19). The
+kernels issue the release's LLK operations in the release's order, so the output is bitwise the composite's
+(:func:`resolve_shared_polynorm` admits it only with the release's decode settings: fp32 PolyNorm, ``stats="tp"``, the
+default ``moments`` / ``horner`` / ``ar`` knobs). Prefill and the dense MLPs keep the composite.
+
 Trace safety: ``forward_decode`` has fixed shapes, per-layer constant slices, no host round trips and frees its
 intermediates in a fixed order; every program is compiled by the first (eager) call.
 """
@@ -79,7 +86,7 @@ import ttnn
 
 from . import weights as W
 from .ccl import MotifCCL
-from .model_config import TILE, MotifTTConfig
+from .model_config import SHARED_POLYNORM_MODES, TILE, MotifTTConfig
 from .polynorm import (
     POLYNORM_MODES,
     PolyNormCoefficients,
@@ -91,6 +98,41 @@ from .polynorm import (
 
 MLP_KINDS = ("dense", "shared")
 MLP_STATS = ("tp", "replicated_gate")
+# the polynorm_tp knobs of the release decode path; B5's fused kernels reproduce exactly these (resolve_shared_polynorm)
+RELEASE_PN_KW = dict(moments="sum", horner="mac", ar="ag_sum")
+
+
+def resolve_shared_polynorm(shared_polynorm: Optional[str], cfg, *, kind: str, stats: str, decode_polynorm: str,
+                            pn_kw: dict, n_local: int) -> str:
+    """B5: the decode PolyNorm a :class:`PolyNormMLP` runs. ``shared_polynorm`` (explicit) or ``cfg.shared_polynorm``
+    (``MOTIF3_SHARED_POLYNORM``; ``None`` / absent = "composite") must be in :data:`SHARED_POLYNORM_MODES`. "fused"
+    needs the shared expert (``kind="shared"``), ``stats="tp"``, the fp32 decode PolyNorm, the release's
+    ``moments`` / ``horner`` / ``ar`` knobs (:data:`RELEASE_PN_KW`: the kernels reproduce that path bit for bit) and
+    a tile-aligned local width the one-core kernels hold: an explicit request raises otherwise, the config default
+    falls back to "composite" (the dense MLPs, diagnostic variants)."""
+    explicit = shared_polynorm is not None
+    mode = str(shared_polynorm if explicit else (getattr(cfg, "shared_polynorm", None) or "composite"))
+    if mode not in SHARED_POLYNORM_MODES:
+        raise ValueError(f"shared_polynorm must be one of {SHARED_POLYNORM_MODES}, got {mode!r}")
+    if mode == "fused":
+        from .kernels.shared_polynorm import MAX_TILES
+
+        why = None
+        if kind != "shared":
+            why = f"the shared expert (kind={kind!r})"
+        elif stats != "tp":
+            why = f"stats='tp' (got {stats!r})"
+        elif decode_polynorm != "fp32":
+            why = f"decode_polynorm='fp32' (got {decode_polynorm!r})"
+        elif dict(pn_kw) != RELEASE_PN_KW:
+            why = f"the release polynorm options {RELEASE_PN_KW} (got {dict(pn_kw)})"
+        elif n_local % TILE or not 1 <= n_local // TILE <= MAX_TILES:
+            why = f"a local width of 1..{MAX_TILES} tiles (got {n_local})"
+        if why is not None:
+            if explicit:
+                raise ValueError(f"shared_polynorm='fused' needs {why}")
+            return "composite"
+    return mode
 
 
 def _free(*ts) -> None:
@@ -209,6 +251,9 @@ class PolyNormMLP:
             bf16 allowed in prefill if PCC holds).
         decode_program_configs: ``{"gate_up": pc|None, "down": pc|None}`` override (None entries = auto).
         intermediate_memory_config: memory config of decode intermediates (default L1 interleaved; DRAM for prefill).
+        shared_polynorm: decode PolyNorm of the shared expert (B5; ``None`` = ``cfg.shared_polynorm``,
+            ``MOTIF3_SHARED_POLYNORM``): "composite" (the release) | "fused" (``tt/kernels/shared_polynorm.py``,
+            bitwise equal); see :func:`resolve_shared_polynorm`.
     """
 
     def __init__(
@@ -231,6 +276,7 @@ class PolyNormMLP:
         stats: str = "tp",
         polynorm_options: Optional[dict] = None,
         pad_decode_rows: bool = True,
+        shared_polynorm: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -328,6 +374,15 @@ class PolyNormMLP:
                 print(f"[motif3.mlp] layer {l} {kind}: decode matmuls on ttnn's auto config: "
                       f"{'; '.join(self.decode_pc_fallbacks)}", flush=True)
         self.decode_pc = dict(decode_program_configs)
+        # B5: fused decode PolyNorm of the shared expert (None = the composite)
+        self.shared_polynorm = resolve_shared_polynorm(shared_polynorm, cfg, kind=kind, stats=stats,
+                                                       decode_polynorm=decode_polynorm, pn_kw=self.pn_kw,
+                                                       n_local=self.n_local)
+        self.pn_fused = None
+        if self.shared_polynorm == "fused":
+            from .kernels.shared_polynorm import FusedSharedPolyNorm
+
+            self.pn_fused = FusedSharedPolyNorm(mesh_device, self.pn, ccl, n_local=self.n_local)
 
     @property
     def coeffs(self) -> PolyNormCoefficients:
@@ -342,6 +397,12 @@ class PolyNormMLP:
             "down": (self.n_local, self.hidden),
         }[mm]
 
+    def _fused_now(self, mode: str, decode: bool, M: int) -> bool:
+        """The fused shared PolyNorm runs on this call: decode, one tile row, and the settings it reproduces (checked per
+        call: tests switch ``decode_polynorm`` / ``pn_kw`` on a built module)."""
+        return (self.pn_fused is not None and decode and M == TILE and mode == "fp32" and self.stats == "tp"
+                and self.pn_kw == RELEASE_PN_KW)
+
     # ---------------------------------------------------------------------------------------------------
     def _rows(self, x, *, mode: str, decode: bool, all_reduce: bool, out_dtype, out_mc, imc, taps=None):
         """gate_up -> PolyNorm (TP or local moments) -> down [-> all_reduce(tp)] on ``x [1, 1, M, 4096]``."""
@@ -354,8 +415,15 @@ class PolyNormMLP:
             return ttnn.linear(a, w, dtype=dtype, memory_config=mc, compute_kernel_config=self.ckc_mm,
                                program_config=pc(name))
 
-        g_full = None
-        if self.stats == "tp":
+        g_full = g = u = None
+        if self._fused_now(mode, decode, M):  # B5: moments kernel -> the release's TP all-gather -> apply kernel
+            gu = mm(x, self.w_gate_up, "gate_up", gu_dtype, imc)
+            h = self.pn_fused(gu, memory_config=imc)
+            if taps is not None:
+                g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, M, n], memory_config=imc)
+                u = ttnn.slice(gu, [0, 0, 0, n], [1, 1, M, 2 * n], memory_config=imc)
+            _free(gu)
+        elif self.stats == "tp":
             gu = mm(x, self.w_gate_up, "gate_up", gu_dtype, imc)
             g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, M, n], memory_config=imc)
             u = ttnn.slice(gu, [0, 0, 0, n], [1, 1, M, 2 * n], memory_config=imc)
@@ -444,6 +512,8 @@ class PolyNormMLP:
         return self.forward_decode(x, **kw) if mode == "decode" else self.forward_prefill(x, **kw)
 
     def deallocate(self) -> None:
+        if self.pn_fused is not None:
+            self.pn_fused.deallocate()
         _free(self.w_gate_up, self.w_gate_full, self.w_up, self.w_down)
         self.pn.deallocate()
 
@@ -465,6 +535,8 @@ __all__ = [
     "MotifDenseMLP",
     "MotifSharedExpert",
     "PolyNormMLP",
+    "RELEASE_PN_KW",
     "build_decode_program_configs",
     "decode_matmul_pc",
+    "resolve_shared_polynorm",
 ]

@@ -140,6 +140,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_ROUTER_MASK",
         "MOTIF3_DECODE_EXPERTS",
         "MOTIF3_MOE_POLYNORM",
+        "MOTIF3_SHARED_POLYNORM",
         "MOTIF3_HOST_STAGING",
         "MOTIF3_HOST_WAIT",
         "MOTIF3_ASYNC_DECODE",

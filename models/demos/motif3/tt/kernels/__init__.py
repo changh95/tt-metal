@@ -8,6 +8,9 @@
 * ``router_fp32`` -- exact-fp32 router logits (WAVE_A_REVIEW D1(b)); kernel sources in ``router_fp32/``.
 * ``moe_polynorm`` -- fused grouped PolyNorm of the decode routed experts (B3, ``MOTIF3_MOE_POLYNORM=fused``); kernel
   sources in ``moe_polynorm/``.
+* ``shared_polynorm`` -- fused decode PolyNorm of the MoE shared expert (B5, ``MOTIF3_SHARED_POLYNORM=fused``; a
+  moments kernel + the release's TP all-gather + an apply kernel, bitwise equal to the composite); kernel sources in
+  ``shared_polynorm/``.
 
 Kernel sources are compiled from their absolute paths at first use (JIT cache ``~/.cache/tt-metal-cache``;
 ``sinkhorn_motif`` also passes a content hash of its sources as a define, so an edited kernel always rebuilds). This
