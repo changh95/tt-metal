@@ -17,7 +17,8 @@ replaces everything after the matmul::
     ->
     w_loc  [1, E_LOC, M, 1] fp32 TILE interleaved  w_loc[e, t] = scale s[t, g] / (sum_k s[t, idx_k] + 1e-20) if this
                                                    chip's expert g = base + e is in token t's top-K, else exactly 0
-    (idx   [1, 1, M, K] uint32 ROW_MAJOR, L1       the top-K ids in rank order; optional, for taps / tests)
+    idx    [1, 1, M, K] uint32 ROW_MAJOR, L1       the top-K ids in rank order (always written, so taps / tests
+                                                   run the production program; freed by the wrapper unless asked)
 
 Decomposition: one worker core per gathered token row (M = 32 or 64 cores, row-major over the compute grid). The
 reader fetches the row's NE scores and the bias row (64 B halves of the tile rows) into one fp32 page each; the
@@ -36,7 +37,7 @@ not bitwise equal to the release. Deterministic and identical on all chips; a ro
 scores (one worker per row, same code at every M), so the T64 step's rows equal the T32 rows bitwise.
 
 Trace safety: no host round trip; outputs are fresh device allocations per call; the program (one per buffer-type
-combination, M, scale and idx flag) is built on the first eager call and its hash memoized, so a traced call only
+combination, M and scale) is built on the first eager call and its hash memoized, so a traced call only
 patches the common runtime args (buffer addresses). L1 per worker: 5 pages of 4 KB (CBs only).
 
 Host helpers (pure torch): :func:`plan`, :func:`emulate_fp32` (the kernel's algorithm bit for bit, except that the
@@ -234,8 +235,7 @@ class FusedRouterTopK:
         gx = self.grid[0]
         reader_ct = [CB_S, CB_B, CB_ID, p["NT"], gx] + _accessor(scores) + _accessor(self.bias) + _accessor(self.ids)
         writer_ct = ([CB_S, CB_O, CB_ID, CB_ST, p["NE"], p["K"], p["E_loc"], p["R"], gx, int(scale_bits),
-                      int(idx is not None)] + _accessor(w_loc) + _accessor(idx if idx is not None else w_loc))
-        # (without idx the w_loc accessor is repeated as a placeholder: the writer's idx accessor is parsed either way)
+                      1] + _accessor(w_loc) + _accessor(idx))
         compute_ct = [CB_S, CB_B, CB_O]
         kernels = [
             ttnn.KernelDescriptor(
@@ -255,10 +255,10 @@ class FusedRouterTopK:
         return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"])
 
     def _program(self, M, scale_bits, scores, w_loc, idx):
-        """The cached descriptor for these tensors' buffer types, M, scale and idx flag, patched with this call's
+        """The cached descriptor for these tensors' buffer types, M and scale, patched with this call's
         addresses (common runtime args only: a cache hit rebuilds nothing)."""
-        ts = (scores, w_loc, self.bias, self.ids) + ((idx,) if idx is not None else ())
-        key = (M, scale_bits, idx is not None) + tuple(tuple(_accessor(t)) for t in ts)
+        ts = (scores, w_loc, self.bias, self.ids, idx)
+        key = (M, scale_bits) + tuple(tuple(_accessor(t)) for t in ts)
         desc = self._desc.get(key)
         if desc is None:
             p = plan(M, self.n_experts, self.top_k, self.e_loc, self.grid)
@@ -271,13 +271,14 @@ class FusedRouterTopK:
             self._desc[key] = desc
         desc.kernels[0].common_runtime_args = [scores.buffer_address(), self.bias.buffer_address(),
                                                self.ids.buffer_address()]
-        desc.kernels[1].common_runtime_args = [w_loc.buffer_address(), idx.buffer_address() if idx is not None else 0]
+        desc.kernels[1].common_runtime_args = [w_loc.buffer_address(), idx.buffer_address()]
         return desc
 
     def __call__(self, scores, *, scale: float = 1.0, memory_config=None, want_idx: bool = False):
         """``scores [1, 1, M, NE]`` fp32 -> ``w_loc [1, E_LOC, M, 1]`` fp32 TILE in ``memory_config`` (interleaved;
         default L1), or ``(w_loc, idx)`` with ``want_idx`` (``idx [1, 1, M, K]`` uint32 ROW_MAJOR in L1). Consumes
-        nothing."""
+        nothing. The kernel writes ``idx`` either way (one program per shape: a tapped eager call compiles exactly the
+        program a later trace capture replays); without ``want_idx`` it is freed right after the op."""
         M = self._check(scores)
         mc = memory_config or ttnn.L1_MEMORY_CONFIG
         if not _is_interleaved(mc):
@@ -285,16 +286,16 @@ class FusedRouterTopK:
         w_loc = ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, self.e_loc, M, 1]), ttnn.float32, ttnn.TILE_LAYOUT, self.mesh_device, mc
         )
-        idx = None
-        if want_idx:
-            idx = ttnn.allocate_tensor_on_device(
-                ttnn.Shape([1, 1, M, self.top_k]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
-                ttnn.L1_MEMORY_CONFIG,
-            )
+        idx = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, M, self.top_k]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
+            ttnn.L1_MEMORY_CONFIG,
+        )
         desc = self._program(M, _f32_bits(scale), scores, w_loc, idx)
-        ios = [scores, self.bias, self.ids] + ([idx] if idx is not None else []) + [w_loc]
-        ttnn.generic_op(ios, desc)
-        return (w_loc, idx) if want_idx else w_loc
+        ttnn.generic_op([scores, self.bias, self.ids, idx, w_loc], desc)
+        if want_idx:
+            return w_loc, idx
+        ttnn.deallocate(idx)
+        return w_loc
 
     def deallocate(self) -> None:
         """Drops the cached descriptors and the constant references (the constants belong to the MoE module)."""

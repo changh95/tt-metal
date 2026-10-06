@@ -17,7 +17,7 @@
 //    WRITE_IDX: also the K selected ids (rank order) to idx [1, 1, M, K] uint32 ROW_MAJOR (page = row q).
 //
 // CT: 0 cb_s, 1 cb_o, 2 cb_id, 3 cb_st, 4 NE, 5 K, 6 E_LOC, 7 R, 8 GX, 9 scale bits (fp32), 10 WRITE_IDX,
-//     11.. TensorAccessorArgs(w_loc), TensorAccessorArgs(idx) (w_loc's again when WRITE_IDX = 0: parsed either way)
+//     11.. TensorAccessorArgs(w_loc), TensorAccessorArgs(idx) (the wrapper always passes idx and WRITE_IDX = 1)
 // common RT: 0 w_loc_addr, 1 idx_addr (0 when not written)
 
 #include <stdint.h>
