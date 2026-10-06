@@ -721,7 +721,9 @@ class MotifMoE:
             "composite" (the release, ``polynorm_impl``) | "fused" (one ``generic_op``,
             :class:`~models.demos.motif3.tt.kernels.moe_polynorm.FusedGroupedPolyNorm`, at the decode row counts 32 /
             64 with the routing weights folded in; not bitwise equal to the composite, ~-100 us per layer at M = 32;
-            :func:`resolve_moe_polynorm`). Prefill and other row counts keep the composite. No device constants beyond
+            :func:`resolve_moe_polynorm`; a chip layout the kernel cannot place, e.g. 48 experts per chip on a (1, 8)
+            submesh, raises when explicit and falls back to "composite" from the config). Prefill and other row counts
+            keep the composite. No device constants beyond
             the layer's PolyNorm constants; the program compiles on the first eager decode call (before any capture).
         decode_experts: decode routed experts (B1; ``None`` = ``cfg.decode_experts``, ``MOTIF3_DECODE_EXPERTS``):
             "dense" (the release) | "sparse" (``ttnn.sparse_matmul`` skips the local experts no live row routes to;
@@ -888,7 +890,14 @@ class MotifMoE:
         if self.moe_polynorm == "fused":
             from .kernels.moe_polynorm import FusedGroupedPolyNorm  # lazy: generic_op kernel, decode shapes only
 
-            self.pn_fused = FusedGroupedPolyNorm(mesh_device, self.pn_consts, e_loc=self.e_loc, inter=self.inter)
+            try:
+                self.pn_fused = FusedGroupedPolyNorm(mesh_device, self.pn_consts, e_loc=self.e_loc, inter=self.inter)
+            except ValueError:
+                # a layout the kernel cannot serve (e.g. 48 experts per chip on a (1, 8) submesh: 192 workers > the
+                # grid): an explicit request raises, the config default falls back to the composite
+                if moe_polynorm is not None:
+                    raise
+                self.moe_polynorm = "composite"
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
