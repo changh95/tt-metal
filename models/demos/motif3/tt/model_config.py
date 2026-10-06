@@ -73,7 +73,7 @@ from .generator_api import SPEC_VERIFY_MODES, WIDE_SPEC_VERIFY_MODES, check_pack
 from .generator_api import check_packed_prefill_max_tokens
 from .generator_api import packed_prefill_max_seg_from_env, packed_prefill_max_tokens_from_env
 from .generator_api import packed_prefill_pk1_from_env
-from .generator_api import HOST_STAGING_MODES, HOST_WAIT_MODES
+from .generator_api import HOST_STAGING_MODES, HOST_WAIT_MODES, check_capture_thread
 from . import prefill_plan as _plan
 
 # ------------------------------------------------------------------------------------------------------------
@@ -1355,6 +1355,10 @@ class MotifTTConfig:
     # How a decode step waits for its trace replay (B6a): "spin" (default: poll until a few ms before the predicted end,
     # then the same blocking read) | "block" (the release); generator_api.HOST_WAIT_MODES. Host only.
     host_wait: str = "spin"  # MOTIF3_HOST_WAIT
+    # The host thread every trace capture runs on (E3 / B7): "main" (default, the release) | "worker" (a short-lived
+    # thread with its own malloc arena: eager prefill after a capture keeps its speed;
+    # generator_api.CAPTURE_THREAD_MODES)
+    capture_thread: str = "main"  # MOTIF3_CAPTURE_THREAD
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1407,7 +1411,8 @@ class MotifTTConfig:
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
           ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
-          ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``, ``MOTIF3_PREFILL_MOE_MIN_ROWS``,
+          ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
+          ``MOTIF3_PREFILL_MOE_MIN_ROWS``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
@@ -1519,6 +1524,7 @@ class MotifTTConfig:
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
+            capture_thread=(os.environ.get("MOTIF3_CAPTURE_THREAD") or "main").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
@@ -1670,6 +1676,7 @@ class MotifTTConfig:
             )
         if self.host_wait not in HOST_WAIT_MODES:
             raise ValueError(f"host_wait (MOTIF3_HOST_WAIT) must be one of {HOST_WAIT_MODES}, got {self.host_wait!r}")
+        self.capture_thread = check_capture_thread(self.capture_thread, name="capture_thread (MOTIF3_CAPTURE_THREAD)")
         if self.host_staging not in HOST_STAGING_MODES:
             raise ValueError(
                 f"host_staging (MOTIF3_HOST_STAGING) must be one of {HOST_STAGING_MODES}, got {self.host_staging!r}"
@@ -2424,6 +2431,7 @@ class MotifTTConfig:
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
             f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows} host_staging={self.host_staging} host_wait={self.host_wait} "
+            f"capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "

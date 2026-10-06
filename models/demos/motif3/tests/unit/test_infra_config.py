@@ -110,6 +110,8 @@ _ENV = (
     "MOTIF3_PREFILL_MOE",
     "MOTIF3_PREFILL_MOE_BLOCK",
     "MOTIF3_PREFILL_MOE_MIN_ROWS",
+    # the capture thread (E3)
+    "MOTIF3_CAPTURE_THREAD",
 )
 
 
@@ -2047,3 +2049,23 @@ def test_r1_no_raw_ttnn_collectives_outside_ccl(tmp_path):
     probe.write_text(src)
     hits = _raw_ttnn_collectives(probe)
     assert len(hits) == 3 and all(h.startswith("probe.py:") for h in hits), hits
+
+
+def test_capture_thread_knob(monkeypatch):
+    """E3 (logs/opt/phaseB/B7): ``MOTIF3_CAPTURE_THREAD`` (``main`` default | ``worker``), the host thread of every
+    trace capture; case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.generator_api import CAPTURE_THREAD_MODES
+
+    assert CAPTURE_THREAD_MODES == ("main", "worker")
+    c = _cfg()
+    assert c.capture_thread == "main" and "capture_thread=main" in c.describe()
+    for v, want in ((" Worker", "worker"), ("main", "main"), ("", "main")):
+        monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", v)
+        assert _cfg().capture_thread == want, v
+    monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", "thread")
+    with pytest.raises(ValueError, match="MOTIF3_CAPTURE_THREAD"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_CAPTURE_THREAD")
+    assert "capture_thread=worker" in _cfg(capture_thread="worker").describe()
+    with pytest.raises(ValueError, match="capture_thread"):
+        _cfg(capture_thread="pool")

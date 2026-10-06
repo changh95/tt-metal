@@ -20,6 +20,7 @@ Lifecycle (vllm-tt-plugin call order, ``generator_api.MotifGenerator`` docstring
    ``warmup_decode(enable_trace=False)`` (stages the persistent inputs of every decode path for width W, one eager
    all-inactive step each) -> ``warmup_decode(enable_trace=True)`` (captures each path's trace, exception-safe; with
    ``spec_verify="auto"`` the T32-spec trace, then the T64 trace).
+   ``MOTIF3_CAPTURE_THREAD=worker`` runs every capture on a worker thread (its own malloc arena).
    Capture refuses to run before every prefill shape was compiled, and after the capture a prefill chunk of a shape the
    warmup did not compile is refused (a program compiled after capture can corrupt the trace: plugin
    ``model_runner.py:3735-3745``; features design D12 / G7); a packed pass of an unwarmed shape runs as solo chunks
@@ -174,6 +175,7 @@ module device-free: ``test_real_generator_class_imports_device_free``).
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -896,6 +898,8 @@ class MotifGenerator(api.MotifGenerator):
         self.stats["fed_steps"] = 0  # ... whose tokens came from the previous step's read (feed)
         self.stats["prestaged_steps"] = 0  # ... whose other inputs were written before that read
         self.stats["settled_reads"] = 0  # outstanding steps read by another call (settle_decode)
+        # E3: the thread trace captures run on (MOTIF3_CAPTURE_THREAD; _on_capture_thread)
+        self.capture_thread = api.check_capture_thread(getattr(cfg, "capture_thread", None), name="cfg.capture_thread")
 
     # ==============================================================================================================
     # construction (GEN-1)
@@ -1619,6 +1623,31 @@ class MotifGenerator(api.MotifGenerator):
             if inp is not None:
                 inp.free()
         return logits
+
+    def _on_capture_thread(self, fn: Callable[[], Any]) -> Any:
+        """Run one trace capture (``fn``) on the thread :attr:`capture_thread` names and return its result (its error
+        re-raised here). ``"worker"``: a short-lived worker thread, joined before returning. A capture keeps
+        thousands of small host objects alive for the trace's lifetime; made on the calling thread they land in
+        glibc's main malloc arena between the eager path's allocations and fragment it (3.2 k -> 30 k free chunks
+        per capture), which made every later eager prefill pass of a dispatch-bound shape ~20-30 ms slower per live
+        trace (logs/opt/phaseB/B7, E3b-E3d). A worker thread allocates from its own arena, so the main thread's stays
+        compact. The device receives the same commands either way. ``"main"``: the calling thread (the release)."""
+        if self.capture_thread != "worker":
+            return fn()
+        box: Dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["result"] = fn()
+            except BaseException as e:  # re-raised on the calling thread
+                box["error"] = e
+
+        th = threading.Thread(target=run, name="motif3-trace-capture")
+        th.start()
+        th.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
 
     # ==============================================================================================================
     # decode paths (GEN-3; features design §3.8, §3.11)
@@ -2682,7 +2711,7 @@ class MotifGenerator(api.MotifGenerator):
             t0 = time.time()
             self._write_inactive(p)  # the capture's own replay below must write nothing
             ttnn.synchronize_device(self.mesh_device)
-            p.trace_id, p.out = self._capture_path(p, pool)
+            p.trace_id, p.out = self._on_capture_thread(lambda: self._capture_path(p, pool))
             p.pool = pool
             self._acknowledge_trace_outputs(p)
             ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=True)  # one replay: all lanes inactive

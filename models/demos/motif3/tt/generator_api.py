@@ -581,6 +581,30 @@ def async_decode_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     return check_async_decode(env.get("MOTIF3_ASYNC_DECODE"))
 
 
+# E3 / B7: the host thread a trace capture runs on. A capture keeps thousands of small host objects alive for the
+# trace's lifetime; made on the serving thread they fragment glibc's main malloc arena and every later eager prefill
+# pass of a dispatch-bound shape (128-512 rows, packed passes) runs ~20-30 ms slower per live trace (logs/opt/phaseB/B7,
+# E3b-E3d). "worker" = each capture on a short-lived worker thread (its own malloc arena; joined before the capture
+# returns); "main" = the calling thread (the release). The device receives the same commands either way.
+CAPTURE_THREAD_MODES = ("main", "worker")
+DEFAULT_CAPTURE_THREAD = "main"
+
+
+def check_capture_thread(mode: Any, *, name: str = "MOTIF3_CAPTURE_THREAD") -> str:
+    """``mode`` lower-cased and stripped if it is one of :data:`CAPTURE_THREAD_MODES` (``""`` / None = the default),
+    else ``ValueError`` naming ``name``."""
+    v = str(mode if mode is not None else "").strip().lower() or DEFAULT_CAPTURE_THREAD
+    if v not in CAPTURE_THREAD_MODES:
+        raise ValueError(f"{name} must be one of {CAPTURE_THREAD_MODES}, got {mode!r}")
+    return v
+
+
+def capture_thread_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_CAPTURE_THREAD``: :data:`CAPTURE_THREAD_MODES`; case and blanks ignored, anything else raises."""
+    env = os.environ if environ is None else environ
+    return check_capture_thread(env.get("MOTIF3_CAPTURE_THREAD"))
+
+
 def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
     64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
@@ -1866,6 +1890,10 @@ __all__ = [
     "DEFAULT_ASYNC_DECODE",
     "check_async_decode",
     "async_decode_from_env",
+    "CAPTURE_THREAD_MODES",
+    "DEFAULT_CAPTURE_THREAD",
+    "check_capture_thread",
+    "capture_thread_from_env",
     "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
     "wide_step_ratio_from_env",
