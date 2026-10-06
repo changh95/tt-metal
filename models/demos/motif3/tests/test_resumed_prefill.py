@@ -891,6 +891,43 @@ def test_cpu_warmup_compiles_every_shape(monkeypatch):
     assert len(model.ops) == n
 
 
+def test_cpu_warmup_compacted_prefill_moe(monkeypatch):
+    """B2a: ``warmup_prefill`` compiles the compacted prefill MoE (``model.warm_prefill_moe``) once, with the rows of
+    every required prefill shape, before the solo chunks; the shared ``CompactPrefillState.frozen`` follows
+    ``trace_captured`` (after the decode capture only warmed compacted shapes run)."""
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tt.moe import CompactPrefillState
+
+    cfg = host_cfg(prefill_span_cap=1024)
+    gen0, model, pool, _ = fake_generator(cfg, monkeypatch)
+    orig = model.prefill_chunk
+
+    def prefill_chunk(tok, *, chunk, kv_caches):  # warm-up sp1 chunks: shapes only (as in the warm-up test above)
+        if chunk.host.path == PP.SP1 and int(chunk.host.fill.max()) < 0:
+            model.ops.append(("layers", chunk.host.path, chunk.host.bucket, chunk.host.start))
+            C = chunk.host.bucket
+            return FakeT(h=[0] * C, start=chunk.host.start, end=chunk.host.end, tokens=tok.tokens[:C], bucket=C)
+        return orig(tok, chunk=chunk, kv_caches=kv_caches)
+
+    model.prefill_chunk = prefill_chunk
+    model.mtp.fill_kv_prefill = lambda hn, nxt, *, kv_cache, chunk: model.ops.append(("mtp", chunk.bucket))
+    st = CompactPrefillState()
+    calls = []
+    model.prefill_moe_state = st
+    model.warm_prefill_moe = lambda rows: calls.append((list(rows), len(model.ops))) or {1024: (12, 15, 19)}
+    gen = G.MotifGenerator(None, cfg, model)
+    gen._pool = pool
+    assert st.frozen() is False
+    gen.warmup_prefill(kv_cache=pool, enable_trace=False)
+    assert [c[0] for c in calls] == [[int(s[1]) for s in gen.required_prefill_shapes()]]
+    assert calls[0][1] == 0, "the MoE warm-up runs before the warm-up chunks"
+    assert "warmup_prefill_moe_s" in gen.timings
+    gen._paths = {"k": SimpleNamespace(traced=True)}
+    assert st.frozen() is True
+    gen._paths = {}
+    assert st.frozen() is False
+
+
 def test_cpu_mtp_part_estimate_and_pool():
     """Part bookkeeping of the MTP layer (review R8: cfg.layer(53) does not exist)."""
     from models.demos.motif3.tt import model as M

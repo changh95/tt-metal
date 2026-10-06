@@ -104,6 +104,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -1378,6 +1379,440 @@ def test_moe_host_fused_polynorm_dispatch(monkeypatch):
     calls.clear()
     M.MotifMoE.experts(moe, f(32), polynorm="fp32", decode=True, row_scale=rs, memory_config="L1")
     assert [c[0] for c in calls] == ["composite"]
+
+
+def test_moe_host_compact_meta():
+    """B2a host row lists (:func:`moe.compact_prefill_meta`), random skewed routes on a (4, 8) layout (32 chips x 12
+    local experts, permuted ids), block sizes 32 / 64 / 128:
+
+    * every (token, local expert) assignment appears exactly once on its chip, with its weight bit-copied; rows of an
+      expert start at a block boundary, tokens ascending, experts in local order (the dense expert-sum order);
+    * pad rows have token 0 / tokv -1 / weight 0; blocks = the one-hot sparsity with exactly ``nb`` nonzeros per chip;
+      unused trailing blocks repeat the last expert; ``cblk`` = the expert constants of each block;
+    * the emulated compact partial (row values ``f_e(x_t) w``, combined through ``tokv``) == the dense sum over the
+      local experts, exactly (integer data);
+    * ``need`` == :func:`compact_need_blocks`; fewer blocks than needed and unknown expert ids raise."""
+    import models.demos.motif3.tt.moe as M
+
+    g = torch.Generator().manual_seed(5)
+    P, El, Kk, S = 32, 12, 8, 512
+    perm = torch.randperm(P * El, generator=g)
+    local = perm.reshape(P, El)
+    # skewed routes: a few hot experts (on chip 3) take a large share; top-8 distinct per token
+    pr = torch.ones(P * El)
+    pr[local[3, :4]] = 60.0
+    idx = torch.stack([torch.multinomial(pr, Kk, replacement=False, generator=g) for _ in range(S)])
+    w = torch.rand(S, Kk, generator=g)
+    pn = torch.randint(-3, 4, (P, El, 4), generator=g).float()
+    val = torch.randint(-4, 5, (P * El, S), generator=g).double()  # f_e(x_t) stand-in per global expert
+    wint = torch.randint(1, 4, (S, Kk), generator=g).double()
+    for mb in (32, 64, 128):
+        need = M.compact_need_blocks(idx, local, mb)
+        nb = need + 3
+        m = M.compact_prefill_meta(idx, w, local, mb, nb, pn=pn)
+        assert m["need"] == need
+        R = nb * mb
+        tok, tokv, wv, eblk, sp = m["tok"], m["tokv"], m["w"], m["eblk"], m["sparsity"]
+        assert tok.shape == (P, R) and tok.dtype == torch.int32 and sp.shape == (P, nb, El)
+        assert torch.equal(sp.sum(-1), torch.ones(P, nb)) and int(sp.sum()) == P * nb
+        assert torch.equal(sp.argmax(-1), eblk)
+        assert torch.equal(m["cblk"], torch.gather(pn, 1, eblk.unsqueeze(-1).expand(P, nb, 4)))
+        pad = tokv < 0
+        assert bool((tok[pad] == 0).all()) and bool((wv[pad] == 0).all())
+        assert torch.equal(tok[~pad].float(), tokv[~pad])
+        g2s = {int(local.reshape(-1)[i]): i for i in range(P * El)}
+        for p in (0, 3, 17, 31):
+            erow = eblk[p].repeat_interleave(mb)  # expert of every row
+            seen = 0
+            for e in range(El):
+                gid = int(local[p, e])
+                tk = torch.nonzero((idx == gid).any(-1)).flatten()
+                rows = torch.nonzero((erow == e) & ~pad[p]).flatten()
+                assert torch.equal(tokv[p, rows].long(), tk), (mb, p, e)  # tokens ascending
+                if len(rows):
+                    assert int(rows[0]) % mb == 0 and torch.equal(rows, rows[0] + torch.arange(len(rows)))
+                    kpos = (idx[tk] == gid).float().argmax(-1)
+                    assert torch.equal(wv[p, rows], w[tk, kpos])  # bit copies
+                seen += len(rows)
+            assert seen == int((~pad[p]).sum())
+            # trailing unused blocks repeat the last expert and hold only pad rows
+            used = int(((~pad[p]).reshape(nb, mb).any(-1)).nonzero().max()) + 1
+            assert bool((eblk[p, used:] == El - 1).all()) or used == nb
+            # emulated combine == dense sum over the chip's experts in local order, exactly
+            ws = torch.zeros(El, S, dtype=torch.float64)
+            for e in range(El):
+                gid = int(local[p, e])
+                hit = idx == gid
+                ws[e] = (wint * hit).sum(-1)
+            dense = sum(ws[e] * val[g2s[int(local[p, e])]] for e in range(El))
+            rv = torch.zeros(R, dtype=torch.float64)
+            for j in torch.nonzero(~pad[p]).flatten().tolist():
+                t, e = int(tok[p, j]), int(erow[j])
+                kpos = int((idx[t] == int(local[p, e])).float().argmax())
+                rv[j] = wint[t, kpos] * val[g2s[int(local[p, e])], t]
+            PT = (tokv[p].double().unsqueeze(0) == torch.arange(S, dtype=torch.float64).unsqueeze(1)).double()
+            assert torch.equal(PT @ rv, dense), (mb, p)
+        with pytest.raises(ValueError, match="busiest chip"):
+            M.compact_prefill_meta(idx, w, local, mb, need - 1)
+        # the serving fast path (numpy, one pass) == the reference lists packed by compact_upload_rows, word for word
+        g2s = M._global_to_slot(local).numpy()
+        pn_bits = (pn.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF).numpy()
+        ladder = tuple(sorted({need, need + 3, need + 9}))
+        n2, nb2, u = M.compact_upload_fast(idx.numpy(), g2s, P, El, mb, ladder, pn_bits, S)
+        assert n2 == need and nb2 == need and u.dtype == np.int32 and u.shape == (P, 4, need * mb)
+        m2 = M.compact_prefill_meta(idx, w, local, mb, need, pn=pn)
+        ref = M.MotifMoE.compact_upload_rows(m2, S, mb, need)
+        assert torch.equal(torch.from_numpy(u).long(), ref) and int(ref.min()) >= 0 and int(ref.max()) < 2 ** 31
+        # row 2: the routing-weight gather index e S + t into the chip's w_loc (transposed, flattened) -> m["w"]
+        for p in (0, 3, 31):
+            wl = torch.zeros(El, S)
+            for e in range(El):
+                hit = idx == int(local[p, e])
+                wl[e] = (w * hit).sum(-1)
+            v = m2["tokv"][p] >= 0
+            assert torch.equal(wl.reshape(-1)[ref[p, 2]][v], m2["w"][p][v])
+            assert torch.equal(ref[p, 1][v], m2["tokv"][p][v].long()) and bool((ref[p, 1][~v] == S).all())
+        assert M.compact_upload_fast(idx.numpy(), g2s, P, El, mb, (need - 1,), pn_bits, S) == (need, None, None)
+    bad = idx.clone()
+    bad[0, 0] = P * El + 5
+    with pytest.raises(ValueError, match="local expert"):
+        M.compact_prefill_meta(bad, w, local, 32, 64)
+    with pytest.raises(ValueError, match="distinct"):
+        M.compact_need_blocks(idx, torch.zeros(P, El, dtype=torch.long), 32)
+    with pytest.raises(ValueError, match="local expert"):
+        M.compact_upload_fast(bad.numpy(), M._global_to_slot(local).numpy(), P, El, 32, (64,),
+                              np.zeros((P, El, 4), np.int32), S)
+
+
+def test_moe_host_compact_ladder_and_resolve(monkeypatch):
+    """B2a: ``compact_block`` ("auto": 32 up to 2048 rows, 64 above; fixed 32 / 64 / 128; others raise),
+    ``compact_ladder`` (floor ``max(e_loc, rows / 4)`` rows, ratio <= 1.25 (+1 at least), last entry = the 2 x rows cap),
+    ``compact_bucket`` (smallest entry >= need, None beyond the cap), ``resolve_prefill_moe`` (default dense; compact
+    needs fold / bf16 / rms: explicit raises, the config default falls back) and the config knobs."""
+    import models.demos.motif3.tt.moe as M
+    from models.demos.motif3.tt.model_config import PREFILL_MOE_BLOCKS, PREFILL_MOE_MODES, MotifTTConfig
+
+    assert PREFILL_MOE_MODES == ("dense", "compact") and PREFILL_MOE_BLOCKS == ("auto", "32", "64", "128")
+    assert [M.compact_block(r, "auto") for r in (128, 1024, 2048, 4096)] == [32, 32, 32, 64]
+    assert [M.compact_block(4096, b) for b in ("32", " 64", 128)] == [32, 64, 128]
+    with pytest.raises(ValueError, match="block"):
+        M.compact_block(1024, "48")
+    for rows, mb in ((1024, 32), (2048, 32), (4096, 64), (4096, 32), (512, 32), (8192, 128)):
+        lad = M.compact_ladder(rows, mb, 12)
+        assert lad[0] == max(12, -(-rows // (4 * mb))) and lad[-1] == -(-2 * rows // mb)
+        assert all(b > a for a, b in zip(lad, lad[1:]))
+        assert all(b <= max(a + 1, -(-a * 5 // 4)) for a, b in zip(lad, lad[1:]))
+        assert M.compact_bucket(1, lad) == lad[0] and M.compact_bucket(lad[-1], lad) == lad[-1]
+        assert M.compact_bucket(lad[-1] + 1, lad) is None
+        for need in range(1, lad[-1] + 1):
+            b = M.compact_bucket(need, lad)
+            assert b >= need and all(x < need for x in lad if x < b)
+    assert M.compact_ladder(1024, 32, 12) == (12, 15, 19, 24, 30, 38, 48, 60, 64)
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE", raising=False)
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert cfg.prefill_moe == "dense" and cfg.prefill_moe_block == "auto" and cfg.prefill_moe_min_rows == 1024
+    Rz = M.resolve_prefill_moe
+    kw = dict(combine_mode="fold", prefill_polynorm="bf16", prefill_polynorm_impl="rms")
+    assert Rz(None, cfg, **kw) == "dense" and Rz("compact", cfg, **kw) == "compact"
+    on = SimpleNamespace(prefill_moe="compact")
+    assert Rz(None, on, **kw) == "compact"
+    for bad in (dict(combine_mode="multiply_sum"), dict(prefill_polynorm="fp32"), dict(prefill_polynorm_impl="horner")):
+        k2 = dict(kw, **bad)
+        assert Rz(None, on, **k2) == "dense"
+        with pytest.raises(ValueError, match="needs"):
+            Rz("compact", cfg, **k2)
+    with pytest.raises(ValueError, match="prefill_moe"):
+        Rz("sparse", cfg, **kw)
+
+
+class _MT:
+    """Per-chip stand-in tensor of the B2a emulation (``chips``: one torch tensor per chip, row-major mesh order)."""
+
+    def __init__(self, chips, dtype=None, layout=None):
+        self.chips = [c for c in chips]
+        self.dtype, self.layout = dtype, layout
+
+    @property
+    def shape(self):
+        return list(self.chips[0].shape)
+
+    @property
+    def spec(self):
+        return ("spec", tuple(self.shape), self.dtype)
+
+    def map(self, fn, **kw):
+        return _MT([fn(c) for c in self.chips], dtype=kw.get("dtype", self.dtype), layout=kw.get("layout", self.layout))
+
+
+def test_moe_host_prefill_compact_emulated(monkeypatch):
+    """B2a ``local_partial(decode=False)`` with the ttnn ops emulated per chip on a (1, 2) mesh (4 local experts per chip,
+    top-2, small dims, integer data so every sum is exact):
+
+    * compacted partial == the dense math (``sum_e w_loc[e] f_e(x)`` in local expert order) on every chip, exactly;
+    * three per-chip uploads, the embedding gather of the chunk's rows, two ``sparse_matmul`` with ``nnz = nb``, ``b``
+      sparse only, the decode experts' program configs for ``mb`` rows and a compact preallocated output; the routes are
+      read from chip 0 only; every intermediate freed once, the caller's ``f`` never;
+    * the busiest chip beyond the ladder cap -> the dense path on the same routes (``dense_cap``), no upload;
+    * ``frozen`` with the shape unwarmed -> the dense path (``dense_unwarmed``); ``warm_compact`` compiles the dense path
+      once and every ladder entry (pad rows only: a zero partial), after which the chunk runs compacted again;
+    * chunks below ``prefill_moe_min_rows``, decode calls and the dense mode never take the compacted path."""
+    import models.demos.motif3.tt.moe as M
+
+    Hs, Is, El, Kk, P, Mr = 64, 16, 4, 2, 2, 128
+    g = torch.Generator().manual_seed(9)
+    local = torch.tensor([[5, 0, 7, 2], [1, 6, 3, 4]])  # chip p's local experts (global ids)
+    Wgu = torch.randint(-1, 2, (P, El, Hs, 2 * Is), generator=g).double()
+    Wd = torch.randint(-1, 2, (P, El, Is, Hs), generator=g).double()
+    pnh = torch.randint(-2, 3, (P, El, 4), generator=g).double()  # c0, c1, c2, b (the emulated PolyNorm uses c0, b)
+    x = torch.randint(-2, 3, (Mr, Hs), generator=g).double()
+    created, freed, calls = [], [], []
+
+    def new(chips, **kw):
+        t = _MT(chips, **kw)
+        created.append(t)
+        return t
+
+    SHARD, REP = object(), object()
+
+    def from_torch(h, *, dtype, layout, device, memory_config, mesh_mapper):
+        calls.append(("upload", dtype, layout, tuple(h.shape)))
+        h = h.double() if dtype != ttnn.uint32 else h.long()
+        if dtype == ttnn.uint32:
+            assert bool(((h >= 0) & (h < 2 ** 31)).all()), "uint32 upload words must be below 2^31"
+        if mesh_mapper is REP:
+            return new([h.clone() for _ in range(P)], dtype=dtype, layout=layout)
+        assert mesh_mapper is SHARD and h.shape[0] == 1
+        a = h.shape[1] // P
+        return new([h[:, p * a:(p + 1) * a].clone() for p in range(P)], dtype=dtype, layout=layout)
+
+    def to_torch(t):
+        assert len(t.chips) == 1, "routes are taken from one chip"
+        return t.chips[0].clone()
+
+    def copy_d2h(dev, host, blocking=True):
+        calls.append(("read", blocking, dev.dtype))
+        host.chips = [c.clone() for c in dev.chips]
+
+    def gather(src, dim, index, memory_config=None):
+        calls.append(("gather",))
+        assert dim == -1 and index.dtype == ttnn.uint32
+        return new([torch.gather(a, -1, b.long()) for a, b in zip(src.chips, index.chips)], dtype=src.dtype)
+
+    def bitcast(t, dtype, memory_config=None):
+        calls.append(("bitcast", t.dtype, dtype))
+        # only the 16-bit bitcast is exact on device (a uint32 -> fp32 bitcast truncates the mantissa)
+        assert t.dtype == ttnn.uint16 and dtype == ttnn.bfloat16
+        return new([c.long().to(torch.int16).view(torch.bfloat16).double() for c in t.chips], dtype=dtype,
+                   layout=t.layout)
+
+    def typecast(t, dtype, memory_config=None):
+        calls.append(("typecast", t.dtype, dtype))
+        assert t.dtype == ttnn.uint32
+        if dtype == ttnn.float32:  # integers: exact below 2^24
+            assert all(bool(((c >= 0) & (c < 2 ** 24)).all()) for c in t.chips)
+            return new([c.double() for c in t.chips], dtype=dtype, layout=t.layout)
+        assert dtype == ttnn.uint16
+        assert all(bool(((c >= 0) & (c < 2 ** 16)).all()) for c in t.chips), "typecast must be exact"
+        return new([((c.long() + 2 ** 15) % 2 ** 16 - 2 ** 15) for c in t.chips], dtype=dtype, layout=t.layout)
+
+    def emb(i, tab, *, layout, memory_config):
+        calls.append(("embedding",))
+        return new([tab.chips[p].reshape(-1, Hs)[i.chips[p].reshape(-1).long()].unsqueeze(0) for p in range(P)])
+
+    def slc(t, a, b, memory_config=None):
+        return new([c[tuple(slice(int(s), int(e)) for s, e in zip(a, b))].clone() for c in t.chips], dtype=t.dtype,
+                   layout=t.layout)
+
+    def sparse_matmul(a, b, *, sparsity, nnz, is_input_a_sparse, is_input_b_sparse, program_config,
+                      compute_kernel_config, dtype, memory_config, optional_output_tensor):
+        calls.append(("sparse_matmul", nnz, is_input_a_sparse, is_input_b_sparse, program_config, dtype,
+                      optional_output_tensor))
+        outs = []
+        for p in range(P):
+            sp = sparsity.chips[p]
+            nb = sp.shape[1]
+            assert sp.shape == (1, nb, 1, El) and int((sp != 0).sum()) == nnz == nb
+            e_of = sp.reshape(nb, El).argmax(-1)
+            outs.append(torch.stack([a.chips[p][0, k] @ b.chips[p][0, int(e_of[k])] for k in range(nb)]).unsqueeze(0))
+        return new(outs, dtype=dtype)
+
+    def bcast(op):
+        return lambda a, b, **kw: new([op(x_, y_) for x_, y_ in zip(a.chips, b.chips)], dtype=kw.get("dtype"))
+
+    def polynorm(g_, consts, *, inter, mode, eps, compute_kernel_config, memory_config, up, impl,
+                 intermediate_memory_config):
+        calls.append(("polynorm", mode, impl, isinstance(consts, dict)))
+        assert isinstance(consts, dict) and mode == "bf16" and impl == "rms"
+        return new([(consts["c0"].chips[p] * g_.chips[p] + consts["b"].chips[p]) * up.chips[p] for p in range(P)])
+
+    def dtt(t, mesh):
+        return torch.stack([c for c in t.chips]).reshape(1, P, *t.shape)
+
+    ns = M.ttnn
+    for name, fn in (("from_torch", from_torch), ("to_torch", to_torch), ("embedding", emb), ("slice", slc),
+                     ("sparse_matmul", sparse_matmul), ("multiply", bcast(torch.mul)),
+                     ("eq", bcast(lambda a, b: (a == b).double())), ("matmul", bcast(torch.matmul))):
+        monkeypatch.setattr(ns, name, fn)
+    monkeypatch.setattr(ns, "get_device_tensors", lambda t: [_MT([c]) for c in t.chips])
+    monkeypatch.setattr(ns, "copy_device_to_host_tensor", copy_d2h)
+    monkeypatch.setattr(ns, "gather", gather)
+    monkeypatch.setattr(ns, "allocate_tensor_on_host", lambda spec, mesh: _MT([]))
+    monkeypatch.setattr(ns, "bitcast", bitcast)
+    monkeypatch.setattr(ns, "typecast", typecast)
+    monkeypatch.setattr(ns, "to_layout", lambda t, layout, memory_config=None: new([c.clone() for c in t.chips],
+                                                                                    dtype=t.dtype, layout=layout))
+    monkeypatch.setattr(ns, "transpose", lambda t, a, b, memory_config=None: new([c.transpose(a, b).clone()
+                                                                                 for c in t.chips], dtype=t.dtype))
+    monkeypatch.setattr(ns, "allocate_tensor_on_device", lambda shape, dtype, layout, mesh, mc: ("OUT", tuple(shape)))
+    monkeypatch.setattr(ns, "create_mesh_mapper", lambda mesh, conf: SHARD)
+    monkeypatch.setattr(ns, "ReplicateTensorToMesh", lambda mesh: REP)
+    monkeypatch.setattr(ns, "MeshMapperConfig", lambda *a, **k: None)
+    monkeypatch.setattr(ns, "PlacementShard", lambda d: d)
+    monkeypatch.setattr(ns, "MeshShape", lambda *a: a)
+    monkeypatch.setattr(ns, "Shape", lambda v: list(v))
+    monkeypatch.setattr(ns, "deallocate", lambda t, *a, **k: freed.append(t))
+    def reshape(t, shape):  # a copy (stand-ins have no buffer): moe._reshape frees the input
+        freed.append(t)
+        return new([c.reshape(tuple(shape)).clone() for c in t.chips], dtype=t.dtype, layout=t.layout)
+
+    monkeypatch.setattr(M, "_reshape", reshape)
+    monkeypatch.setattr(M._pn, "grouped_polynorm", polynorm)
+    monkeypatch.setattr(M, "device_tensors_to_torch", dtt)
+
+    moe = object.__new__(M.MotifMoE)
+    cfg = SimpleNamespace(experts_gate_up_pc=lambda m_tiles: ("pc_gu", m_tiles),
+                          experts_down_pc=lambda m_tiles: ("pc_dn", m_tiles), polynorm_eps=1e-6)
+    moe.__dict__.update(
+        mesh_device=SimpleNamespace(shape=(1, P)), cfg=cfg, hidden=Hs, inter=Is, e_loc=El, top_k=Kk, dram="DRAM",
+        prefill_moe="compact", prefill_moe_block="auto", prefill_moe_min_rows=64, prefill_polynorm="bf16",
+        internal_route_scale=1.0, gate_up_dtype=None, down_dtype=ttnn.bfloat16, combine_dtype=ttnn.bfloat16,
+        combine_mode="fold", decode_experts="dense", decode_rows=(32,),
+        ckc_experts="ckc_e", ckc_polynorm="ckc_p", _pn_host=None, scatter_consts={},
+        local_ids=_MT([local[p].double().reshape(1, El, 1, 1) for p in range(P)]),
+        pn_consts=SimpleNamespace(c={"bf16": {k: _MT([pnh[p, :, i].reshape(1, El, 1, 1) for p in range(P)])
+                                              for i, k in enumerate(("c0", "c1", "c2", "b"))}}),
+        w_gate_up=_MT([Wgu[p].unsqueeze(0) for p in range(P)]), w_down=_MT([Wd[p].unsqueeze(0) for p in range(P)]),
+    )
+    moe.compact_state = M.CompactPrefillState(owner=moe)
+    st = moe.compact_state
+    routes = {}
+
+    def router(f, *, scale=None, memory_config=None, taps=None):
+        i_, w_ = routes["cur"]
+        return (new([i_.double().reshape(1, 1, -1, Kk)] * P, dtype=ttnn.uint32),
+                new([w_.reshape(1, 1, -1, Kk)] * P, dtype=ttnn.float32))
+
+    moe.router = router
+    dense_calls = []
+    def local_weights(i_, w_, memory_config=None):  # per chip: w_loc[e, t] = sum_k w[t, k] (idx[t, k] == id_e)
+        dense_calls.append("local_weights")
+        return new([((i_.chips[p].reshape(-1, 1, Kk) == local[p].double().reshape(1, El, 1)).double()
+                     * w_.chips[p].reshape(-1, 1, Kk)).sum(-1).t().reshape(1, El, -1, 1) for p in range(P)],
+                   dtype=ttnn.float32)
+
+    moe.local_weights = local_weights
+    moe.experts = lambda f, **kw: dense_calls.append("experts") or "Y"
+    moe.reduce_experts = lambda y, memory_config=None: dense_calls.append("reduce") or "PART"
+    monkeypatch.setattr(M, "_free", lambda *ts: freed.extend(t for t in ts if t is not None))
+
+    def dense_ref(i_, w_):
+        out = []
+        for p in range(P):
+            acc = torch.zeros(Mr, Hs, dtype=torch.float64)
+            for e in range(El):
+                wl = ((i_ == int(local[p, e])).double() * w_).sum(-1, keepdim=True)  # [Mr, 1]
+                gu = x @ Wgu[p, e]
+                h = (pnh[p, e, 0] * gu[:, :Is] + pnh[p, e, 3]) * (wl * gu[:, Is:])
+                acc = acc + h @ Wd[p, e]
+            out.append(acc)
+        return out
+
+    f = _MT([x.reshape(1, 1, Mr, Hs)] * P)
+    i1 = torch.stack([torch.randperm(2 * El, generator=g)[:Kk] for _ in range(Mr)])
+    w1 = torch.randint(1, 4, (Mr, Kk), generator=g).double()
+    routes["cur"] = (i1, w1)
+    n_created = len(created)
+    part = moe.local_partial(f, polynorm="bf16", decode=False)
+    assert dense_calls == ["local_weights"] and st.stats["compact"] == 1
+    for p, want in enumerate(dense_ref(i1, w1)):
+        assert torch.equal(part.chips[p].reshape(Mr, Hs), want), p
+    sm = [c for c in calls if c[0] == "sparse_matmul"]
+    mb = M.compact_block(Mr, "auto")
+    nb = M.compact_bucket(M.compact_need_blocks(i1, local, mb), M.compact_ladder(Mr, mb, El))
+    assert [(c[1], c[2], c[3], c[4]) for c in sm] == [(nb, False, True, ("pc_gu", mb // 32)),
+                                                       (nb, False, True, ("pc_dn", mb // 32))]
+    assert all(c[6][0] == "OUT" and c[6][1][1] == nb for c in sm)
+    ups = [c for c in calls if c[0] == "upload"]
+    assert [(u[1], u[2]) for u in ups] == [(ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT), (ttnn.float32, ttnn.TILE_LAYOUT)]
+    assert ups[0][3] == (1, P, 4, nb * mb)  # one per-chip upload: chip p holds [1, 1, 4, rows]
+    assert [c[1:] for c in calls if c[0] == "read"] == [(True, ttnn.uint32)]  # one read: idx (w stays on device)
+    assert sum(1 for c in calls if c[0] == "embedding") == 1 and sum(1 for c in calls if c[0] == "gather") == 1
+    assert [c for c in calls if c[0] == "bitcast"] == [("bitcast", ttnn.uint16, ttnn.bfloat16)]
+    ids_freed = [id(t) for t in freed]
+    assert len(ids_freed) == len(set(ids_freed)), "a tensor was freed twice"
+    assert id(f) not in ids_freed and id(part) not in ids_freed
+    live = [t for t in created[n_created:] if id(t) not in set(ids_freed) and t is not part]
+    assert [t.shape for t in live] == [[1, 1, Mr, 1]] and st.iota[Mr] is live[0], "only the shared iota column lives"
+
+    # beyond the cap: every route on chip 0's experts, one hot expert -> dense on the same routes
+    i2 = torch.stack([torch.tensor([5, 0] if t < 66 else [7, 2]) for t in range(Mr)])  # 3 + 3 + 2 + 2 > 8 blocks
+    routes["cur"] = (i2, w1)
+    calls.clear()
+    dense_calls.clear()
+    assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART"
+    assert dense_calls == ["local_weights", "experts", "reduce"] and st.stats["dense_cap"] == 1
+    assert not [c for c in calls if c[0] == "upload"]
+    # frozen + unwarmed -> dense; warm_compact -> compacted again
+    dense_calls.clear()
+    routes["cur"] = (i1, w1)
+    st.frozen = lambda: True
+    assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART" and st.stats["dense_unwarmed"] == 1
+    dense_calls.clear()
+    routes["cur"] = (torch.zeros(Mr, Kk, dtype=torch.long), torch.zeros(Mr, Kk))  # warm-up routes (ignored)
+    lad = moe.warm_compact(Mr)
+    assert lad == M.compact_ladder(Mr, mb, El) and dense_calls == ["local_weights", "experts", "reduce"] + [
+        "local_weights"] * len(lad)
+    assert st.warmed == {(Mr, mb, b) for b in lad}
+    routes["cur"] = (i1, w1)
+    part2 = moe.local_partial(f, polynorm="bf16", decode=False)
+    assert st.stats["compact"] == 2  # warm_compact runs _compact_device directly (no counter)
+    assert all(torch.equal(a, b) for a, b in zip(part.chips, part2.chips))
+    st.frozen = lambda: False
+    # below min rows / decode / dense mode: never compacted
+    dense_calls.clear()
+    moe.prefill_moe_min_rows = 256
+    assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART"
+    moe.prefill_moe_min_rows = 64
+    moe.prefill_moe = "dense"
+    assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART"
+    moe.prefill_moe = "compact"
+    assert not moe.compact_applies(32) and moe.compact_applies(64)
+    assert st.stats["compact"] == 2
+
+
+def test_moe_host_model_prefill_moe_rows():
+    """B2a model wiring (``MotifModel.compact_moes`` / ``prefill_moe_rows`` / ``warm_prefill_moe``): the chunk sizes of
+    the passes' rows (``prefill_chunk``-row chunks plus a remainder) that the compacted path serves; the warm-up reads
+    every compacted layer's host constants and compiles each chunk size once, on the first layer; nothing without a
+    compacted layer."""
+    from models.demos.motif3.tt.model import MotifModel
+
+    log = []
+
+    def moe(name, mode="compact"):
+        return SimpleNamespace(
+            prefill_moe=mode, prefill_chunk=4096, compact_applies=lambda r: mode == "compact" and int(r) >= 1024,
+            prepare_compact=lambda: log.append(("prepare", name)),
+            warm_compact=lambda r: log.append(("warm", name, r)) or (12, 15))
+
+    m = object.__new__(MotifModel)
+    m.layers = [SimpleNamespace(moe=None), SimpleNamespace(moe=moe("L2")), SimpleNamespace(moe=moe("L3"))]
+    assert [x.prefill_chunk for x in m.compact_moes()] == [4096, 4096]
+    assert m.prefill_moe_rows([128, 512, 1024, 2048, 4096, 8192, 6144, 1024]) == [1024, 2048, 4096]
+    assert m.warm_prefill_moe([128, 1024, 8192]) == {1024: (12, 15), 4096: (12, 15)}
+    assert log == [("prepare", "L2"), ("prepare", "L3"), ("warm", "L2", 1024), ("warm", "L2", 4096)]
+    m.layers = [SimpleNamespace(moe=moe("L2", "dense"))]
+    assert m.compact_moes() == [] and m.prefill_moe_rows([4096]) == [] and m.warm_prefill_moe([4096]) == {}
 
 
 def test_moe_host_import_clean():
@@ -3390,6 +3825,110 @@ def test_moe_device_prefill(mesh_device, device_params):
             print(f"[moe] prefill S={S}: FAILED {type(e).__name__}: {str(e)[:500]}")
         _free(x_tt)
     moe.deallocate()
+    assert not failures, "\n".join(failures)
+
+
+def _chips_equal(a, b):
+    """(mismatching values, all values) between two per-chip tensors of the same shape, over all chips."""
+    sa, sb = ttnn.get_device_tensors(a), ttnn.get_device_tensors(b)
+    bad = n = 0
+    for x, y in zip(sa, sb):
+        tx, ty = ttnn.to_torch(x).float(), ttnn.to_torch(y).float()
+        bad += int((tx != ty).sum()) if tx.shape == ty.shape else tx.numel()
+        n += tx.numel()
+    return bad, n
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_prefill_compact(mesh_device, device_params):
+    """B2a (docs/OPTIMIZATION_PLAN.md §3.3 B2; ``prefill_moe="compact"``; prototype logs/opt/phaseA/m7), real weights of
+    layers 2 and 35 (``MOTIF3_B2A_LAYERS``) from the serving TT cache, real router inputs tiled to S = 1024 / 2048 /
+    4096 / 8192 (``MOTIF3_B2A_S``):
+
+    * the compacted local partial of every chunk == the dense one on all 32 chips (0 mismatching values), and
+      ``forward_prefill`` compacted == dense (replicated output, every chip);
+    * a second compacted run is bitwise equal (determinism); the chunks really ran compacted (state counters);
+    * after ``frozen`` turns on, an unwarmed shape falls back to the dense path (same output), and after
+      ``warm_compact`` the same chunk runs compacted again;
+    * eager ``forward_prefill`` time, dense vs compacted (informational)."""
+    from models.demos.motif3.tt.moe import compact_block, compact_ladder
+
+    cfg, ccl, fab = _setup(mesh_device, "moe_prefill_compact")
+    assert "TORUS_XY" in str(fab.get("committed")), fab
+    data = load_real_inputs()
+    layers = [int(v) for v in os.environ.get("MOTIF3_B2A_LAYERS", "2,35").split(",")]
+    sizes = [int(v) for v in os.environ.get("MOTIF3_B2A_S", "1024,2048,4096,8192").split(",")]
+    failures = []
+    for layer in layers:
+        moe = moe_from_tt_cache(mesh_device, cfg, ccl, layer, prefill_moe="compact")
+        st = moe.compact_state
+        xs = data["layers"][layer]["x"]
+        n = xs.shape[0]
+        try:
+            for S in sizes:
+                tag = f"L{layer} S={S}"
+                x_tt = upload_replicated(xs[torch.arange(S) % n], mesh_device)
+                C = min(S, moe.prefill_chunk)
+                xc = x_tt if C == S else ttnn.slice(x_tt, [0, 0, 0, 0], [1, 1, C, H])
+                try:
+                    moe.prefill_moe = "dense"
+                    pd = moe.local_partial(xc, polynorm=moe.prefill_polynorm, decode=False)
+                    od = moe.forward_prefill(x_tt)
+                    moe.prefill_moe = "compact"
+                    n0 = st.stats["compact"]
+                    pc = moe.local_partial(xc, polynorm=moe.prefill_polynorm, decode=False)
+                    oc = moe.forward_prefill(x_tt)
+                    oc2 = moe.forward_prefill(x_tt)
+                    ran = st.stats["compact"] - n0
+                    bad_p, n_p = _chips_equal(pd, pc)
+                    bad_o, n_o = _chips_equal(od, oc)
+                    bad_r, _ = _chips_equal(oc, oc2)
+                    shapes = sorted(k for k in st.blocks if k[0] == C)
+                    print(f"[moe] B2a {tag}: compacted chunks {ran} (want {1 + 2 * (S // C)}), shapes {shapes}; local "
+                          f"partial mismatches {bad_p}/{n_p}; forward_prefill mismatches {bad_o}/{n_o}; rerun "
+                          f"mismatches {bad_r}")
+                    if ran != 1 + 2 * (S // C) or bad_p or bad_o or bad_r:
+                        failures.append(f"{tag}: ran {ran} partial {bad_p} fwd {bad_o} rerun {bad_r}")
+                    _free([pd, od, pc, oc, oc2])
+                    # frozen: an unwarmed shape runs dense (same output); warm_compact makes it compacted again
+                    mb = compact_block(C, moe.prefill_moe_block)
+                    st.warmed.clear()
+                    st.frozen = lambda: True
+                    u0, c0 = st.stats["dense_unwarmed"], st.stats["compact"]
+                    pf = moe.local_partial(xc, polynorm=moe.prefill_polynorm, decode=False)
+                    fell = st.stats["dense_unwarmed"] - u0 == 1 and st.stats["compact"] == c0
+                    t0 = time.perf_counter()
+                    ladder = moe.warm_compact(C)
+                    warm_s = time.perf_counter() - t0
+                    pw = moe.local_partial(xc, polynorm=moe.prefill_polynorm, decode=False)
+                    ran_w = st.stats["compact"] - c0 == 1
+                    st.frozen = lambda: False
+                    bad_f, _ = _chips_equal(pf, pw)
+                    print(f"[moe] B2a {tag}: frozen + unwarmed -> dense {fell}; warm_compact({C}) ladder {ladder} "
+                          f"(mb {mb}) in {warm_s:.1f} s, then compacted {ran_w}; mismatches {bad_f}")
+                    if not (fell and ran_w) or bad_f or ladder != compact_ladder(C, mb, moe.e_loc):
+                        failures.append(f"{tag}: frozen fallback {fell} warmed {ran_w} mismatches {bad_f}")
+                    _free([pf, pw])
+                    moe.prefill_moe = "dense"
+                    t_d = eager_us(mesh_device, lambda: moe.forward_prefill(x_tt), iters=2)
+                    moe.prefill_moe = "compact"
+                    t_c = eager_us(mesh_device, lambda: moe.forward_prefill(x_tt), iters=2)
+                    print(f"[moe] B2a {tag}: eager forward_prefill dense {t_d / 1e3:.2f} ms, compacted {t_c / 1e3:.2f} "
+                          f"ms (x{t_c / t_d:.3f})")
+                except Exception as e:
+                    failures.append(f"{tag}: {type(e).__name__}: {str(e)[:500]}")
+                    print(f"[moe] B2a {tag}: FAILED {type(e).__name__}: {str(e)[:500]}")
+                    import traceback
+
+                    traceback.print_exc()
+                finally:
+                    if xc is not x_tt:
+                        _free(xc)
+                    _free(x_tt)
+            print(f"[moe] B2a L{layer}: state counters {st.stats}, shapes {dict(sorted(st.blocks.items()))}")
+        finally:
+            moe.deallocate()
     assert not failures, "\n".join(failures)
 
 

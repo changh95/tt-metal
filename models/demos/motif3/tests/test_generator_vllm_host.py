@@ -143,6 +143,9 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_HOST_STAGING",
         "MOTIF3_HOST_WAIT",
         "MOTIF3_ASYNC_DECODE",
+        "MOTIF3_PREFILL_MOE",
+        "MOTIF3_PREFILL_MOE_BLOCK",
+        "MOTIF3_PREFILL_MOE_MIN_ROWS",
     ):
         monkeypatch.delenv(var, raising=False)
 

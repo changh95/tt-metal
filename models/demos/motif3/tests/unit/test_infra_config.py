@@ -106,6 +106,10 @@ _ENV = (
     "MOTIF3_HOST_WAIT",
     # B6b asynchronous decode (the bridge's supports_async_decode)
     "MOTIF3_ASYNC_DECODE",
+    # B2a token-compacted prefill MoE
+    "MOTIF3_PREFILL_MOE",
+    "MOTIF3_PREFILL_MOE_BLOCK",
+    "MOTIF3_PREFILL_MOE_MIN_ROWS",
 )
 
 
@@ -834,6 +838,44 @@ def test_moe_polynorm_knob(monkeypatch):
     assert _cfg(moe_polynorm="fused").moe_polynorm == "fused"
     with pytest.raises(ValueError, match="moe_polynorm"):
         _cfg(moe_polynorm="kernel")
+
+
+def test_prefill_moe_knobs(monkeypatch):
+    """B2a (docs/OPTIMIZATION_PLAN.md §3.3 B2; logs/opt/phaseB/B2a): ``MOTIF3_PREFILL_MOE`` selects the prefill routed
+    experts, ``dense`` (default: the release) or ``compact`` (token-compacted, bitwise equal); ``MOTIF3_PREFILL_MOE_BLOCK``
+    the block rows (``auto`` | 32 | 64 | 128) and ``MOTIF3_PREFILL_MOE_MIN_ROWS`` the smallest compacted chunk (a
+    multiple of 32, default 1024). Case and blanks ignored, anything else refused; ``describe`` shows them."""
+    from models.demos.motif3.tt.model_config import (DEFAULT_PREFILL_MOE_MIN_ROWS, PREFILL_MOE_BLOCKS,
+                                                     PREFILL_MOE_MODES)
+
+    assert PREFILL_MOE_MODES == ("dense", "compact") and PREFILL_MOE_BLOCKS == ("auto", "32", "64", "128")
+    c = _cfg()
+    assert (c.prefill_moe, c.prefill_moe_block, c.prefill_moe_min_rows) == ("dense", "auto", DEFAULT_PREFILL_MOE_MIN_ROWS)
+    assert DEFAULT_PREFILL_MOE_MIN_ROWS == 1024 and "prefill_moe=dense/auto/1024" in c.describe()
+    for v, want in (("compact", "compact"), (" Compact ", "compact"), ("dense", "dense"), ("", "dense")):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE", v)
+        assert _cfg().prefill_moe == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE", "sparse")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE")
+    for v, want in (("64", "64"), (" AUTO ", "auto"), ("", "auto"), ("128", "128")):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE_BLOCK", v)
+        assert _cfg().prefill_moe_block == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE_BLOCK", "48")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_BLOCK"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE_BLOCK")
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE_MIN_ROWS", "512")
+    assert _cfg().prefill_moe_min_rows == 512
+    for bad in ("500", "0"):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE_MIN_ROWS", bad)
+        with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_MIN_ROWS"):
+            _cfg()
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE_MIN_ROWS")
+    assert _cfg(prefill_moe="compact").prefill_moe == "compact"
+    with pytest.raises(ValueError, match="prefill_moe"):
+        _cfg(prefill_moe="fast")
 
 
 def test_host_staging_and_wait_knobs(monkeypatch):

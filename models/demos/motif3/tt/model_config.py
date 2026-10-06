@@ -122,6 +122,17 @@ DECODE_EXPERTS_MODES = ("dense", "sparse")
 # gate_up output; fp32 moments + Horner + routing weight, one bf16 rounding; ~5 ms less per T32 step, not bitwise equal
 # to the composite: 1-ulp bf16 differences in ~2e-5 of the values, logs/opt/phaseA/M10). Decode only (M = 32 / 64).
 MOE_POLYNORM_MODES = ("composite", "fused")
+# Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
+# chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (token-compacted:
+# the host reads the chunk's routes from chip 0 and builds each chip's expert-sorted row lists; the chip gathers only
+# its routed rows, runs them through ttnn.sparse_matmul in blocks of PREFILL_MOE_BLOCKS rows and combines them with a
+# one-hot matmul; bitwise equal to "dense", logs/opt/phaseA/m7 and logs/opt/phaseB/B2a). Decode is not affected.
+PREFILL_MOE_MODES = ("dense", "compact")
+# Rows per expert block of the compacted prefill experts (MOTIF3_PREFILL_MOE_BLOCK): "auto" (moe.compact_block: 32 up
+# to 2048-row chunks, 64 above) or a fixed 32 / 64 / 128.
+PREFILL_MOE_BLOCKS = ("auto", "32", "64", "128")
+# Chunks with fewer rows keep the dense prefill MoE (MOTIF3_PREFILL_MOE_MIN_ROWS; a multiple of 32, >= 32).
+DEFAULT_PREFILL_MOE_MIN_ROWS = 1024
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -1331,6 +1342,11 @@ class MotifTTConfig:
     # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
     # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
     moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
+    # Prefill routed experts (B2a): "dense" (default, the release) | "compact" (token-compacted, bitwise equal to
+    # "dense"; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128") and the smallest chunk it serves.
+    prefill_moe: str = "dense"  # MOTIF3_PREFILL_MOE
+    prefill_moe_block: str = "auto"  # MOTIF3_PREFILL_MOE_BLOCK
+    prefill_moe_min_rows: int = DEFAULT_PREFILL_MOE_MIN_ROWS  # MOTIF3_PREFILL_MOE_MIN_ROWS
     # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
     # "release" (the release code); generator_api.HOST_STAGING_MODES. Host only: device programs and inputs unchanged.
     host_staging: str = "fast"  # MOTIF3_HOST_STAGING
@@ -1389,6 +1405,7 @@ class MotifTTConfig:
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
           ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``, ``MOTIF3_PREFILL_MOE_MIN_ROWS``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
@@ -1495,6 +1512,9 @@ class MotifTTConfig:
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
+            prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "dense").strip().lower(),
+            prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
+            prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             weights_dir=resolve_weights_dir(),
@@ -1655,6 +1675,20 @@ class MotifTTConfig:
         if self.moe_polynorm not in MOE_POLYNORM_MODES:
             raise ValueError(
                 f"moe_polynorm (MOTIF3_MOE_POLYNORM) must be one of {MOE_POLYNORM_MODES}, got {self.moe_polynorm!r}"
+            )
+        if self.prefill_moe not in PREFILL_MOE_MODES:
+            raise ValueError(
+                f"prefill_moe (MOTIF3_PREFILL_MOE) must be one of {PREFILL_MOE_MODES}, got {self.prefill_moe!r}"
+            )
+        if str(self.prefill_moe_block) not in PREFILL_MOE_BLOCKS:
+            raise ValueError(
+                f"prefill_moe_block (MOTIF3_PREFILL_MOE_BLOCK) must be one of {PREFILL_MOE_BLOCKS}, got "
+                f"{self.prefill_moe_block!r}"
+            )
+        mr = self.prefill_moe_min_rows
+        if isinstance(mr, bool) or not isinstance(mr, int) or mr < TILE or mr % TILE:
+            raise ValueError(
+                f"prefill_moe_min_rows (MOTIF3_PREFILL_MOE_MIN_ROWS) must be a multiple of {TILE}, >= {TILE}, got {mr!r}"
             )
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
@@ -2386,7 +2420,8 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} host_staging={self.host_staging} host_wait={self.host_wait} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} "
+            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
@@ -2431,6 +2466,9 @@ __all__ = [
     "ROUTER_LOGITS_IMPLS",
     "ROUTER_MASK_MODES",
     "DECODE_EXPERTS_MODES",
+    "PREFILL_MOE_MODES",
+    "PREFILL_MOE_BLOCKS",
+    "DEFAULT_PREFILL_MOE_MIN_ROWS",
     "MOE_POLYNORM_MODES",
     "HOST_STAGING_MODES",
     "HOST_WAIT_MODES",

@@ -787,6 +787,10 @@ class MotifGenerator(api.MotifGenerator):
         self._paths: Dict[DecodeKey, DecodePath] = {}  # staged decode paths: persistent inputs (+ trace once captured)
         # prefill shapes compiled by warmup_prefill: solo (path, bucket) and packed ("pk0", T, S) / ("pk1", T, S, tails)
         self._warmed: Set[PrefillShape] = set()
+        # B2a: after the decode capture the compacted prefill MoE runs only the shapes warmup_prefill compiled
+        st = getattr(model, "prefill_moe_state", None)
+        if st is not None:
+            st.frozen = lambda: self.trace_captured
         # packed prefill (P5): the per-call switch and the warm-up mode (module docstring)
         self.packed_prefill = bool(getattr(settings, "packed_prefill", False))
         warm = getattr(settings, "packed_warmup", None) or api.DEFAULT_PACKED_WARMUP
@@ -2522,6 +2526,17 @@ class MotifGenerator(api.MotifGenerator):
         if self.trace_captured:
             raise RuntimeError("warmup_prefill after the decode trace capture (prefill shapes must compile before it)")
         t_all = time.time()
+        warm_moe = getattr(self.model, "warm_prefill_moe", None)
+        if warm_moe is not None:  # B2a: compacted prefill MoE (dense fallback + every block count), before the chunks
+            t0 = time.time()
+            ladders = warm_moe([int(s[1]) for s in self.required_prefill_shapes()])
+            if ladders:
+                self.timings["warmup_prefill_moe_s"] = time.time() - t0
+                self.log(
+                    f"warmup compacted prefill MoE: " + "; ".join(f"{r} rows: {len(l)} block counts {l[0]}..{l[-1]}"
+                                                                 for r, l in ladders.items())
+                    + f" in {self.timings['warmup_prefill_moe_s']:.1f} s"
+                )
         for path, b in self.prefill_shapes():
             if (path, b) in self._warmed:
                 continue

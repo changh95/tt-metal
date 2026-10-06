@@ -109,7 +109,7 @@ from .decoder import MotifDecoderLayer, free_tensors
 from .embedding import MotifEmbedding
 from .lm_head import MotifLMHead
 from .model_config import DEFAULT_HF_META_DIR, MotifTTConfig
-from .moe import MotifMoE
+from .moe import CompactPrefillState, MotifMoE
 from .mtp import MotifMTP
 from .rope import MotifRope
 
@@ -522,6 +522,50 @@ class MotifModel:
             self._note_dram(tag, d0)
             self.load_seconds[tag] = time.time() - t1
             self.log(f"MTP layer {L} (model.mtp_layers.0) loaded in {self.load_seconds[tag]:.1f} s (TT cache: {desc})")
+        # B2a: one compacted-prefill state for every MoE layer (upload mapper, local expert ids, combine columns, the
+        # shapes compiled so far)
+        self.prefill_moe_state = CompactPrefillState(owner=self)
+        for layer in self.layers:
+            if getattr(layer, "moe", None) is not None:
+                old = layer.moe.compact_state
+                if old is not self.prefill_moe_state and getattr(old, "owner", None) is layer.moe:
+                    old.deallocate()
+                layer.moe.compact_state = self.prefill_moe_state
+
+    def compact_moes(self) -> List[MotifMoE]:
+        """The MoE modules that run compacted prefill chunks (B2a, ``prefill_moe="compact"``)."""
+        return [l.moe for l in self.layers if getattr(l, "moe", None) is not None
+                and getattr(l.moe, "prefill_moe", "dense") == "compact"]  # fmt: skip
+
+    def prefill_moe_rows(self, pass_rows: Iterable[int]) -> List[int]:
+        """The MoE chunk sizes prefill passes of ``pass_rows`` rows run (``moe.prefill_chunk``-row chunks plus a
+        remainder) that the compacted path serves (``>= prefill_moe_min_rows``); ascending."""
+        moes = self.compact_moes()
+        if not moes:
+            return []
+        m = moes[0]
+        out = set()
+        for r in pass_rows:
+            r = int(r)
+            c = min(r, int(m.prefill_chunk))
+            for v in (c, r % c):
+                if v and m.compact_applies(v):
+                    out.add(v)
+        return sorted(out)
+
+    def warm_prefill_moe(self, pass_rows: Iterable[int]) -> Dict[int, Tuple[int, ...]]:
+        """Warm-up (B2a; before the decode capture): read every compacted MoE layer's host constants and compile the
+        dense and compacted prefill MoE programs of each chunk size of :meth:`prefill_moe_rows` (on the first such
+        layer: every layer runs the same programs). Returns ``{rows: ladder}``."""
+        moes = self.compact_moes()
+        out: Dict[int, Tuple[int, ...]] = {}
+        if not moes:
+            return out
+        for m in moes:
+            m.prepare_compact()
+        for rows in self.prefill_moe_rows(pass_rows):
+            out[rows] = moes[0].warm_compact(rows)
+        return out
 
     def _note_dram(self, tag: str, before: Optional[Dict[str, int]]) -> None:
         after = device_bytes_per_chip(self.mesh_device)
@@ -952,6 +996,9 @@ class MotifModel:
         self.head.close()
         self.rope.release_prefill_tables()
         free_tensors(self.rope)
+        st = getattr(self, "prefill_moe_state", None)
+        if st is not None:
+            st.deallocate()
 
 
 def convert_weights(

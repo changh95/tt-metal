@@ -107,6 +107,22 @@ S, every position >= 0.99986 against the reference experts on the device's route
 reference's own routes are all near-tie route flips (5 / 7 / 66 of 2048 / 4096 / 32768). 48x the useful expert FLOPs;
 the v1 replacement is a compacting dispatch / sparse experts.
 
+B2a token-compacted prefill (``prefill_moe="compact"``, ``MOTIF3_PREFILL_MOE``; off by default, docs/OPTIMIZATION_PLAN.md
+§3.3 B2, prototype logs/opt/phaseA/m7, results logs/opt/phaseB/B2a), per chunk of at least ``prefill_moe_min_rows``
+rows (:meth:`MotifMoE._compact_partial`): the router as above; the chunk's ``idx`` read from chip 0 (one blocking read:
+routes are identical on every chip); on the host (:func:`compact_upload_fast`) every chip's (local expert, token) rows
+sorted by expert then token, each expert padded to whole blocks of ``mb`` rows (:func:`compact_block`), the busiest
+chip's block count rounded up the ladder of the chunk size (:func:`compact_ladder`); one uint32 upload per chunk (row
+tokens, combine keys, routing-weight gather indices, per-block sparsity and PolyNorm constants as bf16 bit patterns).
+On every chip (:meth:`MotifMoE._compact_device`): ``ttnn.embedding`` gathers the routed rows -> ``[1, nb, mb, 4096]``;
+``ttnn.sparse_matmul`` (one expert per block, ``nnz = nb`` exactly) for gate_up and down at the decode experts' program
+configs; the grouped PolyNorm with per-block constants and the routing weights (gathered from the dense path's
+``w_loc``) folded into ``up``; the combine is ``P^T [M, R] @ y [R, 4096]`` with ``P^T`` the one-hot of each row's token,
+so a token's expert terms add in the dense order. The partial is bitwise equal to the dense path's on all 32 chips;
+the RS(dp) / AR(tp) / AG(dp) that follow are unchanged. Every (chunk size, block count) of the ladder compiles in
+:meth:`MotifMoE.warm_compact` (the generator's ``warmup_prefill``); a chunk beyond the ladder's cap, or (after the decode
+capture, :class:`CompactPrefillState`) a shape not warmed, runs the dense path on the same routes.
+
 Weights (``tt/weights.py``): ``router_weights`` (``[4096, 384]`` bf16 + fp32 bias), ``experts_gate_up`` /
 ``experts_down`` + ``ep_layout`` with ``as_tensor(dp_dim=0, tp_dim=1)`` (chip ``k = 8 dp + tp`` holds experts
 ``[12k, 12k+12)``), ``local_expert_ids``; PolyNorm constants ``polynorm.GroupedPolyNormConsts``. Cache names
@@ -129,15 +145,16 @@ the host and on a (1, 8) submesh (``test_moe_device_submesh_1x8``).
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import ttnn
 
 from . import polynorm as _pn
 from . import weights as W
-from .ccl import MotifCCL
-from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig,
-                           mcast1d_matmul_pc)
+from .ccl import MotifCCL, device_tensors_to_torch
+from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, PREFILL_MOE_MODES, ROUTER_MASK_MODES, TILE,
+                           MotifTTConfig, mcast1d_matmul_pc)
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -236,6 +253,245 @@ def resolve_moe_polynorm(moe_polynorm: Optional[str], cfg, *, decode_polynorm: s
                 raise ValueError(f"moe_polynorm='fused' needs {why}")
             return "composite"
     return mode
+
+
+def resolve_prefill_moe(prefill_moe: Optional[str], cfg, *, combine_mode: str, prefill_polynorm: str,
+                        prefill_polynorm_impl: str) -> str:
+    """B2a: the prefill routed-experts mode a :class:`MotifMoE` runs. ``prefill_moe`` (explicit) or ``cfg.prefill_moe``
+    (``MOTIF3_PREFILL_MOE``; ``None`` = "dense") must be in :data:`PREFILL_MOE_MODES`. "compact" needs
+    ``combine_mode="fold"`` (routing weights folded into ``up``), the bf16 prefill PolyNorm (its per-block constants
+    travel as bf16) and the ``rms`` impl (constants as a ``{c0, c1, c2, b}`` mapping): an explicit request raises
+    otherwise, the config default falls back to "dense" (diagnostic modules)."""
+    explicit = prefill_moe is not None
+    mode = str(prefill_moe if explicit else (getattr(cfg, "prefill_moe", None) or "dense"))
+    if mode not in PREFILL_MOE_MODES:
+        raise ValueError(f"prefill_moe must be one of {PREFILL_MOE_MODES}, got {mode!r}")
+    if mode == "compact":
+        why = None
+        if combine_mode != "fold":
+            why = f"combine_mode='fold' (got {combine_mode!r})"
+        elif prefill_polynorm != "bf16":
+            why = f"prefill_polynorm='bf16' (got {prefill_polynorm!r})"
+        elif prefill_polynorm_impl != "rms":
+            why = f"prefill_polynorm_impl='rms' (got {prefill_polynorm_impl!r})"
+        if why is not None:
+            if explicit:
+                raise ValueError(f"prefill_moe='compact' needs {why}")
+            return "dense"
+    return mode
+
+
+# ==============================================================================================================
+# B2a: token-compacted prefill experts (host-built row lists; docs/OPTIMIZATION_PLAN.md §3.3 B2, logs/opt/phaseB/B2a)
+# ==============================================================================================================
+# The NB ladder (blocks per chip) of one chunk size: geometric from the floor (max(e_loc, M / 4 rows)) by this ratio up
+# to PREFILL_MOE_CAP x M rows; a chunk whose busiest chip needs more blocks than the cap runs the dense path (exact too).
+PREFILL_MOE_LADDER_RATIO = 1.25
+PREFILL_MOE_CAP = 2.0
+
+
+def compact_block(rows: int, block) -> int:
+    """Rows per expert block of the compacted prefill experts for a chunk of ``rows`` rows: ``block`` ("auto" | "32" |
+    "64" | "128", ``cfg.prefill_moe_block``). "auto": 32 up to 2048-row chunks, 64 above (M7: the hot experts of the
+    deep layers favour bigger blocks at 4K and 8K, the shallow layers 32 at every size)."""
+    b = str(block).strip().lower()
+    if b == "auto":
+        return TILE if int(rows) <= 2048 else 2 * TILE
+    v = int(b)
+    if v not in (32, 64, 128):
+        raise ValueError(f"prefill MoE block must be 'auto', 32, 64 or 128, got {block!r}")
+    return v
+
+
+def compact_ladder(rows: int, mb: int, e_loc: int) -> Tuple[int, ...]:
+    """The block counts NB the compacted path of a ``rows``-row chunk runs at (each one compiled program set): from
+    ``max(e_loc, ceil(rows / 4 / mb))`` up by :data:`PREFILL_MOE_LADDER_RATIO` (at least +1) to
+    ``ceil(PREFILL_MOE_CAP * rows / mb)``, which is always the last entry."""
+    lo = max(int(e_loc), -(-int(rows) // (4 * int(mb))))
+    cap = max(lo, -(-int(PREFILL_MOE_CAP * int(rows)) // int(mb)))
+    out, b = [], lo
+    while b < cap:
+        out.append(b)
+        b = max(b + 1, math.ceil(b * PREFILL_MOE_LADDER_RATIO))
+    out.append(cap)
+    return tuple(out)
+
+
+def compact_bucket(need: int, ladder: Tuple[int, ...]) -> Optional[int]:
+    """Smallest ladder entry >= ``need`` blocks, or None (beyond the cap: the dense path)."""
+    for b in ladder:
+        if b >= int(need):
+            return int(b)
+    return None
+
+
+def compact_need_blocks(idx, local_ids, mb: int) -> int:
+    """Blocks the busiest chip needs: ``idx [S, K]`` (global expert ids, torch int), ``local_ids [P, E]`` (chip ``p``'s
+    local expert ``e``, global id) -> ``max_p sum_e ceil(count(p, e) / mb)``."""
+    import torch
+
+    P, E = (int(v) for v in local_ids.shape)
+    pe = _slots(idx, local_ids)
+    cnt = torch.bincount(pe, minlength=P * E).reshape(P, E)
+    return int(((cnt + mb - 1) // mb).sum(1).max())
+
+
+def _slots(idx, local_ids):
+    """Chip-expert slot ``p * E + e`` of every routed id of ``idx`` (flattened); an id no chip holds raises."""
+    g2s = _global_to_slot(local_ids)
+    flat = idx.reshape(-1).long()
+    if flat.numel() and (int(flat.min()) < 0 or int(flat.max()) >= int(g2s.numel())):
+        raise ValueError("a routed expert id is not any chip's local expert")
+    pe = g2s[flat]
+    if bool((pe < 0).any()):
+        raise ValueError("a routed expert id is not any chip's local expert")
+    return pe
+
+
+def _global_to_slot(local_ids):
+    import torch
+
+    P, E = (int(v) for v in local_ids.shape)
+    flat = local_ids.reshape(-1).long()
+    g2s = torch.full((int(flat.max()) + 1,), -1, dtype=torch.long)
+    g2s[flat] = torch.arange(P * E, dtype=torch.long)
+    if int((g2s >= 0).sum()) != P * E:
+        raise ValueError("local expert ids must be distinct")
+    return g2s
+
+
+def compact_prefill_meta(idx, w, local_ids, mb: int, nb: int, pn=None) -> Dict[str, object]:
+    """Host row lists of the compacted prefill experts (pure torch; every chip at once).
+
+    Args:
+        idx: ``[S, K]`` global expert ids of each token (the router's top-8, identical on every chip).
+        w: ``[S, K]`` fp32 routing weights (same order as ``idx``; copied bit-exactly).
+        local_ids: ``[P, E]`` chip ``p``'s local expert ``e`` (global id), ``p`` = row-major mesh coordinate.
+        mb: rows per block; nb: blocks per chip (``>=`` :func:`compact_need_blocks`).
+        pn: optional ``[P, E, C]`` per-expert constants (the PolyNorm ``c0, c1, c2, b``); gathered per block.
+
+    Returns per chip (rows ``R = nb * mb``): ``tok [P, R]`` int32 (token of each row; pad rows 0), ``tokv [P, R]`` fp32
+    (token, pad rows -1: they never match a token in the combine), ``w [P, R]`` fp32 (pad rows 0), ``eblk [P, nb]``
+    (local expert of each block; the unused trailing blocks repeat the last expert: their rows are pad rows),
+    ``sparsity [P, nb, E]`` (one-hot of ``eblk``: exactly ``nb`` nonzeros per chip), ``cblk [P, nb, C]`` (with ``pn``),
+    ``need`` (blocks the busiest chip needs). Rows are sorted by (local expert, token): expert ``e``'s rows start at a
+    block boundary, its tokens ascending -- the dense path's expert order, so the combine adds a token's expert terms
+    in the same order."""
+    import torch
+
+    S, K = (int(v) for v in idx.shape)
+    P, E = (int(v) for v in local_ids.shape)
+    mb, nb = int(mb), int(nb)
+    R = nb * mb
+    pe = _slots(idx, local_ids)  # slot p * E + e of every (token, k)
+    t = torch.arange(S, dtype=torch.long).repeat_interleave(K)
+    cnt = torch.bincount(pe, minlength=P * E)  # [P * E]
+    nblk = (cnt + mb - 1) // mb
+    need = int(nblk.reshape(P, E).sum(1).max())
+    if need > nb:
+        raise ValueError(f"{nb} blocks of {mb} rows hold fewer rows than the busiest chip needs ({need} blocks)")
+    blk_end = nblk.reshape(P, E).cumsum(1)  # [P, E]
+    blk_off = (blk_end - nblk.reshape(P, E)).reshape(-1)  # [P * E] first block of each slot
+    order = torch.argsort(pe * S + t)  # unique keys: (slot, token) ascending
+    pe_s, t_s = pe[order], t[order]
+    w_s = w.reshape(-1).to(torch.float32)[order]
+    start = cnt.cumsum(0) - cnt  # first sorted index of each slot
+    rank = torch.arange(S * K, dtype=torch.long) - start[pe_s]
+    p_s = pe_s // E
+    row = blk_off[pe_s] * mb + rank
+    tok = torch.zeros(P, R, dtype=torch.int32)
+    tokv = torch.full((P, R), -1.0, dtype=torch.float32)
+    wv = torch.zeros(P, R, dtype=torch.float32)
+    tok[p_s, row] = t_s.to(torch.int32)
+    tokv[p_s, row] = t_s.to(torch.float32)
+    wv[p_s, row] = w_s
+    b = torch.arange(nb, dtype=torch.long)
+    eblk = (blk_end.unsqueeze(-1) <= b.view(1, 1, nb)).sum(1).clamp(max=E - 1)  # [P, nb]
+    sp = torch.nn.functional.one_hot(eblk, E).to(torch.float32)  # [P, nb, E]
+    out = dict(tok=tok, tokv=tokv, w=wv, eblk=eblk, sparsity=sp, need=need)
+    if pn is not None:
+        out["cblk"] = torch.gather(pn, 1, eblk.unsqueeze(-1).expand(P, nb, int(pn.shape[-1])))
+    return out
+
+
+def compact_upload_fast(idx, g2s, P: int, E: int, mb: int, ladder: Tuple[int, ...], pn_bits, rows_m: int):
+    """The serving path's host metadata in one numpy pass (B2a): ``(need, nb, u)`` with ``u`` the ``[P, 4, nb * mb]``
+    int32 upload of :meth:`MotifMoE._compact_device` -- word for word what ``compact_upload_rows(compact_prefill_meta(
+    ...))`` builds (tested) -- or ``(need, None, None)`` when the busiest chip needs more blocks than the ladder's cap.
+
+    ``idx [S, K]`` int (global expert ids), ``g2s`` the global id -> slot ``p * E + e`` table (:func:`_global_to_slot`,
+    numpy), ``pn_bits [P, E, 4]`` int32 bf16 bit patterns of the per-expert constants, ``rows_m`` the chunk size M (the
+    pad rows' combine key, and the stride of the routing-weight gather index ``e M + t``)."""
+    import numpy as np
+
+    K = int(np.asarray(idx).shape[-1])
+    idx = np.asarray(idx).reshape(-1).astype(np.int64, copy=False)
+    S_K = idx.size
+    pad_key = int(rows_m)
+    if S_K and (int(idx.min()) < 0 or int(idx.max()) >= g2s.size):
+        raise ValueError("a routed expert id is not any chip's local expert")
+    pe = g2s[idx]
+    if S_K and int(pe.min()) < 0:
+        raise ValueError("a routed expert id is not any chip's local expert")
+    cnt = np.bincount(pe, minlength=P * E)
+    nblk = ((cnt + (mb - 1)) // mb).reshape(P, E)
+    need = int(nblk.sum(1).max()) if S_K else 0
+    nb = compact_bucket(need, ladder)
+    if nb is None:
+        return need, None, None
+    rows = int(nb) * int(mb)
+    order = np.argsort(pe, kind="stable")  # flattened order is token-major: tokens ascending within each slot
+    pe_s = pe[order]
+    start = np.cumsum(cnt) - cnt
+    blk_end = np.cumsum(nblk, axis=1)
+    blk_off = (blk_end - nblk).reshape(-1)
+    row = blk_off[pe_s] * mb + (np.arange(S_K) - start[pe_s])
+    flat = (pe_s // E) * (4 * rows) + row
+    t_s = (order // K).astype(np.int32)
+    u = np.zeros((P, 4, rows), dtype=np.int32)
+    u[:, 1, :] = int(pad_key)
+    uf = u.reshape(-1)
+    uf[flat] = t_s
+    uf[flat + rows] = t_s
+    uf[flat + 2 * rows] = (pe_s % E).astype(np.int32) * int(pad_key) + t_s
+    eblk = np.minimum((blk_end[:, :, None] <= np.arange(nb)[None, None, :]).sum(1), E - 1)  # [P, nb]
+    blk = np.zeros((P, int(nb), 32), dtype=np.int32)
+    np.put_along_axis(blk, eblk[:, :, None], 0x3F80, axis=2)  # bf16 1.0 at the block's expert
+    blk[:, :, 16:20] = np.take_along_axis(pn_bits, eblk[:, :, None], axis=1)
+    u[:, 3, : 32 * int(nb)] = blk.reshape(P, -1)
+    return need, int(nb), u
+
+
+class CompactPrefillState:
+    """State the compacted prefill MoE layers of one model share (B2a): the per-chip upload mapper, the host copy of the
+    chips' local expert ids, the combine's token-index columns per chunk size, the (rows, blocks) shapes compiled so far
+    and counters.
+
+    ``frozen`` (a callable; the generator sets it to "a decode trace is captured"): while it returns True only the
+    shapes :meth:`MotifMoE.warm_compact` compiled run compacted; any other chunk falls back to the dense path (compiled
+    by the same warm-up), so nothing compiles after the decode trace capture (F3N rule R2). Before a capture (tests,
+    scripts, the warm-up itself) every shape compiles on first use. ``owner``: the object that frees :attr:`iota`."""
+
+    def __init__(self, owner=None):
+        self.owner = owner
+        self.mapper = None
+        self.local_ids = None  # torch [P, E] long
+        self.iota: Dict[int, object] = {}  # rows -> [1, 1, rows, 1] fp32 TILE (0 .. rows-1), replicated
+        self.warmed = set()  # (rows, mb, nb)
+        self.frozen = lambda: False
+        self.stats: Dict[str, int] = {"compact": 0, "dense_cap": 0, "dense_unwarmed": 0}
+        self.blocks: Dict[Tuple[int, int, int], int] = {}  # (rows, mb, nb) -> calls
+        self.host_bufs: Dict[tuple, object] = {}  # (shape, dtype, layout) -> host staging tensor of the routes read
+        self.g2s = None  # numpy global expert id -> slot p * E + e
+
+    def allows(self, rows: int, mb: int, nb: int) -> bool:
+        return (int(rows), int(mb), int(nb)) in self.warmed or not self.frozen()
+
+    def deallocate(self) -> None:
+        for t in self.iota.values():
+            _free(t)
+        self.iota = {}
+        self.host_bufs = {}
 
 
 # Local program-config helper (README §10 rule 1 wants ``cfg.*_pc()`` builders): requested shared change -- move it
@@ -757,6 +1013,7 @@ class MotifMoE:
         router_mask: Optional[str] = None,
         decode_experts: Optional[str] = None,
         moe_polynorm: Optional[str] = None,
+        prefill_moe: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -898,6 +1155,16 @@ class MotifMoE:
                 if moe_polynorm is not None:
                     raise
                 self.moe_polynorm = "composite"
+
+        # ---- B2a compacted prefill experts: "dense" | "compact" (host copies read lazily; no device constants) ----------
+        self.prefill_moe = resolve_prefill_moe(prefill_moe, cfg, combine_mode=self.combine_mode,
+                                               prefill_polynorm=self.prefill_polynorm,
+                                               prefill_polynorm_impl=self.prefill_polynorm_impl)
+        self.prefill_moe_block = str(getattr(cfg, "prefill_moe_block", "auto"))
+        self.prefill_moe_min_rows = int(getattr(cfg, "prefill_moe_min_rows", 1024))
+        self.compact_state = CompactPrefillState(owner=self)  # MotifModel hands every layer one shared state
+        self._pn_host = None  # [P, 12, 4] fp32 (bf16 values): this layer's c0, c1, c2, b per chip
+        self._pn_bits = None  # the same as int32 bf16 bit patterns (numpy), for compact_upload_fast
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
@@ -1052,6 +1319,11 @@ class MotifMoE:
             )
         else:
             idx, w = self.router(f, scale=self.internal_route_scale, memory_config=mc)
+            if not decode and taps is None and self.compact_applies(M):
+                part = self._compact_partial(f, idx, w)  # None: the dense path below (beyond the cap / not warmed)
+                if part is not None:
+                    _free(idx, w)
+                    return part
             w_loc = self.local_weights(idx, w, memory_config=mc)
             if taps is not None:
                 taps["idx"], taps["w"] = idx, w
@@ -1082,6 +1354,283 @@ class MotifMoE:
         if taps is None:
             _free(w_loc)
         return part
+
+    # ==========================================================================================================
+    # B2a: token-compacted prefill experts
+    # ==========================================================================================================
+    def compact_applies(self, rows: int) -> bool:
+        """This module runs a prefill chunk of ``rows`` rows compacted (``prefill_moe="compact"`` and ``rows >=
+        prefill_moe_min_rows``)."""
+        return getattr(self, "prefill_moe", "dense") == "compact" and int(rows) >= int(self.prefill_moe_min_rows)
+
+    def _mesh_rc(self) -> Tuple[int, int]:
+        R, C = (int(v) for v in tuple(self.mesh_device.shape))
+        return R, C
+
+    def prepare_compact(self) -> None:
+        """Host copies the compacted path needs, read once (eager; the generator's warm-up reads every layer's before
+        the decode capture): the chips' local expert ids (shared by all layers) and this layer's bf16 PolyNorm
+        constants ``[P, 12, 4]``; plus the per-chip upload mapper."""
+        import torch
+
+        st = self.compact_state
+        R, C = self._mesh_rc()
+        if st.mapper is None:
+            st.mapper = ttnn.create_mesh_mapper(
+                self.mesh_device,
+                ttnn.MeshMapperConfig([ttnn.PlacementShard(0), ttnn.PlacementShard(1)], ttnn.MeshShape(R, C)),
+            )
+        if st.local_ids is None:
+            ids = device_tensors_to_torch(self.local_ids, self.mesh_device).float().reshape(R * C, self.e_loc)
+            st.local_ids = ids.round().long()
+        if st.g2s is None:
+            st.g2s = _global_to_slot(st.local_ids).numpy()
+        if self._pn_host is None:
+            c = self.pn_consts.c["bf16"]
+            self._pn_host = torch.stack(
+                [device_tensors_to_torch(c[k], self.mesh_device).float().reshape(R * C, self.e_loc)
+                 for k in ("c0", "c1", "c2", "b")], dim=-1)  # fmt: skip
+        if getattr(self, "_pn_bits", None) is None:
+            self._pn_bits = (self._pn_host.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF).numpy()
+
+    def _iota(self, rows: int):
+        """The combine's token-index column ``[1, 1, rows, 1]`` fp32 (0 .. rows-1), one per chunk size (shared)."""
+        import torch
+
+        st = self.compact_state
+        t = st.iota.get(int(rows))
+        if t is None:
+            t = ttnn.from_torch(
+                torch.arange(int(rows), dtype=torch.float32).reshape(1, 1, int(rows), 1), dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT, device=self.mesh_device, memory_config=self.dram,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )  # fmt: skip
+            st.iota[int(rows)] = t
+        return t
+
+    def _read_routes(self, idx, rows: int):
+        """``idx`` of a prefill chunk -> host ``[rows, 8]`` int64 numpy of chip 0 (the routes are identical on every
+        chip): one blocking copy into a host staging tensor allocated once per spec. The routing weights stay on device
+        (the compacted rows gather them from ``w_loc``)."""
+        import torch
+
+        st = self.compact_state
+        key = (tuple(idx.shape), idx.dtype, idx.layout)
+        h = st.host_bufs.get(key)
+        if h is None:
+            h = st.host_bufs[key] = ttnn.allocate_tensor_on_host(idx.spec, self.mesh_device)
+        ttnn.copy_device_to_host_tensor(idx, h, blocking=True)
+        hi = ttnn.to_torch(ttnn.get_device_tensors(h)[0]).reshape(-1, self.top_k)[:rows]
+        return hi.to(torch.int64).numpy()
+
+    def _compact_partial(self, f, idx, w):
+        """``local_partial`` of a prefill chunk, compacted (B2a): read the routes from chip 0 (they are identical on
+        every chip), build each chip's row lists on the host (:func:`compact_prefill_meta`), run
+        :meth:`_compact_device`. Returns None when the busiest chip needs more blocks than the ladder's cap, or when the
+        shape was not compiled by :meth:`warm_compact` and the state requires it: the caller runs the dense path on the
+        same routes (bitwise the same result)."""
+        st = self.compact_state
+        M = int(f.shape[-2])
+        mb = compact_block(M, self.prefill_moe_block)
+        self.prepare_compact()
+        hi = self._read_routes(idx, M)
+        R, C = self._mesh_rc()
+        need, nb, u = compact_upload_fast(hi, st.g2s, R * C, self.e_loc, mb, compact_ladder(M, mb, self.e_loc),
+                                          self._pn_bits, M)
+        if nb is None:
+            st.stats["dense_cap"] += 1
+            return None
+        if not st.allows(M, mb, nb) or (st.frozen() and M not in st.iota):
+            st.stats["dense_unwarmed"] += 1
+            return None
+        part = self._compact_device(f, idx, w, u, mb, nb)
+        st.stats["compact"] += 1
+        st.blocks[(M, mb, nb)] = st.blocks.get((M, mb, nb), 0) + 1
+        return part
+
+    @staticmethod
+    def compact_upload_rows(meta: Dict[str, object], rows_m: int, mb: int, nb: int):
+        """The single per-chip upload of :meth:`_compact_device` from :func:`compact_prefill_meta`'s lists (the
+        reference packer; serving uses :func:`compact_upload_fast`): ``[P, 4, rows]`` int64 holding uint32 words below
+        2^31: row 0 the row tokens (embedding indices; pad rows 0), row 1 the combine keys as integers (the token, or
+        ``rows_m`` -- the chunk size M, which no token equals -- for pad rows), row 2 the routing-weight gather index
+        ``e M + t`` into this chip's ``w_loc`` (pad rows 0), row 3 per block ``[sparsity (12) | 0 (4) | c0 c1 c2 b |
+        0 (12)]`` as bf16 bit patterns (< 2^16; 32 words per block, ``nb`` blocks; the rest 0). Only integers and bf16
+        bit patterns travel: ``ttnn.bitcast`` to fp32 is not exact on device (its unpack truncates the mantissa), the
+        uint32 -> uint16 typecast and the 16-bit bitcast are."""
+        import torch
+
+        tok = meta["tok"]
+        P, rows = (int(v) for v in tok.shape)
+        E = int(meta["sparsity"].shape[-1])
+        if rows != int(nb) * int(mb) or E > 16 or 32 * int(nb) > rows:
+            raise ValueError(f"compact upload: {rows} rows for {nb} x {mb}, {E} experts")
+        valid = meta["tokv"] >= 0
+        erow = meta["eblk"].repeat_interleave(int(mb), dim=1)  # [P, rows] local expert of every row
+        blk = torch.zeros(P, int(nb), 32, dtype=torch.float32)
+        blk[:, :, :E] = meta["sparsity"]
+        blk[:, :, 16:20] = meta["cblk"]
+        b16 = blk.to(torch.bfloat16)
+        if not torch.equal(b16.float(), blk):
+            raise ValueError("compact upload: block constants must be bf16 values")
+        u = torch.zeros(P, 4, rows, dtype=torch.int64)
+        u[:, 0] = tok.to(torch.int64)
+        u[:, 1] = torch.where(valid, meta["tokv"].to(torch.int64), torch.full_like(u[:, 1], int(rows_m)))
+        u[:, 2] = torch.where(valid, erow * int(rows_m) + tok.to(torch.int64), torch.zeros_like(u[:, 2]))
+        u[:, 3, : 32 * int(nb)] = b16.reshape(P, -1).view(torch.int16).to(torch.int64) & 0xFFFF
+        return u
+
+    def _compact_device(self, f, idx, w, u, mb: int, nb: int):
+        """Device half of the compacted prefill experts for the chunk ``f [1, 1, M, 4096]`` (identical on all chips),
+        its routes ``(idx, w)`` (the router's; not consumed) and the upload words ``u [P, 4, nb * mb]``
+        (:func:`compact_upload_fast`, or :meth:`compact_upload_rows` of :func:`compact_prefill_meta`'s lists) -> this
+        chip's partial ``[1, 1, M, 4096]`` in ``combine_dtype`` (DRAM), bitwise equal to the dense path's.
+
+        One upload (per-chip shards, uint32 ROW_MAJOR ``[1, 1, 4, R]``; integer uploads are ~3x cheaper than fp32 ones),
+        unpacked with exact ops only (uint32 tilize, slices, the integer keys typecast to fp32, the block row's bf16 bit
+        patterns typecast to uint16 and ``bitcast`` to bf16). The routing weights of the rows are gathered from this
+        chip's ``w_loc`` (the dense path's :meth:`local_weights`, transposed: an exact fp32 copy) at ``e M + t``.
+        Then: gather the rows (``ttnn.embedding`` of the untilized chunk: an exact copy) -> ``[1, nb, mb, 4096]``; gate_up
+        with ``ttnn.sparse_matmul`` (``b`` sparse, one expert per block: ``nnz = nb`` exactly, compact output) at the
+        decode experts' program configs for ``mb`` rows; the grouped PolyNorm on the blocks with per-block constants and
+        the routing weights folded into ``up`` (the dense path's ops on the same values); down with ``sparse_matmul``;
+        combine ``P^T [M, R] @ y [R, 4096]`` with ``P^T[t, j] = (key[j] == t)`` (rows in expert order, so a token's
+        expert terms add in the dense order; pad rows have key ``M``, which matches no token)."""
+        import numpy as np
+        import torch
+
+        st = self.compact_state
+        M = int(f.shape[-2])
+        H, I, E = self.hidden, self.inter, self.e_loc
+        R, C = self._mesh_rc()
+        rows = int(nb) * int(mb)
+        dram = self.dram
+
+        if isinstance(u, np.ndarray):
+            u = torch.from_numpy(u)
+        if tuple(u.shape) != (R * C, 4, rows):
+            raise ValueError(f"compact upload of shape {tuple(u.shape)}, want {(R * C, 4, rows)}")
+        U = ttnn.from_torch(u.reshape(R, C, 4, rows).to(torch.int32), dtype=ttnn.uint32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device, memory_config=dram,
+                            mesh_mapper=st.mapper)  # [1, 1, 4, rows] per chip
+        # gather the routed rows
+        tix = ttnn.slice(U, [0, 0, 0, 0], [1, 1, 1, rows], memory_config=dram)  # uint32 ROW_MAJOR
+        x_rm = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        X = ttnn.embedding(tix, x_rm, layout=ttnn.TILE_LAYOUT, memory_config=dram)
+        _free(x_rm, tix)
+        X = _reshape(X, (1, nb, mb, H))
+        # block sparsity / PolyNorm constants (bf16 bit patterns)
+        blk = ttnn.slice(U, [0, 0, 3, 0], [1, 1, 4, 32 * nb], memory_config=dram)
+        blk = _reshape(blk, (1, nb, 1, 32))
+        bt = ttnn.to_layout(blk, ttnn.TILE_LAYOUT, memory_config=dram)
+        _free(blk)
+        b16 = ttnn.typecast(bt, ttnn.uint16, memory_config=dram)  # exact: every word < 2^16
+        _free(bt)
+        bb = ttnn.bitcast(b16, ttnn.bfloat16, memory_config=dram)
+        _free(b16)
+        cblk = {k: ttnn.slice(bb, [0, 0, 0, 16 + i], [1, nb, 1, 17 + i], memory_config=dram)
+                for i, k in enumerate(("c0", "c1", "c2", "b"))}  # fmt: skip
+        brm = ttnn.to_layout(bb, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        _free(bb)
+        sp = ttnn.slice(brm, [0, 0, 0, 0], [1, nb, 1, E], memory_config=dram)  # [1, nb, 1, 12] bf16 ROW_MAJOR
+        _free(brm)
+        # combine keys (integers -> fp32) and the rows' routing weights (gathered from w_loc)
+        Ut = ttnn.to_layout(U, ttnn.TILE_LAYOUT, memory_config=dram)
+        _free(U)
+        k32 = ttnn.slice(Ut, [0, 0, 1, 0], [1, 1, 2, rows], memory_config=dram)
+        gi = ttnn.slice(Ut, [0, 0, 2, 0], [1, 1, 3, rows], memory_config=dram)
+        _free(Ut)
+        keys = ttnn.typecast(k32, ttnn.float32, memory_config=dram)  # exact: integers <= M
+        _free(k32)
+        w_loc = self.local_weights(idx, w, memory_config=dram)  # [1, 12, M, 1] fp32, as the dense path
+        wT = ttnn.transpose(w_loc, -2, -1, memory_config=dram)  # [1, 12, 1, M] (exact)
+        _free(w_loc)
+        wT = _reshape(wT, (1, 1, 1, E * M))
+        wrow = ttnn.gather(wT, -1, gi, memory_config=dram)  # [1, 1, 1, rows] fp32 (exact copy)
+        _free(wT, gi)
+        wcol = ttnn.transpose(wrow, -2, -1, memory_config=dram)  # [1, 1, rows, 1]
+        _free(wrow)
+        wcol = _reshape(wcol, (1, nb, mb, 1))
+
+        # experts on the blocks
+        m_tiles = int(mb) // TILE
+        pc_gu = self.cfg.experts_gate_up_pc(m_tiles=m_tiles)
+        pc_dn = self.cfg.experts_down_pc(m_tiles=m_tiles)
+        gu_dtype = self.gate_up_dtype or ttnn.bfloat16
+        gu = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, 2 * I]), gu_dtype, ttnn.TILE_LAYOUT,
+                                            self.mesh_device, dram)
+        gu = ttnn.sparse_matmul(
+            X, self.w_gate_up, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
+            program_config=pc_gu, compute_kernel_config=self.ckc_experts, dtype=gu_dtype, memory_config=dram,
+            optional_output_tensor=gu,
+        )  # fmt: skip
+        _free(X)
+        g = ttnn.slice(gu, [0, 0, 0, 0], [1, nb, mb, I], memory_config=dram)
+        up = ttnn.slice(gu, [0, 0, 0, I], [1, nb, mb, 2 * I], memory_config=dram)
+        _free(gu)
+        us = ttnn.multiply(wcol, up, memory_config=dram)  # A = w (fp32): fp32 product, broadcast over cols
+        _free(up, wcol)
+        h = _pn.grouped_polynorm(g, cblk, inter=I, mode="bf16", eps=self.cfg.polynorm_eps,
+                                 compute_kernel_config=self.ckc_polynorm, memory_config=dram, up=us, impl="rms",
+                                 intermediate_memory_config=dram)
+        _free(g, us, *cblk.values())
+        y = ttnn.allocate_tensor_on_device(ttnn.Shape([1, nb, mb, H]), self.down_dtype, ttnn.TILE_LAYOUT,
+                                           self.mesh_device, dram)
+        y = ttnn.sparse_matmul(
+            h, self.w_down, sparsity=sp, nnz=int(nb), is_input_a_sparse=False, is_input_b_sparse=True,
+            program_config=pc_dn, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype, memory_config=dram,
+            optional_output_tensor=y,
+        )  # fmt: skip
+        _free(h, sp)
+        y = _reshape(y, (1, 1, rows, H))
+
+        # combine: P^T [M, rows] (one-hot of each row's token) @ y
+        PT = ttnn.eq(keys, self._iota(M), dtype=ttnn.bfloat16, memory_config=dram)
+        _free(keys)
+        part = ttnn.matmul(PT, y, compute_kernel_config=self.ckc_experts, dtype=self.combine_dtype,
+                           memory_config=dram)
+        _free(PT, y)
+        return part
+
+    def warm_compact(self, rows: int) -> Tuple[int, ...]:
+        """Warm-up (before the decode capture): compile the prefill local partial of a ``rows``-row chunk on the dense
+        path (the fallback) and on the compacted path at every block count of its ladder (synthetic row lists: pad rows
+        only, so nothing is combined), and create the chunk size's combine column. Marks the shapes warmed in the shared
+        state (every MoE layer runs the same programs). Returns the ladder."""
+        import torch
+
+        st = self.compact_state
+        M = int(rows)
+        mb = compact_block(M, self.prefill_moe_block)
+        ladder = compact_ladder(M, mb, self.e_loc)
+        self.prepare_compact()
+        self._iota(M)
+        R, C = self._mesh_rc()
+        P = R * C
+        x = ttnn.from_torch(
+            torch.zeros(1, 1, M, self.hidden), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device,
+            memory_config=self.dram, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )  # fmt: skip
+        try:
+            idx, w = self.router(x, scale=self.internal_route_scale, memory_config=self.dram)
+            w_loc = self.local_weights(idx, w, memory_config=self.dram)
+            y = self.experts(x, polynorm=self.prefill_polynorm, decode=False, row_scale=w_loc, memory_config=self.dram)
+            _free(w_loc)
+            _free(self.reduce_experts(y, memory_config=self.dram), y)
+            for nb in ladder:
+                eblk = (torch.arange(nb) % self.e_loc).unsqueeze(0).expand(P, nb)
+                meta = dict(
+                    tok=torch.zeros(P, nb * mb, dtype=torch.int32), tokv=torch.full((P, nb * mb), -1.0),
+                    w=torch.zeros(P, nb * mb), eblk=eblk,
+                    sparsity=torch.nn.functional.one_hot(eblk, self.e_loc).to(torch.float32),
+                    cblk=torch.gather(self._pn_host, 1, eblk.unsqueeze(-1).expand(P, nb, 4)),
+                )  # fmt: skip
+                _free(self._compact_device(x, idx, w, self.compact_upload_rows(meta, M, mb, nb), mb, nb))
+                st.warmed.add((M, mb, int(nb)))
+            _free(idx, w)
+        finally:
+            _free(x)
+        return ladder
 
     # ==========================================================================================================
     # B1: sparse decode experts
@@ -1301,8 +1850,14 @@ class MotifMoE:
         if getattr(self, "pn_fused", None) is not None:
             self.pn_fused.deallocate()
             self.pn_fused = None
+        st = getattr(self, "compact_state", None)
+        if st is not None and getattr(st, "owner", None) is self:
+            st.deallocate()
 
 
-__all__ = ["COMBINE_MODES", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MOE_POLYNORM_MODES",
-           "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc",
-           "resolve_decode_experts", "resolve_moe_polynorm", "wide_decode_rows"]
+__all__ = ["COMBINE_MODES", "CompactPrefillState", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS",
+           "MOE_POLYNORM_MODES", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "compact_block",
+           "compact_bucket", "compact_ladder", "compact_need_blocks", "compact_prefill_meta", "compact_upload_fast",
+           "grouped_polynorm",
+           "prefill_experts_pc", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
+           "wide_decode_rows"]
