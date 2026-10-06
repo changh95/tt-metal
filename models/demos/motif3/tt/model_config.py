@@ -110,8 +110,10 @@ MHC_SINKHORN_IMPLS = ("motif", "stock")  # MHCSite(sinkhorn=...)
 ROUTER_LOGITS_IMPLS = ("composite", "exact_fp32")  # MotifMoE(router_logits=...)
 # Decode routing-weight path (A5, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(router_mask=...)): "gather" (the release:
 # ttnn.gather of the top-8 scores + idx-based local mask) | "scatter" (MotifRouter.route_local: top-8 0/1 mask scattered
-# from topk's idx, local one-hot extraction; same top-8 sets, weights within 1-4 fp32 ulp, -1.7 to -2.0 ms per step).
-ROUTER_MASK_MODES = ("gather", "scatter")
+# from topk's idx, local one-hot extraction; same top-8 sets, weights within 1-4 fp32 ulp, -1.7 to -2.0 ms per step) |
+# "fused" (B4: MotifRouter.route_fused, the router matmul + one generic_op kernels/router_topk.py for bias, top-8,
+# normalize and local extraction; same sets except on exact fp32 ties at the 8th value, weights within fp32 rounding).
+ROUTER_MASK_MODES = ("gather", "scatter", "fused")
 # Decode routed experts (B1, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(decode_experts=...)): "dense" (the release: every
 # chip runs its 12 local experts on all M gathered rows) | "sparse" (ttnn.sparse_matmul skips the local experts no live
 # row routes to; sparsity read on device, nnz=None; inactive lanes masked out of the routing weights). Live rows are
@@ -1334,8 +1336,9 @@ class MotifTTConfig:
     # FlashMLA decode max_cores_per_head_batch on SWA layers (A2, docs/OPTIMIZATION_PLAN.md §3.3): 4 (bitwise equal to
     # the release's 16 on SWA, -0.2 ms per step); 16 restores the release config. Global layers keep 16.
     flash_mla_swa_mcph: int = FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA  # MOTIF3_FLASH_MLA_SWA_MCPH
-    # Decode routing weights (A5): "gather" (default, the release) | "scatter" (not bitwise equal to the release: off
-    # until the Validate gates decide, ROUTER_MASK_MODES). Prefill always takes the gather path.
+    # Decode routing weights (A5 / B4): "gather" (default, the release) | "scatter" (A5) | "fused" (B4); neither is
+    # bitwise equal to the release: off until the Validate gates decide, ROUTER_MASK_MODES. Prefill always takes the
+    # gather path.
     router_mask: str = "gather"  # MOTIF3_ROUTER_MASK
     # Decode routed experts (B1): "dense" (default, the release) | "sparse" (skip the local experts no live row routes
     # to; live rows bitwise equal to "dense", DECODE_EXPERTS_MODES). Prefill is not affected.

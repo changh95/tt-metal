@@ -786,13 +786,15 @@ def test_flash_mla_swa_mcph_knob(monkeypatch):
 
 def test_router_mask_knob(monkeypatch):
     """A5 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/A5): ``MOTIF3_ROUTER_MASK`` selects the decode routing-weight
-    path, ``gather`` (default: the release) or ``scatter`` (``MotifRouter.route_local``; not bitwise equal to the
-    release, so off until the Validate gates); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    path, ``gather`` (default: the release), ``scatter`` (``MotifRouter.route_local``) or ``fused`` (B4,
+    ``MotifRouter.route_fused`` + ``kernels/router_topk``); neither is bitwise equal to the release, so both stay off
+    until the Validate gates; case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES
 
-    assert ROUTER_MASK_MODES == ("gather", "scatter")
+    assert ROUTER_MASK_MODES == ("gather", "scatter", "fused")
     assert _cfg().router_mask == "gather" and "router_mask=gather" in _cfg().describe()
-    for v, want in (("scatter", "scatter"), (" Scatter ", "scatter"), ("gather", "gather"), ("", "gather")):
+    for v, want in (("scatter", "scatter"), (" Scatter ", "scatter"), ("gather", "gather"), ("", "gather"),
+                    ("fused", "fused"), (" FUSED ", "fused")):
         monkeypatch.setenv("MOTIF3_ROUTER_MASK", v)
         assert _cfg().router_mask == want, v
     monkeypatch.setenv("MOTIF3_ROUTER_MASK", "threshold")
@@ -800,6 +802,7 @@ def test_router_mask_knob(monkeypatch):
         _cfg()
     monkeypatch.delenv("MOTIF3_ROUTER_MASK")
     assert _cfg(router_mask="scatter").router_mask == "scatter"
+    assert _cfg(router_mask="fused").router_mask == "fused" and "router_mask=fused" in _cfg(router_mask="fused").describe()
     with pytest.raises(ValueError, match="router_mask"):
         _cfg(router_mask="ge")
 

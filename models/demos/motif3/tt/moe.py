@@ -42,6 +42,10 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    the 384 columns and extracts this chip's 12 weights with a constant one-hot (same top-8 sets incl. exact ties;
    weights within 1-4 fp32 ulp of the gather path; router + local mask 140 -> 104 us traced at M = 32,
    logs/opt/phaseA/A5).
+   B4 (``router_mask="fused"``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, results logs/opt/phaseB/B4): steps 2-3
+   as the router matmul + one ``generic_op`` (:meth:`MotifRouter.route_fused`,
+   :class:`~models.demos.motif3.tt.kernels.router_topk.FusedRouterTopK`, one core per gathered row): bias add on the
+   fp32 SFPU, top-8 by exact fp32 compares (exact ties: lower id), fp32 normalization, this chip's 12 weights.
    B1 (``decode_experts="sparse"``, ``MOTIF3_DECODE_EXPERTS``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, probe
    logs/opt/phaseA/M6): ``w_loc *= lane_mask`` (the step's gathered ``[1, 1, M, 1]`` fp32 0/1 mask of the live rows,
    :meth:`MotifMoE.decode_lane_mask`, built once per step by the model) so inactive lanes route nothing, then the
@@ -811,10 +815,9 @@ class MotifRouter:
             wn = ws
         return idx, wn
 
-    def _scores_topk(self, f, mc) -> Tuple[object, object, object]:
-        """The router head shared by :meth:`__call__` and :meth:`route_local`: ``f [1, 1, M, 4096]`` ->
-        ``(scores [1, 1, M, 384] fp32 = sigmoid(logits), biased = scores + expert_bias, idx [1, 1, M, 8])``, all in
-        ``mc`` (the top-k values are freed)."""
+    def _scores(self, f, mc):
+        """``f [1, 1, M, 4096]`` -> ``scores [1, 1, M, 384]`` fp32 ``= sigmoid(logits)`` in ``mc``: the matmul part of
+        the router head, shared by :meth:`_scores_topk` and :meth:`route_fused`."""
         M = int(f.shape[-2])
         exact = self._use_logits_fn(f)
         pc, pc_sigmoid = self._decode_pcs(M)
@@ -835,6 +838,14 @@ class MotifRouter:
             logits = self.route_logits(f, memory_config=mc)
             scores = ttnn.sigmoid(logits, memory_config=mc)
             _free(logits)
+        return scores
+
+    def _scores_topk(self, f, mc) -> Tuple[object, object, object]:
+        """The router head shared by :meth:`__call__` and :meth:`route_local`: ``f [1, 1, M, 4096]`` ->
+        ``(scores [1, 1, M, 384] fp32 = sigmoid(logits), biased = scores + expert_bias, idx [1, 1, M, 8])``, all in
+        ``mc`` (the top-k values are freed)."""
+        M = int(f.shape[-2])
+        scores = self._scores(f, mc)
         biased = ttnn.add(scores, self.bias, memory_config=mc)
         pad = self._pads.get(M)
         if pad is not None:  # power-of-two width -> multi-core topk (pads are -inf: never selected)
@@ -845,6 +856,28 @@ class MotifRouter:
             vals, idx = ttnn.topk(biased, k=self.top_k, dim=-1, largest=True, sorted=self.topk_sorted, memory_config=mc)
         _free(vals)
         return scores, biased, idx
+
+    def route_fused(self, f, kernel, *, scale: Optional[float] = None, taps: Optional[dict] = None,
+                    memory_config=None):
+        """B4 fused router tail (docs/OPTIMIZATION_PLAN.md §3.3 "A5 and B4"; ``router_mask="fused"``): this chip's
+        routing weights ``w_loc [1, E_loc, M, 1]`` fp32 from the router matmul (:meth:`_scores`, unchanged) and one
+        ``generic_op`` (``kernel``, :class:`~models.demos.motif3.tt.kernels.router_topk.FusedRouterTopK`) that adds
+        the bias on the fp32 SFPU (the op ``ttnn.add`` runs), selects the top-8 by exact fp32 compares (exact ties: the
+        lower expert id), normalizes over the 8 unbiased scores in fp32 and writes this chip's weights -- in place of
+        add, concat, topk and the gather / scatter mask ops. Decode row counts only. Same top-8 sets as
+        :meth:`__call__` except on exact fp32 ties at the 8th value; weights within fp32 rounding of the gather path
+        (not bitwise equal). ``taps`` (tests, eager) receives ``idx`` (``[1, 1, M, 8]`` uint32 ROW_MAJOR, rank order)
+        and ``scores`` (not freed)."""
+        mc = memory_config or self.dram
+        scale = self.route_scale if scale is None else float(scale)
+        scores = self._scores(f, mc)
+        if taps is not None:
+            w_loc, idx = kernel(scores, scale=scale, memory_config=mc, want_idx=True)
+            taps["idx"], taps["scores"] = idx, scores
+        else:
+            w_loc = kernel(scores, scale=scale, memory_config=mc)
+            _free(scores)
+        return w_loc
 
     def route_local(
         self,
@@ -973,7 +1006,11 @@ class MotifMoE:
             (the release: router ``(idx, w)`` + :meth:`local_weights`) | "scatter" (:meth:`MotifRouter.route_local`:
             no ``ttnn.gather``, same top-8 sets, weights within 1-4 fp32 ulp; about -35 us per layer). Prefill always
             takes the gather path. "scatter" builds its constants here (the local one-hot ``[1, 12, 1, 384]`` fp32 and,
-            per decode row count, the scatter's zeros / ones), before any trace capture (F3N rule R3).
+            per decode row count, the scatter's zeros / ones), before any trace capture (F3N rule R3). "fused" (B4):
+            :meth:`MotifRouter.route_fused`, the router matmul + one ``generic_op``
+            (:class:`~models.demos.motif3.tt.kernels.router_topk.FusedRouterTopK`: bias, top-8, normalize, local
+            extraction) at the decode row counts; same top-8 sets except on exact fp32 ties at the 8th value (lower id
+            wins), weights within fp32 rounding of the gather path; no device constants.
         moe_polynorm: decode routed-expert PolyNorm (B3; ``None`` = ``cfg.moe_polynorm``, ``MOTIF3_MOE_POLYNORM``):
             "composite" (the release, ``polynorm_impl``) | "fused" (one ``generic_op``,
             :class:`~models.demos.motif3.tt.kernels.moe_polynorm.FusedGroupedPolyNorm`, at the decode row counts 32 /
@@ -1137,6 +1174,14 @@ class MotifMoE:
 
             for m in self.decode_rows:
                 self.scatter_consts[m] = (rm(torch.zeros(1, 1, m, self.n_experts)), rm(torch.ones(1, 1, m, self.top_k)))
+
+        # ---- B4 fused router tail (decode only): program descriptors only, no device memory (reads router.bias and
+        # local_ids); the program compiles on the first eager decode call, before any capture
+        self.router_fused = None
+        if self.router_mask == "fused":
+            from .kernels.router_topk import FusedRouterTopK  # lazy: generic_op kernel, decode shapes only
+
+            self.router_fused = FusedRouterTopK(mesh_device, self.router.bias, self.local_ids, top_k=self.top_k)
 
         # ---- B1 decode experts: "dense" | "sparse" (no device constants) ----------------------------------------------
         self.decode_experts = resolve_decode_experts(decode_experts, cfg, self.combine_mode)
@@ -1304,7 +1349,8 @@ class MotifMoE:
         experts, combine -> ``[1, 1, M, 4096]`` in ``combine_dtype``, DRAM (still to be summed over all 32 chips).
         ``memory_config``: intermediates (decode: L1). ``taps`` (tests) receives ``idx``, ``w`` (unscaled when
         ``route_scale`` is folded: multiply by ``route_scale / internal_route_scale`` to compare), ``w_loc``; with
-        ``router_mask="scatter"`` at a decode row count ``idx``, ``sel`` (the top-8 0/1 mask) and ``w_loc`` instead.
+        ``router_mask="scatter"`` at a decode row count ``idx``, ``sel`` (the top-8 0/1 mask) and ``w_loc`` instead; with
+        ``router_mask="fused"`` (B4) at a decode row count ``idx`` (ROW_MAJOR, rank order), ``scores`` and ``w_loc``.
 
         B1 (``decode_experts="sparse"``, decode row counts only): ``lane_mask`` (``[1, 1, M, 1]`` fp32 0/1, the
         step's live rows in gathered order; :meth:`decode_lane_mask`) zeroes the routing weights of inactive rows
@@ -1314,7 +1360,10 @@ class MotifMoE:
         mc = memory_config or self.dram
         M = int(f.shape[-2])
         consts = getattr(self, "scatter_consts", {}).get(M) if decode else None
-        if consts is not None:  # A5 "scatter" router mask at a decode row count (taps get idx, sel, w_loc; no "w")
+        fused = getattr(self, "router_fused", None) if decode and M in getattr(self, "decode_rows", ()) else None
+        if fused is not None:  # B4 fused router tail at a decode row count (taps get idx, scores, w_loc; no "w")
+            w_loc = self.router.route_fused(f, fused, scale=self.internal_route_scale, taps=taps, memory_config=mc)
+        elif consts is not None:  # A5 "scatter" router mask at a decode row count (taps get idx, sel, w_loc; no "w")
             w_loc = self.router.route_local(
                 f, self.local_mask, consts, scale=self.internal_route_scale, taps=taps, memory_config=mc
             )
@@ -1851,6 +1900,9 @@ class MotifMoE:
         if getattr(self, "pn_fused", None) is not None:
             self.pn_fused.deallocate()
             self.pn_fused = None
+        if getattr(self, "router_fused", None) is not None:
+            self.router_fused.deallocate()
+            self.router_fused = None
         st = getattr(self, "compact_state", None)
         if st is not None and getattr(st, "owner", None) is self:
             st.deallocate()

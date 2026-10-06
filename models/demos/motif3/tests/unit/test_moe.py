@@ -23,6 +23,12 @@ Host (CPU only; never touches the chips)::
 * ``test_moe_host_router_mask_scatter`` (A5): ``MotifRouter.route_local`` / ``local_partial`` with the ttnn ops
   emulated in torch: topk's sets (exact ties included) on every chip, weights equal to the gather path to fp32
   rounding, no ``ttnn.gather``, no leak or double free, the scatter path only at decode row counts with constants.
+* ``test_moe_host_router_fused_numerics`` (B4): ``kernels/router_topk.emulate_fp32`` (the fused router tail, bit for bit
+  the device kernel's algorithm) vs an independent fp64 / sort-based reference: the top-8 sets (exact ties: lower id),
+  the weights to fp32 rounding, every chip's local slice, M = 64 rows == M = 32 rows bitwise, the key order;
+  ``router_topk.plan`` refusals.
+* ``test_moe_host_router_fused_dispatch`` (B4): ``MotifRouter.route_fused`` (taps, frees) and ``local_partial`` taking it
+  only at decode row counts (before A5's scatter), ``deallocate``.
 * ``test_moe_host_sparse_decode_experts`` (B1): ``local_partial`` with ``decode_experts="sparse"`` and the ttnn ops
   emulated in torch: live rows bitwise == dense, inactive rows 0, the sparsity = the experts live rows route to,
   ``sparse_matmul`` with ``nnz=None`` and the dense program configs, no leak / double free, the dense path kept for
@@ -72,6 +78,9 @@ token below 0.999 against the reference routes must be a route flip.
       $S/devrun.sh -t 1500 -n moe_t64 -- python -m pytest models/demos/motif3/tests/unit/test_moe.py -s \
           -p no:cacheprovider -k t64_rows
 
+* ``test_moe_device_router_fused[composite|exact_fp32]`` (B4, ``router_mask="fused"``): the top-8 contract of the
+  fused router tail on every real token (sets == the gather path's, 100 %), the kernel == ``emulate_fp32`` bitwise,
+  synthetic exact ties, output vs gather, T64 rows == T32 rows, rerun and trace replay bitwise, traced cost.
 * ``test_moe_device_sparse_decode_experts`` (B1, ``decode_experts="sparse"``): real L2 / L35 weights and routes at
   M = 32 (1 / 8 / 32 live lanes) and M = 64 (2 / 16 / 64 live rows): live rows bitwise == dense, inactive rows exactly
   ``add_partial``, unmasked == dense on every row, the device lane mask == host, T64 rows == T32 rows, trace replays
@@ -716,7 +725,7 @@ def test_moe_host_router_mask_scatter(monkeypatch):
     import models.demos.motif3.tt.weights as W
     from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES, MotifTTConfig
 
-    assert ROUTER_MASK_MODES == ("gather", "scatter")
+    assert ROUTER_MASK_MODES == ("gather", "scatter", "fused")
     monkeypatch.delenv("MOTIF3_ROUTER_MASK", raising=False)  # the default, whatever the caller exported (review I-2)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
     assert cfg.router_mask == "gather"  # default off: the scatter weights are not bitwise equal to the release
@@ -842,6 +851,187 @@ def test_moe_host_router_mask_scatter(monkeypatch):
     seen.clear()
     M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 32, H]), polynorm="fp32", decode=True)
     assert seen == [("gather", 32)]
+
+
+def _router_fused_reference(scores, bias, k, scale):
+    """Independent reference for the B4 kernel: top-``k`` of ``scores + bias`` (fp32 values, ranked descending, exact
+    ties to the lower id, via Python sorting of fp64-exact values) and fp64 weights ``scale s / (sum s + 1e-20)``.
+    ``scores [M, E]`` fp32 -> ``(idx [M, k] long, w [M, k] fp64)``."""
+    b = (scores.float() + bias.float().reshape(1, -1)).double()  # fp32 sum (exact in fp64)
+    idx, w = [], []
+    for r in range(scores.shape[0]):
+        order = sorted(range(scores.shape[1]), key=lambda j: (-float(b[r, j]), j))[:k]
+        s = scores[r, order].double()
+        idx.append(order)
+        w.append(s / (s.sum() + 1e-20) * scale)
+    return torch.tensor(idx), torch.stack(w)
+
+
+@torch.no_grad()
+def test_moe_host_router_fused_numerics():
+    """B4 (docs/OPTIMIZATION_PLAN.md §3.3 "A5 and B4"; ``router_mask="fused"``), host side of the fused router tail
+    (``tt/kernels/router_topk.py``; the device kernel matches ``emulate_fp32`` bitwise on all 35,652 real token-layers,
+    logs/opt/phaseB/B4): on random fp32 scores with negative biases and exact ties at the 8th value (8th = 9th and
+    7th = 8th = 9th), M = 32 and 64:
+
+    * the top-8 ids equal the independent reference (rank by the fp32 biased value, exact ties -> lower id), 8 distinct
+      ids per row, rank order;
+    * the weights agree with fp64 ``s / sum(s)`` to fp32 rounding (rel <= 4 ulp), ``scale`` 2.0 doubles them exactly;
+    * every chip's ``w_loc`` slice (base ``12 k``, 12 experts) is the full row's slice, the union of the 32 chips is
+      the top-8 set, everything else exactly 0;
+    * rows are independent: the 64-row call's rows equal the two 32-row calls bitwise (the T64 contract);
+    * ``order_keys`` orders like the fp32 values (negatives, zeros, denormals) and ``plan`` refuses unsupported shapes."""
+    from models.demos.motif3.tt.kernels import router_topk as RT
+
+    E_, K_, El = 384, 8, 12
+    g = torch.Generator().manual_seed(11)
+    for M_ in (32, 64):
+        scores = torch.sigmoid(torch.randn(M_, E_, generator=g) * 2.0).float()
+        bias = ((torch.rand(E_, generator=g) - 0.6) * 0.2).float()
+        biased = scores + bias
+        ties = []
+        for r in range(0, M_, 7):  # 8th = 9th (and every 3rd of those also 7th = 8th)
+            order = torch.argsort(biased[r], descending=True)
+            a, b = int(order[7]), int(order[8])
+            scores[r, b] = biased[r, a] - bias[b]
+            if (scores[r, b] + bias[b]) != biased[r, a]:
+                continue  # not representable as an exact fp32 tie: skip this row
+            if r % 3 == 0:
+                c = int(order[6])
+                scores[r, c] = biased[r, a] - bias[c]
+            biased = scores + bias
+            ties.append(r)
+        srt = torch.sort(scores + bias, dim=-1, descending=True).values
+        n_ties = int((srt[:, 7] == srt[:, 8]).sum())
+        assert n_ties >= len(ties) // 2 > 0, (n_ties, ties)
+        w_full, idx = RT.emulate_fp32(scores.reshape(1, 1, M_, E_), bias, top_k=K_, base=0, e_loc=E_)
+        idx = idx.reshape(M_, K_)
+        w_full = w_full.reshape(E_, M_).t()  # [M, E]
+        ref_i, ref_w = _router_fused_reference(scores, bias, K_, 1.0)
+        assert torch.equal(idx, ref_i)
+        assert all(len(set(row.tolist())) == K_ for row in idx)
+        w_sel = torch.gather(w_full, 1, idx).double()
+        rel = ((w_sel - ref_w).abs() / ref_w).max()
+        assert rel <= 4 * 2.0 ** -24, float(rel)
+        assert int((w_full != 0).sum()) == M_ * K_
+        w2, _ = RT.emulate_fp32(scores.reshape(1, 1, M_, E_), bias, top_k=K_, base=0, e_loc=E_, scale=2.0)
+        assert torch.equal(w2.reshape(E_, M_).t(), w_full * 2.0)
+        union = torch.zeros(M_, E_, dtype=torch.bool)
+        for k in range(E_ // El):
+            wl, _ = RT.emulate_fp32(scores.reshape(1, 1, M_, E_), bias, top_k=K_, base=El * k, e_loc=El)
+            assert tuple(wl.shape) == (1, 1, El, M_, 1)
+            sl = wl.reshape(El, M_).t()
+            assert torch.equal(sl.view(torch.int32), w_full[:, El * k:El * (k + 1)].view(torch.int32))
+            union[:, El * k:El * (k + 1)] = sl != 0
+        assert torch.equal(union, torch.zeros(M_, E_, dtype=torch.bool).scatter_(1, idx, True))
+        if M_ == 64:
+            halves = [RT.emulate_fp32(scores[h * 32:(h + 1) * 32].reshape(1, 1, 32, E_), bias, top_k=K_, base=0,
+                                      e_loc=E_)[0].reshape(E_, 32).t() for h in (0, 1)]
+            assert torch.equal(torch.cat(halves).view(torch.int32), w_full.view(torch.int32))
+    vals = torch.tensor([-3.0, -1.0, -1e-40, -0.0, 0.0, 1e-40, 1e-30, 0.5, 1.0, 7.0], dtype=torch.float32)
+    keys = RT.order_keys(vals)
+    assert torch.equal(torch.argsort(keys), torch.arange(len(vals))) and len(set(keys.tolist())) == len(vals)
+    p = RT.plan(64, 384, 8, 12, (12, 10))
+    assert (p["R"], p["NT"], p["n_workers"]) == (2, 12, 64)
+    assert RT.plan(32, 384, 8, 48, (12, 10))["E_loc"] == 48  # (1, 8) submesh: 48 experts per chip
+    for bad in (dict(M=48), dict(M=128 * 2), dict(n_experts=100), dict(top_k=17), dict(e_loc=63)):
+        kw = dict(M=32, n_experts=384, top_k=8, e_loc=12, grid=(12, 10))
+        kw.update(bad)
+        with pytest.raises(ValueError, match="fused router"):
+            RT.plan(**kw)
+
+
+def test_moe_host_router_fused_dispatch(monkeypatch):
+    """B4 host side of the MoE wiring (no device): ``MotifRouter.route_fused`` runs the router matmul (``_scores``) and
+    the kernel with the module's internal route scale and memory config; without taps the scores are freed once and the
+    result is not; with taps ``idx`` / ``scores`` stay alive (the kernel is asked for ``idx``). ``local_partial`` takes
+    the fused path only at the module's decode row counts (before A5's scatter constants), the gather router for
+    prefill, for other row counts and without a kernel; ``deallocate`` releases the kernel."""
+    import models.demos.motif3.tt.moe as M
+    from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES
+
+    assert ROUTER_MASK_MODES == ("gather", "scatter", "fused")
+    freed, calls = [], []
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda t, *a, **k: freed.append(t))
+
+    class FakeKernel:
+        def __init__(self):
+            self.released = False
+
+        def __call__(self, scores, *, scale, memory_config, want_idx=False):
+            calls.append(("kernel", scores.tag, scale, memory_config, want_idx))
+            w = SimpleNamespace(tag="w_loc")
+            return (w, SimpleNamespace(tag="idx")) if want_idx else w
+
+        def deallocate(self):
+            self.released = True
+
+    r = object.__new__(M.MotifRouter)
+    r.route_scale, r.dram = 2.0, "dram"
+    r._scores = lambda f, mc: calls.append(("scores", mc)) or SimpleNamespace(tag="scores")
+    k = FakeKernel()
+    w = r.route_fused(SimpleNamespace(shape=[1, 1, 32, H]), k, scale=1.0, memory_config="L1")
+    assert w.tag == "w_loc" and calls == [("scores", "L1"), ("kernel", "scores", 1.0, "L1", False)]
+    assert [t.tag for t in freed] == ["scores"]
+    calls.clear(), freed.clear()
+    taps = {}
+    w = r.route_fused(SimpleNamespace(shape=[1, 1, 64, H]), k, taps=taps)
+    assert calls == [("scores", "dram"), ("kernel", "scores", 2.0, "dram", True)] and not freed
+    assert taps["idx"].tag == "idx" and taps["scores"].tag == "scores"
+
+    seen = []
+
+    class _R:
+        def route_fused(self, f, kern, **kw):
+            seen.append(("fused", kern))
+            return "WLOC_F"
+
+        def route_local(self, f, lm, c, **kw):
+            seen.append(("scatter", c))
+            return "WLOC_S"
+
+        def __call__(self, f, **kw):
+            seen.append(("gather", int(f.shape[-2])))
+            return "IDX", "W"
+
+    moe = object.__new__(M.MotifMoE)
+    moe.dram, moe.internal_route_scale, moe.combine_mode, moe.local_mask = "dram", 1.0, "fold", "LMASK"
+    moe.decode_rows, moe.router, moe.router_fused = (32, 64), _R(), "KERN"
+    moe.scatter_consts = {32: "C32", 64: "C64"}  # a fused module never has them; fused must win anyway
+    moe.experts = lambda f, **kw: "Y"
+    moe.reduce_experts = lambda y, **kw: "PART"
+    moe.local_weights = lambda i, w, **kw: "WLOC_G"
+    monkeypatch.setattr(M, "_free", lambda *a: None)
+    for m, decode, want in ((32, True, ("fused", "KERN")), (64, True, ("fused", "KERN")), (96, True, ("gather", 96)),
+                            (32, False, ("gather", 32)), (2048, False, ("gather", 2048))):
+        seen.clear()
+        t = {}
+        assert M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, m, H]), polynorm="fp32", decode=decode,
+                                        taps=t) == "PART"
+        assert seen == [want], (m, decode, seen)
+        assert ("w" in t) == (want[0] == "gather"), t
+    moe.decode_rows = (32,)  # a module without the T64 step: M = 64 is not a decode row count
+    seen.clear()
+    M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 64, H]), polynorm="fp32", decode=True)
+    assert seen == [("scatter", "C64")]
+    moe.router_fused, moe.decode_rows = None, (32, 64)
+    seen.clear()
+    M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 32, H]), polynorm="fp32", decode=True)
+    assert seen == [("scatter", "C32")]
+    del moe.router_fused  # a module built before B4 (no attribute)
+    moe.scatter_consts = {}
+    seen.clear()
+    M.MotifMoE.local_partial(moe, SimpleNamespace(shape=[1, 1, 32, H]), polynorm="fp32", decode=True)
+    assert seen == [("gather", 32)]
+    # deallocate releases the kernel (no device memory of its own)
+    moe2 = object.__new__(M.MotifMoE)
+    moe2.router = SimpleNamespace(deallocate=lambda: None)
+    moe2.pn_consts = SimpleNamespace(deallocate=lambda: None)
+    moe2.w_gate_up = moe2.w_down = moe2.local_ids = None
+    kk = FakeKernel()
+    moe2.router_fused = kk
+    M.MotifMoE.deallocate(moe2)
+    assert kk.released and moe2.router_fused is None
 
 
 @torch.no_grad()
@@ -3315,6 +3505,194 @@ def test_moe_device_router_mask_scatter(mesh_device, device_params, router_logit
             print(f"[moe] A5 L{layer} {router_logits}: T64 rows == T32 rows bitwise {t64_eq}, rerun bitwise {rerun_eq}")
             if not (t64_eq and rerun_eq):
                 failures.append(f"L{layer} {router_logits}: T64 rows {t64_eq} rerun {rerun_eq}")
+        old.deallocate()
+        new.deallocate()
+    assert not failures, failures
+
+
+@pytest.mark.parametrize("router_logits", ["composite", "exact_fp32"])
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_router_fused(mesh_device, device_params, router_logits):
+    """B4 (docs/OPTIMIZATION_PLAN.md §3.3 "A5 and B4"; ``router_mask="fused"``, ``tt/kernels/router_topk.py``; results
+    logs/opt/phaseB/B4), real weights from the serving TT cache, both routers, on the T64 config (32 and 64 rows):
+
+    * the top-8 contract: on every real router input (2971 tokens; all 11 captured layers with the composite router,
+      layer 2 with the exact one) the experts the fused path weights (union of ``w_loc`` over the 32 chips) are exactly
+      the gather path's, 8 per token (100 %), the kernel's ``idx`` is ttnn.topk's set, and the weights agree to
+      <= 1e-6 relative;
+    * the kernel is its host model: every chip's ``w_loc`` and the ``idx`` equal ``router_topk.emulate_fp32`` on the
+      device's scores bitwise (scores replicated on all chips);
+    * synthetic exact ties (composite run): 8th = 9th and 7th = 8th = 9th rows select the lower ids;
+    * the module output at M = 32 vs the gather module: PCC >= 0.99999, max |d| <= 2 bf16 ulp of the row's scale;
+    * T64: the 16-row step's rows bitwise equal the two 32-lane steps' rows, a rerun is bitwise, a trace replay with new
+      inputs equals eager; traced router + mask cost fused vs gather (informational). Prefill is not affected."""
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+    from models.demos.motif3.tt.kernels import router_topk as RT
+
+    cfg = t64_cfg(mesh_device)
+    fab = log_fabric(mesh_device, f"moe_router_fused_{router_logits}")
+    assert str(fab.get("committed")) == "TORUS_XY", fab
+    ccl = MotifCCL(mesh_device, cfg)
+    data = load_real_inputs()
+    layers = list(data["meta"]["layers"]) if router_logits == "composite" else [2]
+    L1 = ttnn.L1_MEMORY_CONFIG
+    E_loc = cfg.experts_per_chip
+    failures = []
+
+    def full_wloc(t, M):
+        a = device_tensors_to_torch(t, mesh_device)  # [R, C, 1, 12, M, 1]
+        out = torch.zeros(M, E, dtype=torch.float32)
+        for dp in range(cfg.dp):
+            for tp in range(cfg.tp):
+                k0 = E_loc * (cfg.tp * dp + tp)
+                out[:, k0:k0 + E_loc] = a[cfg.axes.coord(dp, tp)].reshape(E_loc, M).t().float()
+        return out
+
+    def chip0(t):
+        return ttnn.to_torch(ttnn.get_device_tensors(t)[0])
+
+    if router_logits == "composite":  # synthetic exact ties on the kernel alone (zero bias)
+        ids = moe_from_tt_cache(mesh_device, cfg, ccl, 2, router_mask="gather")
+        g = torch.Generator().manual_seed(0)
+        s = torch.rand(32, E, generator=g) * 0.5
+        srt = torch.sort(s, dim=-1, descending=True)
+        for r in range(16):
+            s[r, srt.indices[r, 8]] = s[r, srt.indices[r, 7]]
+        for r in range(16, 24):
+            s[r, srt.indices[r, 6]] = s[r, srt.indices[r, 7]]
+            s[r, srt.indices[r, 8]] = s[r, srt.indices[r, 7]]
+        st = upload_replicated(s.reshape(1, 1, 32, E), mesh_device, dtype=ttnn.float32)
+        zb = upload_replicated(torch.zeros(1, 1, 1, E), mesh_device, dtype=ttnn.float32)
+        kern = RT.FusedRouterTopK(mesh_device, zb, ids.local_ids, top_k=K)
+        w_t, i_t = kern(st, scale=1.0, memory_config=L1, want_idx=True)
+        ew, ei = RT.emulate_fp32(s.reshape(1, 1, 32, E), torch.zeros(E), top_k=K, base=0, e_loc=E)
+        ok_i = bool(torch.equal(chip0(i_t).reshape(32, K).long(), ei.reshape(32, K)))
+        ok_w = bool(torch.equal(full_wloc(w_t, 32).view(torch.int32), ew.reshape(E, 32).t().view(torch.int32)))
+        print(f"[moe] B4 synthetic ties: idx == emulation (lower id) {ok_i}, w_loc bitwise {ok_w}")
+        if not (ok_i and ok_w):
+            failures.append(f"synthetic ties: idx {ok_i} w {ok_w}")
+        _free([st, zb, w_t, i_t])
+        kern.deallocate()
+        ids.deallocate()
+
+    for layer in layers:
+        # explicit modes: neither module may follow MOTIF3_ROUTER_MASK (review I-2)
+        old = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits, router_mask="gather")
+        new = moe_from_tt_cache(mesh_device, cfg, ccl, layer, router_logits=router_logits, router_mask="fused")
+        assert old.router_mask == "gather" and old.router_fused is None
+        assert new.router_mask == "fused" and new.router_fused is not None and new.scatter_consts == {}
+        xs = data["layers"][layer]["x"]
+        n = xs.shape[0]
+        bias = chip0(new.router.bias).reshape(-1).float()[:E]
+        blocks = _decode_blocks(xs, mesh_device)
+        set_eq, idx_eq, emu_eq, max_rel, rep_ok = 0, 0, 0, 0.0, True
+        for bi, bt in enumerate(blocks):
+            nv = min(32, n - 32 * bi)
+            got = {}
+            taps_new = {}
+            for tag, m, taps in (("old", old, {}), ("new", new, taps_new)):
+                part = m.local_partial(bt, polynorm=m.decode_polynorm, decode=True, taps=taps, memory_config=L1)
+                got[tag] = full_wloc(taps["w_loc"], 32)[:nv]
+                if tag == "old":
+                    i_old = chip0(taps["idx"]).reshape(32, -1)[:nv, :K].long()
+                    _free([taps, part])
+                else:
+                    _free(part)
+            sc, same = read_replicated(taps_new["scores"], mesh_device)
+            rep_ok &= bool(same)
+            i_new = chip0(taps_new["idx"]).reshape(32, K).long()
+            _free(taps_new)
+            ew, ei = RT.emulate_fp32(sc.float().reshape(1, 1, 32, E), bias, top_k=K, base=0, e_loc=E,
+                                     scale=new.internal_route_scale)
+            ew = ew.reshape(E, 32).t()[:nv]
+            emu_eq += int(((ew.view(torch.int32) == got["new"].view(torch.int32)).all(-1)
+                           & (ei.reshape(32, K)[:nv] == i_new[:nv]).all(-1)).sum())
+            a, b = got["old"], got["new"]
+            ok = ((a != 0) == (b != 0)).all(-1) & ((b != 0).sum(-1) == K)
+            set_eq += int(ok.sum())
+            ma = torch.zeros(nv, E, dtype=torch.bool).scatter_(1, i_old, True)
+            mb = torch.zeros(nv, E, dtype=torch.bool).scatter_(1, i_new[:nv], True)
+            idx_eq += int((ma == mb).all(-1).sum())
+            nz = a != 0
+            if nz.any():
+                max_rel = max(max_rel, float(((a - b).abs()[nz] / a.abs()[nz]).max()))
+        _free(blocks)
+        print(f"[moe] B4 L{layer} {router_logits}: top-8 sets equal {set_eq}/{n}, idx sets {idx_eq}/{n}, kernel == "
+              f"emulation {emu_eq}/{n}, scores replicated {rep_ok}, max rel |dw| {max_rel:.2e}")
+        if set_eq != n or idx_eq != n or emu_eq != n or not rep_ok or max_rel > 1e-6:
+            failures.append(f"L{layer} {router_logits}: sets {set_eq} idx {idx_eq} emu {emu_eq} rep {rep_ok} "
+                            f"rel {max_rel:.2e} (n {n})")
+        if layer == layers[0]:
+            sel = spread_tokens(n, 64)
+            x64 = xs[sel]
+            outs = {}
+            for tag, m in (("old", old), ("new", new)):
+                x_tt = upload_lanes(x64[:32], cfg, mesh_device)
+                o = m.forward_decode(x_tt)
+                outs[tag] = device_tensors_to_torch(o, mesh_device).float()
+                _free([o, x_tt])
+            p = pcc(outs["old"].flatten(), outs["new"].flatten())
+            scale = outs["old"].abs().amax(-1, keepdim=True).clamp_min(1e-30)
+            rel = float(((outs["old"] - outs["new"]).abs() / scale).max())
+            print(f"[moe] B4 L{layer} {router_logits}: output vs gather PCC {p:.10f}, max |d| / row max {rel:.2e}")
+            if p < 0.99999 or rel > 2 * 2.0 ** -7:
+                failures.append(f"L{layer} {router_logits}: output PCC {p} rel {rel}")
+            halves = []
+            for half in (x64[:32], x64[32:]):
+                x_tt = upload_lanes(half, cfg, mesh_device)
+                o = new.forward_decode(x_tt)
+                halves.append(device_tensors_to_torch(o, mesh_device))
+                _free([o, x_tt])
+            reps = []
+            for _ in range(2):
+                x16 = upload_rows16(x64, cfg, mesh_device)
+                o = new.forward_decode(x16)
+                reps.append(device_tensors_to_torch(o, mesh_device))
+                _free([o, x16])
+            anchors, drafts = rows16_to_halves(reps[0], cfg)
+            t64_eq = bool(torch.equal(anchors, halves[0])) and bool(torch.equal(drafts, halves[1]))
+            rerun_eq = bool(torch.equal(reps[0], reps[1]))
+            # trace: capture the 64-row step once, replay with new tokens == eager
+            x16 = upload_rows16(x64, cfg, mesh_device)
+            _free(new.forward_decode(x16))  # compile before the capture (F3N rule R2)
+            trace_eq = []
+            with _Capture(mesh_device) as cap:
+                out_t = new.forward_decode(x16)
+            try:
+                for s0 in (1, 2):
+                    x_new = xs[spread_tokens(n - s0, 64) + s0]
+                    ttnn.copy_host_to_device_tensor(upload_rows16(x_new, cfg, mesh_device, device=False), x16)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    got_t = device_tensors_to_torch(out_t, mesh_device)
+                    o = new.forward_decode(x16)
+                    trace_eq.append(bool(torch.equal(got_t, device_tensors_to_torch(o, mesh_device))))
+                    _free(o)
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+                _free(out_t)
+            print(f"[moe] B4 L{layer} {router_logits}: T64 rows == T32 rows bitwise {t64_eq}, rerun bitwise {rerun_eq}"
+                  f", trace replay == eager {trace_eq}")
+            if not (t64_eq and rerun_eq and all(trace_eq)):
+                failures.append(f"L{layer} {router_logits}: T64 rows {t64_eq} rerun {rerun_eq} trace {trace_eq}")
+            if router_logits == "composite":  # traced cost (informational; slope method)
+                for M in (32, 64):
+                    xb = upload_replicated(xs[spread_tokens(n, M)], mesh_device)
+                    t_new = traced_stats(mesh_device, lambda: new.router.route_fused(
+                        xb, new.router_fused, scale=new.internal_route_scale, memory_config=L1), n=32, reps=7,
+                        adapt_to=128)
+
+                    def gather_path():
+                        i, w = old.router(xb, scale=old.internal_route_scale, memory_config=L1)
+                        wl = old.local_weights(i, w, memory_config=L1)
+                        _free([i, w])
+                        return wl
+
+                    t_old = traced_stats(mesh_device, gather_path, n=32, reps=7, adapt_to=128)
+                    print(f"[moe] B4 traced router + mask M = {M}: fused {fmt_traced(t_new)} us vs gather "
+                          f"{fmt_traced(t_old)} us per layer")
+                    _free(xb)
+            _free(x16)
         old.deallocate()
         new.deallocate()
     assert not failures, failures
