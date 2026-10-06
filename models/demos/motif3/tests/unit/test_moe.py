@@ -2121,6 +2121,7 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
     monkeypatch.setattr(M, "_reshape", reshape)
     monkeypatch.setattr(M._pn, "grouped_polynorm", polynorm)
     monkeypatch.setattr(M, "device_tensors_to_torch", dtt)
+    monkeypatch.setattr(M, "PREFILL_MOE_DEVICE_ROWS", (Mr,))  # the kernels serve this toy chunk size
 
     moe = object.__new__(M.MotifMoE)
     cfg = SimpleNamespace(experts_gate_up_pc=lambda m_tiles: ("pc_gu", m_tiles),
@@ -2292,6 +2293,16 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
     part2 = moe.local_partial(f, polynorm="bf16", decode=False)
     assert all(torch.equal(a, b) for a, b in zip(part.chips, part2.chips))
     st.frozen = lambda: False
+    # a chunk size outside PREFILL_MOE_DEVICE_ROWS (not validated on device) never reaches the B2b kernels, frozen or
+    # not: B2a's host dispatch (one route read + upload) and the one-hot matmul combine, the same partial
+    monkeypatch.setattr(M, "PREFILL_MOE_DEVICE_ROWS", (1024, 2048, 4096))
+    assert not M.b2b_rows_ok(Mr) and M.b2b_rows_ok(4096) and not M.b2b_rows_ok(3968)
+    calls.clear()
+    part3 = moe.local_partial(f, polynorm="bf16", decode=False)
+    assert all(torch.equal(a, b) for a, b in zip(part.chips, part3.chips))
+    assert not [c for c in calls if c[0] in ("dispatch", "combine")]
+    assert [c[0] for c in calls if c[0] in ("eq", "matmul")] == ["eq", "matmul"]
+    assert len([c for c in calls if c[0] == "read"]) == 1
     ids_freed = [id(t) for t in freed if isinstance(t, _MT)]  # (the dense stand-ins are strings)
     assert len(ids_freed) == len(set(ids_freed)), "a tensor was freed twice"
 
@@ -4679,7 +4690,8 @@ B2B_COMBOS = (("host", "matmul"), ("host", "gather"), ("device", "matmul"), ("de
 def test_moe_device_prefill_compact_kernels(mesh_device, device_params):
     """B2b (docs/OPTIMIZATION_PLAN.md §3.3 B2; ``MOTIF3_PREFILL_MOE_DISPATCH`` / ``MOTIF3_PREFILL_MOE_COMBINE``;
     logs/opt/phaseB/B2b), real weights of layers 2 and 35 (``MOTIF3_B2B_LAYERS``), real router inputs tiled to S = 1024
-    / 2048 / 4096 (``MOTIF3_B2B_S``):
+    / 2048 / 4096 (``MOTIF3_B2B_S``; a size outside ``moe.PREFILL_MOE_DEVICE_ROWS``, e.g. 3968, runs the dispatch kernel
+    directly as a diagnostic while the model itself keeps such chunks on B2a's host path):
 
     * the dispatch kernel (``kernels.moe_compact.CompactDispatch``) writes exactly B2a's host lists on all 32 chips
       (tokens, keys, block sparsity and PolyNorm words, the rows' routing weights == ``w_loc`` bits, need / NB), from
@@ -4693,7 +4705,7 @@ def test_moe_device_prefill_compact_kernels(mesh_device, device_params):
       reports NB = 0 and the dense path runs (same output);
     * eager ``forward_prefill`` time per combination (informational)."""
     from models.demos.motif3.tt.kernels.moe_compact import dispatch_reference
-    from models.demos.motif3.tt.moe import compact_block, compact_ladder, compact_upload_fast
+    from models.demos.motif3.tt.moe import b2b_rows_ok, compact_block, compact_ladder, compact_upload_fast
 
     cfg, ccl, fab = _setup(mesh_device, "moe_prefill_compact_kernels")
     assert "TORUS_XY" in str(fab.get("committed")), fab
@@ -4795,7 +4807,7 @@ def test_moe_device_prefill_compact_kernels(mesh_device, device_params):
                         oc2 = moe.forward_prefill(x_tt)
                         ran = st.stats["compact"] - n0
                         ran_d = st.stats["device_dispatch"] - n1
-                        want_d = ran if d == "device" else 0
+                        want_d = ran if d == "device" and b2b_rows_ok(C) else 0
                         bad_p, n_p = _chips_equal(pd, pc)
                         bad_o, n_o = _chips_equal(od, oc)
                         bad_r, _ = _chips_equal(oc, oc2)

@@ -133,7 +133,8 @@ B2b kernels (logs/opt/phaseB/B2b; ``prefill_moe_dispatch`` / ``prefill_moe_combi
 the 32-byte block count and slices the first NB blocks (:meth:`MotifMoE._compact_partial_device`), so the routes are
 never read and no upload is made. "gather" sums each token's rows with
 :class:`~models.demos.motif3.tt.kernels.moe_compact.GatherCombine` (fast_reduce_nc's fp32-dest adds) instead of the
-one-hot matmul. Every combination is bitwise equal to the dense path.
+one-hot matmul. Every combination is bitwise equal to the dense path. Both kernels serve only the chunk sizes validated
+on the device (:data:`PREFILL_MOE_DEVICE_ROWS`); any other chunk runs B2a's host dispatch and matmul combine.
 
 Weights (``tt/weights.py``): ``router_weights`` (``[4096, 384]`` bf16 + fp32 bias), ``experts_gate_up`` /
 ``experts_down`` + ``ep_layout`` with ``as_tensor(dp_dim=0, tp_dim=1)`` (chip ``k = 8 dp + tp`` holds experts
@@ -312,6 +313,16 @@ def resolve_prefill_moe_kernels(dispatch: Optional[str], combine: Optional[str],
 # B2b device dispatch: the largest chunk the kernel serves (its L1 holds the chunk's routes and weights: ~0.6 MB per core
 # at 4096 rows); a larger compacted chunk builds its rows on the host (B2a).
 PREFILL_MOE_DISPATCH_MAX_ROWS = 4096
+# The chunk sizes (rows) B2b's kernels -- the device dispatch and the gather combine -- serve: the sizes validated on the
+# device (logs/opt/phaseB/B2b: exact on all 32 chips, the 53-layer gates). Any other chunk (e.g. the 3968-row remainder
+# of an 8064-row CP-L pass, where a B2b run hung the device before any check) uses B2a's host dispatch and the one-hot
+# matmul combine (the same result bit for bit), frozen state or not: an unvalidated shape never reaches the kernels.
+PREFILL_MOE_DEVICE_ROWS = (1024, 2048, 4096)
+
+
+def b2b_rows_ok(rows: int) -> bool:
+    """Whether a ``rows``-row compacted chunk may run B2b's kernels (:data:`PREFILL_MOE_DEVICE_ROWS`)."""
+    return int(rows) in PREFILL_MOE_DEVICE_ROWS and int(rows) <= PREFILL_MOE_DISPATCH_MAX_ROWS
 
 
 # ==============================================================================================================
@@ -1543,7 +1554,7 @@ class MotifMoE:
         M = int(f.shape[-2])
         mb = compact_block(M, self.prefill_moe_block)
         self.prepare_compact()
-        if getattr(self, "prefill_moe_dispatch", "host") == "device" and M <= PREFILL_MOE_DISPATCH_MAX_ROWS:
+        if getattr(self, "prefill_moe_dispatch", "host") == "device" and b2b_rows_ok(M):
             return self._compact_partial_device(f, idx, w, M, mb)
         hi = self._read_routes(idx, M)
         R, C = self._mesh_rc()
@@ -1668,7 +1679,7 @@ class MotifMoE:
         ``keys``)."""
         dram = self.dram
         R = int(y.shape[-2])
-        if getattr(self, "prefill_moe_combine", "matmul") == "gather":
+        if getattr(self, "prefill_moe_combine", "matmul") == "gather" and b2b_rows_ok(M):
             y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
             _free(y)
             part = self.compact_state.combine(y_rm, keys, M=M, key_page=key_page, out_dtype=self.combine_dtype,
@@ -1825,7 +1836,7 @@ class MotifMoE:
             y = self.experts(x, polynorm=self.prefill_polynorm, decode=False, row_scale=w_loc, memory_config=self.dram)
             _free(w_loc)
             _free(self.reduce_experts(y, memory_config=self.dram), y)
-            if getattr(self, "prefill_moe_dispatch", "host") == "device" and M <= PREFILL_MOE_DISPATCH_MAX_ROWS:
+            if getattr(self, "prefill_moe_dispatch", "host") == "device" and b2b_rows_ok(M):
                 # the dispatch program (one per chunk size) on the warm routes, then the post-dispatch programs of
                 # every ladder entry on synthetic capacity buffers (pad rows only: nothing is combined)
                 rows_d = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
@@ -2108,7 +2119,7 @@ class MotifMoE:
 __all__ = ["COMBINE_MODES", "CompactPrefillState", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS",
            "MOE_POLYNORM_MODES", "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "compact_block",
            "compact_bucket", "compact_ladder", "compact_need_blocks", "compact_prefill_meta", "compact_upload_fast",
-           "PREFILL_MOE_DISPATCH_MAX_ROWS", "resolve_prefill_moe_kernels",
+           "PREFILL_MOE_DISPATCH_MAX_ROWS", "PREFILL_MOE_DEVICE_ROWS", "b2b_rows_ok", "resolve_prefill_moe_kernels",
            "grouped_polynorm",
            "prefill_experts_pc", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
            "wide_decode_rows"]
