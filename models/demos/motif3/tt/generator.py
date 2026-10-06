@@ -292,6 +292,71 @@ DECODE_KINDS = (PLAIN, SPEC, WIDE)
 SPEC_KINDS = (SPEC, WIDE)  # the decode paths of a speculating launch (decode_forward_spec)
 DecodeKey = Tuple[str, str]  # (kind "plain" | "spec" | "wide", KV-write mode)
 # decode_forward_spec's host profile (reset_spec_profile): "steps" calls, "passes" device runs, "wide" T64 steps
+class ReplayWaiter:
+    """``host_wait="spin"`` (B6a, ``MOTIF3_HOST_WAIT``): keeps the calling thread busy while a replayed decode trace
+    runs, so the host code after the step's blocking read runs on a hot core.
+
+    With the release's blocking read the thread sleeps for the whole replay (~85 ms on the 53-layer trace); under the
+    host's ``schedutil`` governor the code that follows then runs ~2.5-3x slower than on a busy core
+    (``logs/opt/phaseB/B6a``: the M1 step components match a cold-core microbenchmark, not a warm one). :meth:`spin`
+    polls ``time.sleep(0)`` (a syscall that releases the GIL, so the process's other threads keep running) until
+    ``residual_ms`` before the predicted end of the replay; the caller then makes its usual blocking read, which waits
+    out the rest (a sleep of a few ms does not cool the core). The prediction, per key (path, pass), is the shortest of
+    the last ``window`` replays that ended inside the blocking read (time from the enqueue to the read's return); a
+    replay that had ended before the spin did (the read waited less than ``overshoot_ms``) shortens the prediction by
+    ``backoff_ms`` instead, so a faster device is followed within a few steps and an overshoot costs at most one
+    step's ``residual_ms``. Nothing is spun before the first replay of a key has been timed. The device sees exactly
+    the same commands either way."""
+
+    def __init__(self, residual_ms: float = 3.0, window: int = 8, overshoot_ms: float = 0.25, backoff_ms: float = 2.0,
+                 clock: Callable[[], float] = time.perf_counter, idle: Callable[[], None] = lambda: time.sleep(0)):  # fmt: skip
+        self.residual_ms = float(residual_ms)
+        self.window = int(window)
+        self.overshoot_ms = float(overshoot_ms)
+        self.backoff_ms = float(backoff_ms)
+        self.clock, self.idle = clock, idle
+        self._hist: Dict[Any, List[float]] = {}
+        self._cut: Dict[Any, float] = {}  # backoff applied to the prediction since the last real sample
+        self.stats: Dict[str, float] = {"spins": 0, "spin_ms": 0.0, "blocked_ms": 0.0, "overshoots": 0}
+
+    def predicted_ms(self, key) -> Optional[float]:
+        h = self._hist.get(key)
+        if not h:
+            return None
+        return max(0.0, min(h) - self._cut.get(key, 0.0))
+
+    def spin(self, key, t_enqueue: float) -> float:
+        """Poll until ``residual_ms`` before the predicted end of the replay enqueued at ``t_enqueue`` (clock
+        seconds); returns the clock when the caller starts its blocking read."""
+        pred = self.predicted_ms(key)
+        now = self.clock()
+        if pred is None:
+            return now
+        until = t_enqueue + (pred - self.residual_ms) / 1e3
+        if now < until:
+            self.stats["spins"] += 1
+            t0 = now
+            while now < until:
+                self.idle()
+                now = self.clock()
+            self.stats["spin_ms"] += (now - t0) * 1e3
+        return now
+
+    def done(self, key, t_enqueue: float, t_read: float, t_done: float) -> None:
+        """Record one replay: enqueued at ``t_enqueue``, blocking read started at ``t_read``, returned at
+        ``t_done``."""
+        blocked = (t_done - t_read) * 1e3
+        self.stats["blocked_ms"] += blocked
+        if blocked < self.overshoot_ms and self.predicted_ms(key) is not None:
+            self.stats["overshoots"] += 1
+            self._cut[key] = self._cut.get(key, 0.0) + self.backoff_ms
+            return
+        h = self._hist.setdefault(key, [])
+        h.append((t_done - t_enqueue) * 1e3)
+        del h[: -self.window]
+        self._cut.pop(key, None)
+
+
 SPEC_PROFILE_KEYS = ("steps", "passes", "wide", "plan", "write", "enqueue", "wait", "read", "result", "total")
 
 
@@ -781,6 +846,8 @@ class MotifGenerator(api.MotifGenerator):
         self._dp_mapper = None  # dp_row_mapper, built on first use ("fast")
         self.stats["input_copies"] = 0  # host -> device copies of the paths' own inputs (both modes)
         self.stats["input_copies_skipped"] = 0  # ... skipped because the values did not change ("fast")
+        self.host_wait = api.check_host_wait(getattr(cfg, "host_wait", None), name="cfg.host_wait")
+        self.waiter: Optional[ReplayWaiter] = ReplayWaiter() if self.host_wait == "spin" else None
         self._readers: Dict[Tuple, HostShardReader] = {}  # host staging of the spec outputs' id reads (by role)
 
     # ==============================================================================================================
@@ -1749,6 +1816,17 @@ class MotifGenerator(api.MotifGenerator):
         ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=False)
         self._unread = p.key
 
+    def _spin(self, key, t_enq: float) -> Optional[float]:
+        """``host_wait="spin"``: :meth:`ReplayWaiter.spin` before the step's blocking read (else nothing)."""
+        if self.waiter is None:
+            return None
+        return self.waiter.spin(key, t_enq)
+
+    def _waited(self, key, t_enq: float, t_read: Optional[float]) -> None:
+        """The step's blocking read returned: time the replay (``host_wait="spin"``)."""
+        if self.waiter is not None and t_read is not None:
+            self.waiter.done(key, t_enq, t_read, time.perf_counter())
+
     def _read_done(self) -> None:
         """The step's blocking read returned: every output it replayed is on the host (F3N rule R4)."""
         self._unread = None
@@ -1801,8 +1879,11 @@ class MotifGenerator(api.MotifGenerator):
         head = self.model.head
         if use_trace:
             self._replay(p)
+            t_enq = time.perf_counter()
             try:
+                t_read = self._spin(p.key, t_enq)
                 lg = head.logits_to_host(p.out)  # blocking read of the trace output (fresh host tensor)
+                self._waited(p.key, t_enq, t_read)
             except BaseException:
                 self._abort_step()
                 raise
@@ -1862,13 +1943,18 @@ class MotifGenerator(api.MotifGenerator):
         self.stats["decode_steps"] += 1
         dev = so = None
         try:
+            t_enq = t_read = None
             if use_trace:
                 self._replay(p)
+                t_enq = time.perf_counter()
                 rm, so_read = p.out, p.so
+                t_read = self._spin(p.key, t_enq)
             else:
                 rm = dev = self._plain_step(p, pool)
                 so = so_read = self._take_so()
             res = smp.read(so_read)  # blocking (chip 0, 1 KB): waits for the step
+            if t_enq is not None:
+                self._waited(p.key, t_enq, t_read)
             res = self._finish_sampled("plain", batch.positions, res, rm)
             self._read_done()
         except BaseException:
@@ -2009,8 +2095,10 @@ class MotifGenerator(api.MotifGenerator):
                     self._write_spec(p, ps)
                 dev = so = None
                 t1 = time.perf_counter()
+                t_enq = None
                 if use_trace:
                     self._replay(p)
+                    t_enq = time.perf_counter()
                     rm, a_t, m_t = p.out
                     so_read = p.so
                 else:
@@ -2022,22 +2110,31 @@ class MotifGenerator(api.MotifGenerator):
                 t2 = time.perf_counter()
                 lg = None
                 sample_here = smp is not None and i == 0
+                wkey = (p.key, n_pass, i)
                 if fast:
                     ra, rmm = self._out_reader(f"a{i}", a_t), self._out_reader(f"m{i}", m_t)
                     ttnn.copy_device_to_host_tensor(a_t, ra.host, blocking=False)
                     block = i == n_pass - 1 and not read_logits and not sample_here
+                    t_read = self._spin(wkey, t_enq) if (block or sample_here or read_logits) else None
                     ttnn.copy_device_to_host_tensor(m_t, rmm.host, blocking=block)
                     if sample_here:  # the step's one blocking read: every chip's info (lands a / m too)
                         res_s = smp.read(so_read, mesh_sync=True)
+                    if block or sample_here:
+                        self._waited(wkey, t_enq, t_read)
                     t3 = time.perf_counter()
                     if read_logits:
                         lg = head.logits_to_host(rm)  # blocking: every read enqueued before it has landed too
+                        if not sample_here:
+                            self._waited(wkey, t_enq, t_read)
                     staged.append((ra, rmm))
                     if sample_here:
                         rm_s = rm
                 else:
                     try:
+                        t_read = self._spin(wkey, t_enq) if t_enq is not None else None
                         a = head.tokens_to_host(a_t)  # blocking: waits for the step
+                        if t_enq is not None:
+                            self._waited(wkey, t_enq, t_read)
                         t3 = time.perf_counter()
                         m = head.tokens_to_host(m_t)
                         lg = head.logits_to_host(rm) if read_logits else None
@@ -2484,6 +2581,13 @@ class MotifGenerator(api.MotifGenerator):
     def release_traces(self) -> None:
         """Release every captured decode trace and its outputs (the persistent inputs stay: a re-capture reuses
         them)."""
+        waiter = getattr(self, "waiter", None)
+        if waiter is not None and waiter.stats["spins"]:
+            w = waiter.stats
+            self.log(
+                f"host wait (spin): {int(w['spins'])} replays, {w['spin_ms'] / max(1, w['spins']):.2f} ms polled and "
+                f"{w['blocked_ms'] / max(1, w['spins']):.2f} ms blocked per replay, {int(w['overshoots'])} overshoots"
+            )
         err = None
         for p in self._paths.values():
             if p.trace_id is None:
@@ -2525,6 +2629,7 @@ __all__ = [
     "LaneSampling",
     "PrefillBatchPlan",
     "PrefillRowJob",
+    "ReplayWaiter",
     "SPEC",
     "SPEC_KINDS",
     "SampledSpecDecodeResult",

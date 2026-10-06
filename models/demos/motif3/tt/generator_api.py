@@ -535,6 +535,23 @@ def host_staging_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     return check_host_staging(env.get("MOTIF3_HOST_STAGING"))
 
 
+# B6a: how the generator waits for a replayed decode trace. "block" (the release) = the step's blocking read sleeps
+# until the device is done (~85 ms of idle core: under the schedutil governor the host code that follows runs ~2.5-3x
+# slower, logs/opt/phaseB/B6a); "spin" = the calling thread first polls (time.sleep(0): the GIL is released every
+# iteration) until a few ms before the predicted end of the replay, then makes the same blocking read. Host only.
+HOST_WAIT_MODES = ("block", "spin")
+DEFAULT_HOST_WAIT = "block"
+
+
+def check_host_wait(mode: Any, *, name: str = "MOTIF3_HOST_WAIT") -> str:
+    """``mode`` lower-cased and stripped if it is one of :data:`HOST_WAIT_MODES` (``""`` / None = the default), else
+    ``ValueError`` naming ``name``."""
+    v = str(mode if mode is not None else "").strip().lower() or DEFAULT_HOST_WAIT
+    if v not in HOST_WAIT_MODES:
+        raise ValueError(f"{name} must be one of {HOST_WAIT_MODES}, got {mode!r}")
+    return v
+
+
 def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
     64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
@@ -1813,6 +1830,9 @@ __all__ = [
     "DEFAULT_HOST_STAGING",
     "check_host_staging",
     "host_staging_from_env",
+    "HOST_WAIT_MODES",
+    "DEFAULT_HOST_WAIT",
+    "check_host_wait",
     "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
     "wide_step_ratio_from_env",

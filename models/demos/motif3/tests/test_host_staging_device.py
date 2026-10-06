@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""B6a device gate (docs/OPT_PHASE_A_REVIEW.md §7.1-7.2; logs/opt/phaseB/B6a): the host-only decode knob
-``MOTIF3_HOST_STAGING`` (``release`` | ``fast``) leaves every decode output bitwise unchanged.
+"""B6a device gate (docs/OPT_PHASE_A_REVIEW.md §7.1-7.2; logs/opt/phaseB/B6a): the host-only decode knobs
+``MOTIF3_HOST_STAGING`` (``release`` | ``fast``) and ``MOTIF3_HOST_WAIT`` (``block`` | ``spin``) leave every decode
+output bitwise unchanged.
 
 One ``MotifGenerator`` (real weights, layers 0..3, device sampler on, the plain ``row`` path and the KV-R ``all`` path
-both captured) runs the same 100-step free-running decode schedule once per arm: ``release`` (the reference),
-``fast``, ``fast`` again and ``release`` again (run-to-run determinism). Lanes join and leave mid-run (pos 0,
+both captured) runs the same 100-step free-running decode schedule once per arm: ``release/block`` (the reference),
+``fast/block``, ``fast/spin`` and ``release/block`` again (run-to-run determinism). Lanes join and leave mid-run (pos 0,
 fresh blocks), cross a block boundary (64 tokens), half the lanes sample (seeded top-p) and every tenth step reads the
 logits (host path) instead of sampling. Each arm writes its own blocks (attention reads only positions the arm wrote),
 so every arm must produce bitwise identical tokens, logprobs and logits on each path. The arms switch the generator's
-``host_staging`` in place (the persistent-input records are cleared at each switch); nothing is compiled
+``host_staging`` / ``waiter`` in place (the persistent-input records are cleared at each switch); nothing is compiled
 after the capture.
 
 Run::
@@ -35,7 +36,7 @@ NUM_BLOCKS = 1100
 STEPS = 100
 WIDTH = MAX_MODEL_LEN // BLOCK
 MESH = [pytest.param((4, 8), device_params(), id="4x8")]
-ARMS = ["release", "fast", "fast", "release"]
+ARMS = [("release", "block"), ("fast", "block"), ("fast", "spin"), ("release", "block")]
 
 
 def _schedule():
@@ -106,7 +107,7 @@ def test_host_staging_and_wait_are_bitwise_neutral(mesh_device, device_params):
     import ttnn
     from models.demos.motif3.tt import generator_api as api
     from models.demos.motif3.tt.ccl import log_fabric
-    from models.demos.motif3.tt.generator import MotifGenerator
+    from models.demos.motif3.tt.generator import MotifGenerator, ReplayWaiter
     from models.demos.motif3.tt.model_config import DEFAULT_WEIGHTS_DIR
     from models.demos.motif3.tt.weights import HFWeightLoader
 
@@ -122,7 +123,7 @@ def test_host_staging_and_wait_are_bitwise_neutral(mesh_device, device_params):
     gen = MotifGenerator.create(hf_config=None, mesh_device=mesh_device, settings=settings)
     failures = []
     try:
-        assert gen.host_staging == "release"  # the default
+        assert gen.host_staging == "release" and gen.host_wait == "block" and gen.waiter is None  # the defaults
         pool = gen.allocate_kv_cache(num_blocks=NUM_BLOCKS, block_size=BLOCK, num_layers=N_LAYERS)
         gen.enable_device_sampling()
         gen._warmed = set(gen.prefill_shapes())  # no prefill in this test: decode-only capture
@@ -137,7 +138,8 @@ def test_host_staging_and_wait_are_bitwise_neutral(mesh_device, device_params):
         run_idx = 0
         for path in paths:
             for arm in ARMS:
-                gen.host_staging = arm
+                gen.host_staging = arm[0]
+                gen.waiter = ReplayWaiter() if arm[1] == "spin" else None
                 for p in gen._paths.values():
                     p.host_last.clear()  # the records describe what THIS mode copied
                 st0 = dict(gen.stats)
@@ -146,8 +148,10 @@ def test_host_staging_and_wait_are_bitwise_neutral(mesh_device, device_params):
                 recs, walls = _run(gen, pool, api, path, base, plan, vocab)
                 copies = gen.stats["input_copies"] - st0["input_copies"]
                 skipped = gen.stats["input_copies_skipped"] - st0["input_copies_skipped"]
+                w = gen.waiter.stats if gen.waiter is not None else {}
                 print(f"[b6a] path {path} arm {arm}: {len(recs)} steps, step wall median "
-                      f"{statistics.median(walls) * 1e3:.3f} ms, input copies {copies} (+{skipped} skipped)")
+                      f"{statistics.median(walls) * 1e3:.3f} ms, input copies {copies} (+{skipped} skipped), "
+                      f"waiter {w}")  # fmt: skip
                 out[(path, arm, run_idx)] = recs
         # every arm == the first arm of its path, bitwise
         for path in paths:

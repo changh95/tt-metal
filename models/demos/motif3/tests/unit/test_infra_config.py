@@ -101,8 +101,9 @@ _ENV = (
     "MOTIF3_DECODE_EXPERTS",
     # B3 fused decode MoE PolyNorm
     "MOTIF3_MOE_POLYNORM",
-    # B6a host input staging
+    # B6a host input staging / replay wait
     "MOTIF3_HOST_STAGING",
+    "MOTIF3_HOST_WAIT",
 )
 
 
@@ -833,24 +834,33 @@ def test_moe_polynorm_knob(monkeypatch):
         _cfg(moe_polynorm="kernel")
 
 
-def test_host_staging_knob(monkeypatch):
+def test_host_staging_and_wait_knobs(monkeypatch):
     """B6a (docs/OPT_PHASE_A_REVIEW.md §7.1; logs/opt/phaseB/B6a): ``MOTIF3_HOST_STAGING`` (``release`` default |
-    ``fast``) is a host-only decode knob; case and blanks ignored, anything else refused; ``describe`` shows it."""
-    from models.demos.motif3.tt.model_config import HOST_STAGING_MODES
+    ``fast``) and ``MOTIF3_HOST_WAIT`` (``block`` default | ``spin``) are host-only decode knobs; case and blanks
+    ignored, anything else refused; ``describe`` shows both."""
+    from models.demos.motif3.tt.model_config import HOST_STAGING_MODES, HOST_WAIT_MODES
 
-    assert HOST_STAGING_MODES == ("release", "fast")
+    assert HOST_STAGING_MODES == ("release", "fast") and HOST_WAIT_MODES == ("block", "spin")
     c = _cfg()
-    assert c.host_staging == "release" and "host_staging=release" in c.describe()
+    assert c.host_staging == "release" and c.host_wait == "block"
+    assert "host_staging=release host_wait=block" in c.describe()
     for v, want in (("fast", "fast"), (" FAST ", "fast"), ("release", "release"), ("", "release")):
         monkeypatch.setenv("MOTIF3_HOST_STAGING", v)
         assert _cfg().host_staging == want, v
+    for v, want in (("spin", "spin"), (" Spin", "spin"), ("block", "block"), ("", "block")):
+        monkeypatch.setenv("MOTIF3_HOST_WAIT", v)
+        assert _cfg().host_wait == want, v
     monkeypatch.setenv("MOTIF3_HOST_STAGING", "turbo")
     with pytest.raises(ValueError, match="MOTIF3_HOST_STAGING"):
         _cfg()
     monkeypatch.delenv("MOTIF3_HOST_STAGING")
-    assert _cfg(host_staging="fast").host_staging == "fast"
-    with pytest.raises(ValueError, match="host_staging"):
-        _cfg(host_staging="turbo")
+    monkeypatch.setenv("MOTIF3_HOST_WAIT", "busy")
+    with pytest.raises(ValueError, match="MOTIF3_HOST_WAIT"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_HOST_WAIT")
+    assert _cfg(host_staging="fast", host_wait="spin").host_wait == "spin"
+    with pytest.raises(ValueError, match="host_wait"):
+        _cfg(host_wait="poll")
 
 
 def test_module_defaults(monkeypatch):

@@ -1134,19 +1134,21 @@ def test_cpu_negative_control_cross_row_without_kvr(monkeypatch):
     log(f"negative control: {len(wrong)}/8 requests wrong with forced cross-row partners and no KV-R")
 
 
-@pytest.mark.parametrize("spec, kvr", [(False, False), (False, True), (True, True), (True, False)])
-def test_cpu_host_staging_fast_lossless(monkeypatch, spec, kvr):
-    """B6a (``MOTIF3_HOST_STAGING=fast``): on the emulated device the fast staging decodes
+@pytest.mark.parametrize("spec, kvr, wait", [(False, False, "block"), (False, True, "spin"), (True, True, "block"),
+                                             (True, False, "spin")])  # fmt: skip
+def test_cpu_host_staging_fast_lossless(monkeypatch, spec, kvr, wait):
+    """B6a (``MOTIF3_HOST_STAGING=fast``, ``MOTIF3_HOST_WAIT``): on the emulated device the fast staging decodes
     exactly the release's tokens (plain path ``row`` / ``all``; spec ``row_split`` / ``all_split``, traced and eager),
     with fewer input copies (an input whose values did not change is not copied again: the page table between block
-    crossings, idle lanes' rows), and every persistent input ends holding the values copied last."""
+    crossings, idle lanes' rows), and every persistent input ends holding the values copied last. ``spin`` changes
+    nothing the device sees."""
     results = {}
     for staging in ("release", "fast"):
         gen, model, dev, pool, tr = emu_generator(
-            monkeypatch, kvr=kvr, spec=spec, cfg_kw=dict(host_staging=staging),
+            monkeypatch, kvr=kvr, spec=spec, cfg_kw=dict(host_staging=staging, host_wait=wait),
             decode_kv_mode="all" if kvr else "row",
         )  # fmt: skip
-        assert gen.host_staging == staging
+        assert gen.host_staging == staging and gen.host_wait == wait and (gen.waiter is not None) == (wait == "spin")
         W = 128
         gen.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
         gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=W)
@@ -1208,6 +1210,47 @@ def test_cpu_path_host_rows_match_release():
             assert rows["cur"][0].data_ptr() != pos.data_ptr()  # kept in host_last: never the caller's tensor
         else:
             assert set(rows) == {"tokens", "rot"}
+
+
+def test_cpu_replay_waiter():
+    """``ReplayWaiter`` (``MOTIF3_HOST_WAIT=spin``) on a fake clock: no spin before a key's first timed replay; then
+    it polls (calling ``idle`` each time) until ``residual_ms`` before the shortest of the last ``window`` replays;
+    a replay that ended before the spin did (read waited < ``overshoot_ms``) shortens the prediction by
+    ``backoff_ms`` (not recorded as a sample), until a real sample resets it; keys are independent."""
+    from models.demos.motif3.tt.generator import ReplayWaiter
+
+    t = [0.0]
+    idles = []
+
+    def idle():
+        idles.append(t[0])
+        t[0] += 0.0005
+
+    w = ReplayWaiter(residual_ms=3.0, window=3, overshoot_ms=0.25, backoff_ms=2.0, clock=lambda: t[0], idle=idle)
+    assert w.predicted_ms("a") is None
+    assert w.spin("a", 0.0) == 0.0 and not idles  # nothing known yet
+    w.done("a", 0.0, 0.0, 0.085)
+    assert w.predicted_ms("a") == pytest.approx(85.0)
+    t[0] = 1.0
+    tr = w.spin("a", 1.0)  # spins to 1.0 + 82 ms
+    assert tr == pytest.approx(1.082, abs=6e-4) and len(idles) > 100 and w.stats["spins"] == 1
+    w.done("a", 1.0, tr, 1.0855)  # blocked 3.5 ms: a real sample
+    assert w.predicted_ms("a") == pytest.approx(85.0)
+    w.done("a", 2.0, 2.0, 2.084)
+    assert w.predicted_ms("a") == pytest.approx(84.0)  # shortest of the window
+    for i in range(3):
+        w.done("a", 3.0 + i, 3.0 + i, 3.0 + i + 0.090)
+    assert w.predicted_ms("a") == pytest.approx(90.0)  # the 84 / 85 ms samples left the window
+    w.done("a", 9.0, 9.087, 9.0871)  # the read returned at once: the replay ended before the spin did
+    assert w.stats["overshoots"] == 1 and w.predicted_ms("a") == pytest.approx(88.0)
+    w.done("a", 10.0, 10.087, 10.0871)
+    assert w.predicted_ms("a") == pytest.approx(86.0)
+    w.done("a", 11.0, 11.080, 11.0855)  # a real sample: the backoff is dropped
+    assert w.predicted_ms("a") == pytest.approx(85.5)
+    t[0] = 20.0
+    n = len(idles)
+    assert w.spin("a", 19.0) == 20.0 and len(idles) == n  # already past the target: no polling
+    assert w.predicted_ms("b") is None and w.spin("b", 20.0) == 20.0
 
 
 def test_cpu_decode_paths_lifecycle(monkeypatch):

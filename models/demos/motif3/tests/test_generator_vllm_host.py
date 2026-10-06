@@ -141,6 +141,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_DECODE_EXPERTS",
         "MOTIF3_MOE_POLYNORM",
         "MOTIF3_HOST_STAGING",
+        "MOTIF3_HOST_WAIT",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -3240,6 +3241,9 @@ def test_host_staging_knob_in_the_bridge(monkeypatch):
     with pytest.raises(ValueError, match="MOTIF3_HOST_STAGING"):
         _bridge()
     assert api.host_staging_from_env({}) == "release" and api.HOST_STAGING_MODES == ("release", "fast")
+    assert api.check_host_wait(None) == "block" and api.check_host_wait(" Spin") == "spin"
+    with pytest.raises(ValueError, match="MOTIF3_HOST_WAIT"):
+        api.check_host_wait("busy")
 
 
 @pytest.mark.parametrize("kvr", [True, False])
