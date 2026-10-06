@@ -2278,7 +2278,10 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
     routes["cur"] = (i1, w1)
     st.frozen = lambda: True
     dense_calls.clear()
+    calls.clear()
     assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART" and st.stats["dense_unwarmed"] == 1
+    # an unwarmed chunk size launches no dispatch program after the capture (F3N rule R2)
+    assert not [c for c in calls if c[0] in ("dispatch", "sparse_matmul", "combine")]
     routes["cur"] = (torch.zeros(Mr, Kk, dtype=torch.long), torch.zeros(Mr, Kk))
     calls.clear()
     assert moe.warm_compact(Mr) == lad and st.warmed == {(Mr, mb, b) for b in lad}

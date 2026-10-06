@@ -249,7 +249,7 @@ class CompactDispatch:
             cbs = [
                 _scratch(0, cores, mt * 2048),
                 _scratch(1, cores, mt * 2048),
-                _scratch(2, cores, 16384 + M * 4),
+                _scratch(2, cores, 16384 + cap * mb * 4),  # tables + one expert's token list (<= CAP MB rows)
                 _scratch(3, cores, 2 * cap * mb * 4),
                 _scratch(4, cores, 6 * 1024),
             ]
@@ -337,8 +337,8 @@ class GatherCombine:
                 _cb(4, cores, 2048, self.top_k * self.cw, ttnn.bfloat16),  # cb_tl: every level of one unit
                 _cb(16, cores, out_tile, 2, out_dtype),  # cb_o
             ]
-            rct = ([M, R, WT, G, self.grid[0], NW, 0, 1, 2, 3, int(key_page), kwidth * 4, H * 2] + _accessor(y_rm)
-                   + _accessor(keys))
+            rct = ([M, R, WT, G, self.grid[0], NW, 0, 1, 2, 3, int(key_page), kwidth * 4, H * 2, self.top_k]
+                   + _accessor(y_rm) + _accessor(keys))
             cct = [M, WT, G, self.grid[0], NW, 0, 1, 2, 4, 16, self.top_k]
             wct = [M, WT, G, self.grid[0], NW, 16] + _accessor(part)
             defines = [("MOTIF_COMBINE_SRC", self._tag)]

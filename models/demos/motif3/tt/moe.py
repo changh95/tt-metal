@@ -1579,6 +1579,11 @@ class MotifMoE:
         None (the dense path on the same routes) beyond the ladder's cap or for an unwarmed shape, as B2a."""
         st = self.compact_state
         ladder = compact_ladder(M, mb, self.e_loc)
+        if st.frozen() and not any(k[0] == M and k[1] == mb for k in st.warmed):
+            # a chunk size the warm-up did not compile: its dispatch program would compile after the decode capture
+            # (F3N rule R2) -- the dense path, before any device work (B2a decides the same after its host pass)
+            st.stats["dense_unwarmed"] += 1
+            return None
         rows = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
         need, nb = self._read_need(rows.need)
         if nb == 0:

@@ -133,7 +133,7 @@ void kernel_main() {
     const uint32_t sp_l1 = cm_l1 + 256;                    // 64 B
     const uint32_t need_l1 = sp_l1 + 64;                   // 32 B
     const uint32_t chip_l1 = need_l1 + 64;                 // P words (q == E)
-    const uint32_t tok_l1 = misc + 16384;                  // M words: this expert's tokens (q < E)
+    const uint32_t tok_l1 = misc + 16384;                  // ROWS_CAP words: this expert's tokens (q < E)
     const uint32_t rows_l1 = align64(get_write_ptr(cb_rows));  // tix [ROWS_CAP], keys [ROWS_CAP]
     const uint32_t tile_l1 = align64(get_write_ptr(cb_tile));  // wcol tile 4 KB | blk tile 2 KB
     const uint32_t wt_l1 = tile_l1;
@@ -177,7 +177,12 @@ void kernel_main() {
                     if (d < E) {
                         cnt[d] += 1;
                         if (d == e) {
-                            tok[n++] = (tr << 9) | (r << 4) | k;  // token tile row, row, rank of the hit
+                            // stored up to ROWS_CAP (an expert with more rows exceeds the cap: nothing is written);
+                            // counted always (duplicate ids in a garbage row can push a list past M)
+                            if (n < ROWS_CAP) {
+                                tok[n] = (tr << 9) | (r << 4) | k;  // token tile row, row, rank of the hit
+                            }
+                            ++n;
                         }
                     }
                 }
@@ -191,7 +196,7 @@ void kernel_main() {
             used += b;
         }
         const uint32_t nblk = (n + MB - 1) / MB;
-        if (nblk != 0 && used <= CAP) {
+        if (nblk != 0 && used <= CAP && n <= ROWS_CAP) {
             // weights: fetch the faces of every tile row holding one of the tokens (one barrier)
             uint32_t last = 0xFFFFFFFFu;
             for (uint32_t i = 0; i < n; ++i) {

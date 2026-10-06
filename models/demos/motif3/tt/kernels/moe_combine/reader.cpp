@@ -18,7 +18,7 @@
 // way). cb_z: one zero tile, the second operand of the adds.
 //
 // CT: 0 M, 1 ROWS, 2 WT, 3 G, 4 GX, 5 NW, 6 cb_rm, 7 cb_cnt, 8 cb_z, 9 cb_keys, 10 KP, 11 KPAGE (keys page bytes),
-//     12 HB (y row bytes), 13.. TensorAccessorArgs(y), TensorAccessorArgs(keys)
+//     12 HB (y row bytes), 13 KMAX (levels the compute kernel holds), 14.. TensorAccessorArgs(y), (keys)
 // common RT: 0 y_addr, 1 keys_addr
 
 #include <stdint.h>
@@ -39,13 +39,14 @@ void kernel_main() {
     constexpr uint32_t KP = get_compile_time_arg_val(10);
     constexpr uint32_t KPAGE = get_compile_time_arg_val(11);
     constexpr uint32_t HB = get_compile_time_arg_val(12);
-    constexpr auto y_args = TensorAccessorArgs<13>();
+    constexpr uint32_t KMAX = get_compile_time_arg_val(13);
+    constexpr auto y_args = TensorAccessorArgs<14>();
     constexpr auto k_args = TensorAccessorArgs<y_args.next_compile_time_args_offset()>();
     constexpr uint32_t CW = WT / G;
     constexpr uint32_t NU = (M / 32) * G;
     constexpr uint32_t MAXL = 16;  // list slots per token (the wrapper's cb_tl holds top-K <= MAXL levels)
     constexpr uint32_t SEG = CW * 64;  // bytes of one row segment (CW bf16 tiles wide)
-    static_assert(WT % G == 0 && ROWS % 32 == 0, "combine shape");
+    static_assert(WT % G == 0 && ROWS % 32 == 0 && KMAX >= 1 && KMAX <= MAXL, "combine shape");
     static_assert(SEG % 512 == 0, "a row segment must be a multiple of 512 B (zero fill)");
 
     const uint32_t q = static_cast<uint32_t>(get_absolute_logical_y()) * GX + get_absolute_logical_x();
@@ -95,7 +96,7 @@ void kernel_main() {
                     L = m + 1 > L ? m + 1 : L;
                 }
             }
-            L = L > MAXL ? MAXL : L;
+            L = L > KMAX ? KMAX : L;  // a token has at most top-K rows; never ask the compute kernel for more
             cur_tr = tr;
         }
         cb_reserve_back(cb_cnt, 1);
