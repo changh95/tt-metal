@@ -104,6 +104,8 @@ _ENV = (
     # B6a host input staging / replay wait
     "MOTIF3_HOST_STAGING",
     "MOTIF3_HOST_WAIT",
+    # B6b asynchronous decode (the bridge's supports_async_decode)
+    "MOTIF3_ASYNC_DECODE",
 )
 
 

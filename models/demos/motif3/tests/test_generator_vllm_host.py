@@ -142,6 +142,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_MOE_POLYNORM",
         "MOTIF3_HOST_STAGING",
         "MOTIF3_HOST_WAIT",
+        "MOTIF3_ASYNC_DECODE",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -306,6 +307,9 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.sampler_kwargs = None  # what the bridge passed to enable_device_sampling (rng_seed = vLLM's --seed)
         self.sampled_steps = []  # (active lanes, lane-ordered sampling lists, spec?) of every device-sampled step
         self.host_steps = 0  # decode steps that returned logits (host sampling)
+        # B6b split submission (MotifGenerator.submit_decode_sampled / read_decode_sampled)
+        self._outstanding = None
+        self.async_log = []  # ("submit", fed?) / ("read",) / ("settle",) in call order
 
     @classmethod
     def create(cls, *, hf_config, mesh_device, settings):
@@ -389,6 +393,48 @@ class FakeMotifGenerator(api.MotifGenerator):
         self.sampled_steps.append((lanes, sampling, False))
         return self._sample_lanes(truths, batch.positions.tolist(), sampling)
 
+    # ---- B6b: the real generator's split submission contract, computed eagerly (the fake device is synchronous) ----
+    @property
+    def supports_async_decode(self):
+        return not self.settings.spec_decode
+
+    @property
+    def outstanding_decode(self):
+        return self._outstanding
+
+    def settle_decode(self):
+        if self._outstanding is None:
+            return None
+        self.async_log.append(("settle",))
+        return self.read_decode_sampled(self._outstanding)
+
+    def submit_decode_sampled(self, batch, sampling, *, kv_cache, enable_trace, feed=None):
+        """``MotifGenerator.submit_decode_sampled``: no other step may be outstanding; with ``feed`` the step must
+        continue it (same active lanes, positions + 1) and its tokens are ``feed``'s sampled tokens."""
+        prev = self._outstanding
+        assert prev is None or prev is feed, "a submitted step is not read yet (and is not this step's feed)"
+        if feed is not None:
+            act = batch.positions >= 0
+            assert torch.equal(act, feed.positions >= 0), "a fed step must keep the previous step's lanes"
+            assert torch.equal(batch.positions[act], feed.positions[act] + 1), "a fed step runs at position + 1"
+            res = self.read_decode_sampled(feed)
+            tok = torch.where(act, res.tokens.to(torch.int32), torch.zeros_like(batch.positions))
+            batch = api.DecodeBatch(tokens=tok, positions=batch.positions, page_table=batch.page_table)
+        sample = self.decode_forward_sampled(batch, sampling, kv_cache=kv_cache, enable_trace=enable_trace)
+        sub = SimpleNamespace(sample=sample, result=None, positions=batch.positions.clone(), fed=feed is not None)
+        self._outstanding = sub
+        self.async_log.append(("submit", feed is not None))
+        return sub
+
+    def read_decode_sampled(self, sub):
+        if sub.result is not None:
+            return sub.result
+        assert sub is self._outstanding, "read of a submission that is neither outstanding nor read"
+        self._outstanding = None
+        sub.result = sub.sample
+        self.async_log.append(("read",))
+        return sub.result
+
     def allocate_kv_cache(self, *, num_blocks, block_size, num_layers):
         assert num_layers == self.num_layers
         self.alloc_args = dict(num_blocks=num_blocks, block_size=block_size, num_layers=num_layers)
@@ -417,6 +463,7 @@ class FakeMotifGenerator(api.MotifGenerator):
 
     def prefill_forward_batch(self, requests, *, kv_cache, enable_trace=False):
         assert kv_cache is self.handle
+        self.settle_decode()  # the real generator reads an outstanding decode step before any other device call
         reqs = api.check_prefill_batch(requests)
         if any(r.resumed for r in reqs):
             assert self.settings.resumed_prefill, "a resumed row on a launch without chunked prefill / prefix caching"
@@ -531,6 +578,7 @@ class FakeMotifGenerator(api.MotifGenerator):
     def decode_forward(self, batch, *, kv_cache, enable_trace):
         assert kv_cache is self.handle
         assert isinstance(batch, api.DecodeBatch)
+        self.settle_decode()
         assert not self.settings.spec_decode, "a speculating launch runs every decode step through decode_forward_spec"
         if self.fail_next_decode:
             self.fail_next_decode = False
@@ -3112,6 +3160,205 @@ def test_device_sampled_decode_plumbing(num_slots):
     with loguru_messages() as seen:
         bridge.release_persistent_capture()
     assert any("Motif-3 device sampling:" in m and '"device_steps"' in m for m in seen)
+
+
+# ---- B6b: asynchronous decode (MOTIF3_ASYNC_DECODE=on) --------------------------------------------------------------
+def test_async_decode_knob_and_capability():
+    """``MOTIF3_ASYNC_DECODE``: ``off`` (default) / ``on``, case and blanks ignored, anything else refused; the class
+    capability ``supports_async_decode`` follows it (and nothing else)."""
+    assert api.ASYNC_DECODE_MODES == ("off", "on") and api.DEFAULT_ASYNC_DECODE == "off"
+    assert api.check_async_decode(None) == "off" and api.check_async_decode(" ON ") == "on"
+    assert api.async_decode_from_env({}) == "off" and api.async_decode_from_env({"MOTIF3_ASYNC_DECODE": ""}) == "off"
+    with pytest.raises(ValueError, match="MOTIF3_ASYNC_DECODE"):
+        api.async_decode_from_env({"MOTIF3_ASYNC_DECODE": "1"})
+    off, on = gv.model_capabilities_from_env({}), gv.model_capabilities_from_env({"MOTIF3_ASYNC_DECODE": "on"})
+    assert off["supports_async_decode"] is False and on["supports_async_decode"] is True
+    assert {k: v for k, v in off.items() if k != "supports_async_decode"} == {
+        k: v for k, v in on.items() if k != "supports_async_decode"
+    }
+    assert gv.MotifForCausalLM.model_capabilities["supports_async_decode"] is False  # the import-time default
+
+
+def _async_caps(monkeypatch):
+    monkeypatch.setattr(gv.MotifForCausalLM, "model_capabilities",
+                        {**gv.MotifForCausalLM.model_capabilities, "supports_async_decode": True})  # fmt: skip
+
+
+class AsyncPlugin:
+    """The plugin's asynchronous decode as it reaches the bridge (``async_decode.py`` under vLLM's 2-deep batch
+    queue): a step is submitted with ``read_from_device=False``; a steady step (``reload_inputs=False``) carries the
+    host's STALE tokens / positions (the previous step is not applied yet) and the current page table; the previous
+    step's result is read (``read_decode_output(async_read=True)`` + ``process_decode_output_host``) only after the
+    next step was submitted, then applied; a reloading step (layout change, prefill, host sampling) drains first."""
+
+    def __init__(self, d: PluginDriver):
+        self.d = d
+        self.pending = None  # (rows, handle)
+        self.prev_pt = None
+        self.steady_steps = 0
+
+    def resolve(self, pending="current"):
+        if pending == "current":
+            pending, self.pending = self.pending, None
+        if pending is None:
+            return
+        rows, h = pending
+        out, events = self.d.bridge.read_decode_output(h, async_read=True)
+        assert events == [] and out is h
+        out = self.d.bridge.process_decode_output_host(out, is_tokens=True)
+        assert out is h.output()  # one read: later calls return the same objects
+        for r, t in zip(rows, self.d._take_sampled(rows, out)):
+            self.d.seqs[r].append(t)
+
+    def step(self, rows=None, *, steady):
+        d = self.d
+        rows = list(d.order if rows is None else rows)
+        if not steady:
+            self.resolve()
+        kwargs = d._decode_common(rows)
+        tokens = torch.zeros(d.num_slots, 1, dtype=torch.int32)
+        pos = torch.full((d.num_slots,), -1, dtype=torch.int32)
+        for i, r in enumerate(rows):  # the host's view: one step behind while a step is pending
+            tokens[i, 0], pos[i] = d.seqs[r][-1], len(d.seqs[r]) - 1
+        pt = kwargs["page_table"]
+        kwargs.update(reload_inputs=not steady, sampling_params=d._tt_sampling_params(rows))
+        if steady:
+            kwargs["reload_page_table"] = self.prev_pt is None or not torch.equal(pt, self.prev_pt)
+        prev = self.pending
+        h = d.bridge.decode_forward(tokens=tokens, start_pos=pos, **kwargs)
+        self.prev_pt = pt.clone()
+        self.steady_steps += int(steady)
+        assert isinstance(h, gv.MotifPendingDecode), type(h)
+        d._after_decode(rows)
+        self.pending = (rows, h)
+        self.resolve(prev)  # the engine reads step k once step k + 1 is queued
+        return h
+
+
+def test_async_decode_serves_the_synchronous_tokens(monkeypatch):
+    """B6b on the fake generator, with the plugin's own slot bookkeeping: greedy, seeded top-p and top-k rows decode
+    asynchronously -- steady steps with stale host inputs (``reload_inputs=False``, page-table refreshes at block
+    crossings), reloads after a finished request, a prefill while a step is pending, a host-sampled step -- and every
+    token equals the fake model's ground truth / the fake device sampler (``PluginDriver._take_sampled``). Steady
+    steps are fed: the generator reads step k inside the submission of step k + 1 (one read per step)."""
+    _async_caps(monkeypatch)
+    bridge, gen, kv, d = _allocated_bridge(8, device=True)
+    assert bridge._async
+    kinds = [dict(temperature=0.0), dict(temperature=1.0, top_p=0.95, seed=7), dict(temperature=0.7, top_k=20, seed=3),
+             dict(temperature=0.0)]  # fmt: skip
+    for i in range(4):
+        d.add(f"a{i}", [1, 5, 3] + [100 + 37 * i + j for j in range(20 + 9 * i)], **kinds[i])
+    d.prefill([f"a{i}" for i in range(4)])
+    ap = AsyncPlugin(d)
+    ap.step(steady=False)
+    for _ in range(40):  # crosses block boundaries (block size 32)
+        ap.step(steady=True)
+    assert gen.async_log.count(("submit", True)) == 40
+    assert gen.outstanding_decode is ap.pending[1].sub  # the last step is submitted, not read
+    idle = api.DecodeBatch(tokens=torch.zeros(32, dtype=torch.int32), positions=torch.full((32,), -1, dtype=torch.int32),
+                           page_table=torch.zeros(32, kv.page_table_width, dtype=torch.int32))  # fmt: skip
+    with pytest.raises(AssertionError, match="not read yet"):  # the fake's twin of the generator's RuntimeError
+        gen.submit_decode_sampled(idle, ((0.0,) * 32,) * 4, kv_cache=kv.device_cache, enable_trace=True)
+    ap.resolve()
+    d.finish("a1")  # layout change: the plugin reloads
+    with pytest.raises(RuntimeError, match="resident decode step"):
+        ap.step(steady=True)
+    ap.step(steady=False)
+    for _ in range(5):
+        ap.step(steady=True)
+    ap.resolve()
+    d.add("b0", [1, 5, 3] + list(range(200, 260)), temperature=1.0, top_p=0.9, seed=5)
+    d.prefill(["b0"])  # the plugin drained; the next decode reloads
+    with pytest.raises(RuntimeError, match="resident decode step"):
+        ap.step(steady=True)
+    ap.step(steady=False)
+    for _ in range(6):
+        ap.step(steady=True)
+    pending = ap.pending
+    d.add("c0", [1, 5, 3] + list(range(300, 340)))
+    ap.pending = None
+    d.prefill(["c0"])  # a prefill while a step is still pending: the generator reads it first ...
+    assert ("settle",) in gen.async_log
+    ap.resolve(pending)  # ... and the plugin's late read gets the same result
+    d.device = False
+    d.decode()  # a host-sampled step (logits) after a device chain
+    d.device = True
+    ap.step(steady=False)
+    for _ in range(3):
+        ap.step(steady=True)
+    # vLLM releases a request one step after it finished; under async scheduling the step in between already ran
+    # without it (a reload). A released slot that is not in the resident step keeps the chain (e.g. a max_tokens=1
+    # request that finished at its prefill).
+    used = {d.runner._req_state_slot[r] for r in d.order}
+    free_slot = next(sl for sl in range(8) if sl not in used)
+    bridge.release_request(free_slot)
+    ap.step(steady=True)
+    ap.resolve()
+    st = bridge.sampling_stats
+    assert st.resident_steps == ap.steady_steps == 55 and st.deferred_steps == 55 + 4
+    assert st.device_steps == d.stats["device_steps"] == gen.async_log.count(("read",)) == 59
+    assert gen._outstanding is None
+
+
+def test_async_decode_contract_rejections(monkeypatch):
+    """What a steady step (``reload_inputs=False``) must be: the continuation of a device-sampled step of the same
+    rows. Refused: no resident step, host sampling, a slot remap, changed active rows or row count; the knob off
+    (partial adapter); a verify; and the knob on a speculating launch."""
+    bridge, gen, kv, d = _allocated_bridge(8, device=True)  # knob off: the release
+    d.add("x", [1, 5, 3, 9, 9])
+    d.prefill(["x"])
+    kw = d._decode_common(["x"])
+    tok, pos = torch.zeros(8, 1, dtype=torch.int32), torch.full((8,), -1, dtype=torch.int32)
+    pos[0] = 4
+    kw.update(reload_inputs=False, sampling_params=d._tt_sampling_params(["x"]))
+    with pytest.raises(NotImplementedError, match="partial decode-reload v1 adapter"):
+        bridge.decode_forward(tokens=tok, start_pos=pos, **kw)
+
+    _async_caps(monkeypatch)
+    with pytest.raises(ValueError, match="without speculation"):
+        _bridge(spec_tokens=1)
+    bridge, gen, kv, d = _allocated_bridge(8, device=True)
+    for i in range(3):
+        d.add(f"y{i}", [1, 5, 3] + [400 + i] * (6 + i))
+    d.prefill(["y0", "y1", "y2"])
+    ap = AsyncPlugin(d)
+    with pytest.raises(RuntimeError, match="resident decode step"):
+        ap.step(steady=True)
+    ap.step(steady=False)
+    ap.resolve()
+    rows = list(d.order)
+
+    def call(**over):
+        kw = d._decode_common(rows)
+        tok = torch.zeros(8, 1, dtype=torch.int32)
+        p = torch.full((8,), -1, dtype=torch.int32)
+        for i, r in enumerate(rows):
+            tok[i, 0], p[i] = d.seqs[r][-1], len(d.seqs[r]) - 1
+        kw.update(reload_inputs=False, sampling_params=d._tt_sampling_params(rows))
+        kw.update(over)
+        return bridge.decode_forward(tokens=kw.pop("tokens", tok), start_pos=kw.pop("start_pos", p), **kw)
+
+    with pytest.raises(ValueError, match="host-sampled"):
+        call(sampling_params=None)
+    with pytest.raises(ValueError, match="slot_remap"):
+        call(slot_remap=torch.arange(8, dtype=torch.int32))
+    p2 = torch.full((8,), -1, dtype=torch.int32)
+    p2[:2] = 5
+    with pytest.raises(ValueError, match="active rows changed"):
+        call(start_pos=p2)
+    with pytest.raises(ValueError, match="continue the previous step"):
+        call(tokens=torch.zeros(4, 1, dtype=torch.int32))
+    with pytest.raises(NotImplementedError):  # a verify on a launch without speculation
+        call(num_valid_drafts=torch.zeros(8, dtype=torch.int32), accepted_counts=torch.ones(8, dtype=torch.int32),
+             spec_mode="argmax_ids")  # fmt: skip
+    h = call()  # the continuation itself is served
+    assert isinstance(h, gv.MotifPendingDecode)
+    toks = bridge.process_decode_output_host(h, is_tokens=True)
+    with pytest.raises(TypeError, match="not logits"):
+        bridge.process_decode_output_host(h, is_tokens=False)
+    assert bridge.read_decode_output(h) is toks  # without async_read: resolved (cached)
+    sync = call(read_from_device=True)  # read_from_device=True: host tokens now (synchronous scheduling)
+    assert torch.is_tensor(sync) and tuple(sync.shape) == (8, 1)
 
 
 class _RecordingGenerator(FakeMotifGenerator):

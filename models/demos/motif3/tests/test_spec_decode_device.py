@@ -613,6 +613,13 @@ class EmuHead:
             self.reads.flush()
         return torch.as_tensor(t.value, dtype=torch.int64).clone()
 
+    # the plain step with the device sampler (MotifGenerator._head_and_sample): the "streams" are the argmax ids
+    def forward_decode(self, X):
+        return _T(list(X.value))
+
+    def logits_rm(self, lg):
+        return _T(list(lg.value))
+
 
 class EmuKVW:
     """``DecodeKVWrite`` on the emulated device: records the step (the emulated model applies its calls). ``rows=64``
@@ -679,7 +686,7 @@ class EmuModel:
             rot_idxs.value, positions_to_rot_idxs(positions, self.cfg, rows_per_dp=rows_per_dp)
         ), "RoPE rows != the step's positions"
 
-    def decode(self, tokens, *, rot_idxs, cur_pos, page_table, kv_caches, kv_write=None):
+    def decode(self, tokens, *, rot_idxs, cur_pos, page_table, kv_caches, kv_write=None, return_streams=False):
         self.decode_calls["plain"] += 1
         if kv_write is not None:
             assert cur_pos is kv_write.cur_pos and page_table is kv_write.page_table
@@ -740,6 +747,9 @@ class EmuTrace:
     def execute(self, mesh, tid, cq_id=0, blocking=False):
         p = next(p for p in self.gen._paths.values() if p.trace_id == tid)
         new = self.gen._device_step(p, p.pool)
+        so = self.gen._take_so()
+        if p.so is not None:  # the captured sampler's outputs (EmuSampler)
+            p.so.tokens.value, p.so.info.value = so.tokens.value, so.info.value
         if isinstance(new, tuple):
             for o, x in zip(p.out, new):
                 if o is not None:  # (the argmax-only T64 path has no logits output)
@@ -750,6 +760,93 @@ class EmuTrace:
         self.kinds.append(p.kind)
 
     def release(self, mesh, tid):
+        pass
+
+
+def emu_draw(argmax: int, ctr: int, vocab: int) -> int:
+    """The emulated sampler's draw of a sampled lane: a function of the step's argmax and its RNG counter."""
+    return 100 + ((int(argmax) - 100 + 1 + (int(ctr) * 2654435761) % 97) % (vocab - 100))
+
+
+class EmuSampler:
+    """``MotifDeviceSampler`` on the emulated device (B6b tests): greedy lanes take the argmax; a sampled lane draws
+    :func:`emu_draw` from its RNG counter (seed and position: ``set_positions``); a sampled lane whose counter is
+    divisible by 5 is FLAGGED with a wrong device token, which ``resolve`` replaces from the step's counters
+    (``res.counters``) -- so a result read with another step's counters resolves to a wrong token."""
+
+    gumbel = False
+
+    def __init__(self, vocab: int):
+        self.V = int(vocab)
+        self.temps = [0.0] * api.NUM_LANES
+        self.seeds = [None] * api.NUM_LANES
+        import numpy as np
+
+        self._ctr = np.zeros((api.NUM_LANES, 2), dtype=np.uint32)
+        self.stats = {"steps": 0, "flagged_lanes": 0, "param_uploads": 0, "resolved": 0}
+        self.calls: List[str] = []
+
+    @property
+    def lane_params(self):
+        return [SimpleNamespace(full_support=False) for _ in range(api.NUM_LANES)]
+
+    def set_params(self, temperature, top_p, top_k, seeds, *, force=False):
+        self.calls.append("params")
+        new = (list(temperature), list(seeds))
+        if (self.temps, self.seeds) == new:
+            return False
+        self.temps, self.seeds = new
+        self.stats["param_uploads"] += 1
+        return True
+
+    def set_positions(self, positions):
+        import numpy as np
+
+        self.calls.append("positions")
+        pos = torch.as_tensor(positions).reshape(-1).tolist()
+        c = np.zeros((api.NUM_LANES, 2), dtype=np.uint32)
+        for l, p in enumerate(pos):
+            c[l, 0] = (0 if self.seeds[l] is None else int(self.seeds[l]) * 1000) + max(int(p), 0)
+        self._ctr = c
+        return c.copy()
+
+    def counter_draw(self, lane: int, argmax: int, ctr) -> int:
+        return int(argmax) if self.temps[lane] < 1e-5 else emu_draw(argmax, int(ctr[lane, 0]), self.V)
+
+    def sample(self, lg):
+        from models.demos.motif3.tt.sampling import INFO_INDEX, INFO_ROWS, SamplerOutput
+
+        a = list(lg.value)
+        info = torch.zeros(len(INFO_ROWS), api.NUM_LANES)
+        for l in range(api.NUM_LANES):
+            t = self.counter_draw(l, a[l], self._ctr) if a[l] >= 0 else 0
+            flag = self.temps[l] >= 1e-5 and int(self._ctr[l, 0]) % 5 == 0 and a[l] >= 0
+            info[INFO_INDEX["token"], l] = float(t + 1 if flag else t)
+            info[INFO_INDEX["flag"], l] = 1.0 if flag else 0.0
+        return SamplerOutput(tokens=_T(info[INFO_INDEX["token"]].tolist()), info=_T(info))
+
+    def read(self, so, *, all_chips=False, mesh_sync=False, count=True):
+        from models.demos.motif3.tt.sampling import SampleResult
+
+        self.calls.append("read")
+        res = SampleResult.from_info(torch.as_tensor(so.info.value).clone())
+        res.counters = self._ctr.copy()  # the counters written LAST (MotifDeviceSampler.read)
+        if count:
+            self.stats["steps"] += 1
+            self.stats["flagged_lanes"] += int(res.flags.sum())
+        return res
+
+    def resolve(self, res, logits_host, *, lanes=None, active=None):
+        todo = [l for l in torch.nonzero(res.flags).reshape(-1).tolist() if active is None or bool(active[l])]
+        if todo:
+            lg = logits_host()
+            for l in todo:
+                res.tokens[l] = self.counter_draw(l, int(lg[l].float().argmax()), res.counters)
+                res.resolved.append(l)
+                self.stats["resolved"] += 1
+        return res
+
+    def deallocate(self):
         pass
 
 
@@ -1178,6 +1275,144 @@ def test_cpu_host_staging_fast_lossless(monkeypatch, spec, kvr, wait):
     assert st_f["input_copies"] + st_f["input_copies_skipped"] == st_r["input_copies"]
     log(f"B6a spec={spec} kvr={kvr}: release {st_r['input_copies']} input copies; fast {st_f['input_copies']} "
         f"(+{st_f['input_copies_skipped']} skipped)")  # fmt: skip
+
+
+def _emu_sampled_run(gen, pool, reqs, *, width: int, mode: str, trace: bool = True, finish_at: Optional[int] = None):
+    """Device-sampled decode of ``reqs`` through one generator: ``mode="sync"`` = ``decode_forward_sampled`` per step;
+    ``"async"`` = B6b as the bridge drives it: ``submit_decode_sampled`` (the first step and every step after a lane
+    finished: no feed, after reading the outstanding step; every other step fed by the previous submission) and the
+    previous step's result read after the next submission. Even lanes greedy, odd lanes seeded T = 1. Returns
+    ``{name: tokens}``. ``finish_at``: request 0 stops after that many tokens (a layout change)."""
+    T = [0.0 if l % 2 == 0 else 1.0 for l in range(api.NUM_LANES)]
+    S = [None if l % 2 == 0 else 17 + l for l in range(api.NUM_LANES)]
+    sampling = (T, [1.0] * api.NUM_LANES, [api.VOCAB_SIZE] * api.NUM_LANES, S)
+    for r in reqs:
+        r.out, r.done = [r.first], False
+    if finish_at is not None:
+        reqs[0].max_new = finish_at
+
+    def batch(live):
+        tok = torch.zeros(api.NUM_LANES, dtype=torch.int32)
+        pos = torch.full((api.NUM_LANES,), -1, dtype=torch.int32)
+        pt = torch.zeros(api.NUM_LANES, width, dtype=torch.int32)
+        for r in live:
+            p = r.anchor_pos()
+            tok[r.lane], pos[r.lane] = r.out[-1], p
+            pt[r.lane, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.int32)[:width]
+        return api.DecodeBatch(tokens=tok, positions=pos, page_table=pt)
+
+    def commit(live, res):
+        for r in live:
+            r.out.append(int(res.tokens[r.lane]))
+            if len(r.out) >= r.max_new:
+                r.done = True
+
+    pending = None  # (live, submission)
+    while True:
+        live = [r for r in reqs if not r.done]
+        if mode == "sync":
+            if not live:
+                break
+            commit(live, gen.decode_forward_sampled(batch(live), sampling, kv_cache=pool, enable_trace=trace))
+            continue
+        if pending is not None:
+            plive, psub = pending
+            # the next step continues it only if no lane finished with it (the plugin's layout check)
+            steady = all(len(r.out) + 1 < r.max_new for r in plive) and plive == live
+            if steady:
+                b = batch(live)
+                b = api.DecodeBatch(tokens=b.tokens, positions=b.positions + (b.positions >= 0).int(),
+                                    page_table=b.page_table)  # host one step behind: positions + 1  # fmt: skip
+                sub = gen.submit_decode_sampled(b, sampling, kv_cache=pool, enable_trace=trace, feed=psub)
+                commit(plive, gen.read_decode_sampled(psub))  # cached: read inside the submission
+                pending = (live, sub)
+                continue
+            commit(plive, gen.read_decode_sampled(psub))
+            pending = None
+            live = [r for r in reqs if not r.done]
+        if not live:
+            break
+        pending = (live, gen.submit_decode_sampled(batch(live), sampling, kv_cache=pool, enable_trace=trace))
+    assert gen.outstanding_decode is None
+    return {r.name: list(r.out) for r in reqs}
+
+
+@pytest.mark.parametrize("kvr, staging", [(False, "fast"), (True, "fast"), (False, "release")])
+def test_cpu_async_decode_split_submission_lossless(monkeypatch, kvr, staging):
+    """B6b (``MOTIF3_ASYNC_DECODE=on``): on the emulated device with an emulated device sampler (greedy lanes, seeded
+    lanes, flagged lanes resolved on the host from the step's counters), ``submit_decode_sampled`` /
+    ``read_decode_sampled`` with ``feed`` decode exactly the tokens of ``decode_forward_sampled`` (traced and eager,
+    plain ``row`` / ``all``, both host stagings), through a finished lane (an unfed reload). Traced fed steps are
+    pre-staged: the sampler's counters of step k + 1 are written before step k is read, so the read must attach step
+    k's own counters (else its flagged lanes resolve to other tokens)."""
+    results = {}
+    for mode in ("sync", "async"):
+        gen, model, dev, pool, tr = emu_generator(
+            monkeypatch, kvr=kvr, spec=False, decode_kv_mode="all" if kvr else "row", cfg_kw=dict(host_staging=staging)
+        )  # fmt: skip
+        gen.sampler = EmuSampler(dev.V)
+        assert gen.supports_async_decode
+        W = 128
+        gen.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
+        gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=W)
+        reqs = emu_requests(dev, 10, seed=31, width=W, max_new=45)
+        out = _emu_sampled_run(gen, pool, reqs, width=W, mode=mode, finish_at=20)
+        reqs2 = emu_requests(dev, 4, seed=32, width=W, max_new=12, start_block=2000)
+        out2 = _emu_sampled_run(gen, pool, reqs2, width=W, mode=mode, trace=False)
+        results[mode] = (out, out2, dict(gen.stats), dict(gen.sampler.stats))
+    (o_s, e_s, st_s, sm_s), (o_a, e_a, st_a, sm_a) = results["sync"], results["async"]
+    assert o_a == o_s and e_a == e_s
+    assert sm_s["resolved"] > 0 and sm_a["resolved"] == sm_s["resolved"]  # flagged lanes, resolved alike
+    assert st_s["async_submits"] == 0 and st_a["async_submits"] == st_s["decode_steps"] - 1  # minus the eager warmup step
+    assert st_a["fed_steps"] > 30 and st_a["prestaged_steps"] > 20 and st_a["prestaged_steps"] < st_a["fed_steps"]
+    assert st_a["decode_steps"] == st_s["decode_steps"] and st_a["sampled_steps"] == st_s["sampled_steps"]
+    log(f"B6b kvr={kvr} {staging}: {st_a['async_submits']} submissions, {st_a['fed_steps']} fed, "
+        f"{st_a['prestaged_steps']} pre-staged, {sm_a['resolved']} flagged lanes resolved")  # fmt: skip
+
+
+def test_cpu_async_decode_refusals(monkeypatch):
+    """``submit_decode_sampled``: a fed step must continue its feed (lanes, positions + 1); no unfed submission while
+    one is outstanding; a read is done once (a later read returns the cached result); another generator call reads
+    the outstanding step first (``settle_decode``); a speculating launch has no split submission."""
+    gen, model, dev, pool, tr = emu_generator(monkeypatch, kvr=True, spec=False, decode_kv_mode="all")
+    gen.sampler = EmuSampler(dev.V)
+    W = 128
+    gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=W)
+    reqs = emu_requests(dev, 3, seed=5, width=W, max_new=10)
+    smp = ([0.0] * 32, [1.0] * 32, [api.VOCAB_SIZE] * 32, [None] * 32)
+    tok = torch.zeros(32, dtype=torch.int32)
+    pos = torch.full((32,), -1, dtype=torch.int32)
+    pt = torch.zeros(32, W, dtype=torch.int32)
+    for r in reqs:
+        tok[r.lane], pos[r.lane] = r.first, r.anchor_pos() + 1  # out is empty: anchor = S - 1; first sits at S
+        pt[r.lane, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.int32)
+    b = api.DecodeBatch(tokens=tok, positions=pos, page_table=pt)
+    sub = gen.submit_decode_sampled(b, smp, kv_cache=pool, enable_trace=True)
+    assert gen.outstanding_decode is sub and not sub.read
+    with pytest.raises(RuntimeError, match="not read yet"):
+        gen.submit_decode_sampled(b, smp, kv_cache=pool, enable_trace=True)
+    with pytest.raises(ValueError, match="position \\+ 1"):
+        gen.submit_decode_sampled(b, smp, kv_cache=pool, enable_trace=True, feed=sub)
+    p2 = pos.clone()
+    p2[reqs[0].lane] = -1
+    with pytest.raises(ValueError, match="lanes"):
+        gen.submit_decode_sampled(api.DecodeBatch(tokens=tok, positions=p2, page_table=pt), smp, kv_cache=pool,
+                                  enable_trace=True, feed=sub)  # fmt: skip
+    assert gen.outstanding_decode is sub  # refused before any device op
+    n = gen.sampler.stats["steps"]
+    res = gen.settle_decode()  # e.g. a prefill call: the outstanding step is read first
+    assert gen.outstanding_decode is None and gen.read_decode_sampled(sub) is res and gen.sampler.stats["steps"] == n + 1
+    nxt = api.DecodeBatch(tokens=tok, positions=pos + (pos >= 0).int(), page_table=pt)
+    sub2 = gen.submit_decode_sampled(nxt, smp, kv_cache=pool, enable_trace=True, feed=sub)  # feed already read: ok
+    assert gen.stats["prestaged_steps"] == 0 and gen.stats["fed_steps"] == 1
+    gen.decode_forward_sampled(api.DecodeBatch(tokens=tok, positions=pos + 2 * (pos >= 0).int(), page_table=pt), smp,
+                               kv_cache=pool, enable_trace=True)  # fmt: skip
+    assert sub2.read and gen.stats["settled_reads"] == 2
+    gen2, *_ = emu_generator(monkeypatch, kvr=True, spec=True)
+    assert not gen2.supports_async_decode
+    with pytest.raises(NotImplementedError, match="plain decode path"):
+        gen2.sampler = EmuSampler(dev.V)
+        gen2.submit_decode_sampled(b, smp, kv_cache=gen2._pool, enable_trace=False)
 
 
 def test_cpu_path_host_rows_match_release():

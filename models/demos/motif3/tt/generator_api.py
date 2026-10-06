@@ -554,6 +554,33 @@ def check_host_wait(mode: Any, *, name: str = "MOTIF3_HOST_WAIT") -> str:
     return v
 
 
+# B6b: vLLM asynchronous scheduling for the non-MTP launches (OPTIMIZATION_PLAN.md §3.3 B6, OPT_PHASE_A_REVIEW.md §7.2).
+# "on": the bridge declares ``supports_async_decode`` (decode-reload contract v1, full adapter): a device-sampled decode
+# step returns before its 1 KB read (``read_from_device=False``), and a steady step (``reload_inputs=False``) takes its
+# tokens from the previous step's read and its positions from the previous step + 1, so vLLM's scheduling and the
+# plugin's input build for step k + 1 run while step k replays. The device runs the same trace on the same inputs.
+# "off" (default) = the release: every decode reloads its inputs and reads its result before returning. The MTP launch
+# keeps "off" (the plugin refuses async scheduling with speculation unless supports_async_spec_decode).
+ASYNC_DECODE_MODES = ("off", "on")
+DEFAULT_ASYNC_DECODE = "off"
+
+
+def check_async_decode(mode: Any, *, name: str = "MOTIF3_ASYNC_DECODE") -> str:
+    """``mode`` lower-cased and stripped if it is one of :data:`ASYNC_DECODE_MODES` (``""`` / None = the default),
+    else ``ValueError`` naming ``name``."""
+    v = str(mode if mode is not None else "").strip().lower() or DEFAULT_ASYNC_DECODE
+    if v not in ASYNC_DECODE_MODES:
+        raise ValueError(f"{name} must be one of {ASYNC_DECODE_MODES}, got {mode!r}")
+    return v
+
+
+def async_decode_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_ASYNC_DECODE``: ``off`` (default) or ``on`` (B6b, :data:`ASYNC_DECODE_MODES`); case and blanks ignored,
+    anything else raises ``ValueError``."""
+    env = os.environ if environ is None else environ
+    return check_async_decode(env.get("MOTIF3_ASYNC_DECODE"))
+
+
 def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
     64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
@@ -1835,6 +1862,10 @@ __all__ = [
     "HOST_WAIT_MODES",
     "DEFAULT_HOST_WAIT",
     "check_host_wait",
+    "ASYNC_DECODE_MODES",
+    "DEFAULT_ASYNC_DECODE",
+    "check_async_decode",
+    "async_decode_from_env",
     "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
     "wide_step_ratio_from_env",

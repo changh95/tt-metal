@@ -620,6 +620,43 @@ class DecodePath:
         return self.trace_id is not None
 
 
+@dataclass(eq=False)
+class SampledSubmission:
+    """B6b (``MOTIF3_ASYNC_DECODE=on``): one device-sampled plain decode step submitted by
+    :meth:`MotifGenerator.submit_decode_sampled` and not read yet, or read and kept for the caller.
+
+    ``positions``: the step's lane positions (-1 = idle); ``sampling``: the lane-ordered ``(temperature, top_p, top_k,
+    seeds)`` it was sampled with (normalised to tuples); ``counters``: the RNG counters written for it (the host fallback
+    of a flagged lane needs the step's own counters, and the next step's may be written before this one is read);
+    ``t_enq``: when its replay was enqueued (traced steps); ``dev`` / ``so``: an eager step's outputs (freed by the
+    read); ``result``: the :class:`SampleResult` once read (:meth:`MotifGenerator.read_decode_sampled`, exactly once);
+    ``error``: the read's exception (a failed read is not repeated)."""
+
+    key: DecodeKey
+    positions: torch.Tensor
+    sampling: Tuple[Tuple[Any, ...], ...]
+    traced: bool
+    t0: float
+    counters: Any = None
+    t_enq: Optional[float] = None
+    dev: Any = None
+    so: Any = None
+    result: Optional[SampleResult] = None
+    error: Optional[BaseException] = None
+
+    @property
+    def read(self) -> bool:
+        return self.result is not None or self.error is not None
+
+
+def _sampling_key(sampling) -> Tuple[Tuple[Any, ...], ...]:
+    """``sampling`` (lane-ordered ``(temperature, top_p, top_k, seeds)`` sequences or tensors) as nested tuples."""
+    return tuple(
+        tuple(v.reshape(-1).tolist()) if isinstance(v, torch.Tensor) else (None if v is None else tuple(v))
+        for v in sampling
+    )
+
+
 @dataclass
 class PrefillRowJob:
     """One row of a ``prefill_forward_batch`` call after the host checks: its plan and every chunk's host tables."""
@@ -849,6 +886,12 @@ class MotifGenerator(api.MotifGenerator):
         self.host_wait = api.check_host_wait(getattr(cfg, "host_wait", None), name="cfg.host_wait")
         self.waiter: Optional[ReplayWaiter] = ReplayWaiter() if self.host_wait == "spin" else None
         self._readers: Dict[Tuple, HostShardReader] = {}  # host staging of the spec outputs' id reads (by role)
+        # B6b (MOTIF3_ASYNC_DECODE, the bridge): the device-sampled plain step submitted and not read yet
+        self._outstanding: Optional[SampledSubmission] = None
+        self.stats["async_submits"] = 0  # submit_decode_sampled calls
+        self.stats["fed_steps"] = 0  # ... whose tokens came from the previous step's read (feed)
+        self.stats["prestaged_steps"] = 0  # ... whose other inputs were written before that read
+        self.stats["settled_reads"] = 0  # outstanding steps read by another call (settle_decode)
 
     # ==============================================================================================================
     # construction (GEN-1)
@@ -1440,6 +1483,7 @@ class MotifGenerator(api.MotifGenerator):
         input order. ``enable_trace`` (plugin ``trace_mode="all"``) is ignored: prefill is eager. Timings:
         ``last_prefill_plan_s`` (host checks, plan and tables), ``last_prefill_s`` (the passes: device work and host
         reads, from the first upload to the last logits row)."""
+        self.settle_decode()
         pool = self._check_pool(kv_cache)
         t0 = time.time()
         batch = self.plan_prefill_batch(requests)
@@ -1671,13 +1715,18 @@ class MotifGenerator(api.MotifGenerator):
             last[k] = v
             self.stats["input_copies"] += 1
 
-    def _write_path_inputs(self, p: DecodePath, tokens, positions, page_table=None) -> None:
+    def _write_path_inputs(self, p: DecodePath, tokens, positions, page_table=None, *, only=None) -> None:
         """The path's own inputs (``tokens`` / ``rot``, and ``cur`` / ``pt`` on the plain ``row`` path) for one step,
-        per :attr:`host_staging`."""
+        per :attr:`host_staging`. ``only`` (B6b): a predicate on the input name; the others are not written."""
         if self.host_staging == "fast":
-            self._copy_path_inputs(p, self._path_host_rows(p.kind, p.mode, tokens, positions, page_table))
+            rows = self._path_host_rows(p.kind, p.mode, tokens, positions, page_table)
+            if only is not None:
+                rows = {k: v for k, v in rows.items() if only(k)}
+            self._copy_path_inputs(p, rows)
             return
         h = self._path_host_inputs(p.kind, p.mode, tokens, positions, page_table)
+        if only is not None:
+            h = {k: v for k, v in h.items() if only(k)}
         for k, v in h.items():
             ttnn.copy_host_to_device_tensor(v, p.inputs[k])
         self.stats["input_copies"] += len(h)
@@ -1861,6 +1910,7 @@ class MotifGenerator(api.MotifGenerator):
         the T64 trace): the step is an ordinary spec step (``decode_forward_spec`` without drafts, the same logits; the
         MTP layer also writes its cache, design G8). ``path`` (tests): run a specific ``(kind, mode)`` path instead of
         the serving one."""
+        self.settle_decode()
         pool = self._check_pool(kv_cache)
         key = self._resolve_key(None, path)
         if key[0] in SPEC_KINDS:
@@ -1923,6 +1973,7 @@ class MotifGenerator(api.MotifGenerator):
         speculating launch this is the ordinary step of the spec trace (:meth:`decode_forward_spec` with
         ``sampling``; ``spec_verify="wide"``: of the T64 trace, sampling its anchor rows)."""
         smp = self._require_sampler()
+        self.settle_decode()
         pool = self._check_pool(kv_cache)
         key = self._resolve_key(None, path)
         if key[0] in SPEC_KINDS:
@@ -1963,6 +2014,186 @@ class MotifGenerator(api.MotifGenerator):
         finally:
             _free(dev, so)
         self.timings["last_sampled_step_ms"] = (time.perf_counter() - t0) * 1e3
+        return res
+
+    # ==============================================================================================================
+    # B6b: split submission and read of a device-sampled plain step (MOTIF3_ASYNC_DECODE, vLLM async scheduling)
+    # ==============================================================================================================
+    @property
+    def supports_async_decode(self) -> bool:
+        """:meth:`submit_decode_sampled` / :meth:`read_decode_sampled` serve this launch: the plain serving path (a
+        speculating launch decodes through :meth:`decode_forward_spec`)."""
+        return not self.spec_launch
+
+    @property
+    def outstanding_decode(self) -> Optional[SampledSubmission]:
+        """The submitted device-sampled step whose result is not read yet (None if every step was read)."""
+        return self._outstanding
+
+    def settle_decode(self) -> Optional[SampleResult]:
+        """Read the outstanding submitted step, if any (its result stays on the :class:`SampledSubmission` for its
+        owner). Every other device call of the generator does this first (F3N rule R4, and the decode trace's outputs
+        must be read before anything replays it again)."""
+        sub = self._outstanding
+        if sub is None:
+            return None
+        self.stats["settled_reads"] += 1
+        return self.read_decode_sampled(sub)
+
+    def submit_decode_sampled(
+        self,
+        batch: api.DecodeBatch,
+        sampling: LaneSampling,
+        *,
+        kv_cache: Any,
+        enable_trace: bool,
+        feed: Optional[SampledSubmission] = None,
+        path: Optional[DecodeKey] = None,
+    ) -> SampledSubmission:
+        """Submit one device-sampled plain decode step and return before its read (B6b; :meth:`read_decode_sampled`
+        reads it). :meth:`decode_forward_sampled` = this + the read, with the same device inputs and replay.
+
+        ``feed`` (the previous step's submission): the step's input tokens are that step's sampled tokens (after the
+        host fallback), lane by lane -- ``batch.tokens`` is ignored. The step must continue it exactly: the same
+        active lanes on the same path, each at its position + 1 (else ``ValueError`` before any device op). A traced
+        fed step whose feed is still outstanding writes every other input first (RoPE rows, ``cur`` / page table or
+        the ``DecodeKVWrite`` inputs; the sampler's parameters and RNG counters when they are the feed's), then reads
+        the feed, then writes the tokens and replays: the host work before the read overlaps the device's previous
+        step. Device writes are in order on the command queue, so nothing reaches the trace's inputs before the
+        previous replay is done. Without ``feed`` no step may be outstanding (read it first).
+
+        Returns the :class:`SampledSubmission` (it becomes :attr:`outstanding_decode`)."""
+        smp = self._require_sampler()
+        pool = self._check_pool(kv_cache)
+        key = self._resolve_key(PLAIN, path) if path is not None else self.serving_path
+        if key[0] != PLAIN:
+            raise NotImplementedError(
+                f"submit_decode_sampled serves the plain decode path; this launch decodes on {key} "
+                f"(decode_forward_spec)"
+            )
+        prev = self._outstanding
+        if prev is not None and prev is not feed:
+            raise RuntimeError(
+                "a submitted decode step is not read yet: read_decode_sampled() it (or feed it) before the next one"
+            )
+        positions = batch.positions.to(torch.int32)
+        active = positions >= 0
+        if feed is not None:
+            if feed.error is not None:
+                raise RuntimeError(f"the fed decode step failed: {feed.error!r}")
+            f_act = feed.positions >= 0
+            if feed.key != key or not torch.equal(active, f_act):
+                raise ValueError(
+                    f"a fed decode step must keep the previous step's lanes and path: lanes "
+                    f"{torch.nonzero(active).reshape(-1).tolist()} on {key}, previous "
+                    f"{torch.nonzero(f_act).reshape(-1).tolist()} on {feed.key}"
+                )
+            if not torch.equal(positions[active], feed.positions[active] + 1):
+                raise ValueError("a fed decode step must run every lane at its previous position + 1")
+            batch = api.DecodeBatch(
+                tokens=torch.zeros_like(positions), positions=positions, page_table=batch.page_table
+            )  # placeholder tokens (valid ids) for the host checks; the real ones are written after the feed's read
+        self._check_plain_batch(batch, pool)
+        use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
+        if use_trace and self._paths[key].so is None:
+            raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
+        p = self._stage_path(key, batch.page_table_width)
+        skey = _sampling_key(sampling)
+        sub = SampledSubmission(key=key, positions=positions.clone(), sampling=skey, traced=use_trace,
+                                t0=time.perf_counter())  # fmt: skip
+        self.stats["async_submits"] += 1
+        tokens = batch.tokens
+        if feed is not None:
+            self.stats["fed_steps"] += 1
+            sampler_first = feed.sampling == skey
+            if use_trace and not feed.read:  # pre-stage: everything but the tokens before the previous step's read
+                self.stats["prestaged_steps"] += 1
+                self._write_path_inputs(p, tokens, positions, batch.page_table, only=lambda k: k != "tokens")
+                if p.kv_write is not None:
+                    p.kv_write.write_step(KVWriteStep.ordinary(positions, batch.page_table))
+                if sampler_first:
+                    smp.set_params(*sampling)
+                    sub.counters = smp.set_positions(positions)
+                tokens = self._fed_tokens(feed, active)
+                self._write_path_inputs(p, tokens, positions, batch.page_table, only=lambda k: k == "tokens")
+            else:
+                tokens = self._fed_tokens(feed, active)
+                sampler_first = False
+                self._write_plain(p, api.DecodeBatch(tokens=tokens, positions=positions, page_table=batch.page_table))
+            if sub.counters is None:
+                smp.set_params(*sampling)
+                sub.counters = smp.set_positions(positions)
+        else:
+            self._write_plain(p, batch)
+            smp.set_params(*sampling)
+            sub.counters = smp.set_positions(positions)
+        self.stats["decode_steps"] += 1
+        if use_trace:
+            self._replay(p)
+            sub.t_enq = time.perf_counter()
+        else:
+            try:
+                sub.dev = self._plain_step(p, pool)
+                sub.so = self._take_so()
+            except BaseException:
+                _free(sub.dev, self._take_so())
+                raise
+        self._outstanding = sub
+        return sub
+
+    def _fed_tokens(self, feed: SampledSubmission, active: torch.Tensor) -> torch.Tensor:
+        """The input tokens of the step after ``feed``: its sampled tokens on the active lanes (read now if needed)."""
+        res = self.read_decode_sampled(feed)
+        tok = res.tokens.reshape(-1).to(torch.int32)
+        tok = torch.where(active, tok, torch.zeros_like(tok))
+        check_token_ids(tok[active], self.cfg)
+        return tok
+
+    def read_decode_sampled(self, sub: SampledSubmission) -> SampleResult:
+        """The :class:`SampleResult` of a submitted step (lane order), as :meth:`decode_forward_sampled` returns it:
+        the 1 KB read (blocking; after the ``host_wait`` spin), the step's own RNG counters, the exact host fallback of
+        the flagged active lanes and the counters. Reads exactly once: later calls return the cached result (or raise
+        the read's error again)."""
+        if sub.result is not None:
+            return sub.result
+        if sub.error is not None:
+            raise sub.error
+        if sub is not self._outstanding:
+            raise RuntimeError("read_decode_sampled: this submission is neither outstanding nor read")
+        smp = self._require_sampler()
+        try:
+            if sub.traced:
+                p = self._paths[sub.key]
+                t_read = None
+                if self.waiter is not None:
+                    pred = self.waiter.predicted_ms(sub.key)
+                    late = pred is not None and (time.perf_counter() - sub.t_enq) * 1e3 >= pred
+                    t_read = None if late else self._spin(sub.key, sub.t_enq)  # late: no sample (the device idled)
+                res = smp.read(p.so)  # blocking (chip 0, 1 KB): waits for the step
+                if t_read is not None:
+                    self._waited(sub.key, sub.t_enq, t_read)
+                rm = p.out
+            else:
+                res = smp.read(sub.so)
+                rm = sub.dev
+            if sub.counters is not None:
+                res.counters = sub.counters.copy()  # the step's (the next step's may be written already)
+            res = self._finish_sampled("plain", sub.positions, res, rm)
+        except BaseException as e:
+            sub.error = e
+            self._outstanding = None
+            if sub.traced:
+                self._abort_step()
+            raise
+        finally:
+            if not sub.traced:
+                _free(sub.dev, sub.so)
+                sub.dev = sub.so = None
+        if sub.traced:
+            self._read_done()
+        self._outstanding = None
+        sub.result = res
+        self.timings["last_sampled_step_ms"] = (time.perf_counter() - sub.t0) * 1e3
         return res
 
     def plan_spec_step(self, batch: api.SpecDecodeBatch, *, path: Optional[DecodeKey] = None) -> SpecStepPlan:
@@ -2030,6 +2261,7 @@ class MotifGenerator(api.MotifGenerator):
 
         Every step ends in one blocking read of the outputs it replayed (F3N rule R4: a replay of the other trace while
         outputs are unread is refused, :meth:`_replay`)."""
+        self.settle_decode()
         pool = self._check_pool(kv_cache)
         if self.model.mtp is None:
             raise NotImplementedError("decode_forward_spec needs the MTP layer (the generator was built without it)")
@@ -2394,6 +2626,7 @@ class MotifGenerator(api.MotifGenerator):
         "all_split")``, captured second); ``"wide"`` captures the T64 trace alone. A T64 path is staged and captured
         only under ``ring_gather="safe"`` (F3N R1, checked here again: tests may switch ``MotifCCL.ring_gather`` at run
         time)."""
+        self.settle_decode()
         pool = self._check_pool(kv_cache)
         W = int(page_table_width)
         if W < 1:
@@ -2587,6 +2820,11 @@ class MotifGenerator(api.MotifGenerator):
     def release_traces(self) -> None:
         """Release every captured decode trace and its outputs (the persistent inputs stay: a re-capture reuses
         them)."""
+        if getattr(self, "_outstanding", None) is not None:  # B6b: a submitted step is read before its trace goes
+            try:
+                self.settle_decode()
+            except Exception as e:  # the traces are released anyway
+                self.log(f"release_traces: the outstanding decode step's read failed: {e!r}")
         waiter = getattr(self, "waiter", None)
         if waiter is not None and waiter.stats["spins"]:
             w = waiter.stats
@@ -2639,6 +2877,7 @@ __all__ = [
     "SPEC",
     "SPEC_KINDS",
     "SampledSpecDecodeResult",
+    "SampledSubmission",
     "SpecPass",
     "SpecStepPlan",
     "check_decode_page_tables",

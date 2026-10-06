@@ -87,8 +87,8 @@ complete; the generator's ``create:`` line logs the policy).
 
 What the plugin calls, and what this class does
 ------------------------------------------------
-* ``model_capabilities`` (class level, read before any instance exists, :func:`model_capabilities_from_env`): no
-  async decode, ``supports_device_penalties: False`` explicitly (the plugin's default for that key is True);
+* ``model_capabilities`` (class level, read before any instance exists, :func:`model_capabilities_from_env`):
+  ``supports_async_decode`` only with ``MOTIF3_ASYNC_DECODE=on`` (B6b, below), ``supports_device_penalties: False`` explicitly (the plugin's default for that key is True);
   ``supports_sample_on_device`` follows ``MOTIF3_DEVICE_SAMPLING`` (default on; NO ``max_device_top_k``: the sampler
   is exact for every top-k / top-p, flagging what it cannot certify for the exact host fallback, and ``top_p = 1``
   lanes without top-k take its full-vocab Gumbel path); ``supports_prefix_caching`` / ``supports_chunked_prefill`` /
@@ -126,9 +126,23 @@ What the plugin calls, and what this class does
   (``drafts_all_lanes``, asked with the prior-smoothed running acceptance).
 * ``warmup_model_prefill`` / ``warmup_model_decode`` / ``release_request`` / ``release_persistent_capture``.
 
-Decode-reload contract v1, partial adapter (``vllm-tt-plugin/docs/DECODE_RELOAD_CONTRACT.md``): every decode must
-carry ``reload_inputs=True`` (always the case without ``supports_async_decode``); ``reload_inputs=False``,
-``reload_page_table=True`` and the legacy ``reset_batch`` keyword raise.
+Decode-reload contract v1 (``vllm-tt-plugin/docs/DECODE_RELOAD_CONTRACT.md``). ``MOTIF3_ASYNC_DECODE`` off (the
+default, the release): a partial adapter, every decode must carry ``reload_inputs=True`` (always the case without
+``supports_async_decode``); ``reload_inputs=False``, ``reload_page_table=True`` and the legacy ``reset_batch`` keyword
+raise.
+
+B6b, ``MOTIF3_ASYNC_DECODE=on`` (non-MTP launches; drop ``--no-async-scheduling`` so vLLM schedules asynchronously):
+a full adapter with ``supports_async_decode``. A device-sampled plain step submitted with ``read_from_device=False``
+returns a :class:`MotifPendingDecode` before its 1 KB read (``generator.submit_decode_sampled``). A steady step
+(``reload_inputs=False``, the plugin's resident fast path) continues the previous one: same rows, lanes and sampling,
+positions + 1, page table from the call (current), and its tokens = the previous step's sampled tokens, read on the host
+after every other input of the step was written (``feed``). So vLLM's ``update_from_output`` / ``schedule`` and the
+plugin's input build for step k + 1 run while step k replays; the read of step k, the token write and the replay of
+k + 1 stay on the critical path. The token comes from the host read rather than from the device (the sampler's host
+fallback may replace a flagged lane's token, so the device token is not final), which keeps every step bitwise the
+synchronous one. Host-sampled steps (penalties, logprobs > 0, structured output, ...) and every step the plugin does
+not deem steady reload as before; the plugin drains the pending step first. The MTP launch keeps it off (refused at
+construction: the plugin refuses async scheduling with speculation).
 """
 
 from __future__ import annotations
@@ -139,6 +153,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,6 +206,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     check_spec_result,
     check_tt_config,
     chunk_budget_from_env,
+    async_decode_from_env,
     feature_switch_from_env,
     host_staging_from_env,
     kv_cache_bytes_per_chip,
@@ -342,12 +358,13 @@ def model_capabilities_from_env(environ: Optional[Mapping[str, str]] = None) -> 
     by default for a model that allows them; device sampling needs ``sample_on_device_mode``). With every switch off
     (``MOTIF3_*=0``, ``MOTIF3_DEVICE_SAMPLING=0``) this is exactly the draft-1 dict. Device sampling declares no
     ``max_device_top_k`` (the sampler is exact for every top-k / top-p; a declared bound would only send requests to
-    the host) and keeps ``supports_device_penalties`` False (penalized steps sample on the host)."""
+    the host) and keeps ``supports_device_penalties`` False (penalized steps sample on the host).
+    ``supports_async_decode`` follows ``MOTIF3_ASYNC_DECODE`` (B6b; default ``off``, the release)."""
     sw = feature_switches(environ)
     caps: Dict[str, Any] = {
         "supports_prefix_caching": sw["MOTIF3_PREFIX_CACHING"],
         "supports_chunked_prefill": sw["MOTIF3_CHUNKED_PREFILL"],
-        "supports_async_decode": False,
+        "supports_async_decode": async_decode_from_env(environ) == "on",  # B6b, MOTIF3_ASYNC_DECODE
         "supports_sample_on_device": device_sampling_switch(environ),
         "supports_device_penalties": False,  # the plugin's default for an absent key is True
         "supports_spec_decode": sw["MOTIF3_SPEC_DECODE"],
@@ -916,6 +933,10 @@ class SamplingStats:
     host_steps: int = 0  # decode steps the plugin sampled on the host (no sampling_params) on a device-sampling launch
     verify_steps_with_params: int = 0  # verify steps that carried sampling_params (the argmax path is kept)
     nongreedy_verify_rows: int = 0  # ... their non-greedy active rows (PS-1 keeps this at 0)
+    # B6b (MOTIF3_ASYNC_DECODE=on): device-sampled steps returned before their read (read_from_device=False), and
+    # steady steps that took their inputs from the previous step (reload_inputs=False)
+    deferred_steps: int = 0
+    resident_steps: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dataclasses.asdict(self)
@@ -960,6 +981,47 @@ def wants_logprobs(sampling_params: Any) -> bool:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# B6b: asynchronous decode (MOTIF3_ASYNC_DECODE=on)
+# ----------------------------------------------------------------------------------------------------------------
+@dataclass
+class _ResidentDecode:
+    """The last device-sampled decode step of the bridge (row order): what a steady step (``reload_inputs=False``)
+    continues. ``sub`` is the generator's ``SampledSubmission`` (its tokens feed the next step)."""
+
+    rows: int
+    lanes: List[int]
+    active: torch.Tensor
+    row_pos: torch.Tensor
+    sub: Any
+
+
+class MotifPendingDecode:
+    """A device-sampled decode step returned before its read (``decode_forward(read_from_device=False)`` with
+    ``MOTIF3_ASYNC_DECODE=on``). :meth:`output` reads it once (``generator.read_decode_sampled``, cached there; a later
+    step that needs its tokens may have read it already) and returns what a synchronous ``decode_forward`` returns: the
+    tokens ``int32 [B, 1]`` in row order, or ``(tokens, logprobs float32 [B])`` when a row asked for logprobs."""
+
+    def __init__(self, bridge: "MotifForCausalLM", sub: Any, lane_idx: torch.Tensor, active: torch.Tensor,
+                 sampling_params: Any):  # fmt: skip
+        self._bridge, self.sub = bridge, sub
+        self._lane_idx, self._active, self._params = lane_idx, active, sampling_params
+        self._out: Any = None
+
+    @property
+    def resolved(self) -> bool:
+        return self._out is not None
+
+    def output(self):
+        b = self._bridge
+        with b._lock:
+            if self._out is None:
+                sample = b.generator.read_decode_sampled(self.sub)
+                tokens = b._sampled_tokens(sample, self._lane_idx, self._active)
+                self._out = b._sampled_output(sample, tokens, self._lane_idx, self._active, self._params)
+            return self._out
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # The vLLM model class
 # ----------------------------------------------------------------------------------------------------------------
 class MotifForCausalLM:
@@ -974,7 +1036,9 @@ class MotifForCausalLM:
     """
 
     # Explicit commands (reload_inputs / reload_page_table / reload_sampling_params / reset_sampling_state).
-    # Partial v1 adapter: async decode stays off, so the plugin sends reload_inputs=True on every decode.
+    # MOTIF3_ASYNC_DECODE off (default): partial v1 adapter, async decode off, the plugin sends reload_inputs=True on
+    # every decode. on (B6b): full v1 adapter with supports_async_decode (DECODE_RELOAD_CONTRACT.md "Additional
+    # requirements"): reload_inputs=False / reload_page_table=True on steady device-sampled steps, read_from_device.
     decode_input_update_contract = 1
 
     # Read by the plugin from the CLASS at config time (platform.py:1815-1822), before any instance exists; the
@@ -1030,6 +1094,21 @@ class MotifForCausalLM:
         self.host_staging = host_staging_from_env()
         self._lane_idx_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
         self._arange_cache: Optional[torch.Tensor] = None
+        # B6b (MOTIF3_ASYNC_DECODE): what the class told the plugin (read at import, the same in every process)
+        self._async = bool(self.model_capabilities.get("supports_async_decode", False))
+        if self._async and self._spec:
+            raise ValueError(
+                "MOTIF3_ASYNC_DECODE=on serves the launches without speculation (the plugin refuses asynchronous "
+                "scheduling with speculative decoding: supports_async_spec_decode is False); unset it on the MTP launch"
+            )
+        if self._async and not getattr(generator, "supports_async_decode", False):
+            raise ValueError(
+                f"MOTIF3_ASYNC_DECODE=on, but the generator {type(generator).__name__} has no split decode submission "
+                f"(supports_async_decode / submit_decode_sampled / read_decode_sampled)"
+            )
+        self._resident: Optional[_ResidentDecode] = None  # the last device-sampled step (async decode)
+        self._pending: Optional[MotifPendingDecode] = None  # ... while the plugin has not read it
+        self._lock = threading.RLock()  # the plugin may resolve a deferred step from its output thread
 
     # ---- vLLM model-inspection protocol (registry._ModelInfo); never executed on TT ---------------------------
     def embed_input_ids(self, input_ids):
@@ -1522,6 +1601,27 @@ class MotifForCausalLM:
         empty_slots=None,
         **kwargs,
     ):
+        """One prefill step (:meth:`_prefill_forward_unlocked` documents it) under the bridge's lock. It ends the
+        resident decode chain (B6b: the plugin reloads the next decode)."""
+        with self._lock:
+            self._resident = None
+            return self._prefill_forward_unlocked(
+                tokens, page_table, kv_cache, prompt_lens, start_pos=start_pos, enable_trace=enable_trace,
+                sampling_params=sampling_params, empty_slots=empty_slots, **kwargs,
+            )  # fmt: skip
+
+    def _prefill_forward_unlocked(
+        self,
+        tokens,
+        page_table,
+        kv_cache,
+        prompt_lens,
+        start_pos=None,
+        enable_trace=False,
+        sampling_params=None,
+        empty_slots=None,
+        **kwargs,
+    ):
         """Prefill every row of one plugin step with ONE ``generator.prefill_forward_batch`` call
         (``model_runner.py:3155-3219``; features design §2.3).
 
@@ -1630,6 +1730,37 @@ class MotifForCausalLM:
         spec_mode=None,
         **kwargs,
     ):
+        """One decode step (the plugin's call; :meth:`_decode_forward_unlocked` documents it), under the bridge's lock:
+        with ``MOTIF3_ASYNC_DECODE=on`` the plugin may resolve a deferred step (:class:`MotifPendingDecode`) from its
+        output thread."""
+        with self._lock:
+            return self._decode_forward_unlocked(
+                tokens, start_pos, page_table, kv_cache, enable_trace=enable_trace,
+                read_from_device=read_from_device, sampling_params=sampling_params, slot_remap=slot_remap,
+                reload_inputs=reload_inputs, reload_page_table=reload_page_table,
+                reload_sampling_params=reload_sampling_params, reset_sampling_state=reset_sampling_state,
+                num_valid_drafts=num_valid_drafts, accepted_counts=accepted_counts, spec_mode=spec_mode, **kwargs,
+            )  # fmt: skip
+
+    def _decode_forward_unlocked(
+        self,
+        tokens,
+        start_pos,
+        page_table,
+        kv_cache,
+        enable_trace=True,
+        read_from_device=True,
+        sampling_params=None,
+        slot_remap=None,
+        reload_inputs=True,
+        reload_page_table=False,
+        reload_sampling_params=False,
+        reset_sampling_state=False,
+        num_valid_drafts=None,
+        accepted_counts=None,
+        spec_mode=None,
+        **kwargs,
+    ):
         """One decode step (``async_decode.py:1144-1292``).
 
         Args (keyword, as the plugin sends them):
@@ -1642,7 +1773,10 @@ class MotifForCausalLM:
                 zeroed, as above).
             kv_cache: the ``MotifKVCache``.
             enable_trace: plugin ``trace_mode in ("all", "decode_only")``.
-            read_from_device: ignored; the result is always a host tensor (the plugin then skips its read hooks).
+            read_from_device: ``MOTIF3_ASYNC_DECODE`` off: ignored, the result is always a host tensor (the plugin then
+                skips its read hooks). on (B6b): a device-sampled step with ``read_from_device=False`` returns a
+                :class:`MotifPendingDecode` before its read (``read_decode_output`` / ``process_decode_output_host``
+                resolve it); host-sampled and verify steps still return host tensors.
             sampling_params: ``TTSamplingParams`` of the step's rows (lists of length B, padding rows greedy) when the
                 plugin samples this step on device (``sample_on_device_mode`` "decode_only" and no host-only request
                 in the step): the step is sampled by the generator's exact device sampler. On a verify step they are
@@ -1651,7 +1785,10 @@ class MotifForCausalLM:
             slot_remap: ``torch.int32 [max_num_seqs]`` or None: row ``i`` reads state slot ``slot_remap[i]``. Applied
                 to the lane map exactly once, after the generator accepted the step.
             reload_inputs / reload_page_table / reload_sampling_params / reset_sampling_state: contract-v1 commands.
-                Without async decode the plugin always sends ``reload_inputs=True``. The device sampler needs no
+                Without async decode the plugin always sends ``reload_inputs=True``. With ``MOTIF3_ASYNC_DECODE=on``
+                a steady device-sampled step comes with ``reload_inputs=False`` (and ``reload_page_table=True`` when
+                the blocks changed): its ``tokens`` / ``start_pos`` are stale and ignored; the step continues the
+                previous one (:meth:`_decode_resident`). ``page_table`` is always current. The device sampler needs no
                 reload or reset: it compares the lane parameters every step (a device write only on change) and its
                 RNG has no hidden state (counters derived from (seed, position) every step).
             num_valid_drafts / accepted_counts: ``torch.int32 [B]``, a verify step only (``SPEC_DECODE_CONTRACT.md``
@@ -1685,12 +1822,21 @@ class MotifForCausalLM:
                 f"missing {missing}"
             )
         if not reload_inputs:
-            raise NotImplementedError(
-                "MotifForCausalLM is a partial decode-reload v1 adapter: every decode must reload its inputs "
-                "(supports_async_decode is False)"
-            )
+            if not self._async:
+                raise NotImplementedError(
+                    "MotifForCausalLM is a partial decode-reload v1 adapter: every decode must reload its inputs "
+                    "(supports_async_decode is False; MOTIF3_ASYNC_DECODE=on makes it a full one)"
+                )
+            if is_verify:
+                raise ValueError("a verify step always reloads its inputs (plugin contract)")
+            return self._decode_resident(
+                kv, tokens, start_pos, page_table, slot_remap, sampling_params, bool(enable_trace),
+                bool(read_from_device),
+            )  # fmt: skip
         if reload_page_table:
             raise ValueError("reload_page_table is only legal with reload_inputs=False (plugin contract)")
+        # every reloading step ends the resident chain (a device-sampled one starts a new chain below)
+        self._resident = None
         if sampling_params is not None:
             self._require_device_sampling()
         if is_verify:
@@ -1750,6 +1896,11 @@ class MotifForCausalLM:
                 logits = result.logits
             else:
                 sample = getattr(result, "sample", None)
+        elif sampling is not None and self._async:  # B6b: submit, read later (or now with read_from_device)
+            return self._submit_sampled(
+                kv, batch, sampling, sampling_params, rows, lanes, lane_idx, active, pos, slot_remap,
+                bool(enable_trace), bool(read_from_device), feed=None,
+            )  # fmt: skip
         elif sampling is not None:
             sample = self.generator.decode_forward_sampled(
                 batch, sampling, kv_cache=kv.device_cache, enable_trace=bool(enable_trace)
@@ -1774,6 +1925,80 @@ class MotifForCausalLM:
         else:
             out = logits.index_select(0, lane_idx)
         return out.unsqueeze(1)
+
+    # ---- B6b: asynchronous decode (MOTIF3_ASYNC_DECODE=on) ------------------------------------------------------
+    def _submit_sampled(
+        self, kv, batch, sampling, sampling_params, rows, lanes, lane_idx, active, row_pos, slot_remap,
+        enable_trace: bool, read_from_device: bool, *, feed,
+    ):  # fmt: skip
+        """Submit a device-sampled step (``generator.submit_decode_sampled``), commit the slot move, record the step
+        as the resident chain's last and return its :class:`MotifPendingDecode` (resolved now with
+        ``read_from_device``)."""
+        gen = self.generator
+        if feed is None and getattr(gen, "outstanding_decode", None) is not None:
+            gen.settle_decode()  # a reloading step after a deferred one the plugin has not read (its result is kept)
+        sub = gen.submit_decode_sampled(batch, sampling, kv_cache=kv.device_cache, enable_trace=enable_trace, feed=feed)
+        # Accepted: commit the slot move exactly once (the plugin settles its own map right after we return).
+        self._lanes.commit(slot_remap)
+        self._resident = _ResidentDecode(rows=int(rows), lanes=list(lanes), active=active.clone(),
+                                         row_pos=row_pos.clone(), sub=sub)  # fmt: skip
+        handle = MotifPendingDecode(self, sub, lane_idx, active, sampling_params)
+        if read_from_device:
+            return handle.output()
+        self.sampling_stats.deferred_steps += 1
+        return handle
+
+    def _decode_resident(
+        self, kv, tokens, start_pos, page_table, slot_remap, sampling_params, enable_trace: bool,
+        read_from_device: bool,
+    ):  # fmt: skip
+        """A steady device-sampled step (``reload_inputs=False``, decode-reload contract v1): the rows, lanes and
+        sampling of the previous step, each active row one position further, its token the previous step's sampled
+        token (``generator.submit_decode_sampled(feed=...)``: read on the host, after every other input of this step
+        is written). ``tokens`` / ``start_pos`` are the plugin's stale host copies: only their shape and active rows
+        are checked. ``page_table`` is current (a block crossing comes with ``reload_page_table=True``; it is fitted
+        every step). Anything that is not a continuation of the previous step raises."""
+        r = self._resident
+        if r is None:
+            raise RuntimeError(
+                "decode_forward(reload_inputs=False) without a resident decode step: the plugin must reload after a "
+                "prefill, a host-sampled or verify step, a layout change or a released request"
+            )
+        if sampling_params is None:
+            raise ValueError("reload_inputs=False on a host-sampled decode step (host sampling reloads every step)")
+        if slot_remap is not None:
+            raise ValueError("reload_inputs=False with a slot_remap: a layout change must reload its inputs")
+        tok = torch.as_tensor(tokens)
+        stale = torch.as_tensor(start_pos)
+        if tok.ndim != 2 or tok.shape[1] != 1 or int(tok.shape[0]) != r.rows or stale.reshape(-1).shape[0] != r.rows:
+            raise ValueError(
+                f"reload_inputs=False: decode tokens {tuple(tok.shape)} / start_pos {tuple(stale.shape)} do not "
+                f"continue the previous step's {r.rows} rows"
+            )
+        if not torch.equal(stale.reshape(-1) >= 0, r.active):
+            raise ValueError("reload_inputs=False, but the active rows changed: a layout change must reload its inputs")
+        pos = torch.where(r.active, r.row_pos + 1, r.row_pos).to(torch.int32)
+        if bool((pos[r.active] >= self.settings.max_seq_len).any()):
+            raise ValueError(f"decode positions must be in [0, {self.settings.max_seq_len})")
+        need = torch.where(r.active, pos.to(torch.int64) // kv.block_size + 1, torch.zeros_like(pos, dtype=torch.int64))
+        fast = self.host_staging == "fast"
+        fit = self._fit_page_table_fast if fast else self._fit_page_table
+        pt = fit(page_table, kv, need, "decode_forward (resident)")
+        lane_idx = self._lane_index(r.lanes)
+        lane_pos = torch.full((NUM_LANES,), -1, dtype=torch.int32)
+        lane_pt = torch.zeros((NUM_LANES, kv.page_table_width if fast else pt.shape[1]), dtype=torch.int32)
+        lane_pos[lane_idx] = pos
+        if fast:
+            lane_pt[lane_idx, : pt.shape[1]] = pt
+        else:
+            lane_pt[lane_idx] = pt
+        batch = DecodeBatch(tokens=torch.zeros(NUM_LANES, dtype=torch.int32), positions=lane_pos, page_table=lane_pt)
+        sampling = lane_sampling_lists(sampling_params, r.lanes)
+        self.sampling_stats.resident_steps += 1
+        return self._submit_sampled(
+            kv, batch, sampling, sampling_params, r.rows, r.lanes, lane_idx, r.active, pos, None, enable_trace,
+            read_from_device, feed=r.sub,
+        )  # fmt: skip
 
     # ---- device sampling ----------------------------------------------------------------------------------------
     def _require_device_sampling(self) -> None:
@@ -2172,15 +2397,24 @@ class MotifForCausalLM:
         return isinstance(tt_out, tuple) and all(t is None or isinstance(t, torch.Tensor) for t in tt_out)
 
     def read_decode_output(self, tt_out, async_read=False):
-        """``decode_forward`` already returns host tensors (logits, device-sampled tokens, or ``(tokens, logprobs)``);
-        nothing is outstanding on the device."""
+        """``decode_forward`` returns host tensors (logits, device-sampled tokens, or ``(tokens, logprobs)``), or with
+        ``MOTIF3_ASYNC_DECODE=on`` a :class:`MotifPendingDecode`: ``async_read`` hands it back with no events (the
+        read happens in :meth:`process_decode_output_host`, or earlier when the next step needs its tokens); without
+        ``async_read`` it is resolved now."""
+        if isinstance(tt_out, MotifPendingDecode):
+            return (tt_out, []) if async_read else tt_out.output()
         if not self._is_host_output(tt_out):
             raise TypeError(f"expected the host output decode_forward returned, got {type(tt_out)}")
         return (tt_out, []) if async_read else tt_out
 
     def process_decode_output_host(self, tt_out, is_tokens=False):
         """Host logits (``is_tokens=False``) or the device-sampled tokens / ``(tokens, logprobs)`` (``is_tokens``),
-        returned unchanged (``decode_forward`` already read them from the device)."""
+        returned unchanged (``decode_forward`` already read them from the device), or a :class:`MotifPendingDecode`
+        resolved (its one read, if no later step has made it)."""
+        if isinstance(tt_out, MotifPendingDecode):
+            if not is_tokens:
+                raise TypeError("a deferred Motif-3 decode step holds device-sampled tokens, not logits")
+            return tt_out.output()
         if not self._is_host_output(tt_out):
             raise TypeError(f"expected host {'tokens' if is_tokens else 'logits'}, got {type(tt_out)}")
         return tt_out
@@ -2238,6 +2472,12 @@ class MotifForCausalLM:
         lane's retained speculation entry and tell the generator."""
         lane = self._lanes.lane_of_slot(slot)
         self._retained.pop(lane, None)
+        r = self._resident
+        if r is not None and any(on and l == lane for l, on in zip(r.lanes, r.active.tolist())):
+            # a request of the resident decode step left: the next decode reloads (a layout change), and a steady
+            # step after this raises. A request that never decoded (e.g. max_tokens 1, finished at its prefill) is
+            # released while the other rows keep their steady chain.
+            self._resident = None
         self.generator.release_lane(lane)
 
     def release_persistent_capture(self):
@@ -2280,6 +2520,7 @@ __all__ = [
     "MTP_WEIGHT_PREFIX",
     "MotifForCausalLM",
     "MotifKVCache",
+    "MotifPendingDecode",
     "NULL_BLOCK_RESERVE_TOKENS",
     "SERVING_TT_CONFIG",
     "SPECULATIVE_CONFIG",
