@@ -127,7 +127,8 @@ MOE_POLYNORM_MODES = ("composite", "fused")
 # Decode shared-expert PolyNorm (B5, docs/OPTIMIZATION_PLAN.md §3.3; PolyNormMLP(shared_polynorm=...)): "composite" (the
 # release: tt/polynorm.py polynorm_tp, 19 small programs incl. the moments all-gather) | "fused"
 # (tt/kernels/shared_polynorm.py: a one-core moments kernel, the same TP all-gather, a one-core apply kernel; the same
-# LLK operations in the same order, so bitwise equal to the composite by construction). Decode only (one 32-row tile).
+# LLK operations in the same order, so bitwise equal to the composite by construction; the default since the B5 gates
+# passed, logs/opt/phaseB/B5). Decode only (one 32-row tile).
 SHARED_POLYNORM_MODES = ("composite", "fused")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
@@ -1351,9 +1352,10 @@ class MotifTTConfig:
     # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
     # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
     moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
-    # Decode shared-expert PolyNorm (B5): "composite" (default, the release) | "fused" (moments kernel + the release's
-    # moments all-gather + apply kernel; SHARED_POLYNORM_MODES). Prefill and the dense MLPs are not affected.
-    shared_polynorm: str = "composite"  # MOTIF3_SHARED_POLYNORM
+    # Decode shared-expert PolyNorm (B5): "fused" (default: moments kernel + the release's moments all-gather + apply
+    # kernel, bitwise equal to the release) | "composite" (the release; SHARED_POLYNORM_MODES). Prefill and the dense
+    # MLPs are not affected.
+    shared_polynorm: str = "fused"  # MOTIF3_SHARED_POLYNORM
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1534,7 +1536,7 @@ class MotifTTConfig:
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
-            shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "composite").strip().lower(),
+            shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),

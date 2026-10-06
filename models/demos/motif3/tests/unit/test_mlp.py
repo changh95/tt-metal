@@ -637,10 +637,10 @@ def test_shared_polynorm_host_dispatch(monkeypatch):
     assert SHARED_POLYNORM_MODES == ("composite", "fused")
     monkeypatch.delenv("MOTIF3_SHARED_POLYNORM", raising=False)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
-    assert cfg.shared_polynorm == "composite"
+    assert cfg.shared_polynorm == "fused"  # the default since the B5 gates
     R = MM.resolve_shared_polynorm
     ok = dict(kind="shared", stats="tp", decode_polynorm="fp32", pn_kw=dict(MM.RELEASE_PN_KW), n_local=160)
-    assert R(None, cfg, **ok) == "composite" and R("fused", cfg, **ok) == "fused"
+    assert R(None, cfg, **ok) == "fused" and R("fused", cfg, **ok) == "fused"
     assert R("composite", cfg, **ok) == "composite"
     fz = types.SimpleNamespace(shared_polynorm="fused")
     assert R(None, fz, **ok) == "fused" and R(None, types.SimpleNamespace(), **ok) == "composite"

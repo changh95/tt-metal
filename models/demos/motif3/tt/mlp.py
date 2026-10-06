@@ -64,8 +64,8 @@ read is lazy (weights, ``act_fn.{weight,bias}``): with all files cached, the mod
 Output scale: ``polynorm.polynorm_output_scale(cfg, l)`` (0.5, folded into ``W_down``; exact for a power of two);
 ``polynorm.check_polynorm_semantics(cfg)`` rejects ``polynorm_sigmoid_weight=False`` once the config parses it.
 
-Fused shared-expert PolyNorm (B5, ``shared_polynorm="fused"``, ``MOTIF3_SHARED_POLYNORM``; docs/OPTIMIZATION_PLAN.md
-§3.3): the decode PolyNorm of the shared expert runs as ``tt/kernels/shared_polynorm.py`` (a one-core moments kernel
+Fused shared-expert PolyNorm (B5, ``shared_polynorm="fused"``, ``MOTIF3_SHARED_POLYNORM``, the default since the B5
+gates; docs/OPTIMIZATION_PLAN.md §3.3; ``composite`` restores the release ops): the decode PolyNorm of the shared expert runs as ``tt/kernels/shared_polynorm.py`` (a one-core moments kernel
 on the gate_up output, the release's moments all-gather, a one-core apply kernel: 3 programs instead of 19). The
 kernels issue the release's LLK operations in the release's order, so the output is bitwise the composite's
 (:func:`resolve_shared_polynorm` admits it only with the release's decode settings: fp32 PolyNorm, ``stats="tp"``, the
