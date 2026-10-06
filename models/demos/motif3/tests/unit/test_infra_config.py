@@ -842,7 +842,7 @@ def test_moe_polynorm_knob(monkeypatch):
 
 def test_prefill_moe_knobs(monkeypatch):
     """B2a (docs/OPTIMIZATION_PLAN.md §3.3 B2; logs/opt/phaseB/B2a): ``MOTIF3_PREFILL_MOE`` selects the prefill routed
-    experts, ``dense`` (default: the release) or ``compact`` (token-compacted, bitwise equal); ``MOTIF3_PREFILL_MOE_BLOCK``
+    experts, ``compact`` (default: token-compacted, bitwise equal) or ``dense`` (the release); ``MOTIF3_PREFILL_MOE_BLOCK``
     the block rows (``auto`` | 32 | 64 | 128) and ``MOTIF3_PREFILL_MOE_MIN_ROWS`` the smallest compacted chunk (a
     multiple of 32, default 1024). Case and blanks ignored, anything else refused; ``describe`` shows them."""
     from models.demos.motif3.tt.model_config import (DEFAULT_PREFILL_MOE_MIN_ROWS, PREFILL_MOE_BLOCKS,
@@ -850,9 +850,10 @@ def test_prefill_moe_knobs(monkeypatch):
 
     assert PREFILL_MOE_MODES == ("dense", "compact") and PREFILL_MOE_BLOCKS == ("auto", "32", "64", "128")
     c = _cfg()
-    assert (c.prefill_moe, c.prefill_moe_block, c.prefill_moe_min_rows) == ("dense", "auto", DEFAULT_PREFILL_MOE_MIN_ROWS)
-    assert DEFAULT_PREFILL_MOE_MIN_ROWS == 1024 and "prefill_moe=dense/auto/1024" in c.describe()
-    for v, want in (("compact", "compact"), (" Compact ", "compact"), ("dense", "dense"), ("", "dense")):
+    assert (c.prefill_moe, c.prefill_moe_block, c.prefill_moe_min_rows) == ("compact", "auto",
+                                                                              DEFAULT_PREFILL_MOE_MIN_ROWS)
+    assert DEFAULT_PREFILL_MOE_MIN_ROWS == 1024 and "prefill_moe=compact/auto/1024" in c.describe()
+    for v, want in (("compact", "compact"), (" Dense ", "dense"), ("dense", "dense"), ("", "compact")):
         monkeypatch.setenv("MOTIF3_PREFILL_MOE", v)
         assert _cfg().prefill_moe == want, v
     monkeypatch.setenv("MOTIF3_PREFILL_MOE", "sparse")
@@ -873,7 +874,7 @@ def test_prefill_moe_knobs(monkeypatch):
         with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_MIN_ROWS"):
             _cfg()
     monkeypatch.delenv("MOTIF3_PREFILL_MOE_MIN_ROWS")
-    assert _cfg(prefill_moe="compact").prefill_moe == "compact"
+    assert _cfg(prefill_moe="dense").prefill_moe == "dense"
     with pytest.raises(ValueError, match="prefill_moe"):
         _cfg(prefill_moe="fast")
 

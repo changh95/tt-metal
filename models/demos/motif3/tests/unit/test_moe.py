@@ -1510,10 +1510,11 @@ def test_moe_host_compact_ladder_and_resolve(monkeypatch):
     assert M.compact_ladder(1024, 32, 12) == (12, 15, 19, 24, 30, 38, 48, 60, 64)
     monkeypatch.delenv("MOTIF3_PREFILL_MOE", raising=False)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
-    assert cfg.prefill_moe == "dense" and cfg.prefill_moe_block == "auto" and cfg.prefill_moe_min_rows == 1024
+    assert cfg.prefill_moe == "compact" and cfg.prefill_moe_block == "auto" and cfg.prefill_moe_min_rows == 1024
     Rz = M.resolve_prefill_moe
     kw = dict(combine_mode="fold", prefill_polynorm="bf16", prefill_polynorm_impl="rms")
-    assert Rz(None, cfg, **kw) == "dense" and Rz("compact", cfg, **kw) == "compact"
+    assert Rz(None, cfg, **kw) == "compact" and Rz("dense", cfg, **kw) == "dense"
+    assert Rz(None, SimpleNamespace(), **kw) == "dense"  # a config without the field: the release
     on = SimpleNamespace(prefill_moe="compact")
     assert Rz(None, on, **kw) == "compact"
     for bad in (dict(combine_mode="multiply_sum"), dict(prefill_polynorm="fp32"), dict(prefill_polynorm_impl="horner")):

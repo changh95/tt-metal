@@ -107,7 +107,7 @@ S, every position >= 0.99986 against the reference experts on the device's route
 reference's own routes are all near-tie route flips (5 / 7 / 66 of 2048 / 4096 / 32768). 48x the useful expert FLOPs;
 the v1 replacement is a compacting dispatch / sparse experts.
 
-B2a token-compacted prefill (``prefill_moe="compact"``, ``MOTIF3_PREFILL_MOE``; off by default, docs/OPTIMIZATION_PLAN.md
+B2a token-compacted prefill (``prefill_moe="compact"``, ``MOTIF3_PREFILL_MOE``; the default, docs/OPTIMIZATION_PLAN.md
 §3.3 B2, prototype logs/opt/phaseA/m7, results logs/opt/phaseB/B2a), per chunk of at least ``prefill_moe_min_rows``
 rows (:meth:`MotifMoE._compact_partial`): the router as above; the chunk's ``idx`` read from chip 0 (one blocking read:
 routes are identical on every chip); on the host (:func:`compact_upload_fast`) every chip's (local expert, token) rows
@@ -258,7 +258,8 @@ def resolve_moe_polynorm(moe_polynorm: Optional[str], cfg, *, decode_polynorm: s
 def resolve_prefill_moe(prefill_moe: Optional[str], cfg, *, combine_mode: str, prefill_polynorm: str,
                         prefill_polynorm_impl: str) -> str:
     """B2a: the prefill routed-experts mode a :class:`MotifMoE` runs. ``prefill_moe`` (explicit) or ``cfg.prefill_moe``
-    (``MOTIF3_PREFILL_MOE``; ``None`` = "dense") must be in :data:`PREFILL_MOE_MODES`. "compact" needs
+    (``MOTIF3_PREFILL_MOE``, default "compact"; a config without the field = "dense") must be in
+    :data:`PREFILL_MOE_MODES`. "compact" needs
     ``combine_mode="fold"`` (routing weights folded into ``up``), the bf16 prefill PolyNorm (its per-block constants
     travel as bf16) and the ``rms`` impl (constants as a ``{c0, c1, c2, b}`` mapping): an explicit request raises
     otherwise, the config default falls back to "dense" (diagnostic modules)."""

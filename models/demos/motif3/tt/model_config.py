@@ -123,7 +123,8 @@ DECODE_EXPERTS_MODES = ("dense", "sparse")
 # to the composite: 1-ulp bf16 differences in ~2e-5 of the values, logs/opt/phaseA/M10). Decode only (M = 32 / 64).
 MOE_POLYNORM_MODES = ("composite", "fused")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
-# chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (token-compacted:
+# chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
+# the B2a gates passed; token-compacted:
 # the host reads the chunk's routes from chip 0 and builds each chip's expert-sorted row lists; the chip gathers only
 # its routed rows, runs them through ttnn.sparse_matmul in blocks of PREFILL_MOE_BLOCKS rows and combines them with a
 # one-hot matmul; bitwise equal to "dense", logs/opt/phaseA/m7 and logs/opt/phaseB/B2a). Decode is not affected.
@@ -1342,9 +1343,10 @@ class MotifTTConfig:
     # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
     # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
     moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
-    # Prefill routed experts (B2a): "dense" (default, the release) | "compact" (token-compacted, bitwise equal to
-    # "dense"; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128") and the smallest chunk it serves.
-    prefill_moe: str = "dense"  # MOTIF3_PREFILL_MOE
+    # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
+    # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
+    # and the smallest chunk it serves.
+    prefill_moe: str = "compact"  # MOTIF3_PREFILL_MOE
     prefill_moe_block: str = "auto"  # MOTIF3_PREFILL_MOE_BLOCK
     prefill_moe_min_rows: int = DEFAULT_PREFILL_MOE_MIN_ROWS  # MOTIF3_PREFILL_MOE_MIN_ROWS
     # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
@@ -1512,7 +1514,7 @@ class MotifTTConfig:
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
-            prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "dense").strip().lower(),
+            prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
