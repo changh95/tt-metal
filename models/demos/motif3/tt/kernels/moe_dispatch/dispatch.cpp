@@ -172,7 +172,8 @@ void kernel_main() {
                     if constexpr (CONTIG) {
                         d = row[k] - base;  // unsigned: other chips' ids land >= E
                     } else {
-                        d = slot[row[k]] - my_p * E;
+                        const uint32_t g = row[k];
+                        d = g < NE ? slot[g] - my_p * E : E;  // an out-of-range id (garbage row): not local
                     }
                     if (d < E) {
                         cnt[d] += 1;
