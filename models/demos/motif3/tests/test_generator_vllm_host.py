@@ -3230,18 +3230,20 @@ def test_fit_page_table_fast_matches_release(monkeypatch):
 
 
 def test_host_staging_knob_in_the_bridge(monkeypatch):
-    """``MOTIF3_HOST_STAGING`` (B6a): ``release`` by default, ``fast`` on request (case and blanks ignored), anything
+    """``MOTIF3_HOST_STAGING`` (B6a): ``fast`` by default, ``release`` on request (case and blanks ignored), anything
     else refused when the bridge is built; the lane index cache only in ``fast``."""
-    assert _bridge()[0].host_staging == "release"
-    monkeypatch.setenv("MOTIF3_HOST_STAGING", " FAST ")
     b = _bridge()[0]
     assert b.host_staging == "fast" and b._lane_index([3, 1]) is b._lane_index([3, 1])
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", " RELEASE ")
+    r = _bridge()[0]
+    assert r.host_staging == "release" and r._lane_index([3, 1]) is not r._lane_index([3, 1])
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", "fast")
     assert b._lane_index([3, 1]).tolist() == [3, 1] and b._lane_index([3, 1]).dtype == torch.long
     monkeypatch.setenv("MOTIF3_HOST_STAGING", "turbo")
     with pytest.raises(ValueError, match="MOTIF3_HOST_STAGING"):
         _bridge()
-    assert api.host_staging_from_env({}) == "release" and api.HOST_STAGING_MODES == ("release", "fast")
-    assert api.check_host_wait(None) == "block" and api.check_host_wait(" Spin") == "spin"
+    assert api.host_staging_from_env({}) == "fast" and api.HOST_STAGING_MODES == ("release", "fast")
+    assert api.check_host_wait(None) == "spin" and api.check_host_wait(" Block") == "block"
     with pytest.raises(ValueError, match="MOTIF3_HOST_WAIT"):
         api.check_host_wait("busy")
 

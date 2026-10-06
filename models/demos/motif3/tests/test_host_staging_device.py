@@ -123,7 +123,7 @@ def test_host_staging_and_wait_are_bitwise_neutral(mesh_device, device_params):
     gen = MotifGenerator.create(hf_config=None, mesh_device=mesh_device, settings=settings)
     failures = []
     try:
-        assert gen.host_staging == "release" and gen.host_wait == "block" and gen.waiter is None  # the defaults
+        assert gen.host_staging == "fast" and gen.host_wait == "spin" and gen.waiter is not None  # the defaults
         pool = gen.allocate_kv_cache(num_blocks=NUM_BLOCKS, block_size=BLOCK, num_layers=N_LAYERS)
         gen.enable_device_sampling()
         gen._warmed = set(gen.prefill_shapes())  # no prefill in this test: decode-only capture

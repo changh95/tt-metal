@@ -1331,12 +1331,12 @@ class MotifTTConfig:
     # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
     # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
     moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
-    # Per-decode-step host input staging (B6a): "release" (default) | "fast" (the same device inputs with fewer host
-    # ops; generator_api.HOST_STAGING_MODES). Host only: the device programs and their inputs are unchanged.
-    host_staging: str = "release"  # MOTIF3_HOST_STAGING
-    # How a decode step waits for its trace replay (B6a): "block" (default, the release) | "spin" (poll until a few ms
-    # before the predicted end, then the same blocking read; generator_api.HOST_WAIT_MODES). Host only.
-    host_wait: str = "block"  # MOTIF3_HOST_WAIT
+    # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
+    # "release" (the release code); generator_api.HOST_STAGING_MODES. Host only: device programs and inputs unchanged.
+    host_staging: str = "fast"  # MOTIF3_HOST_STAGING
+    # How a decode step waits for its trace replay (B6a): "spin" (default: poll until a few ms before the predicted end,
+    # then the same blocking read) | "block" (the release); generator_api.HOST_WAIT_MODES. Host only.
+    host_wait: str = "spin"  # MOTIF3_HOST_WAIT
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1495,8 +1495,8 @@ class MotifTTConfig:
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
-            host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "release").strip().lower(),
-            host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "block").strip().lower(),
+            host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
+            host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,

@@ -1117,7 +1117,9 @@ def test_cpu_generator_decode_kv_write_wiring(monkeypatch):
     monkeypatch.setattr(G.ttnn, "to_device", lambda v, mesh, memory_config=None: ("dev", v), raising=False)
     monkeypatch.setattr(G.ttnn, "copy_host_to_device_tensor", lambda h, d: host_calls.append((h, d)), raising=False)
     for kvr, mode in ((False, "row"), (True, "all")):
-        cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8), kv_replicated_decode=kvr)
+        # the release staging's wiring (host_staging="fast" is wired through the emulated device in
+        # tests/test_spec_decode_device.py::test_cpu_host_staging_fast_lossless)
+        cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8), kv_replicated_decode=kvr, host_staging="release")
         model = FakeModel(cfg)
         model.embed.decode_tokens_host = lambda t: ("tok", tuple(t.shape))
         dec = {}

@@ -1168,6 +1168,8 @@ def test_cpu_host_staging_fast_lossless(monkeypatch, spec, kvr, wait):
         for p in gen._paths.values():  # the device inputs hold the last values copied
             for k, v in p.host_last.items():
                 assert torch.equal(p.inputs[k].value, v), (p.key, k)
+        served = gen._paths[gen.serving_path]
+        assert gen._inputs is served.inputs and not served.host_last  # a caller may write them: records dropped
         results[staging] = ({r.name: list(r.out) for r in reqs + reqs2}, dict(gen.stats))
     (out_r, st_r), (out_f, st_f) = results["release"], results["fast"]
     assert out_f == out_r

@@ -2539,8 +2539,14 @@ class MotifGenerator(api.MotifGenerator):
 
     @property
     def _inputs(self) -> Optional[Dict[str, Any]]:
+        """Draft-1 form: the serving path's persistent device inputs. A caller may write them directly
+        (``ttnn.copy_host_to_device_tensor(_host_inputs(batch)[k], _inputs[k])``), so the ``host_staging="fast"``
+        records of what was copied last are dropped: the next step copies every input again."""
         p = self._serving
-        return None if p is None else p.inputs
+        if p is None:
+            return None
+        p.host_last.clear()
+        return p.inputs
 
     @property
     def _kv_write(self) -> Optional[DecodeKVWrite]:

@@ -835,19 +835,19 @@ def test_moe_polynorm_knob(monkeypatch):
 
 
 def test_host_staging_and_wait_knobs(monkeypatch):
-    """B6a (docs/OPT_PHASE_A_REVIEW.md §7.1; logs/opt/phaseB/B6a): ``MOTIF3_HOST_STAGING`` (``release`` default |
-    ``fast``) and ``MOTIF3_HOST_WAIT`` (``block`` default | ``spin``) are host-only decode knobs; case and blanks
-    ignored, anything else refused; ``describe`` shows both."""
+    """B6a (docs/OPT_PHASE_A_REVIEW.md §7.1; logs/opt/phaseB/B6a): ``MOTIF3_HOST_STAGING`` (``fast`` default |
+    ``release``) and ``MOTIF3_HOST_WAIT`` (``spin`` default | ``block``) are host-only decode knobs (bitwise neutral:
+    the defaults since the B6a gates); case and blanks ignored, anything else refused; ``describe`` shows both."""
     from models.demos.motif3.tt.model_config import HOST_STAGING_MODES, HOST_WAIT_MODES
 
     assert HOST_STAGING_MODES == ("release", "fast") and HOST_WAIT_MODES == ("block", "spin")
     c = _cfg()
-    assert c.host_staging == "release" and c.host_wait == "block"
-    assert "host_staging=release host_wait=block" in c.describe()
-    for v, want in (("fast", "fast"), (" FAST ", "fast"), ("release", "release"), ("", "release")):
+    assert c.host_staging == "fast" and c.host_wait == "spin"
+    assert "host_staging=fast host_wait=spin" in c.describe()
+    for v, want in (("fast", "fast"), (" RELEASE ", "release"), ("release", "release"), ("", "fast")):
         monkeypatch.setenv("MOTIF3_HOST_STAGING", v)
         assert _cfg().host_staging == want, v
-    for v, want in (("spin", "spin"), (" Spin", "spin"), ("block", "block"), ("", "block")):
+    for v, want in (("spin", "spin"), (" Block", "block"), ("block", "block"), ("", "spin")):
         monkeypatch.setenv("MOTIF3_HOST_WAIT", v)
         assert _cfg().host_wait == want, v
     monkeypatch.setenv("MOTIF3_HOST_STAGING", "turbo")
@@ -858,7 +858,7 @@ def test_host_staging_and_wait_knobs(monkeypatch):
     with pytest.raises(ValueError, match="MOTIF3_HOST_WAIT"):
         _cfg()
     monkeypatch.delenv("MOTIF3_HOST_WAIT")
-    assert _cfg(host_staging="fast", host_wait="spin").host_wait == "spin"
+    assert _cfg(host_staging="release", host_wait="block").host_wait == "block"
     with pytest.raises(ValueError, match="host_wait"):
         _cfg(host_wait="poll")
 

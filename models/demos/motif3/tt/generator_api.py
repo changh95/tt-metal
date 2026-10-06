@@ -512,11 +512,12 @@ def packed_warmup_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
 
 
 # B6a (docs/OPT_PHASE_A_REVIEW.md §7.1-7.2; logs/opt/phaseB/B6a): the per-decode-step host input staging of the
-# bridge and the generator. "release" = the release code; "fast" = the same device inputs built with fewer host ops
+# bridge and the generator (default "fast" since the B6a gates). "release" = the release code; "fast" = the same device
+# inputs built with fewer host ops
 # (cached mesh mappers, page-table work only on the used columns, persistent inputs whose values did not change are not
 # copied again, cached lane index tensors). The device sees bit-identical inputs either way.
 HOST_STAGING_MODES = ("release", "fast")
-DEFAULT_HOST_STAGING = "release"
+DEFAULT_HOST_STAGING = "fast"
 
 
 def check_host_staging(mode: Any, *, name: str = "MOTIF3_HOST_STAGING") -> str:
@@ -529,18 +530,19 @@ def check_host_staging(mode: Any, *, name: str = "MOTIF3_HOST_STAGING") -> str:
 
 
 def host_staging_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
-    """``MOTIF3_HOST_STAGING``: ``release`` (default) or ``fast`` (B6a, :data:`HOST_STAGING_MODES`); case and blanks
+    """``MOTIF3_HOST_STAGING``: ``fast`` (default) or ``release`` (B6a, :data:`HOST_STAGING_MODES`); case and blanks
     ignored, anything else raises ``ValueError``."""
     env = os.environ if environ is None else environ
     return check_host_staging(env.get("MOTIF3_HOST_STAGING"))
 
 
-# B6a: how the generator waits for a replayed decode trace. "block" (the release) = the step's blocking read sleeps
+# B6a: how the generator waits for a replayed decode trace (default "spin" since the B6a gates). "block" (the
+# release) = the step's blocking read sleeps
 # until the device is done (~85 ms of idle core: under the schedutil governor the host code that follows runs ~2.5-3x
 # slower, logs/opt/phaseB/B6a); "spin" = the calling thread first polls (time.sleep(0): the GIL is released every
 # iteration) until a few ms before the predicted end of the replay, then makes the same blocking read. Host only.
 HOST_WAIT_MODES = ("block", "spin")
-DEFAULT_HOST_WAIT = "block"
+DEFAULT_HOST_WAIT = "spin"
 
 
 def check_host_wait(mode: Any, *, name: str = "MOTIF3_HOST_WAIT") -> str:
