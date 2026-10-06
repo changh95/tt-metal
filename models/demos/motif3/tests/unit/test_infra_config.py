@@ -99,6 +99,8 @@ _ENV = (
     "MOTIF3_ROUTER_MASK",
     # Phase B (docs/OPT_PHASE_A_REVIEW.md §7.2): B1 sparse decode experts
     "MOTIF3_DECODE_EXPERTS",
+    # B3 fused decode MoE PolyNorm
+    "MOTIF3_MOE_POLYNORM",
 )
 
 
@@ -807,6 +809,26 @@ def test_decode_experts_knob(monkeypatch):
     assert _cfg(decode_experts="sparse").decode_experts == "sparse"
     with pytest.raises(ValueError, match="decode_experts"):
         _cfg(decode_experts="skip")
+
+
+def test_moe_polynorm_knob(monkeypatch):
+    """B3 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/M10): ``MOTIF3_MOE_POLYNORM`` selects the decode routed-expert
+    PolyNorm, ``composite`` (default: the release) or ``fused`` (one generic_op, not bitwise equal: off until the shared
+    eval); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.model_config import MOE_POLYNORM_MODES
+
+    assert MOE_POLYNORM_MODES == ("composite", "fused")
+    assert _cfg().moe_polynorm == "composite" and "moe_polynorm=composite" in _cfg().describe()
+    for v, want in (("fused", "fused"), (" Fused ", "fused"), ("composite", "composite"), ("", "composite")):
+        monkeypatch.setenv("MOTIF3_MOE_POLYNORM", v)
+        assert _cfg().moe_polynorm == want, v
+    monkeypatch.setenv("MOTIF3_MOE_POLYNORM", "horner")
+    with pytest.raises(ValueError, match="MOTIF3_MOE_POLYNORM"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_MOE_POLYNORM")
+    assert _cfg(moe_polynorm="fused").moe_polynorm == "fused"
+    with pytest.raises(ValueError, match="moe_polynorm"):
+        _cfg(moe_polynorm="kernel")
 
 
 def test_module_defaults(monkeypatch):

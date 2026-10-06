@@ -51,6 +51,10 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    Horner ``mac``, fp32 intermediates) with the routing weights folded into ``up`` (``h = poly(g) * (w_loc * u)``,
    rounded to bf16 once; never block float) -> ``@ W_down [1,12,1280,4096]`` (bfp8, ``experts_down_pc``; the PolyNorm
    x0.5 and route_scale x2.0 folded into ``W_down``: net x1.0, exact) -> ``y [1,12,32,4096]`` = weighted expert outputs.
+   B3 (``moe_polynorm="fused"``, ``MOTIF3_MOE_POLYNORM``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, prototype
+   logs/opt/phaseA/M10): the grouped PolyNorm and the routing-weight multiply are one ``generic_op``
+   (:class:`~models.demos.motif3.tt.kernels.moe_polynorm.FusedGroupedPolyNorm`: fp32 moments + Horner on 48 cores,
+   ``h`` rounded to bf16 once; not bitwise equal to the composite) at the decode row counts 32 / 64, dense and B1 sparse.
 5. Combine (MOE-5): ``fast_reduce_nc(y, dims=[1])`` (bf16 terms summed in an fp32 dest, packed in ``combine_dtype``:
    bf16 by default; ``combine_dtype=fp32`` packs the fp32 dest into a preallocated fp32 output, so the per-chip partial
    is a true fp32 sum) -> ``[1,1,32,4096]`` -> ``ccl.ar_dp`` (sum over the 4 chips of the column) ->
@@ -132,7 +136,8 @@ import ttnn
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL
-from .model_config import DECODE_EXPERTS_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc
+from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig,
+                           mcast1d_matmul_pc)
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -204,6 +209,32 @@ def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str
                 f"output, so a skipped expert's zero slice is its exact contribution), got {combine_mode!r}"
             )
         return "dense"
+    return mode
+
+
+def resolve_moe_polynorm(moe_polynorm: Optional[str], cfg, *, decode_polynorm: str, combine_mode: str,
+                         gate_up_dtype=None) -> str:
+    """B3: the decode routed-expert PolyNorm a :class:`MotifMoE` runs. ``moe_polynorm`` (explicit) or
+    ``cfg.moe_polynorm`` (``MOTIF3_MOE_POLYNORM``; ``None`` = "composite") must be in :data:`MOE_POLYNORM_MODES`.
+    "fused" needs the fp32 decode PolyNorm with an fp32 gate_up output (the kernel reads fp32 ``gu``) and
+    ``combine_mode="fold"`` (it folds the routing weights): an explicit request raises otherwise, the config default
+    falls back to "composite" (diagnostic modules)."""
+    explicit = moe_polynorm is not None
+    mode = str(moe_polynorm if explicit else (getattr(cfg, "moe_polynorm", None) or "composite"))
+    if mode not in MOE_POLYNORM_MODES:
+        raise ValueError(f"moe_polynorm must be one of {MOE_POLYNORM_MODES}, got {mode!r}")
+    if mode == "fused":
+        why = None
+        if decode_polynorm != "fp32":
+            why = f"decode_polynorm='fp32' (got {decode_polynorm!r})"
+        elif gate_up_dtype is not None and gate_up_dtype != ttnn.float32:
+            why = f"an fp32 gate_up output (got {gate_up_dtype})"
+        elif combine_mode != "fold":
+            why = f"combine_mode='fold' (got {combine_mode!r})"
+        if why is not None:
+            if explicit:
+                raise ValueError(f"moe_polynorm='fused' needs {why}")
+            return "composite"
     return mode
 
 
@@ -686,6 +717,12 @@ class MotifMoE:
             no ``ttnn.gather``, same top-8 sets, weights within 1-4 fp32 ulp; about -35 us per layer). Prefill always
             takes the gather path. "scatter" builds its constants here (the local one-hot ``[1, 12, 1, 384]`` fp32 and,
             per decode row count, the scatter's zeros / ones), before any trace capture (F3N rule R3).
+        moe_polynorm: decode routed-expert PolyNorm (B3; ``None`` = ``cfg.moe_polynorm``, ``MOTIF3_MOE_POLYNORM``):
+            "composite" (the release, ``polynorm_impl``) | "fused" (one ``generic_op``,
+            :class:`~models.demos.motif3.tt.kernels.moe_polynorm.FusedGroupedPolyNorm`, at the decode row counts 32 /
+            64 with the routing weights folded in; not bitwise equal to the composite, ~-100 us per layer at M = 32;
+            :func:`resolve_moe_polynorm`). Prefill and other row counts keep the composite. No device constants beyond
+            the layer's PolyNorm constants; the program compiles on the first eager decode call (before any capture).
         decode_experts: decode routed experts (B1; ``None`` = ``cfg.decode_experts``, ``MOTIF3_DECODE_EXPERTS``):
             "dense" (the release) | "sparse" (``ttnn.sparse_matmul`` skips the local experts no live row routes to;
             live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
@@ -717,6 +754,7 @@ class MotifMoE:
         prefill_chunk: Optional[int] = None,
         router_mask: Optional[str] = None,
         decode_experts: Optional[str] = None,
+        moe_polynorm: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -843,6 +881,15 @@ class MotifMoE:
         # ---- B1 decode experts: "dense" | "sparse" (no device constants) ----------------------------------------------
         self.decode_experts = resolve_decode_experts(decode_experts, cfg, self.combine_mode)
 
+        # ---- B3 fused decode PolyNorm: "composite" | "fused" (program descriptors only; no device memory) ---------------
+        self.moe_polynorm = resolve_moe_polynorm(moe_polynorm, cfg, decode_polynorm=self.decode_polynorm,
+                                                 combine_mode=self.combine_mode, gate_up_dtype=self.gate_up_dtype)
+        self.pn_fused = None
+        if self.moe_polynorm == "fused":
+            from .kernels.moe_polynorm import FusedGroupedPolyNorm  # lazy: generic_op kernel, decode shapes only
+
+            self.pn_fused = FusedGroupedPolyNorm(mesh_device, self.pn_consts, e_loc=self.e_loc, inter=self.inter)
+
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
     # ==========================================================================================================
@@ -895,8 +942,10 @@ class MotifMoE:
         )
         if x12 is not f:  # (a 1-expert-per-chip repeat could hand f back)
             _free(x12)
-        h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc,
-                          impl=self.polynorm_impl if decode else self.prefill_polynorm_impl)
+        h = self._decode_fused(gu, row_scale, mc) if decode else None
+        if h is None:
+            h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc,
+                              impl=self.polynorm_impl if decode else self.prefill_polynorm_impl)
         _free(gu)
         y = ttnn.matmul(
             h, self.w_down, program_config=pc_dn, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype,
@@ -927,6 +976,17 @@ class MotifMoE:
                                  intermediate_memory_config=mc)
         _free(g, u)
         return h
+
+    def _decode_fused(self, gu, row_scale, mc):
+        """B3: ``h`` from the fused kernel when this module runs it (``moe_polynorm="fused"``), the call is at a decode
+        row count with routing weights and ``gu`` / ``row_scale`` meet its contract (fp32 TILE interleaved); else
+        ``None`` (the caller runs the composite)."""
+        fused = getattr(self, "pn_fused", None)
+        if fused is None or row_scale is None or int(gu.shape[-2]) not in self.decode_rows:
+            return None
+        if not fused.supports(gu, row_scale):
+            return None
+        return fused(gu, row_scale, memory_config=mc)
 
     def reduce_experts(self, y, *, memory_config=None):
         """``sum_e y[e]``: ``[1, 12, M, 4096]`` (already weighted) -> ``[1, 1, M, 4096]`` in ``combine_dtype``
@@ -1047,7 +1107,9 @@ class MotifMoE:
             is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=gu_dtype,
         )  # [1, 1, 1, 12, M, 2560]
         gu = _reshape(gu, (1, self.e_loc, M, 2 * self.inter))
-        h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc, impl=self.polynorm_impl)
+        h = self._decode_fused(gu, row_scale, mc)
+        if h is None:
+            h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc, impl=self.polynorm_impl)
         _free(gu)
         y = ttnn.sparse_matmul(
             h, self.w_down, sparsity=sparsity, program_config=pc_dn, nnz=None, is_input_a_sparse=True,
@@ -1227,8 +1289,11 @@ class MotifMoE:
         for z, o in getattr(self, "scatter_consts", {}).values():
             _free(z, o)
         self.local_mask, self.scatter_consts = None, {}
+        if getattr(self, "pn_fused", None) is not None:
+            self.pn_fused.deallocate()
+            self.pn_fused = None
 
 
-__all__ = ["COMBINE_MODES", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MotifMoE",
-           "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc",
-           "resolve_decode_experts", "wide_decode_rows"]
+__all__ = ["COMBINE_MODES", "DECODE_EXPERTS_MODES", "DECODE_ROWS", "EXACT_ROUTER_DECODE_ROWS", "MOE_POLYNORM_MODES",
+           "MotifMoE", "MotifRouter", "POLYNORM_IMPLS", "POLYNORM_MODES", "grouped_polynorm", "prefill_experts_pc",
+           "resolve_decode_experts", "resolve_moe_polynorm", "wide_decode_rows"]

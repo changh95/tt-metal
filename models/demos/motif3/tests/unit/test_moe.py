@@ -1169,6 +1169,217 @@ def test_moe_host_sparse_lane_mask_wiring(monkeypatch):
     assert got["lane_mask"] is lm and not any(t is lm for t in freed)
 
 
+def _hf_grouped_polynorm_fp64(g, u, weight, bias, *, bias_clamp, output_scale, eps=1e-6):
+    """HF ``GroupedPolyNorm.forward_single`` (modeling_motif.py) per expert in fp64: ``g, u [E, M, I]``, raw
+    ``act_fn.weight [E, 3]`` / ``.bias [E, 1]`` -> ``output_scale * (sum_k sigmoid(w_k) N(g^(3-k)) + clamp(b)) * u``."""
+    w = torch.sigmoid(weight.float()).double()  # HF: sigmoid(w.float()), the rest in fp64 here
+    b = bias.float().double().clamp(-bias_clamp, bias_clamp)
+    g, u = g.double(), u.double()
+
+    def N(z):
+        return z / torch.sqrt(z.pow(2).mean(-1, keepdim=True) + eps)
+
+    out = []
+    for e in range(g.shape[0]):
+        poly = w[e, 0] * N(g[e] ** 3) + w[e, 1] * N(g[e] ** 2) + w[e, 2] * N(g[e]) + b[e]
+        out.append(poly * u[e] * output_scale)
+    return torch.stack(out)
+
+
+def _fused_case(Mr, seed, *, El=12, Is=I):
+    """Synthetic decode gate_up output (bf16-valued fp32, heavy tails like real gates), routing weights (0 for ~30 %),
+    raw act_fn weight / bias with several biases outside +-0.5 (so the routed-expert clamp matters)."""
+    g = torch.Generator().manual_seed(seed)
+    z = torch.randn(1, El, Mr, 2 * Is, generator=g)
+    chi = torch.randn(1, El, Mr, 2 * Is, 4, generator=g).pow(2).sum(-1) / 4
+    gu = (z / chi.sqrt() * 3.0).clamp(-60, 60).to(torch.bfloat16).float()
+    w = torch.rand(1, El, Mr, 1, generator=g)
+    w[w < 0.3] = 0.0
+    weight = torch.randn(El, 3, generator=g)
+    bias = torch.randn(El, 1, generator=g) * 0.6
+    bias[0, 0], bias[1, 0] = 1.7, -2.3  # clamped to +-0.5 by the routed-expert semantics
+    return gu, w, weight, bias
+
+
+@torch.no_grad()
+def test_moe_host_fused_polynorm_numerics():
+    """B3 (docs/OPTIMIZATION_PLAN.md §3.3; ``moe_polynorm="fused"``; prototype logs/opt/phaseA/M10), host side: the
+    fused kernel's algorithm (``kernels.moe_polynorm.emulate_fp32``: G = 4 rank-ordered moment partials,
+    ``a = rsqrt(s D + E)``, the routing weight folded into the coefficients, Horner, one bf16 rounding), fed with the
+    *production* constants (``weights.polynorm_coefficients`` with ``cfg.polynorm_bias_clamp`` ->
+    ``GroupedPolyNormConsts.host_tensors``), against the HF ``GroupedPolyNorm.forward_single`` semantics in fp64:
+
+    * fp32 parity: PCC at the bf16 output-rounding floor (PCC of the fp64 value rounded to bf16, -1e-7) and every
+      element within one bf16 rounding of the fp64 value (2^-8 relative, + 1e-5 |w u| for fp32 cancellation inside
+      the polynomial), at M = 32 and 64;
+    * the routed-expert bias clamp: the clamped bias matches, the unclamped one does not (experts 0 / 1 have |b| > 0.5);
+    * the x0.5 output scale stays in ``W_down``: ``h @ experts_down(W, 0.5 x route_scale)`` == HF ``route_scale x w x
+      (0.5 PolyNorm(g) u) @ W^T`` (PCC >= 0.99999), and ``plan``'s layout / L1 budget;
+    * rows with routing weight 0 are exactly 0; rows are independent (T64 rows 0..31 == the T32 call bitwise)."""
+    from models.demos.motif3.tt import weights as W
+    from models.demos.motif3.tt.kernels import moe_polynorm as F
+    from models.demos.motif3.tt.model_config import MotifTTConfig
+    from models.demos.motif3.tt.polynorm import GroupedPolyNormConsts
+
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    El = cfg.experts_per_chip
+    assert (cfg.polynorm_bias_clamp, cfg.polynorm_output_scale, cfg.route_scale) == (0.5, 0.5, 2.0)
+    # ---- plan: the M10 layout (G = 4: 48 workers on 4 grid rows, 10 + 10 tiles each) and its CB budget ----
+    p32, p64 = F.plan(El, I, 32), F.plan(El, I, 64)
+    assert (p32["G"], p32["n"], p32["R"], p32["n_workers"], p32["rows"]) == (4, 10, 1, 48, 4)
+    assert (p64["n"], p64["R"]) == (10, 2) and p32["l1_bytes"] < 200 * 1024 and p64["l1_bytes"] < 360 * 1024
+    assert F.worker_cores(48, 12)[13] == (1, 1) and F.worker_cores(50, 12)[-1] == (1, 4)
+    for bad in (dict(M=96), dict(M=16), dict(G=3), dict(G=11)):
+        kw = dict(E=El, inter=I, M=32, G=4)
+        kw.update(bad)
+        with pytest.raises(ValueError):
+            F.plan(**kw)
+    with pytest.raises(ValueError, match="do not fit"):
+        F.plan(El, I, 32, G=10, grid=(12, 9))
+    out32 = gu32 = w32 = None
+    _, _, weight, bias = _fused_case(32, seed=5)
+    for Mr in (32, 64):
+        gu, w, _, _ = _fused_case(Mr, seed=5 + Mr)
+        if Mr == 64:
+            gu[:, :, :32], w[:, :, :32] = gu32, w32  # rows 0..31 = the T32 call's
+        c, b = W.polynorm_coefficients(weight, bias, bias_clamp=cfg.polynorm_bias_clamp)  # [E, 3], [E, 1]
+        assert float(b.abs().max()) <= 0.5 and float(bias.abs().max()) > 0.5
+        # the production constants of these 12 experts (host_tensors over all 384, chip 0 = experts 0..11)
+        call = torch.cat([c, torch.full((cfg.num_experts - El, 3), 0.5)])
+        ball = torch.cat([b.reshape(-1), torch.zeros(cfg.num_experts - El)])
+        ht = GroupedPolyNormConsts.host_tensors(cfg, call, ball)
+        D = ht["D"][0:3, :El, 0, 0].t()  # [E, 3] moment order g^2, g^4, g^6 (rows 3 dp + k of dp 0)
+        Ec = ht["E"][0:3, :El, 0, 0].t()
+        bb = ht["b"][0, :El, 0, 0]
+        h = F.emulate_fp32(gu, w, D, Ec, bb)
+        assert h.dtype == torch.bfloat16 and tuple(h.shape) == (1, El, Mr, I)
+        # HF semantics in fp64 (output_scale 1 here: the 0.5 lives in W_down), routing weight on u
+        ref = _hf_grouped_polynorm_fp64(gu[0, ..., :I], w[0].double() * gu[0, ..., I:].double(), weight, bias,
+                                        bias_clamp=cfg.polynorm_bias_clamp, output_scale=1.0)
+        assert torch.allclose(F.golden_fp64(gu, w, c, b.reshape(-1))[0], ref, rtol=1e-10, atol=1e-10)
+        hd = h[0].double()
+        err = (hd - ref).abs()
+        tol = ref.abs() * 2.0**-8 + 1e-5 * (w[0].double() * gu[0, ..., I:].double()).abs() + 1e-30  # + fp32 cancellation
+        assert bool((err <= tol).all()), (Mr, float((err - tol).max()))
+        floor = pcc(ref, ref.to(torch.bfloat16).double())  # the bf16 output-rounding floor (~0.9999987)
+        assert pcc(ref, hd) >= floor - 1e-7, (Mr, pcc(ref, hd), floor)
+        # the clamp matters: with the raw bias experts 0 / 1 are far off
+        raw = _hf_grouped_polynorm_fp64(gu[0, ..., :I], w[0].double() * gu[0, ..., I:].double(), weight, bias, bias_clamp=1e9,
+                                        output_scale=1.0)
+        for e in (0, 1):
+            live = w[0, e, :, 0] != 0
+            assert float((raw[e][live] - hd[e][live]).abs().max()) > 0.1 * float(hd[e][live].abs().max()), e
+        # routing weight 0 -> exactly 0
+        assert bool((h[0][w[0, :, :, 0] == 0] == 0).all())
+        # x0.5 (and route_scale x2) in W_down: h @ W_down_folded == HF route_scale * w * (0.5 PolyNorm u) @ down^T
+        gw = torch.Generator().manual_seed(9)
+        Hs = 64
+        down = torch.randn(El, Hs, I, generator=gw).to(torch.bfloat16)  # HF down_proj [E, H, I]
+        wd = W.experts_down(down, cfg.polynorm_output_scale * cfg.route_scale).double()  # [E, I, H]
+        y = torch.einsum("emi,eih->emh", hd, wd)
+        hf = _hf_grouped_polynorm_fp64(gu[0, ..., :I], gu[0, ..., I:], weight, bias,
+                                       bias_clamp=cfg.polynorm_bias_clamp, output_scale=cfg.polynorm_output_scale)
+        y_ref = cfg.route_scale * w[0].double() * torch.einsum("emi,ehi->emh", hf, down.double())
+        assert pcc(y_ref, y) >= 0.99999, (Mr, pcc(y_ref, y))
+        if Mr == 32:
+            gu32, w32, out32 = gu.clone(), w.clone(), h.clone()
+        else:
+            assert torch.equal(h[:, :, :32], out32), "T64 rows 0..31 != the T32 call"
+
+
+@torch.no_grad()
+def test_moe_host_fused_polynorm_dispatch(monkeypatch):
+    """B3 host side of the MoE wiring (ttnn ops recorded, no device): ``resolve_moe_polynorm`` (config default,
+    explicit modes, bad modes; "fused" needs the fp32 decode PolyNorm, an fp32 gate_up and the "fold" combine: explicit
+    raises, the config default falls back to "composite"); ``experts()`` and ``sparse_experts()`` run the fused kernel
+    instead of the composite at decode M = 32 / 64 with routing weights, the composite for prefill, for other row
+    counts, without routing weights, when the kernel refuses the tensors, and when the module has no kernel (the
+    default); ``h`` is freed once, ``gu`` / ``row_scale`` never by the kernel call."""
+    import models.demos.motif3.tt.moe as M
+    from models.demos.motif3.tt.model_config import MOE_POLYNORM_MODES, MotifTTConfig
+
+    assert MOE_POLYNORM_MODES == ("composite", "fused")
+    monkeypatch.delenv("MOTIF3_MOE_POLYNORM", raising=False)
+    cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
+    assert cfg.moe_polynorm == "composite"
+    R = M.resolve_moe_polynorm
+    ok = dict(decode_polynorm="fp32", combine_mode="fold")
+    assert R(None, cfg, **ok) == "composite" and R("fused", cfg, **ok) == "fused" and R("composite", cfg, **ok) == "composite"
+    fz = SimpleNamespace(moe_polynorm="fused")
+    assert R(None, fz, **ok) == "fused" and R(None, SimpleNamespace(), **ok) == "composite"
+    assert R(None, fz, **ok, gate_up_dtype=ttnn.float32) == "fused"
+    for bad in (dict(decode_polynorm="bf16"), dict(combine_mode="multiply_sum"), dict(gate_up_dtype=ttnn.bfloat16)):
+        kw = dict(ok)
+        kw.update(bad)
+        assert R(None, fz, **kw) == "composite", bad
+        with pytest.raises(ValueError, match="fused"):
+            R("fused", cfg, **kw)
+    with pytest.raises(ValueError, match="moe_polynorm"):
+        R("kernel", cfg, **ok)
+
+    calls, freed = [], []
+
+    class FakeFused:
+        def __init__(self, ok=True):
+            self.ok = ok
+
+        def supports(self, gu, w):
+            return self.ok
+
+        def __call__(self, gu, w, *, memory_config=None):
+            calls.append(("fused", int(gu.shape[-2]), memory_config))
+            return SimpleNamespace(shape=[1, 12, int(gu.shape[-2]), I], tag="h_fused")
+
+    monkeypatch.setattr(M.ttnn, "repeat", lambda f, reps, **kw: SimpleNamespace(shape=[1, 12] + list(f.shape[2:])))
+    monkeypatch.setattr(M.ttnn, "matmul", lambda a, b, **kw: SimpleNamespace(shape=[1, 12, a.shape[2], 2 * I]))
+    monkeypatch.setattr(M.ttnn, "sparse_matmul",
+                        lambda a, b, **kw: SimpleNamespace(shape=[1, 12, a.shape[-2], 2 * I]))
+    monkeypatch.setattr(M, "_reshape", lambda t, shape: SimpleNamespace(shape=list(shape)))
+    monkeypatch.setattr(M.ttnn, "deallocate", lambda t, *a, **k: freed.append(t))
+    moe = object.__new__(M.MotifMoE)
+    moe.e_loc, moe.inter, moe.hidden, moe.dram = 12, I, H, "dram"
+    moe.gate_up_dtype, moe.down_dtype, moe.ckc_experts = None, ttnn.bfloat16, "ckc"
+    moe.w_gate_up, moe.w_down, moe.prefill_pc = "W_gate_up", "W_down", False
+    moe.polynorm_impl = moe.prefill_polynorm_impl = "horner"
+    moe.pc_gate_up = moe.pc_down = "pc"
+    moe.pc_wide = {64: ("pc64", "pc64")}
+    moe.decode_rows = (32, 64)
+    moe.polynorm = lambda gu, **kw: calls.append(("composite", int(gu.shape[-2]))) or SimpleNamespace(
+        shape=[1, 12, int(gu.shape[-2]), I], tag="h_comp")
+    rs = SimpleNamespace(shape=[1, 12, 32, 1], tag="w")
+    f = lambda m: SimpleNamespace(shape=[1, 1, m, H])  # noqa: E731
+    cases = [  # (pn_fused, M, decode, row_scale, want)
+        (None, 32, True, rs, "composite"),
+        (FakeFused(), 32, True, rs, "fused"),
+        (FakeFused(), 64, True, rs, "fused"),
+        (FakeFused(), 32, False, rs, "composite"),  # prefill
+        (FakeFused(), 96, True, rs, "composite"),  # not a decode row count
+        (FakeFused(), 32, True, None, "composite"),  # multiply_sum (no routing weights folded)
+        (FakeFused(ok=False), 32, True, rs, "composite"),  # contract refused
+    ]
+    for fused, m, decode, row_scale, want in cases:
+        moe.pn_fused = fused
+        for path in ("dense", "sparse"):
+            if path == "sparse" and (not decode or m not in (32, 64)):
+                continue
+            calls.clear(), freed.clear()
+            if path == "dense":
+                M.MotifMoE.experts(moe, f(m), polynorm="fp32", decode=decode, row_scale=row_scale, memory_config="L1")
+            else:
+                M.MotifMoE.sparse_experts(moe, f(m), "sp", polynorm="fp32", row_scale=row_scale, memory_config="L1")
+            kinds = [c[0] for c in calls]
+            assert kinds == [want], (fused, m, decode, path, calls)
+            if want == "fused":
+                assert calls[0][2] == "L1"
+            hs = [t for t in freed if getattr(t, "tag", "").startswith("h_")]
+            assert len(hs) == 1 and hs[0].tag == ("h_fused" if want == "fused" else "h_comp"), (path, freed)
+            assert row_scale is None or not any(t is row_scale for t in freed)
+    del moe.pn_fused  # a module built before B3 (no attribute): the composite
+    calls.clear()
+    M.MotifMoE.experts(moe, f(32), polynorm="fp32", decode=True, row_scale=rs, memory_config="L1")
+    assert [c[0] for c in calls] == ["composite"]
+
+
 def test_moe_host_import_clean():
     code = (
         "import sys; import models.demos.motif3.tt.moe as m; "
@@ -2882,6 +3093,192 @@ def test_moe_device_sparse_decode_experts(mesh_device, device_params):
                       f"{fmt_traced(st['sparse'])} us per call (M6: 1035 / 524 / 631 / 904)")
             _free([x_dev, lm_dev])
         moe.deallocate()
+    assert not failures, failures
+
+
+def _chips(t):
+    """Every chip's local tensor (fp64), in device order."""
+    return [ttnn.to_torch(c).double() for c in ttnn.get_device_tensors(t)]
+
+
+def _pn_golden_from_consts(gu, w, D, Ec, b):
+    """fp64 grouped PolyNorm from the device constants of one chip: ``gu [1, E, M, 2 I]``, ``w [1, E, M, 1]``,
+    ``D, Ec [3, E, 1, 1]`` (moment order g^2, g^4, g^6), ``b [1, E, 1, 1]`` -> ``(sum_m a_m g^m + b) (w u)`` with
+    ``a_m = (s_m D_m + E_m)^-1/2 = c_m rsqrt(mean(g^(2m)) + eps)``."""
+    I2 = gu.shape[-1] // 2
+    g, u = gu[..., :I2], gu[..., I2:]
+    D, Ec, b = D.reshape(1, 3, -1, 1, 1), Ec.reshape(1, 3, -1, 1, 1), b.reshape(1, -1, 1, 1)
+    poly = b.expand(g.shape).clone()
+    for m in range(3):
+        s_m = (g ** (2 * (m + 1))).sum(-1, keepdim=True)
+        a_m = (s_m * D[:, m] + Ec[:, m]).rsqrt()
+        poly = poly + a_m * g ** (m + 1)
+    return poly * (w * u)
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_fused_polynorm(mesh_device, device_params):
+    """B3 (docs/OPTIMIZATION_PLAN.md §3.3; ``moe_polynorm="fused"``; prototype logs/opt/phaseA/M10), real layer-2 /
+    layer-35 weights from the serving TT cache on the T64 config, real router inputs, every chip checked:
+
+    * kernel: the fused ``h`` vs an fp64 golden built from each chip's own device constants (``D``, ``E``, clamped
+      ``b``; asserted PCC >= 0.99999 per chip and every token >= 0.9999) and vs the composite ``h`` (asserted: at
+      most one bf16 rounding apart, |d| <= 2^-7 |h| + 1e-6, and < 0.1 % of the values differ; counts reported); rows
+      with routing weight 0 exactly 0; two calls bitwise equal; M = 64: gate_up rows 0..31 == M = 32 and fused rows
+      0..31 == the M = 32 call bitwise;
+    * module: ``forward_decode`` fused vs composite at M = 32 and the T64 step (PCC >= 0.9999 every lane row), T64
+      rows == the two T32 calls bitwise (fused), B1 sparse + fused (unmasked) == dense + fused bitwise; trace capture
+      with persistent ``x``, replays with new tokens == eager bitwise, two replays equal;
+    * static CBs end below an L1 pin; traced cost (informational): PolyNorm composite vs fused at M = 32 / 64 and
+      ``forward_decode`` composite vs fused."""
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+
+    cfg = t64_cfg(mesh_device)
+    fab = log_fabric(mesh_device, "moe_fused_polynorm")
+    assert str(fab.get("committed")) == "TORUS_XY", fab
+    ccl = MotifCCL(mesh_device, cfg)
+    data = load_real_inputs()
+    pin = l1_pin(mesh_device)
+    L1 = ttnn.L1_MEMORY_CONFIG
+    failures, rows = [], []
+    g = torch.Generator().manual_seed(77)
+
+    def note(msg, ok=True):
+        rows.append(msg)
+        print(f"[moe] B3 {msg}")
+        if not ok:
+            failures.append(msg)
+
+    for layer in (2, 35):
+        if layer not in data["layers"]:
+            continue
+        moe = moe_from_tt_cache(mesh_device, cfg, ccl, layer, moe_polynorm="fused")
+        assert moe.moe_polynorm == "fused" and moe.pn_fused is not None and moe.decode_rows == (32, 64)
+        fused = moe.pn_fused
+        xs = data["layers"][layer]["x"].float()
+        n = xs.shape[0]
+        consts = [_chips(t) for t in (moe.pn_consts.D, moe.pn_consts.E, moe.pn_consts.c["fp32"]["b"])]
+        tok = torch.randperm(n, generator=g)[:64]
+        h32 = None
+        for M in (32, 64):
+            f = upload_replicated(xs[tok[:M]], mesh_device)
+            idx, w = moe.router(f, scale=moe.internal_route_scale, memory_config=L1)
+            w_loc = moe.local_weights(idx, w, memory_config=L1)
+            x12 = ttnn.repeat(f, ttnn.Shape([1, moe.e_loc, 1, 1]), memory_config=L1)
+            pc = moe.pc_gate_up if M == 32 else moe.pc_wide[64][0]
+            gu = ttnn.matmul(x12, moe.w_gate_up, program_config=pc, compute_kernel_config=moe.ckc_experts,
+                             dtype=ttnn.float32, memory_config=L1)
+            hc = moe.polynorm(gu, mode="fp32", row_scale=w_loc, memory_config=L1)
+            hf = fused(gu, w_loc, memory_config=L1)
+            hf2 = fused(gu, w_loc, memory_config=L1)
+            gus, ws, hcs, hfs, hf2s = (_chips(t) for t in (gu, w_loc, hc, hf, hf2))
+            worst_pcc, worst_tok, n_diff, n_tot, max_ulp_viol, zero_ok = 1.0, 1.0, 0, 0, 0.0, True
+            for i in range(len(gus)):
+                want = _pn_golden_from_consts(gus[i], ws[i], consts[0][i], consts[1][i], consts[2][i])
+                st = stats(want.reshape(-1, I), hfs[i].reshape(-1, I))
+                worst_pcc, worst_tok = min(worst_pcc, st["pcc"]), min(worst_tok, st["min_token_pcc"])
+                d = (hfs[i] - hcs[i]).abs()
+                n_diff += int((d > 0).sum())
+                n_tot += d.numel()
+                max_ulp_viol = max(max_ulp_viol, float((d - (hcs[i].abs() * 2.0**-7 + 1e-6)).max()))
+                zero_ok &= bool((hfs[i][(ws[i] == 0).expand_as(hfs[i])] == 0).all())
+            det = all(torch.equal(a, b) for a, b in zip(hfs, hf2s))
+            note(f"L{layer} M={M} kernel: vs fp64 worst chip PCC {worst_pcc:.8f}, worst token {worst_tok:.7f}; vs "
+                 f"composite {n_diff} / {n_tot} values differ ({n_diff / n_tot:.2e}), beyond 1 bf16 rounding "
+                 f"{max(max_ulp_viol, 0.0):.3g}; w = 0 rows exactly 0 {zero_ok}; 2 calls bitwise {det}",
+                 worst_pcc >= 0.99999 and worst_tok >= 0.9999 and max_ulp_viol <= 0 and n_diff / n_tot < 1e-3
+                 and zero_ok and det)
+            if M == 32:
+                h32, gu32 = hfs, gus
+                st_c = traced_stats(mesh_device, lambda: moe.polynorm(gu, mode="fp32", row_scale=w_loc,
+                                                                      memory_config=L1), n=16, reps=5, adapt_to=64)
+            else:
+                same_gu = all(torch.equal(a[:, :, :32], b) for a, b in zip(gus, gu32))
+                same_h = all(torch.equal(a[:, :, :32], b) for a, b in zip(hfs, h32))
+                note(f"L{layer} M=64 rows 0..31: gate_up == M=32 {same_gu}, fused h == M=32 call {same_h}",
+                     (not same_gu) or same_h)
+                st_c = traced_stats(mesh_device, lambda: moe.polynorm(gu, mode="fp32", row_scale=w_loc,
+                                                                      memory_config=L1), n=16, reps=5, adapt_to=64)
+            st_f = traced_stats(mesh_device, lambda: fused(gu, w_loc, memory_config=L1), n=16, reps=5, adapt_to=64)
+            note(f"L{layer} M={M} traced PolyNorm: composite {fmt_traced(st_c)} us, fused {fmt_traced(st_f)} us "
+                 f"(M10: 127.1 -> 25.3 / 192.5 -> 56.8)")
+            _free([f, idx, w, w_loc, x12, gu, hc, hf, hf2])
+
+        # ---- module: forward_decode fused vs composite, T64 rows, sparse + fused ----
+        def run(x_tt, mode, experts="dense"):
+            moe.pn_fused = fused if mode == "fused" else None
+            moe.decode_experts = experts
+            o = moe.forward_decode(x_tt)
+            full = device_tensors_to_torch(o, mesh_device)
+            _free(o)
+            return full
+
+        def lane_rows(full, M):
+            rws = torch.stack([full[cfg.axes.coord(dp, 0)].reshape(-1, H) for dp in range(cfg.dp)])
+            if M == 32:
+                return rws.reshape(32, H)
+            Lr = cfg.lanes_per_row
+            return torch.cat([rws[:, :Lr].reshape(32, H), rws[:, Lr:].reshape(32, H)])
+
+        x64 = xs[torch.randperm(n, generator=g)[:64]]
+        halves = []
+        for half in (x64[:32], x64[32:]):
+            x_tt = upload_lanes(half, cfg, mesh_device)
+            oc, of = run(x_tt, "composite"), run(x_tt, "fused")
+            osf = run(x_tt, "fused", "sparse")
+            a, b = lane_rows(oc, 32).double(), lane_rows(of, 32).double()
+            tp = row_pcc(a, b)
+            note(f"L{layer} forward_decode M=32: fused vs composite PCC {pcc(a, b):.7f}, min lane {float(tp.min()):.7f}"
+                 f", sparse+fused == dense+fused {torch.equal(osf, of)}",
+                 float(tp.min()) >= 0.9999 and torch.equal(osf, of))
+            halves.append(lane_rows(of, 32))
+            _free(x_tt)
+        x16 = upload_rows16(x64, cfg, mesh_device)
+        o64c, o64 = lane_rows(run(x16, "composite"), 64), lane_rows(run(x16, "fused"), 64)
+        t64_eq = bool(torch.equal(o64[:32], halves[0])) and bool(torch.equal(o64[32:], halves[1]))
+        tp = row_pcc(o64c.double(), o64.double())
+        note(f"L{layer} T64 (fused): rows == T32 rows bitwise {t64_eq}; vs composite min row PCC {float(tp.min()):.7f}",
+             t64_eq and float(tp.min()) >= 0.9999)
+        _free(x16)
+
+        # ---- trace (layer 2): persistent x, new tokens per replay; traced cost composite vs fused ----
+        if layer == 2:
+            moe.pn_fused, moe.decode_experts = fused, "dense"
+            x_dev = upload_lanes(xs[:32], cfg, mesh_device)
+            _free(moe.forward_decode(x_dev))  # eager warm (compiles)
+            with _Capture(mesh_device) as cap:
+                out_t = moe.forward_decode(x_dev)
+            try:
+                for it in range(3):
+                    x = xs[torch.randperm(n, generator=g)[:32]]
+                    ttnn.copy_host_to_device_tensor(upload_lanes(x, cfg, mesh_device, device=False), x_dev)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t1 = device_tensors_to_torch(out_t, mesh_device)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t2 = device_tensors_to_torch(out_t, mesh_device)
+                    o_e = moe.forward_decode(x_dev)
+                    te = device_tensors_to_torch(o_e, mesh_device)
+                    _free(o_e)
+                    note(f"trace replay {it}: traced == eager {torch.equal(t1, te)}, 2 replays equal "
+                         f"{torch.equal(t1, t2)}", torch.equal(t1, te) and torch.equal(t1, t2))
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+                _free(out_t)
+            x16 = upload_rows16(x64, cfg, mesh_device)
+            for M, xt in ((32, x_dev), (64, x16)):
+                st = {}
+                for mode in ("composite", "fused"):
+                    moe.pn_fused = fused if mode == "fused" else None
+                    st[mode] = traced_stats(mesh_device, lambda: moe.forward_decode(xt), n=8, reps=5, adapt_to=16)
+                note(f"L{layer} forward_decode traced M={M}: composite {fmt_traced(st['composite'])} us, fused "
+                     f"{fmt_traced(st['fused'])} us per call")
+            moe.pn_fused = fused
+            _free([x_dev, x16])
+        moe.deallocate()
+    _free(pin)
+    print("[moe] B3 summary:\n[moe]   " + "\n[moe]   ".join(rows))
+    assert rows, "no layer ran"
     assert not failures, failures
 
 

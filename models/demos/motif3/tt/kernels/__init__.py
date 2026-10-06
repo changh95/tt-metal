@@ -6,6 +6,8 @@
   ``attn_res_weighted_reduce_nc`` weight layout) in fp32 SFPU math (WAVE_A_REVIEW MHC-6 "Option B"); kernel sources
   in ``sinkhorn_motif/``.
 * ``router_fp32`` -- exact-fp32 router logits (WAVE_A_REVIEW D1(b)); kernel sources in ``router_fp32/``.
+* ``moe_polynorm`` -- fused grouped PolyNorm of the decode routed experts (B3, ``MOTIF3_MOE_POLYNORM=fused``); kernel
+  sources in ``moe_polynorm/``.
 
 Kernel sources are compiled from their absolute paths at first use (JIT cache ``~/.cache/tt-metal-cache``;
 ``sinkhorn_motif`` also passes a content hash of its sources as a define, so an edited kernel always rebuilds). This

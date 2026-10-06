@@ -116,6 +116,11 @@ ROUTER_MASK_MODES = ("gather", "scatter")
 # row routes to; sparsity read on device, nnz=None; inactive lanes masked out of the routing weights). Live rows are
 # bitwise equal to "dense" (logs/opt/phaseA/M6); decode only, prefill keeps the masked-dense path.
 DECODE_EXPERTS_MODES = ("dense", "sparse")
+# Decode routed-expert PolyNorm (B3, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(moe_polynorm=...)): "composite" (the
+# release: tt/polynorm.py's grouped Horner fp32, ~17 ops) | "fused" (tt/kernels/moe_polynorm.py: one generic_op over the
+# gate_up output; fp32 moments + Horner + routing weight, one bf16 rounding; ~5 ms less per T32 step, not bitwise equal
+# to the composite: 1-ulp bf16 differences in ~2e-5 of the values, logs/opt/phaseA/M10). Decode only (M = 32 / 64).
+MOE_POLYNORM_MODES = ("composite", "fused")
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -1322,6 +1327,9 @@ class MotifTTConfig:
     # Decode routed experts (B1): "dense" (default, the release) | "sparse" (skip the local experts no live row routes
     # to; live rows bitwise equal to "dense", DECODE_EXPERTS_MODES). Prefill is not affected.
     decode_experts: str = "dense"  # MOTIF3_DECODE_EXPERTS
+    # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
+    # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
+    moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1373,7 +1381,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
@@ -1479,6 +1487,7 @@ class MotifTTConfig:
             flash_mla_swa_mcph=_env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA),
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
+            moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
@@ -1627,6 +1636,10 @@ class MotifTTConfig:
             raise ValueError(
                 f"decode_experts (MOTIF3_DECODE_EXPERTS) must be one of {DECODE_EXPERTS_MODES}, got "
                 f"{self.decode_experts!r}"
+            )
+        if self.moe_polynorm not in MOE_POLYNORM_MODES:
+            raise ValueError(
+                f"moe_polynorm (MOTIF3_MOE_POLYNORM) must be one of {MOE_POLYNORM_MODES}, got {self.moe_polynorm!r}"
             )
         if self.router_logits not in ROUTER_LOGITS_IMPLS:
             raise ValueError(f"router_logits must be one of {ROUTER_LOGITS_IMPLS}, got {self.router_logits!r}")
@@ -2358,7 +2371,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
@@ -2403,6 +2416,7 @@ __all__ = [
     "ROUTER_LOGITS_IMPLS",
     "ROUTER_MASK_MODES",
     "DECODE_EXPERTS_MODES",
+    "MOE_POLYNORM_MODES",
     "SDPA_PREFILL_CHUNKS",
     "SP1_GLOBAL_CHUNKS",
     "SP1_GLOBAL_CHUNKS_BF16_KV",
