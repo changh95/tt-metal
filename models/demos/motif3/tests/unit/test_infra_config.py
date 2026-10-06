@@ -101,6 +101,8 @@ _ENV = (
     "MOTIF3_DECODE_EXPERTS",
     # B3 fused decode MoE PolyNorm
     "MOTIF3_MOE_POLYNORM",
+    # B6a host input staging
+    "MOTIF3_HOST_STAGING",
 )
 
 
@@ -829,6 +831,26 @@ def test_moe_polynorm_knob(monkeypatch):
     assert _cfg(moe_polynorm="fused").moe_polynorm == "fused"
     with pytest.raises(ValueError, match="moe_polynorm"):
         _cfg(moe_polynorm="kernel")
+
+
+def test_host_staging_knob(monkeypatch):
+    """B6a (docs/OPT_PHASE_A_REVIEW.md §7.1; logs/opt/phaseB/B6a): ``MOTIF3_HOST_STAGING`` (``release`` default |
+    ``fast``) is a host-only decode knob; case and blanks ignored, anything else refused; ``describe`` shows it."""
+    from models.demos.motif3.tt.model_config import HOST_STAGING_MODES
+
+    assert HOST_STAGING_MODES == ("release", "fast")
+    c = _cfg()
+    assert c.host_staging == "release" and "host_staging=release" in c.describe()
+    for v, want in (("fast", "fast"), (" FAST ", "fast"), ("release", "release"), ("", "release")):
+        monkeypatch.setenv("MOTIF3_HOST_STAGING", v)
+        assert _cfg().host_staging == want, v
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", "turbo")
+    with pytest.raises(ValueError, match="MOTIF3_HOST_STAGING"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_HOST_STAGING")
+    assert _cfg(host_staging="fast").host_staging == "fast"
+    with pytest.raises(ValueError, match="host_staging"):
+        _cfg(host_staging="turbo")
 
 
 def test_module_defaults(monkeypatch):

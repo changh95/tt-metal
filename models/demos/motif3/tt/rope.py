@@ -238,6 +238,19 @@ def chunk_rot_rows(positions, max_positions: int) -> torch.Tensor:
     return pos.to(torch.int32)[None].contiguous()
 
 
+def dp_row_mapper(cfg: MotifTTConfig, mesh_device):
+    """The mesh mapper of :func:`shard_lanes`: tensor dim 0 split over the DP mesh axis, replicated over TP. Callers
+    that stage inputs every decode step build it once and pass it as ``shard_lanes(..., mapper=)`` (B6a)."""
+    dims = cfg.axes.mesh_dims(dp_dim=0, tp_dim=None)
+    return ttnn.create_mesh_mapper(
+        mesh_device,
+        ttnn.MeshMapperConfig(
+            [ttnn.PlacementReplicate() if d is None else ttnn.PlacementShard(d) for d in dims],
+            ttnn.MeshShape(*cfg.axes.mesh_shape),
+        ),
+    )
+
+
 def shard_lanes(
     rows: torch.Tensor,
     cfg: MotifTTConfig,
@@ -247,18 +260,14 @@ def shard_lanes(
     layout=ttnn.ROW_MAJOR_LAYOUT,
     device=None,
     memory_config=None,
+    mapper=None,
 ):
     """``[dp, ...]`` host tensor -> mesh tensor whose DP row ``r`` holds ``rows[r]`` (shape ``[1, ...]``), replicated
     over TP. ``device=None`` returns a host mesh tensor for ``ttnn.copy_host_to_device_tensor`` into a persistent
-    device input (trace replay); pass ``device=mesh_device`` to upload directly."""
-    dims = cfg.axes.mesh_dims(dp_dim=0, tp_dim=None)
-    mapper = ttnn.create_mesh_mapper(
-        mesh_device,
-        ttnn.MeshMapperConfig(
-            [ttnn.PlacementReplicate() if d is None else ttnn.PlacementShard(d) for d in dims],
-            ttnn.MeshShape(*cfg.axes.mesh_shape),
-        ),
-    )
+    device input (trace replay); pass ``device=mesh_device`` to upload directly. ``mapper``: a
+    :func:`dp_row_mapper` of the same ``cfg`` / mesh to reuse (default: a new one per call)."""
+    if mapper is None:
+        mapper = dp_row_mapper(cfg, mesh_device)
     return ttnn.from_torch(
         rows,
         dtype=dtype,
@@ -484,6 +493,7 @@ __all__ = [
     "rotate_half",
     "rotate_half_matrix",
     "shard_lanes",
+    "dp_row_mapper",
     "yarn_correction_range",
     "yarn_inv_freq",
 ]

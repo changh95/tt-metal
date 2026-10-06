@@ -511,6 +511,30 @@ def packed_warmup_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     return v
 
 
+# B6a (docs/OPT_PHASE_A_REVIEW.md §7.1-7.2; logs/opt/phaseB/B6a): the per-decode-step host input staging of the
+# bridge and the generator. "release" = the release code; "fast" = the same device inputs built with fewer host ops
+# (cached mesh mappers, page-table work only on the used columns, persistent inputs whose values did not change are not
+# copied again, cached lane index tensors). The device sees bit-identical inputs either way.
+HOST_STAGING_MODES = ("release", "fast")
+DEFAULT_HOST_STAGING = "release"
+
+
+def check_host_staging(mode: Any, *, name: str = "MOTIF3_HOST_STAGING") -> str:
+    """``mode`` lower-cased and stripped if it is one of :data:`HOST_STAGING_MODES` (``""`` / None = the default),
+    else ``ValueError`` naming ``name``."""
+    v = str(mode if mode is not None else "").strip().lower() or DEFAULT_HOST_STAGING
+    if v not in HOST_STAGING_MODES:
+        raise ValueError(f"{name} must be one of {HOST_STAGING_MODES}, got {mode!r}")
+    return v
+
+
+def host_staging_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``MOTIF3_HOST_STAGING``: ``release`` (default) or ``fast`` (B6a, :data:`HOST_STAGING_MODES`); case and blanks
+    ignored, anything else raises ``ValueError``."""
+    env = os.environ if environ is None else environ
+    return check_host_staging(env.get("MOTIF3_HOST_STAGING"))
+
+
 def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     """``MOTIF3_SPEC_VERIFY``: ``packed`` (default, S1: drafts on idle lanes of the 32-lane trace), ``wide`` (the
     64-row trace alone, S3) or ``auto`` (both traces; the 64-row one only for verify steps whose drafts do not fit idle
@@ -1785,6 +1809,10 @@ __all__ = [
     "serving_additional_config",
     "smoothed_acceptance",
     "spec_verify_from_env",
+    "HOST_STAGING_MODES",
+    "DEFAULT_HOST_STAGING",
+    "check_host_staging",
+    "host_staging_from_env",
     "tt_cache_policy_from_env",
     "wide_min_lanes_from_env",
     "wide_step_ratio_from_env",

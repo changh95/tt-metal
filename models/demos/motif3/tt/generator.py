@@ -194,7 +194,7 @@ from .attention import (
     warmup_chunk_host_tables,
     warmup_packed_host_tables,
 )
-from .embedding import check_token_ids
+from .embedding import check_token_ids, decode_token_rows
 from .kv_write import (
     DecodeKVWrite,
     KVWriteStep,
@@ -211,7 +211,7 @@ from .model import LazySource, MotifKVPool, MotifModel, normalize_cache_policy
 from .model_config import ROUTER_EXACT_FP32_DECODE_ROWS, MotifTTConfig, require_l1_small
 from .moe import EXACT_ROUTER_DECODE_ROWS
 from .mtp import mtp_next_tokens
-from .rope import positions_to_rot_idxs, shard_lanes
+from .rope import dp_row_mapper, positions_to_rot_idxs, shard_lanes
 from .sampling import MotifDeviceSampler, SampleResult, SamplerOutput
 
 # A prefill program-set key: solo (path "sp0" | "sp1", bucket); packed ("pk0", T, S) | ("pk1", T, S, "shared" |
@@ -542,6 +542,9 @@ class DecodePath:
     pool: Any = None
     warmed: bool = False
     so: Optional[SamplerOutput] = None
+    # B6a ``host_staging="fast"``: the host values last copied into each of ``inputs`` (an input whose new values are
+    # equal is not copied again; DecodeKVWrite.write_step does the same for its inputs)
+    host_last: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     @property
     def key(self) -> DecodeKey:
@@ -773,6 +776,11 @@ class MotifGenerator(api.MotifGenerator):
         }
         self.timings: Dict[str, float] = {}
         self.spec_profile: Dict[str, float] = {k: 0.0 for k in SPEC_PROFILE_KEYS}
+        # B6a (MOTIF3_HOST_STAGING): "fast" builds the same per-step device inputs with fewer host ops
+        self.host_staging = api.check_host_staging(getattr(cfg, "host_staging", None), name="cfg.host_staging")
+        self._dp_mapper = None  # dp_row_mapper, built on first use ("fast")
+        self.stats["input_copies"] = 0  # host -> device copies of the paths' own inputs (both modes)
+        self.stats["input_copies_skipped"] = 0  # ... skipped because the values did not change ("fast")
         self._readers: Dict[Tuple, HostShardReader] = {}  # host staging of the spec outputs' id reads (by role)
 
     # ==============================================================================================================
@@ -1560,6 +1568,53 @@ class MotifGenerator(api.MotifGenerator):
             out["pt"] = shard_lanes(pt.contiguous(), cfg, mesh, dtype=ttnn.int32, device=None)
         return out
 
+    def _path_host_rows(self, kind: str, mode: str, tokens: torch.Tensor, positions: torch.Tensor, page_table=None):
+        """``host_staging="fast"``: the torch values and ttnn dtypes of :meth:`_path_host_inputs` (``{name: (rows,
+        dtype)}``, every one ROW_MAJOR with the DP-row mapper), before any host mesh tensor is built. Identical
+        values: the same helpers (:func:`decode_token_rows`, :func:`positions_to_rot_idxs`) on the same inputs."""
+        cfg = self.cfg
+        pos = positions.to(torch.int32)
+        active = pos >= 0
+        tok = torch.where(active, tokens.to(torch.int32), torch.zeros_like(pos))
+        rpd = self.wide_rows_per_dp if kind == WIDE else None
+        out = {
+            "tokens": (decode_token_rows(tok, cfg, n_streams=self.model.embed.n_streams, rows_per_dp=rpd), ttnn.uint32),
+            "rot": (positions_to_rot_idxs(pos, cfg, rows_per_dp=rpd), ttnn.uint32),
+        }
+        if kind == PLAIN and mode == "row":
+            pt = page_table.to(torch.int32) * active[:, None]  # == torch.where(active, pt, 0) on int32
+            out["cur"] = (pos.clone(), ttnn.int32)  # a copy: ``pos`` may be the caller's tensor (kept in host_last)
+            out["pt"] = (pt.contiguous(), ttnn.int32)
+        return out
+
+    def _copy_path_inputs(self, p: DecodePath, rows) -> None:
+        """Copy ``rows`` (:meth:`_path_host_rows`) into ``p.inputs``, skipping the inputs whose values equal the ones
+        copied last (``host_staging="fast"``)."""
+        if self._dp_mapper is None:
+            self._dp_mapper = dp_row_mapper(self.cfg, self.mesh_device)
+        last = p.host_last
+        for k, (v, dtype) in rows.items():
+            prev = last.get(k)
+            if prev is not None and torch.equal(prev, v):
+                self.stats["input_copies_skipped"] += 1
+                continue
+            host = ttnn.from_torch(v, dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=self._dp_mapper)
+            last.pop(k, None)  # a failed copy leaves no stale record
+            ttnn.copy_host_to_device_tensor(host, p.inputs[k])
+            last[k] = v
+            self.stats["input_copies"] += 1
+
+    def _write_path_inputs(self, p: DecodePath, tokens, positions, page_table=None) -> None:
+        """The path's own inputs (``tokens`` / ``rot``, and ``cur`` / ``pt`` on the plain ``row`` path) for one step,
+        per :attr:`host_staging`."""
+        if self.host_staging == "fast":
+            self._copy_path_inputs(p, self._path_host_rows(p.kind, p.mode, tokens, positions, page_table))
+            return
+        h = self._path_host_inputs(p.kind, p.mode, tokens, positions, page_table)
+        for k, v in h.items():
+            ttnn.copy_host_to_device_tensor(v, p.inputs[k])
+        self.stats["input_copies"] += len(h)
+
     def _stage_path(self, key: DecodeKey, width: int) -> DecodePath:
         """The path's persistent inputs for page-table width ``width``, allocated on first use. Refused once any trace
         is captured: a buffer allocated after a capture and kept across replays may be overwritten by them (the trace
@@ -1609,26 +1664,20 @@ class MotifGenerator(api.MotifGenerator):
         self._paths.pop(p.key, None)
 
     def _write_plain(self, p: DecodePath, batch: api.DecodeBatch) -> None:
-        h = self._path_host_inputs(p.kind, p.mode, batch.tokens, batch.positions, batch.page_table)
-        for k, v in h.items():
-            ttnn.copy_host_to_device_tensor(v, p.inputs[k])
+        self._write_path_inputs(p, batch.tokens, batch.positions, batch.page_table)
         if p.kv_write is not None:
             p.kv_write.write_step(KVWriteStep.ordinary(batch.positions, batch.page_table))
 
     def _write_spec(self, p: DecodePath, ps: SpecPass) -> None:
         """One spec pass's inputs (the plan's checks ran already: ``write_step`` skips its own validation)."""
-        h = self._path_host_inputs(p.kind, p.mode, ps.tokens, ps.step.positions)
-        for k, v in h.items():
-            ttnn.copy_host_to_device_tensor(v, p.inputs[k])
+        self._write_path_inputs(p, ps.tokens, ps.step.positions)
         p.kv_write.write_step(ps.step, validate=False)
 
     def _write_wide(self, p: DecodePath, plan: VP.WideStepPlan) -> None:
         """One T64 step's inputs (``verify_plan.plan_wide_step`` ran every check already): the 64 physical rows' tokens
         (``[4, 16]`` per DP row) and RoPE rows, then the ``DecodeKVWrite(rows=64)`` inputs (``cur_pos [16]`` /
         ``page_table [16, W]`` per DP row, the call inputs, the A'' group inputs; unchanged inputs are skipped)."""
-        h = self._path_host_inputs(WIDE, p.mode, plan.tokens, plan.positions)
-        for k, v in h.items():
-            ttnn.copy_host_to_device_tensor(v, p.inputs[k])
+        self._write_path_inputs(p, plan.tokens, plan.positions)
         p.kv_write.write_step(plan.step, validate=False)
 
     def _plain_step(self, p: DecodePath, pool: MotifKVPool):

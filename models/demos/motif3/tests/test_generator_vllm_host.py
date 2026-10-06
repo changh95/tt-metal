@@ -140,6 +140,7 @@ def _fresh_bridge_process_state(monkeypatch):
         "MOTIF3_ROUTER_MASK",
         "MOTIF3_DECODE_EXPERTS",
         "MOTIF3_MOE_POLYNORM",
+        "MOTIF3_HOST_STAGING",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -3110,6 +3111,135 @@ def test_device_sampled_decode_plumbing(num_slots):
     with loguru_messages() as seen:
         bridge.release_persistent_capture()
     assert any("Motif-3 device sampling:" in m and '"device_steps"' in m for m in seen)
+
+
+class _RecordingGenerator(FakeMotifGenerator):
+    """Records every decode input the bridge hands the generator (B6a: release vs fast staging)."""
+
+    def decode_forward(self, batch, *, kv_cache, enable_trace):
+        self.__dict__.setdefault("batches", []).append(
+            ("logits", batch.tokens.clone(), batch.positions.clone(), batch.page_table.clone(), None)
+        )
+        return super().decode_forward(batch, kv_cache=kv_cache, enable_trace=enable_trace)
+
+    def decode_forward_sampled(self, batch, sampling, *, kv_cache, enable_trace):
+        self.__dict__.setdefault("batches", []).append(
+            ("sampled", batch.tokens.clone(), batch.positions.clone(), batch.page_table.clone(), sampling)
+        )
+        return super().decode_forward_sampled(batch, sampling, kv_cache=kv_cache, enable_trace=enable_trace)
+
+
+def _staging_traffic(monkeypatch, mode, num_slots, device):
+    """Seeded serving traffic (prefills, decodes with row shuffles / slot remaps, host-routed steps, finish, preempt
+    and resume) through a bridge built with ``MOTIF3_HOST_STAGING=mode``; returns what the generator received and
+    every request's final sequence."""
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", mode)
+    bridge, gen, kv, d = _allocated_bridge(num_slots, device=device, gen_cls=_RecordingGenerator)
+    assert bridge.host_staging == mode
+    rng = random.Random(77 + num_slots + 1000 * device)
+    kinds = [dict(temperature=0.0), dict(temperature=1.0, top_p=0.95, seed=7), dict(temperature=0.0, logprobs=True),
+             dict(temperature=0.7, top_k=20, seed=3)]  # fmt: skip
+    next_id, preempted = 0, []
+
+    def new_request():
+        nonlocal next_id
+        rid = f"r{next_id}"
+        kw = kinds[next_id % len(kinds)] if device else {}
+        d.add(rid, [1, 5, 3] + [rng.randrange(100, 4000) for _ in range(rng.randrange(2, 90))], **kw)
+        next_id += 1
+        return rid
+
+    cap = min(num_slots, 12)
+    d.prefill([new_request() for _ in range(min(5, cap))])
+    for step in range(80):
+        if preempted and len(d.order) < cap and rng.random() < 0.25:
+            d.prefill([preempted.pop(0)])
+        elif len(d.order) < cap - 2 and rng.random() < 0.3:
+            d.prefill([new_request() for _ in range(rng.randrange(1, 3))])
+        rows = list(d.order)
+        if rng.random() < 0.3:
+            rng.shuffle(rows)
+        if device and step % 9 == 8:
+            d.device = False
+            d.decode(rows)
+            d.device = True
+        else:
+            d.decode(rows)
+        if len(d.order) > 3 and rng.random() < 0.1:
+            d.finish(rng.choice(d.order))
+        if len(d.order) > 3 and rng.random() < 0.05:
+            victim = rng.choice(d.order)
+            d.preempt(victim)
+            preempted.append(victim)
+    assert d.remaps > 3 and len(gen.batches) == 80
+    return gen.batches, {r: list(v) for r, v in d.seqs.items()}
+
+
+@pytest.mark.parametrize("num_slots, device", [(32, False), (8, False), (32, True), (8, True)])
+def test_host_staging_fast_hands_the_generator_the_same_inputs(monkeypatch, num_slots, device):
+    """B6a (``MOTIF3_HOST_STAGING=fast``): the bridge's fast decode staging (``_fit_page_table_fast``, the cached
+    lane index) hands the generator exactly the release's lane-ordered tokens, positions, page tables and sampling
+    lists on every step of the same traffic, and every request ends with the same sequence."""
+    ref, seqs_ref = _staging_traffic(monkeypatch, "release", num_slots, device)
+    got, seqs_got = _staging_traffic(monkeypatch, "fast", num_slots, device)
+    assert seqs_got == seqs_ref
+    assert len(got) == len(ref)
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert a[0] == b[0], i
+        for x, y in zip(a[1:4], b[1:4]):
+            assert x.dtype == y.dtype and torch.equal(x, y), (i, a[0])
+        assert a[4] == b[4], i
+
+
+def test_fit_page_table_fast_matches_release(monkeypatch):
+    """``_fit_page_table_fast`` is ``_fit_page_table`` restricted to the used columns: equal values (int32 / int64
+    tables, narrower / wider than the context window, stale tails, padding rows) and the same errors."""
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", "fast")
+    bridge, gen = _bridge(num_slots=8, max_seq_len=1024)
+    kv = bridge.allocate_kv_cache((640, 1, 32, 576), torch.bfloat16, 3)
+    W = kv.page_table_width
+    rng = torch.Generator().manual_seed(5)
+    n_cases = 0
+    for trial in range(300):
+        rows = int(torch.randint(1, 9, (1,), generator=rng))
+        cols = int(torch.randint(1, W + 8, (1,), generator=rng))
+        dtype = torch.int64 if trial % 2 else torch.int32
+        pt = torch.randint(-2, 700 if trial % 7 == 0 else 640, (rows, cols), generator=rng, dtype=dtype)
+        if trial % 5 == 0:
+            pt[:, : min(cols, 3)] = 0  # a needed entry on the null block
+        need = torch.randint(0, min(cols, W) + (2 if trial % 11 == 0 else 1), (rows,), generator=rng)
+        if trial % 13 == 0:
+            need.zero_()
+        try:
+            want = bridge._fit_page_table(pt, kv, need, "t")
+        except ValueError as e:
+            with pytest.raises(ValueError) as got_e:
+                bridge._fit_page_table_fast(pt, kv, need, "t")
+            assert str(got_e.value) == str(e)
+            continue
+        got = bridge._fit_page_table_fast(pt, kv, need, "t")
+        assert got.dtype == torch.int32 and got.shape == (rows, int(need.max()))
+        full = torch.zeros(rows, W, dtype=torch.int32)
+        full[:, : got.shape[1]] = got
+        assert torch.equal(full, want)
+        n_cases += 1
+    assert n_cases > 50
+    with pytest.raises(ValueError, match="must be"):
+        bridge._fit_page_table_fast(torch.zeros(3), kv, torch.ones(3), "t")
+
+
+def test_host_staging_knob_in_the_bridge(monkeypatch):
+    """``MOTIF3_HOST_STAGING`` (B6a): ``release`` by default, ``fast`` on request (case and blanks ignored), anything
+    else refused when the bridge is built; the lane index cache only in ``fast``."""
+    assert _bridge()[0].host_staging == "release"
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", " FAST ")
+    b = _bridge()[0]
+    assert b.host_staging == "fast" and b._lane_index([3, 1]) is b._lane_index([3, 1])
+    assert b._lane_index([3, 1]).tolist() == [3, 1] and b._lane_index([3, 1]).dtype == torch.long
+    monkeypatch.setenv("MOTIF3_HOST_STAGING", "turbo")
+    with pytest.raises(ValueError, match="MOTIF3_HOST_STAGING"):
+        _bridge()
+    assert api.host_staging_from_env({}) == "release" and api.HOST_STAGING_MODES == ("release", "fast")
 
 
 @pytest.mark.parametrize("kvr", [True, False])

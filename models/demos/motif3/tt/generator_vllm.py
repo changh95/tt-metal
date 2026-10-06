@@ -192,6 +192,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     check_tt_config,
     chunk_budget_from_env,
     feature_switch_from_env,
+    host_staging_from_env,
     kv_cache_bytes_per_chip,
     kv_cache_dtype_from_env,
     kv_pool_tokens_from_env,
@@ -1024,6 +1025,11 @@ class MotifForCausalLM:
         self.sampling_stats = SamplingStats()
         raw = os.environ.get("MOTIF3_SAMPLING_LOG_EVERY", "").strip()
         self.sampling_log_every = int(raw) if raw.isdecimal() else SAMPLING_LOG_EVERY  # 0 = shutdown only
+        # B6a (MOTIF3_HOST_STAGING): "fast" = the same decode inputs with fewer host ops (_fit_page_table on the used
+        # columns only, cached lane index tensors)
+        self.host_staging = host_staging_from_env()
+        self._lane_idx_cache: Dict[Tuple[int, ...], torch.Tensor] = {}
+        self._arange_cache: Optional[torch.Tensor] = None
 
     # ---- vLLM model-inspection protocol (registry._ModelInfo); never executed on TT ---------------------------
     def embed_input_ids(self, input_ids):
@@ -1450,6 +1456,45 @@ class MotifForCausalLM:
             raise ValueError(f"{where}: page_table has block ids outside [1, {kv.num_blocks})")
         return fitted.contiguous()
 
+    def _fit_page_table_fast(self, page_table, kv: MotifKVCache, valid_blocks: torch.Tensor, where: str) -> torch.Tensor:
+        """:meth:`_fit_page_table` (``host_staging="fast"``): the same checks and errors, but only the first
+        ``max(valid_blocks)`` columns of the result (``int32 [rows, top]``; every later column of the full result is
+        0)."""
+        pt = torch.as_tensor(page_table)
+        if pt.ndim != 2 or pt.shape[0] != valid_blocks.shape[0]:
+            raise ValueError(f"{where}: page_table must be [{valid_blocks.shape[0]}, blocks], got {tuple(pt.shape)}")
+        width = kv.page_table_width
+        need = valid_blocks.to(torch.int64)
+        top = int(need.max()) if need.numel() else 0
+        if top > min(width, pt.shape[1]):
+            raise ValueError(
+                f"{where}: a row needs {int(need.max())} blocks; the block table has {pt.shape[1]} columns and the "
+                f"context window {width}"
+            )
+        ar = self._arange_cache
+        if ar is None or ar.shape[0] < width:
+            ar = self._arange_cache = torch.arange(width)
+        valid = ar[None, :top] < need[:, None]
+        fitted = pt[:, :top].to(torch.int32) * valid
+        if bool(((fitted < 1) & valid).any()):
+            raise ValueError(f"{where}: a position this step needs is on the null block (block id 0)")
+        if bool((fitted >= kv.num_blocks).any()):
+            raise ValueError(f"{where}: page_table has block ids outside [1, {kv.num_blocks})")
+        return fitted
+
+    def _lane_index(self, lanes: List[int]) -> torch.Tensor:
+        """``torch.tensor(lanes, dtype=torch.long)``, cached per lane list (``host_staging="fast"``; callers never
+        modify it)."""
+        if self.host_staging != "fast":
+            return torch.tensor(lanes, dtype=torch.long)
+        key = tuple(lanes)
+        t = self._lane_idx_cache.get(key)
+        if t is None:
+            if len(self._lane_idx_cache) >= 4096:
+                self._lane_idx_cache.clear()
+            t = self._lane_idx_cache[key] = torch.tensor(lanes, dtype=torch.long)
+        return t
+
     def _reject_unsupported(self, kwargs: dict, where: str) -> None:
         if "reset_batch" in kwargs:
             raise TypeError(
@@ -1670,15 +1715,20 @@ class MotifForCausalLM:
         if bool((pos < -1).any()) or bool((pos[active] >= self.settings.max_seq_len).any()):
             raise ValueError(f"decode positions must be -1 or in [0, {self.settings.max_seq_len})")
         need = torch.where(active, pos.to(torch.int64) // kv.block_size + 1, torch.zeros_like(pos, dtype=torch.int64))
-        pt = self._fit_page_table(page_table, kv, need, "decode_forward")  # inactive rows come back all zero
+        fast = self.host_staging == "fast"
+        fit = self._fit_page_table_fast if fast else self._fit_page_table
+        pt = fit(page_table, kv, need, "decode_forward")  # inactive rows come back all zero ("fast": used columns)
         lanes = self._lanes.decode_lanes(rows, slot_remap)
-        lane_idx = torch.tensor(lanes, dtype=torch.long)
+        lane_idx = self._lane_index(lanes)
         lane_tokens = torch.zeros(NUM_LANES, dtype=torch.int32)
         lane_pos = torch.full((NUM_LANES,), -1, dtype=torch.int32)
-        lane_pt = torch.zeros((NUM_LANES, pt.shape[1]), dtype=torch.int32)
+        lane_pt = torch.zeros((NUM_LANES, kv.page_table_width if fast else pt.shape[1]), dtype=torch.int32)
         lane_tokens[lane_idx] = torch.where(active, tok.to(torch.int32), torch.zeros_like(pos))
         lane_pos[lane_idx] = pos
-        lane_pt[lane_idx] = pt
+        if fast:
+            lane_pt[lane_idx, : pt.shape[1]] = pt
+        else:
+            lane_pt[lane_idx] = pt
         batch = DecodeBatch(tokens=lane_tokens, positions=lane_pos, page_table=lane_pt)
         retained: Dict[int, SpecRetained] = {}
         sampling = None if sampling_params is None else lane_sampling_lists(sampling_params, lanes)

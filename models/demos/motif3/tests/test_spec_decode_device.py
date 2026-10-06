@@ -787,6 +787,12 @@ def emu_generator(
     monkeypatch.setattr(G.ttnn, "synchronize_device", lambda mesh: model.reads.flush(), raising=False)
     monkeypatch.setattr(G.ttnn, "copy_device_to_host_tensor", model.reads.copy, raising=False)
     monkeypatch.setattr(G, "HostShardReader", EmuReader)
+    # B6a host_staging="fast": the host mesh tensors come from ttnn.from_torch with a cached DP-row mapper; the emulated
+    # embedding takes the lane-ordered tokens (as decode_tokens_host above)
+    monkeypatch.setattr(G, "dp_row_mapper", lambda cfg_, mesh: object())
+    monkeypatch.setattr(G, "decode_token_rows", lambda t, cfg_, n_streams=None, rows_per_dp=None: t.clone())
+    monkeypatch.setattr(G.ttnn, "from_torch", lambda v, **kw: _T(v.clone()), raising=False)
+    model.embed.n_streams = cfg.n_streams
     gen = G.MotifGenerator(None, cfg, model, log=None, **gen_kw)
     tr = EmuTrace(gen)
     monkeypatch.setattr(G.ttnn, "begin_trace_capture", tr.begin, raising=False)
@@ -1126,6 +1132,82 @@ def test_cpu_negative_control_cross_row_without_kvr(monkeypatch):
     wrong = [r.name for r in reqs if r.out != ref[r.name]]
     assert st.gen_stats["cross_row_partners"] > 0 and wrong, "the stale cross-row read went unnoticed"
     log(f"negative control: {len(wrong)}/8 requests wrong with forced cross-row partners and no KV-R")
+
+
+@pytest.mark.parametrize("spec, kvr", [(False, False), (False, True), (True, True), (True, False)])
+def test_cpu_host_staging_fast_lossless(monkeypatch, spec, kvr):
+    """B6a (``MOTIF3_HOST_STAGING=fast``): on the emulated device the fast staging decodes
+    exactly the release's tokens (plain path ``row`` / ``all``; spec ``row_split`` / ``all_split``, traced and eager),
+    with fewer input copies (an input whose values did not change is not copied again: the page table between block
+    crossings, idle lanes' rows), and every persistent input ends holding the values copied last."""
+    results = {}
+    for staging in ("release", "fast"):
+        gen, model, dev, pool, tr = emu_generator(
+            monkeypatch, kvr=kvr, spec=spec, cfg_kw=dict(host_staging=staging),
+            decode_kv_mode="all" if kvr else "row",
+        )  # fmt: skip
+        assert gen.host_staging == staging
+        W = 128
+        gen.warmup_decode(kv_cache=pool, enable_trace=False, page_table_width=W)
+        gen.warmup_decode(kv_cache=pool, enable_trace=True, page_table_width=W)
+        reqs = emu_requests(dev, 12, seed=8, width=W, max_new=70)
+        ref = {r.name: reference_greedy(r, dev.V) for r in reqs}
+        drv = GreedyDriver(gen, pool, width=W, block_size=64)
+        if spec:
+            drv.run_spec(reqs, policy="budget")
+        else:
+            drv.run_plain(reqs)
+        assert all(r.out == ref[r.name] for r in reqs), f"{staging}: decode differs from the reference"
+        drv.trace = False
+        reqs2 = emu_requests(dev, 5, seed=9, width=W, max_new=20, start_block=2000)
+        ref2 = {r.name: reference_greedy(r, dev.V) for r in reqs2}
+        drv.run_spec(reqs2, policy="all") if spec else drv.run_plain(reqs2)
+        assert all(r.out == ref2[r.name] for r in reqs2), f"{staging}: eager decode differs from the reference"
+        for p in gen._paths.values():  # the device inputs hold the last values copied
+            for k, v in p.host_last.items():
+                assert torch.equal(p.inputs[k].value, v), (p.key, k)
+        results[staging] = ({r.name: list(r.out) for r in reqs + reqs2}, dict(gen.stats))
+    (out_r, st_r), (out_f, st_f) = results["release"], results["fast"]
+    assert out_f == out_r
+    assert st_f["decode_steps"] == st_r["decode_steps"] and st_r["input_copies_skipped"] == 0
+    assert st_f["input_copies_skipped"] > 0 and st_f["input_copies"] < st_r["input_copies"]
+    assert st_f["input_copies"] + st_f["input_copies_skipped"] == st_r["input_copies"]
+    log(f"B6a spec={spec} kvr={kvr}: release {st_r['input_copies']} input copies; fast {st_f['input_copies']} "
+        f"(+{st_f['input_copies_skipped']} skipped)")  # fmt: skip
+
+
+def test_cpu_path_host_rows_match_release():
+    """``_path_host_rows`` (fast) holds exactly the values the release's ``_path_host_inputs`` converts: the tokens
+    rows of ``decode_token_rows`` (inactive lanes 0, negative ids -> pad), the RoPE rows, ``cur`` and the page table
+    with idle lanes zeroed (int32 / int64 tables, T32 and T64 rows)."""
+    from models.demos.motif3.tt import generator as G
+    from models.demos.motif3.tt.embedding import decode_token_rows
+    from models.demos.motif3.tt.rope import positions_to_rot_idxs
+
+    cfg = host_cfg(kv_replicated_decode=False, spec_tokens=1, spec_verify="auto")
+    stub = SimpleNamespace(cfg=cfg, model=SimpleNamespace(embed=SimpleNamespace(n_streams=4)), wide_rows_per_dp=16)
+    rng = torch.Generator().manual_seed(3)
+    for trial in range(60):
+        kind = (G.PLAIN, G.SPEC, G.WIDE)[trial % 3]
+        n = 64 if kind == G.WIDE else 32
+        pos = torch.randint(-1, 4000, (n,), generator=rng, dtype=torch.int32)
+        pos[torch.randint(0, n, (n // 3,), generator=rng)] = -1
+        tok = torch.randint(-1, cfg.vocab_size, (n,), generator=rng, dtype=torch.int32)
+        pt = torch.randint(0, 900, (n, 70), generator=rng, dtype=torch.int64 if trial % 2 else torch.int32)
+        rows = G.MotifGenerator._path_host_rows(stub, kind, "row", tok, pos, pt)
+        act = pos >= 0
+        t0 = torch.where(act, tok, torch.zeros_like(tok))
+        rpd = 16 if kind == G.WIDE else None
+        assert torch.equal(rows["tokens"][0], decode_token_rows(t0, cfg, n_streams=4, rows_per_dp=rpd))
+        assert torch.equal(rows["rot"][0], positions_to_rot_idxs(pos, cfg, rows_per_dp=rpd))
+        assert rows["tokens"][1] == G.ttnn.uint32 and rows["rot"][1] == G.ttnn.uint32
+        if kind == G.PLAIN:
+            want = torch.where(act[:, None], pt.to(torch.int32), torch.zeros_like(pt)).to(torch.int32)
+            assert rows["pt"][0].dtype == torch.int32 and torch.equal(rows["pt"][0], want)
+            assert torch.equal(rows["cur"][0], pos) and rows["cur"][1] == rows["pt"][1] == G.ttnn.int32
+            assert rows["cur"][0].data_ptr() != pos.data_ptr()  # kept in host_last: never the caller's tensor
+        else:
+            assert set(rows) == {"tokens", "rot"}
 
 
 def test_cpu_decode_paths_lifecycle(monkeypatch):
