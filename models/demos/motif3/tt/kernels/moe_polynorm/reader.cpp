@@ -12,9 +12,10 @@
 //   D   [3, E, 1, 1]      fp32 TILE: tile (m, e) = m E + e, value at element 0          (D_m = 1 / (I c_m^2))
 //   Ec  [3, E, 1, 1]      fp32 TILE: same layout                                        (E_m = eps / c_m^2)
 //   b   [1, E, 1, 1]      fp32 TILE: tile e                                             (bias, clamped to +-0.5)
-// The 7 constants of expert e land in CB_K (one fp32 tile) at byte offsets 64 j (j = D1 D2 D3 E1 E2 E3 b): the
-// compute kernel reads them with read_tile_value (element 16 j). They are per-chip device tensors (EP placement), so
-// one SPMD program serves all 32 chips.
+// The 7 constants of expert e land in CB_K as 7 fp32 tiles (j = D1 D2 D3 E1 E2 E3 b), each value broadcast down
+// column 0. The compute kernel combines them with SFPU binary tile ops (no scalar runtime args, no mailbox reads: a
+// read_tile_value version produced all-NaN output after certain earlier ops). They are per-chip device tensors (EP
+// placement), so one SPMD program serves all 32 chips.
 // After the gate / up / w reads: wait until all G group members have written their moment partials into this core's
 // CB_RECV (semaphore == G; bounded spin so a bug can never hang the shared device), re-arm the semaphore and publish
 // CB_RECV.
@@ -64,14 +65,14 @@ void kernel_main() {
     const auto es = TensorAccessor(e_args, e_addr, kb);
     const auto bs = TensorAccessor(b_args, b_addr, kb);
 
-    // the 7 per-expert constants (64 B each: one aligned read of the tile's first bytes)
-    cb_reserve_back(cb_k, 1);
+    // the 7 per-expert constants: one aligned 64 B read of each constant tile's first bytes into tile j of CB_K
+    cb_reserve_back(cb_k, 7);
     const uint32_t kdst = get_write_ptr(cb_k);
     for (uint32_t m = 0; m < 3; ++m) {
-        noc_async_read(ds.get_noc_addr(m * E + e), kdst + 64 * m, 64);
-        noc_async_read(es.get_noc_addr(m * E + e), kdst + 64 * (3 + m), 64);
+        noc_async_read(ds.get_noc_addr(m * E + e), kdst + kb * m, 64);
+        noc_async_read(es.get_noc_addr(m * E + e), kdst + kb * (3 + m), 64);
     }
-    noc_async_read(bs.get_noc_addr(e), kdst + 64 * 6, 64);
+    noc_async_read(bs.get_noc_addr(e), kdst + kb * 6, 64);
 
     // gate tiles (phase 1 needs them first)
     cb_reserve_back(cb_g, n * R);
@@ -84,7 +85,19 @@ void kernel_main() {
         }
     }
     noc_async_read_barrier();
-    cb_push_back(cb_k, 1);
+    // broadcast each constant (element 0) down column 0 of its tile (rows 0..15: face 0, rows 16..31: face 2; fp32
+    // elements, 16 per face row); the compute kernel only uses column 0 of the constant tiles
+    for (uint32_t j = 0; j < 7; ++j) {
+        volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kdst + kb * j);
+        const uint32_t v = t[0];
+        for (uint32_t r = 1; r < 16; ++r) {
+            t[16 * r] = v;
+        }
+        for (uint32_t r = 0; r < 16; ++r) {
+            t[512 + 16 * r] = v;
+        }
+    }
+    cb_push_back(cb_k, 7);
     cb_push_back(cb_g, n * R);
 
     // up tiles + routing weight tiles

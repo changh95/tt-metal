@@ -3122,8 +3122,9 @@ def test_moe_device_fused_polynorm(mesh_device, device_params):
     """B3 (docs/OPTIMIZATION_PLAN.md §3.3; ``moe_polynorm="fused"``; prototype logs/opt/phaseA/M10), real layer-2 /
     layer-35 weights from the serving TT cache on the T64 config, real router inputs, every chip checked:
 
-    * kernel: the fused ``h`` vs an fp64 golden built from each chip's own device constants (``D``, ``E``, clamped
-      ``b``; asserted PCC >= 0.99999 per chip and every token >= 0.9999) and vs the composite ``h`` (asserted: at
+    * kernel (after B1's sparsity ops, the regression case of a mailbox-based build): every value finite; the fused
+      ``h`` vs an fp64 golden built from each chip's own device constants (``D``, ``E``, clamped ``b``; asserted on
+      the routed (expert, token) rows: PCC >= 0.99999 per chip and every row >= 0.9999) and vs the composite ``h`` (asserted: at
       most one bf16 rounding apart, |d| <= 2^-7 |h| + 1e-6, and < 0.1 % of the values differ; counts reported); rows
       with routing weight 0 exactly 0; two calls bitwise equal; M = 64: gate_up rows 0..31 == M = 32 and fused rows
       0..31 == the M = 32 call bitwise;
@@ -3170,25 +3171,32 @@ def test_moe_device_fused_polynorm(mesh_device, device_params):
             gu = ttnn.matmul(x12, moe.w_gate_up, program_config=pc, compute_kernel_config=moe.ckc_experts,
                              dtype=ttnn.float32, memory_config=L1)
             hc = moe.polynorm(gu, mode="fp32", row_scale=w_loc, memory_config=L1)
+            # B1's sparsity ops (max, fp32 -> bf16 typecast, to_layout) first: a read_tile_value build of the kernel
+            # returned all-NaN h after them (stale compute-thread mailbox state); the constants now come as tiles
+            _free(moe.decode_sparsity(w_loc, memory_config=L1))
             hf = fused(gu, w_loc, memory_config=L1)
             hf2 = fused(gu, w_loc, memory_config=L1)
             gus, ws, hcs, hfs, hf2s = (_chips(t) for t in (gu, w_loc, hc, hf, hf2))
-            worst_pcc, worst_tok, n_diff, n_tot, max_ulp_viol, zero_ok = 1.0, 1.0, 0, 0, 0.0, True
-            for i in range(len(gus)):
+            worst_pcc, worst_tok, n_diff, n_tot, max_ulp_viol, zero_ok, finite = 1.0, 1.0, 0, 0, 0.0, True, True
+            for i in range(len(gus)):  # NaN-safe: a non-finite value fails "finite", never slips through min / max
+                finite &= bool(torch.isfinite(hfs[i]).all()) and bool(torch.isfinite(hcs[i]).all())
                 want = _pn_golden_from_consts(gus[i], ws[i], consts[0][i], consts[1][i], consts[2][i])
-                st = stats(want.reshape(-1, I), hfs[i].reshape(-1, I))
-                worst_pcc, worst_tok = min(worst_pcc, st["pcc"]), min(worst_tok, st["min_token_pcc"])
+                routed = (ws[i] != 0).reshape(-1)  # rows of (expert, token) with a routing weight (else h == 0)
+                st = stats(want.reshape(-1, I)[routed], hfs[i].reshape(-1, I)[routed])
+                worst_pcc = st["pcc"] if not st["pcc"] >= worst_pcc else worst_pcc
+                worst_tok = st["min_token_pcc"] if not st["min_token_pcc"] >= worst_tok else worst_tok
                 d = (hfs[i] - hcs[i]).abs()
-                n_diff += int((d > 0).sum())
+                n_diff += int((d != 0).sum())
                 n_tot += d.numel()
-                max_ulp_viol = max(max_ulp_viol, float((d - (hcs[i].abs() * 2.0**-7 + 1e-6)).max()))
+                v = float((d - (hcs[i].abs() * 2.0**-7 + 1e-6)).max())
+                max_ulp_viol = v if not v <= max_ulp_viol else max_ulp_viol
                 zero_ok &= bool((hfs[i][(ws[i] == 0).expand_as(hfs[i])] == 0).all())
             det = all(torch.equal(a, b) for a, b in zip(hfs, hf2s))
             note(f"L{layer} M={M} kernel: vs fp64 worst chip PCC {worst_pcc:.8f}, worst token {worst_tok:.7f}; vs "
                  f"composite {n_diff} / {n_tot} values differ ({n_diff / n_tot:.2e}), beyond 1 bf16 rounding "
-                 f"{max(max_ulp_viol, 0.0):.3g}; w = 0 rows exactly 0 {zero_ok}; 2 calls bitwise {det}",
-                 worst_pcc >= 0.99999 and worst_tok >= 0.9999 and max_ulp_viol <= 0 and n_diff / n_tot < 1e-3
-                 and zero_ok and det)
+                 f"{max_ulp_viol:.3g}; w = 0 rows exactly 0 {zero_ok}; all finite {finite}; 2 calls bitwise {det}",
+                 finite and worst_pcc >= 0.99999 and worst_tok >= 0.9999 and max_ulp_viol <= 0
+                 and n_diff / n_tot < 1e-3 and zero_ok and det)
             if M == 32:
                 h32, gu32 = hfs, gus
                 st_c = traced_stats(mesh_device, lambda: moe.polynorm(gu, mode="fp32", row_scale=w_loc,
@@ -3229,17 +3237,19 @@ def test_moe_device_fused_polynorm(mesh_device, device_params):
             osf = run(x_tt, "fused", "sparse")
             a, b = lane_rows(oc, 32).double(), lane_rows(of, 32).double()
             tp = row_pcc(a, b)
+            fin = bool(torch.isfinite(b).all()) and bool(torch.isfinite(osf.float()).all())
             note(f"L{layer} forward_decode M=32: fused vs composite PCC {pcc(a, b):.7f}, min lane {float(tp.min()):.7f}"
-                 f", sparse+fused == dense+fused {torch.equal(osf, of)}",
-                 float(tp.min()) >= 0.9999 and torch.equal(osf, of))
+                 f", sparse+fused == dense+fused {torch.equal(osf, of)}, finite {fin}",
+                 fin and float(tp.min()) >= 0.9999 and torch.equal(osf, of))
             halves.append(lane_rows(of, 32))
             _free(x_tt)
         x16 = upload_rows16(x64, cfg, mesh_device)
         o64c, o64 = lane_rows(run(x16, "composite"), 64), lane_rows(run(x16, "fused"), 64)
         t64_eq = bool(torch.equal(o64[:32], halves[0])) and bool(torch.equal(o64[32:], halves[1]))
         tp = row_pcc(o64c.double(), o64.double())
-        note(f"L{layer} T64 (fused): rows == T32 rows bitwise {t64_eq}; vs composite min row PCC {float(tp.min()):.7f}",
-             t64_eq and float(tp.min()) >= 0.9999)
+        fin = bool(torch.isfinite(o64.float()).all())
+        note(f"L{layer} T64 (fused): rows == T32 rows bitwise {t64_eq}; vs composite min row PCC {float(tp.min()):.7f}"
+             f", finite {fin}", fin and t64_eq and float(tp.min()) >= 0.9999)
         _free(x16)
 
         # ---- trace (layer 2): persistent x, new tokens per replay; traced cost composite vs fused ----

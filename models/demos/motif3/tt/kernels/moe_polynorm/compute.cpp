@@ -17,8 +17,9 @@
 // The x0.5 PolyNorm output scale is folded into W_down by the caller (as on the composite path); b is the clamped
 // bias (+-0.5) of the routed experts.
 //
-// CT: 0 cb_g, 1 cb_u, 2 cb_w, 3 cb_part, 4 cb_recv, 5 cb_coef, 6 cb_out, 7 cb_k, 8 n, 9 R, 10 G
-// CB_K: one fp32 tile, element 16 j = constant j (D1 D2 D3 E1 E2 E3 b; moment order g^2, g^4, g^6) as fp32 bits.
+// CT: 0 cb_g, 1 cb_u, 2 cb_w, 3 cb_part, 4 cb_recv, 5 cb_coef, 6 cb_out, 7 cb_k, 8 n, 9 R, 10 G, 11 debug stage (0)
+// CB_K: 7 fp32 tiles, tile j = constant j (D1 D2 D3 E1 E2 E3 b; moment order g^2, g^4, g^6) in column 0; combined
+// with SFPU binary tile ops (s D + E, w b), whose results in column 0 are what the column broadcasts read.
 
 #include <cstdint>
 
@@ -27,7 +28,6 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/eltwise_binary_sfpu.h"
-#include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/fill.h"
 #include "api/compute/eltwise_unary/rsqrt.h"
@@ -89,6 +89,24 @@ inline void horner() {
         dst_reg++;
     }
 }
+// before the column broadcasts: DEST tiles 0, 1, 2, 4 (A1, A2, A3, B) carry their values in column 0 only; the other
+// columns hold whatever the CBs / earlier ops left (stale L1 in the unsent faces of the moment partials, tile padding of
+// w, rsqrt of that), which can be Inf / NaN, and the broadcast helper does not tolerate non-finite values outside
+// column 0 (they poison the whole tile). Replace every non-finite value by 0 (column 0 is finite for finite inputs).
+inline void finite_or_zero() {
+#pragma GCC unroll 1
+    for (int i = 0; i < 32; ++i) {
+#pragma GCC unroll 4
+        for (int t = 0; t < 4; ++t) {
+            const int k = (t == 3 ? 4 : t) * 32;
+            vFloat v = dst_reg[k];
+            v_if(sfpi::exexp(v, sfpi::ExponentMode::Biased) == 255) { v = 0.0f; }
+            v_endif;
+            dst_reg[k] = v;
+        }
+        dst_reg++;
+    }
+}
 inline void noop_init() {}
 }  // namespace ckernel::sfpu::motif_pn
 #endif
@@ -111,6 +129,119 @@ inline void moments_batch(uint32_t nb) {
     }
 }
 
+// The coefficient tiles of tile row tr -> 4 tiles of cb_dst. stage 0 = the full computation (A1, A2, A3, B column
+// broadcasts -> cb_coef); debug stages (CT arg 11 = 1..4: h tiles 0..3 of every worker's tile rows replaced, bf16):
+// 1 = the group moment sums s1..s3 + the last partial of s1, 2 = s_m D_m + E_m (m = 1..3) + the E_3 tile,
+// 3 = a1..a3 (after rsqrt) + the D_3 tile, 4 = the final A1, A2, A3, B tiles.
+template <uint32_t cb_recv, uint32_t cb_k, uint32_t cb_w, uint32_t cb_coef, uint32_t R, uint32_t G>
+inline void coef_block(uint32_t tr, uint32_t cb_dst, uint32_t stage) {
+    // coefficients of this tile row
+    cb_reserve_back(cb_dst, 4);
+    tile_regs_acquire();
+    copy_init(cb_recv);
+    for (uint32_t m = 0; m < 3; ++m) {
+        copy_tile(cb_recv, 3 * tr + m, m);  // slot 0
+    }
+    for (uint32_t p = 1; p < G; ++p) {
+        copy_init(cb_recv);
+        for (uint32_t m = 0; m < 3; ++m) {
+            copy_tile(cb_recv, p * 3 * R + 3 * tr + m, 3 + m);
+        }
+        add_binary_tile_init();
+        for (uint32_t m = 0; m < 3; ++m) {
+            add_binary_tile(m, 3 + m, m);
+        }
+    }
+    if (stage == 1) {  // debug: tiles (0, 1, 2, 3) -> cb_dst
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_dst);
+        pack_tile(0, cb_dst);
+        pack_tile(1, cb_dst);
+        pack_tile(2, cb_dst);
+        pack_tile(3, cb_dst);
+        pack_reconfig_data_format(cb_coef);
+        tile_regs_release();
+        cb_push_back(cb_dst, 4);
+        return;
+    }
+    for (uint32_t m = 0; m < 3; ++m) {
+        copy_init(cb_k);
+        copy_tile(cb_k, m, 3);      // D_m (column 0)
+        copy_tile(cb_k, 3 + m, 4);  // E_m
+        mul_binary_tile_init();
+        mul_binary_tile(m, 3, m);
+        add_binary_tile_init();
+        add_binary_tile(m, 4, m);
+    }
+    if (stage == 2) {  // debug: tiles (0, 1, 2, 4) -> cb_dst
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_dst);
+        pack_tile(0, cb_dst);
+        pack_tile(1, cb_dst);
+        pack_tile(2, cb_dst);
+        pack_tile(4, cb_dst);
+        pack_reconfig_data_format(cb_coef);
+        tile_regs_release();
+        cb_push_back(cb_dst, 4);
+        return;
+    }
+    rsqrt_tile_init();
+    for (uint32_t m = 0; m < 3; ++m) {
+        rsqrt_tile(m);  // a_(m+1)
+    }
+    if (stage == 3) {  // debug: tiles (0, 1, 2, 3) -> cb_dst
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_dst);
+        pack_tile(0, cb_dst);
+        pack_tile(1, cb_dst);
+        pack_tile(2, cb_dst);
+        pack_tile(3, cb_dst);
+        pack_reconfig_data_format(cb_coef);
+        tile_regs_release();
+        cb_push_back(cb_dst, 4);
+        return;
+    }
+    copy_init(cb_w);
+    copy_tile(cb_w, tr, 3);
+    copy_tile(cb_w, tr, 4);
+    mul_binary_tile_init();
+    for (uint32_t m = 0; m < 3; ++m) {
+        mul_binary_tile(m, 3, m);  // A_m = w a_m
+    }
+    copy_init(cb_k);
+    copy_tile(cb_k, 6, 5);  // b
+    mul_binary_tile_init();
+    mul_binary_tile(4, 5, 4);  // B = w b
+    MOTIF_PN_SFPU((ckernel::sfpu::motif_pn::finite_or_zero));
+    fill_tile_init();
+    fill_tile(3, 0.0f);
+    fill_tile(5, 0.0f);
+    fill_tile(6, 0.0f);
+    fill_tile(7, 0.0f);
+    sfpu_bcast_col_init();
+    sfpu_add_bcast_col(3, 0);  // A1
+    sfpu_add_bcast_col(5, 1);  // A2
+    sfpu_add_bcast_col(6, 2);  // A3
+    sfpu_add_bcast_col(7, 4);  // B
+    tile_regs_commit();
+    tile_regs_wait();
+    if (cb_dst != cb_coef) {
+        pack_reconfig_data_format(cb_dst);
+    }
+    pack_tile(3, cb_dst);
+    pack_tile(5, cb_dst);
+    pack_tile(6, cb_dst);
+    pack_tile(7, cb_dst);
+    if (cb_dst != cb_coef) {
+        pack_reconfig_data_format(cb_coef);
+    }
+    tile_regs_release();
+    cb_push_back(cb_dst, 4);
+}
+
 void kernel_main() {
     constexpr uint32_t cb_g = get_compile_time_arg_val(0);
     constexpr uint32_t cb_u = get_compile_time_arg_val(1);
@@ -123,6 +254,7 @@ void kernel_main() {
     constexpr uint32_t n = get_compile_time_arg_val(8);
     constexpr uint32_t R = get_compile_time_arg_val(9);
     constexpr uint32_t G = get_compile_time_arg_val(10);
+    constexpr uint32_t DEBUG = get_compile_time_arg_val(11);
 
     compute_kernel_hw_startup(cb_g, cb_part);
 
@@ -156,77 +288,20 @@ void kernel_main() {
     }
     cb_push_back(cb_part, 3 * R);
 
-    // ---------------- per-expert constants ----------------
-    cb_wait_front(cb_k, 1);
-    uint32_t Db[3], Eb[3];
-    for (uint32_t m = 0; m < 3; ++m) {
-        Db[m] = read_tile_value(cb_k, 0, 16 * m);
-        Eb[m] = read_tile_value(cb_k, 0, 16 * (3 + m));
-    }
-    const uint32_t bb = read_tile_value(cb_k, 0, 16 * 6);
-
+    cb_wait_front(cb_k, 7);
     // ---------------- phase 3: group moments -> coefficients -> h ----------------
     cb_wait_front(cb_u, n * R);
     cb_wait_front(cb_w, R);
     cb_wait_front(cb_recv, 3 * R * G);
     for (uint32_t tr = 0; tr < R; ++tr) {
-        // coefficients of this tile row
-        cb_reserve_back(cb_coef, 4);
-        tile_regs_acquire();
-        copy_init(cb_recv);
-        for (uint32_t m = 0; m < 3; ++m) {
-            copy_tile(cb_recv, 3 * tr + m, m);  // slot 0
+        if constexpr (DEBUG != 0) {
+            coef_block<cb_recv, cb_k, cb_w, cb_coef, R, G>(tr, cb_out, DEBUG == 4 ? 0 : DEBUG);
         }
-        for (uint32_t p = 1; p < G; ++p) {
-            copy_init(cb_recv);
-            for (uint32_t m = 0; m < 3; ++m) {
-                copy_tile(cb_recv, p * 3 * R + 3 * tr + m, 3 + m);
-            }
-            add_binary_tile_init();
-            for (uint32_t m = 0; m < 3; ++m) {
-                add_binary_tile(m, 3 + m, m);
-            }
-        }
-        binop_with_scalar_tile_init();
-        for (uint32_t m = 0; m < 3; ++m) {
-            mul_unary_tile(m, Db[m]);
-            add_unary_tile(m, Eb[m]);
-        }
-        rsqrt_tile_init();
-        for (uint32_t m = 0; m < 3; ++m) {
-            rsqrt_tile(m);  // a_(m+1)
-        }
-        copy_init(cb_w);
-        copy_tile(cb_w, tr, 3);
-        copy_tile(cb_w, tr, 4);
-        mul_binary_tile_init();
-        for (uint32_t m = 0; m < 3; ++m) {
-            mul_binary_tile(m, 3, m);  // A_m = w a_m
-        }
-        binop_with_scalar_tile_init();
-        mul_unary_tile(4, bb);  // B = w b
-        fill_tile_init();
-        fill_tile(3, 0.0f);
-        fill_tile(5, 0.0f);
-        fill_tile(6, 0.0f);
-        fill_tile(7, 0.0f);
-        sfpu_bcast_col_init();
-        sfpu_add_bcast_col(3, 0);  // A1
-        sfpu_add_bcast_col(5, 1);  // A2
-        sfpu_add_bcast_col(6, 2);  // A3
-        sfpu_add_bcast_col(7, 4);  // B
-        tile_regs_commit();
-        tile_regs_wait();
-        pack_tile(3, cb_coef);
-        pack_tile(5, cb_coef);
-        pack_tile(6, cb_coef);
-        pack_tile(7, cb_coef);
-        tile_regs_release();
-        cb_push_back(cb_coef, 4);
+        coef_block<cb_recv, cb_k, cb_w, cb_coef, R, G>(tr, cb_coef, 0);
 
         // h tiles, 2 per DEST round (custom SFPI Horner)
         cb_wait_front(cb_coef, 4);
-        for (uint32_t j0 = 0; j0 < n; j0 += 2) {
+        for (uint32_t j0 = (DEBUG != 0 ? 4 : 0); j0 < n; j0 += 2) {
             const uint32_t nb = (n - j0) < 2 ? (n - j0) : 2;
             cb_reserve_back(cb_out, nb);
             tile_regs_acquire();
@@ -263,5 +338,5 @@ void kernel_main() {
     cb_pop_front(cb_g, n * R);
     cb_pop_front(cb_u, n * R);
     cb_pop_front(cb_w, R);
-    cb_pop_front(cb_k, 1);
+    cb_pop_front(cb_k, 7);
 }

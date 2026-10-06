@@ -38,7 +38,7 @@ so the T64 step's rows equal the T32 rows bitwise (M10 ``t64_rows0_31_bitwise_eq
 Trace safety: no host round trip; the output is a fresh device allocation per call; the program (one per buffer-type
 combination and M) is built on the first eager call and its hash is memoized, so a traced call only patches the
 common runtime args (buffer addresses). No persistent L1: receive buffers are per-program CBs, the semaphore is
-re-armed by the reader. L1 per worker: ~184 KB of CBs at M = 32, ~350 KB at M = 64 (:func:`plan`).
+re-armed by the reader. L1 per worker: ~196 KB of CBs at M = 32, ~340 KB at M = 64 (:func:`plan`).
 
 Host helpers (pure torch / no device): :func:`plan` (layout and CB budget), :func:`golden_fp64` (the HF semantics),
 :func:`emulate_fp32` (the kernel's algorithm in fp32 torch: grouping, rank-order sums, coefficient fold, Horner).
@@ -109,7 +109,7 @@ def plan(E: int, inter: int, M: int, G: int = DEFAULT_GROUP, grid: Tuple[int, in
         CB_RECV: (3 * R * G, FP32_TILE_BYTES),
         CB_COEF: (4, FP32_TILE_BYTES),
         CB_OUT: (OUT_TILES, BF16_TILE_BYTES),
-        CB_K: (1, FP32_TILE_BYTES),
+        CB_K: (7, FP32_TILE_BYTES),
     }
     return dict(E=E, inter=inter, M=M, G=G, IT=IT, n=n, R=R, n_workers=n_workers, grid=(gx, gy), rows=rows,
                 cb_tiles=cb_tiles, l1_bytes=sum(t * b for t, b in cb_tiles.values()))
@@ -224,10 +224,15 @@ class FusedGroupedPolyNorm:
             ``b``, TILE).
         e_loc / inter: local experts per chip (12) and the intermediate size (1280).
         group: cores per expert (default :data:`DEFAULT_GROUP`; must divide ``inter / 32``).
+        debug: 0 (production) or a diagnostic stage 1..4 of ``compute.cpp``'s ``coef_block`` (h tiles 0..3 of every
+            worker's tile rows hold that stage's tiles instead of h).
     """
 
-    def __init__(self, mesh_device, consts, *, e_loc: int, inter: int, group: int = DEFAULT_GROUP):
+    def __init__(self, mesh_device, consts, *, e_loc: int, inter: int, group: int = DEFAULT_GROUP, debug: int = 0):
         self.mesh_device = mesh_device
+        if debug not in (0, 1, 2, 3, 4):
+            raise ValueError(f"fused MoE PolyNorm: debug stage {debug} not in 0..4")
+        self.debug = int(debug)  # 0 = production; 1..4 = compute.cpp's coef_block debug stages (diagnostics only)
         self.D = consts.D
         self.Ec = consts.E
         self.b = consts.c["fp32"]["b"]
@@ -302,7 +307,7 @@ class FusedGroupedPolyNorm:
         sems = [ttnn.SemaphoreDescriptor(id=SEM_ID, core_ranges=cores, initial_value=0)]
         from ..model_config import compute_config_descriptor  # lazy: keeps this module's import light
 
-        cc = compute_config_descriptor("polynorm", fp32_unpack_cbs=[CB_G, CB_U, CB_W, CB_RECV, CB_COEF],
+        cc = compute_config_descriptor("polynorm", fp32_unpack_cbs=[CB_G, CB_U, CB_W, CB_RECV, CB_COEF, CB_K],
                                        dst_full_sync_en=True)
         nx, ny = self._noc_tables()
         defines = [("MOTIF_PN_SRC", self._tag)]
@@ -310,7 +315,7 @@ class FusedGroupedPolyNorm:
         reader_ct = ([CB_G, CB_U, CB_W, CB_RECV, CB_K, SEM_ID, n, R, G, 3 * R * G, IT, self.e_loc, self.grid[0]]
                      + _accessor(gu) + _accessor(w) + _accessor(self.D) + _accessor(self.Ec) + _accessor(self.b))
         writer_ct = [CB_PART, CB_OUT, CB_RECV, SEM_ID, n, R, G, IT, self.grid[0]] + list(nx) + list(ny) + _accessor(h)
-        compute_ct = [CB_G, CB_U, CB_W, CB_PART, CB_RECV, CB_COEF, CB_OUT, CB_K, n, R, G]
+        compute_ct = [CB_G, CB_U, CB_W, CB_PART, CB_RECV, CB_COEF, CB_OUT, CB_K, n, R, G, self.debug]
         kernels = [
             ttnn.KernelDescriptor(
                 kernel_source=str(READER_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
