@@ -585,10 +585,11 @@ def async_decode_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
 # trace's lifetime; made on the serving thread they fragment glibc's main malloc arena and every later eager prefill
 # pass of a dispatch-bound shape (128-512 rows, packed passes) runs ~20-30 ms slower per live trace (logs/opt/phaseB/B7,
 # E3b-E3d). "worker" = each capture on a short-lived worker thread (its own malloc arena; joined before the capture
-# returns; the default since its gates passed); "main" = the calling thread (the release). The device receives the
-# same commands either way.
+# returns); "main" = the calling thread (the release, and the default: served with MOTIF3_PREFILL_TRACE=128, worker
+# captures cost +60-75 ms TTFT at 1K and +15-30 ms at 4K, logs/opt/phaseB/B7/report.md). The device receives the same
+# commands either way.
 CAPTURE_THREAD_MODES = ("main", "worker")
-DEFAULT_CAPTURE_THREAD = "worker"
+DEFAULT_CAPTURE_THREAD = "main"
 
 
 def check_capture_thread(mode: Any, *, name: str = "MOTIF3_CAPTURE_THREAD") -> str:

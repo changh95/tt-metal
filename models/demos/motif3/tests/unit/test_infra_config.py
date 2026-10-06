@@ -2054,21 +2054,21 @@ def test_r1_no_raw_ttnn_collectives_outside_ccl(tmp_path):
 
 
 def test_capture_thread_knob(monkeypatch):
-    """E3 (logs/opt/phaseB/B7): ``MOTIF3_CAPTURE_THREAD`` (``worker`` default since its gates | ``main``, the release),
-    the host thread of every trace capture; case and blanks ignored, anything else refused; ``describe`` shows it."""
+    """E3 (logs/opt/phaseB/B7): ``MOTIF3_CAPTURE_THREAD`` (``main`` default, the release | ``worker``; worker
+    lost served 1K / 4K TTFT with the B7 prefill traces), the host thread of every trace capture; case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.generator_api import CAPTURE_THREAD_MODES
 
     assert CAPTURE_THREAD_MODES == ("main", "worker")
     c = _cfg()
-    assert c.capture_thread == "worker" and "capture_thread=worker" in c.describe()
-    for v, want in ((" Worker", "worker"), ("main", "main"), (" MAIN", "main"), ("", "worker")):
+    assert c.capture_thread == "main" and "capture_thread=main" in c.describe()
+    for v, want in ((" Worker", "worker"), ("main", "main"), (" MAIN", "main"), ("", "main")):
         monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", v)
         assert _cfg().capture_thread == want, v
     monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", "thread")
     with pytest.raises(ValueError, match="MOTIF3_CAPTURE_THREAD"):
         _cfg()
     monkeypatch.delenv("MOTIF3_CAPTURE_THREAD")
-    assert "capture_thread=main" in _cfg(capture_thread="main").describe()
+    assert "capture_thread=worker" in _cfg(capture_thread="worker").describe()
     with pytest.raises(ValueError, match="capture_thread"):
         _cfg(capture_thread="pool")
 
@@ -2081,7 +2081,7 @@ def test_prefill_trace_knob(monkeypatch):
 
     assert PREFILL_TRACE_BUCKETS == (128, 256, 512)
     c = _cfg()
-    assert c.prefill_trace == "128" and "prefill_trace=128 capture_thread=worker" in c.describe()
+    assert c.prefill_trace == "128" and "prefill_trace=128 capture_thread=main" in c.describe()
     for v, want in (("on", "128"), (" 256,128 ", "128,256"), ("OFF", "off"), ("", "128"), ("512", "512")):
         monkeypatch.setenv("MOTIF3_PREFILL_TRACE", v)
         assert _cfg().prefill_trace == want, v

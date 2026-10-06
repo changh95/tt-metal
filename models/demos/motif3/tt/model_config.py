@@ -1359,10 +1359,10 @@ class MotifTTConfig:
     # generator_api.check_prefill_trace, "on" = "128") whose solo sp0 / sp1 chunks replay a trace captured with the
     # decode traces (traced == eager bitwise) | "off" (the release: every prefill chunk eager).
     prefill_trace: str = "128"  # MOTIF3_PREFILL_TRACE
-    # The host thread every trace capture runs on (E3 / B7): "worker" (default since its gates passed: a short-lived
-    # thread with its own malloc arena, so eager prefill after a capture keeps its speed) | "main" (the release);
-    # generator_api.CAPTURE_THREAD_MODES
-    capture_thread: str = "worker"  # MOTIF3_CAPTURE_THREAD
+    # The host thread every trace capture runs on (E3 / B7): "main" (default, the release) | "worker" (a short-lived
+    # thread with its own malloc arena: eager sp0 128 after a capture keeps its speed in process, but served 1K / 4K
+    # TTFT with the B7 prefill traces is slower, logs/opt/phaseB/B7/report.md); generator_api.CAPTURE_THREAD_MODES
+    capture_thread: str = "main"  # MOTIF3_CAPTURE_THREAD
 
     # ---- device / mesh ----------------------------------------------------------------------------------------
     mesh_shape: Tuple[int, int] = (4, 8)
@@ -1529,7 +1529,7 @@ class MotifTTConfig:
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "128",
-            capture_thread=(os.environ.get("MOTIF3_CAPTURE_THREAD") or "worker").strip().lower(),
+            capture_thread=(os.environ.get("MOTIF3_CAPTURE_THREAD") or "main").strip().lower(),
             weights_dir=resolve_weights_dir(),
             tt_cache_root=resolve_tt_cache_root(),
             weights_revision=os.environ.get("TT_MODEL_WEIGHTS_REVISION") or DEFAULT_WEIGHTS_REVISION,
