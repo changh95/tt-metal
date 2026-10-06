@@ -2478,9 +2478,8 @@ def test_moe_device_decode_real(mesh_device, device_params, layer):
             _free(out_e2)
             taps2 = {}
             out_e3 = moe.forward_decode(x_tt, taps=taps2)  # the routes of the replayed inputs
-            idx2 = read_replicated(taps2["idx"], mesh_device, chips=[0])[0].reshape(-1, K).long()
-            w2 = read_replicated(taps2["w"], mesh_device, chips=[0])[0].reshape(-1, K).double() * (
-                moe.route_scale / moe.internal_route_scale)
+            idx2, w2, _ = read_routes(taps2, moe, mesh_device, chips=[0])  # gather or scatter (A5) router path
+            w2 = w2.double() * (moe.route_scale / moe.internal_route_scale)
             _free([taps2, out_e3])
             want2, _, _ = ref(x_new)
             want2_dev, _, _ = ref(x_new, idx2, w2.float())
