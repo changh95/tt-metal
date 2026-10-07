@@ -118,7 +118,8 @@ ROUTER_MASK_MODES = ("gather", "scatter", "fused")
 # Decode routed experts (B1, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(decode_experts=...)): "dense" (the release: every
 # chip runs its 12 local experts on all M gathered rows) | "sparse" (ttnn.sparse_matmul skips the local experts no live
 # row routes to; sparsity read on device, nnz=None; inactive lanes masked out of the routing weights). Live rows are
-# bitwise equal to "dense" (logs/opt/phaseA/M6); decode only, prefill keeps the masked-dense path.
+# bitwise equal to "dense" (logs/opt/phaseA/M6, logs/opt/phaseB/B1); decode only, prefill keeps the masked-dense path.
+# "sparse" is the default since 2026-10-07 (G16 restated, logs/opt/phaseB2/B1-FLIP); "dense" restores the release.
 DECODE_EXPERTS_MODES = ("dense", "sparse")
 # Decode routed-expert PolyNorm (B3, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(moe_polynorm=...)): "composite" (the
 # release: tt/polynorm.py's grouped Horner fp32, ~17 ops) | "fused" (tt/kernels/moe_polynorm.py: one generic_op over the
@@ -162,10 +163,12 @@ PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
 # reroutes every such gather (+0.26-0.45 ms per decode step); "native" = the plain ttnn.all_gather (the pre-fix
 # behaviour, prefill not run-to-run reproducible). Validation and cost: docs/determinism/FIX.md.
 RING_GATHER_MODES = ("safe", "lean", "native")
-# T64 step / T32-spec step device-time ratio r (docs/p5_t64/P5_T64_DESIGN.md §4.9, option A'': 1.118 at 1K, 1.126 at
-# 4K, 1.173 at 32K context): the input of the T64 drafting crossover c* (verify_plan.crossover_lanes). Gate G16
-# re-measures it on the full model.
-DEFAULT_WIDE_STEP_RATIO = 1.13
+# T64 step / T32-spec step device-time ratio r: the input of the T64 drafting crossover c* (verify_plan.crossover_lanes).
+# Gate G16 measures it on the full model. The release used 1.13 (design §4.9, option A'': 1.118 / 1.126 / 1.173 at
+# 1K / 4K / 32K; G16 1.124 / 1.138 at 1K / 8K). With B1 sparse decode experts (the default since 2026-10-07) and B3 / B4
+# fused, G16 measured 1.208 / 1.218 at 1K / 8K all_split (1.189 / 1.224 row_split; 1.246 at 32K), T64 73.3 / 76.1 ms
+# (logs/opt/phaseB2/B1-FLIP/g16.json): r = 1.21, c* = 20 at the prior 0.85 (19 at 1.13).
+DEFAULT_WIDE_STEP_RATIO = 1.21
 # Gathered decode row counts at which tt/moe.py's MotifRouter runs the exact-fp32 router kernel (RouterLogitsFP32) when
 # router_logits="exact_fp32" (MotifRouter._use_logits_fn; moe.EXACT_ROUTER_DECODE_ROWS must list the same counts,
 # test_infra_config checks it): 32 (T32 steps) and the 64 rows of a T64 step (review edit R-E7: WP-D D1, rows bitwise
@@ -1356,9 +1359,9 @@ class MotifTTConfig:
     # "gather" (the release) | "scatter" (A5, deprecated: B4 selects the same sets and is faster); neither is bitwise
     # equal to the release, ROUTER_MASK_MODES. Prefill always takes the gather path.
     router_mask: str = "fused"  # MOTIF3_ROUTER_MASK
-    # Decode routed experts (B1): "dense" (default, the release) | "sparse" (skip the local experts no live row routes
-    # to; live rows bitwise equal to "dense", DECODE_EXPERTS_MODES). Prefill is not affected.
-    decode_experts: str = "dense"  # MOTIF3_DECODE_EXPERTS
+    # Decode routed experts (B1): "sparse" (default since 2026-10-07: skip the local experts no live row routes to;
+    # live rows bitwise equal to "dense") | "dense" (the release; DECODE_EXPERTS_MODES). Prefill is not affected.
+    decode_experts: str = "sparse"  # MOTIF3_DECODE_EXPERTS
     # Decode routed-expert PolyNorm (B3): "fused" (default since the Phase B eval passed, docs/OPT_PHASE_B_EVAL.md; one
     # kernel, not bitwise equal to the composite) | "composite" (the release; MOE_POLYNORM_MODES). Prefill is not
     # affected.
@@ -1549,7 +1552,7 @@ class MotifTTConfig:
             ring_gather=(os.environ.get("MOTIF3_RING_GATHER") or "safe").strip(),
             flash_mla_swa_mcph=_env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA),
             router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "fused").strip().lower(),
-            decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
+            decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "sparse").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "fused").strip().lower(),
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),

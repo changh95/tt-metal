@@ -106,7 +106,8 @@ def unguarded(alpha: float, r: float) -> int:
         (0.88, R, 19),
         (1.0, R, 19),
         (1.0, 1.0, 17),  # clamped from 16
-        (0.85, 1.13, 19),  # the defaults: prior alpha_0, MotifTTConfig.wide_step_ratio
+        (0.85, 1.13, 19),  # the release defaults: prior alpha_0, r 1.13
+        (0.85, 1.21, 20),  # the defaults: prior alpha_0, MotifTTConfig.wide_step_ratio (G16 with B1 sparse)
     ],
 )
 def test_crossover_lanes_table(alpha, ratio, want):
@@ -152,10 +153,10 @@ def test_crossover_lanes_guard_and_clamp():
 
 
 def test_drafts_all_lanes():
-    prior, r = DEFAULT_SPEC_ALPHA_PRIOR, 1.13
+    prior, r = DEFAULT_SPEC_ALPHA_PRIOR, 1.21
     assert GeneratorSettings().spec_alpha_prior == prior and spec_cfg().wide_step_ratio == r
     c_star = VP.crossover_lanes(prior, r)
-    assert c_star == 19
+    assert c_star == 20
     for live in (range(0), range(1), range(16), range(32)):
         assert VP.drafts_all_lanes(live, spec_verify="packed", ratio=r) is False
         assert VP.drafts_all_lanes(live, spec_verify="wide", ratio=r) is True
@@ -171,9 +172,9 @@ def test_drafts_all_lanes():
     assert VP.drafts_all_lanes(range(32), spec_verify="auto", ratio=r, acceptance=good)
     bad = smoothed_acceptance(100, 10000)
     assert bad < r - 1 and not VP.drafts_all_lanes(range(32), spec_verify="auto", ratio=r, acceptance=bad)
-    mid = smoothed_acceptance(500, 1000)  # ~0.52: c* = 20
+    mid = smoothed_acceptance(500, 1000)  # ~0.52: c* = 22 at r 1.21 (20 at 1.13)
     c_mid = VP.crossover_lanes(mid, r)
-    assert c_mid == 20
+    assert c_mid == 22
     assert not VP.drafts_all_lanes(range(c_mid - 1), spec_verify="auto", ratio=r, acceptance=mid)
     assert VP.drafts_all_lanes(range(c_mid), spec_verify="auto", ratio=r, acceptance=mid)
     # MOTIF3_WIDE_MIN_LANES overrides c* (33 = never)

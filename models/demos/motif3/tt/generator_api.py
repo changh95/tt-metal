@@ -694,7 +694,7 @@ def check_wide_step_ratio(ratio: float) -> float:
 
 def wide_step_ratio_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[float]:
     """``MOTIF3_WIDE_STEP_RATIO``: unset = None (``MotifTTConfig.wide_step_ratio`` keeps
-    ``model_config.DEFAULT_WIDE_STEP_RATIO``, 1.13), else the T64 step / T32-spec step device-time ratio ``r`` the
+    ``model_config.DEFAULT_WIDE_STEP_RATIO``, 1.21), else the T64 step / T32-spec step device-time ratio ``r`` the
     ``auto`` drafting crossover ``c*`` uses (:func:`check_wide_step_ratio`: a finite float >= 1)."""
     env = os.environ if environ is None else environ
     raw = env.get("MOTIF3_WIDE_STEP_RATIO")
@@ -1015,7 +1015,7 @@ class GeneratorSettings:
             acceptance :meth:`MotifGenerator.drafts_all_lanes` assumes before any draft was verified.
         wide_step_ratio: the T64 / T32-spec step ratio ``r`` of ``c*`` (``MOTIF3_WIDE_STEP_RATIO``, a finite float
             >= 1); None (default) keeps ``MotifTTConfig.wide_step_ratio`` at ``model_config.DEFAULT_WIDE_STEP_RATIO``
-            (1.13). ``MotifTTConfig.from_settings`` maps it.
+            (1.21). ``MotifTTConfig.from_settings`` maps it.
     """
 
     max_batch_size: int = NUM_LANES

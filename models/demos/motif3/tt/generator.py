@@ -1222,7 +1222,7 @@ class MotifGenerator(api.MotifGenerator):
         bridge keeps its idle-lane budget, so every draft fits the 32-lane trace); True in ``wide``; in ``auto`` True
         iff the distinct live lanes reach ``settings.wide_min_lanes`` when set, else ``c* =
         verify_plan.crossover_lanes(acceptance, cfg.wide_step_ratio)`` (17..33, 33 = never; ``acceptance=None``: the
-        prior ``settings.spec_alpha_prior`` = 0.85, c* = 19 at r = 1.13). Raises on a live lane outside ``[0, 32)`` or
+        prior ``settings.spec_alpha_prior`` = 0.85, c* = 20 at r = 1.21). Raises on a live lane outside ``[0, 32)`` or
         an acceptance outside ``[0, 1]``."""
         s = self.settings
         mode = self.spec_verify if (self.spec_launch and self.wide_path is not None) else "packed"

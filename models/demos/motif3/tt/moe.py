@@ -47,8 +47,8 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    as the router matmul + one ``generic_op`` (:meth:`MotifRouter.route_fused`,
    :class:`~models.demos.motif3.tt.kernels.router_topk.FusedRouterTopK`, one core per gathered row): bias add on the
    fp32 SFPU, top-8 by exact fp32 compares (exact ties: lower id), fp32 normalization, this chip's 12 weights.
-   B1 (``decode_experts="sparse"``, ``MOTIF3_DECODE_EXPERTS``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, probe
-   logs/opt/phaseA/M6): ``w_loc *= lane_mask`` (the step's gathered ``[1, 1, M, 1]`` fp32 0/1 mask of the live rows,
+   B1 (``decode_experts="sparse"``, ``MOTIF3_DECODE_EXPERTS``; the default since 2026-10-07, ``dense`` restores the
+   release; docs/OPTIMIZATION_PLAN.md §3.3, probe logs/opt/phaseA/M6, results logs/opt/phaseB/B1, logs/opt/phaseB2/B1-FLIP): ``w_loc *= lane_mask`` (the step's gathered ``[1, 1, M, 1]`` fp32 0/1 mask of the live rows,
    :meth:`MotifMoE.decode_lane_mask`, built once per step by the model) so inactive lanes route nothing, then the
    sparsity ``s = max_M(w_loc)`` -> bf16 -> ROW_MAJOR ``[1, 1, 1, 12]`` (nonzero = some live row routes to the expert).
 4. Experts (MOE-4, G6): ``repeat(f_all) [1,12,32,4096] @ W_gate_up [1,12,4096,2560]`` (bfp8, ``experts_gate_up_pc``,
@@ -226,10 +226,10 @@ def _reshape(t, shape):
 
 def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str) -> str:
     """B1: the decode-experts mode a :class:`MotifMoE` runs. ``decode_experts`` (explicit) or ``cfg.decode_experts``
-    (``MOTIF3_DECODE_EXPERTS``; ``None`` = "dense") must be in :data:`DECODE_EXPERTS_MODES`. "sparse" needs
-    ``combine_mode="fold"`` (the routing weights folded into the PolyNorm output, so a skipped expert's zero slice is
-    its exact contribution): an explicit request raises, the config default falls back to "dense" for the HF-order
-    ``multiply_sum`` diagnostic module."""
+    (``MOTIF3_DECODE_EXPERTS``, default "sparse"; a config without the field = "dense") must be in
+    :data:`DECODE_EXPERTS_MODES`. "sparse" needs ``combine_mode="fold"`` (the routing weights folded into the PolyNorm
+    output, so a skipped expert's zero slice is its exact contribution): an explicit request raises, the config
+    default falls back to "dense" for the HF-order ``multiply_sum`` diagnostic module."""
     explicit = decode_experts is not None
     mode = str(decode_experts if explicit else (getattr(cfg, "decode_experts", None) or "dense"))
     if mode not in DECODE_EXPERTS_MODES:
@@ -1075,7 +1075,7 @@ class MotifMoE:
             fp32 dest, :class:`~models.demos.motif3.tt.kernels.moe_compact.GatherCombine`). Every combination is
             bitwise equal to the dense path.
         decode_experts: decode routed experts (B1; ``None`` = ``cfg.decode_experts``, ``MOTIF3_DECODE_EXPERTS``):
-            "dense" (the release) | "sparse" (``ttnn.sparse_matmul`` skips the local experts no live row routes to;
+            "dense" (the release) | "sparse" (the config default; ``ttnn.sparse_matmul`` skips the local experts no live row routes to;
             live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
             constants: the sparsity tensor is built per call, the lane mask per step (:meth:`decode_lane_mask`).
     """

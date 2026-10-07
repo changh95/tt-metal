@@ -814,13 +814,13 @@ def test_router_mask_knob(monkeypatch):
 
 def test_decode_experts_knob(monkeypatch):
     """B1 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/M6): ``MOTIF3_DECODE_EXPERTS`` selects the decode routed
-    experts, ``dense`` (default: the release) or ``sparse`` (``ttnn.sparse_matmul`` skips the local experts no live row
-    routes to); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    experts, ``sparse`` (default since 2026-10-07: ``ttnn.sparse_matmul`` skips the local experts no live row routes
+    to) or ``dense`` (the release); case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.model_config import DECODE_EXPERTS_MODES
 
     assert DECODE_EXPERTS_MODES == ("dense", "sparse")
-    assert _cfg().decode_experts == "dense" and "decode_experts=dense" in _cfg().describe()
-    for v, want in (("sparse", "sparse"), (" Sparse ", "sparse"), ("dense", "dense"), ("", "dense")):
+    assert _cfg().decode_experts == "sparse" and "decode_experts=sparse" in _cfg().describe()
+    for v, want in (("sparse", "sparse"), (" Sparse ", "sparse"), ("dense", "dense"), (" DENSE", "dense"), ("", "sparse")):
         monkeypatch.setenv("MOTIF3_DECODE_EXPERTS", v)
         assert _cfg().decode_experts == want, v
     monkeypatch.setenv("MOTIF3_DECODE_EXPERTS", "indices")
@@ -1716,7 +1716,7 @@ def test_tt_cache_policy_settings_and_env():
 
 def test_wide_step_ratio_override():
     """MOTIF3_WIDE_STEP_RATIO -> GeneratorSettings.wide_step_ratio -> MotifTTConfig.from_settings: unset keeps exactly
-    today's config (r = DEFAULT_WIDE_STEP_RATIO = 1.13), a value moves r and with it c*, and the check is
+    today's config (r = DEFAULT_WIDE_STEP_RATIO = 1.21, G16 with B1 sparse), a value moves r and with it c*, and the check is
     MotifTTConfig.validate's rule (finite, >= 1)."""
     from models.demos.motif3.tt import verify_plan as vp
 
@@ -1733,10 +1733,10 @@ def test_wide_step_ratio_override():
         pinned = MotifTTConfig.from_settings(
             api.GeneratorSettings(wide_step_ratio=DEFAULT_WIDE_STEP_RATIO, **extra), mesh_shape=(4, 8), hf_config=raw
         )
-        assert unset.wide_step_ratio == DEFAULT_WIDE_STEP_RATIO == 1.13 and _fields(unset) == _fields(pinned)
+        assert unset.wide_step_ratio == DEFAULT_WIDE_STEP_RATIO == 1.21 and _fields(unset) == _fields(pinned)
         assert unset.describe() == pinned.describe()
     # a value: the settings, the config, the T64 line of describe() and c* follow it
-    for value, c_star in ((1.0, 17), (1.13, 19), (1.2, 20), (1.3, 22), (2, 33)):
+    for value, c_star in ((1.0, 17), (1.13, 19), (1.2, 20), (1.21, 20), (1.3, 22), (2, 33)):
         s = api.GeneratorSettings(wide_step_ratio=value, **spec)
         c = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
         assert c.wide_step_ratio == float(value) and f"r {float(value):g})" in c.describe()
@@ -1981,7 +1981,7 @@ def test_spec_verify_config_and_f3_refusals(monkeypatch):
     "lean" refused), and "auto" with the exact-fp32 router only at a T64 row count the MoE runs it at (R-E7)."""
     cfg = _cfg()
     assert (cfg.spec_verify, cfg.wide_rows_per_dp, cfg.wide_step_ratio) == ("packed", 0, DEFAULT_WIDE_STEP_RATIO)
-    assert DEFAULT_WIDE_STEP_RATIO == 1.13 and cfg.ring_gather == "safe"
+    assert DEFAULT_WIDE_STEP_RATIO == 1.21 and cfg.ring_gather == "safe"
     for shape in ((4, 8), (8, 4)):
         for mode in api.WIDE_SPEC_VERIFY_MODES:
             c = _cfg(mesh_shape=shape, spec_tokens=1, spec_verify=mode)
@@ -1993,7 +1993,7 @@ def test_spec_verify_config_and_f3_refusals(monkeypatch):
     s = api.GeneratorSettings(prefix_caching=True, chunked_prefill=True, spec_tokens=1, spec_verify="auto")
     c = MotifTTConfig.from_settings(s, mesh_shape=(4, 8), hf_config=raw)
     assert (c.spec_verify, c.wide_rows_per_dp, c.kv_write_mode) == ("auto", 16, "all_split")
-    assert "spec=1 spec_verify=auto (T64 16 rows/DP row, r 1.13)" in c.describe() and "ring_gather=safe" in c.describe()
+    assert "spec=1 spec_verify=auto (T64 16 rows/DP row, r 1.21)" in c.describe() and "ring_gather=safe" in c.describe()
     plain = MotifTTConfig.from_settings(api.GeneratorSettings(), mesh_shape=(4, 8), hf_config=raw)
     assert (plain.spec_verify, plain.wide_rows_per_dp) == ("packed", 0)
 

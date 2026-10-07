@@ -115,7 +115,7 @@ def crossover_lanes(alpha: float, ratio: float) -> int:
 
     Args:
         alpha: the acceptance ``a`` in ``[0, 1]`` (the bridge's prior-smoothed estimate).
-        ratio: ``r`` = T64 step time / T32 spec step time (``MotifTTConfig.wide_step_ratio``, 1.13 by default; G16
+        ratio: ``r`` = T64 step time / T32 spec step time (``MotifTTConfig.wide_step_ratio``, 1.21 by default; G16
             measures it), finite and ``> 0``.
     """
     a = _check_rate("the acceptance alpha", alpha)

@@ -1058,10 +1058,11 @@ def test_moe_host_sparse_decode_experts(monkeypatch):
     assert DECODE_EXPERTS_MODES == ("dense", "sparse")
     monkeypatch.delenv("MOTIF3_DECODE_EXPERTS", raising=False)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
-    assert cfg.decode_experts == "dense"  # default off until the B1 gates decide
+    assert cfg.decode_experts == "sparse"  # the default since 2026-10-07 (logs/opt/phaseB2/B1-FLIP)
     # ---- resolve_decode_experts ----
     R = M.resolve_decode_experts
-    assert R(None, cfg, "fold") == "dense" and R("sparse", cfg, "fold") == "sparse" and R("dense", cfg, "fold") == "dense"
+    assert R(None, cfg, "fold") == "sparse" and R("sparse", cfg, "fold") == "sparse" and R("dense", cfg, "fold") == "dense"
+    assert R(None, cfg, "multiply_sum") == "dense"  # the config default falls back for the HF-order diagnostic module
     sp = SimpleNamespace(decode_experts="sparse")
     assert R(None, sp, "fold") == "sparse" and R(None, sp, "multiply_sum") == "dense" and R("dense", sp, "fold") == "dense"
     assert R(None, SimpleNamespace(), "fold") == "dense"

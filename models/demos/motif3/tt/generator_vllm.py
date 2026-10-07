@@ -59,7 +59,7 @@ EngineCore, so export them in the API server and EngineCore alike):
 * T64, ``MOTIF3_SPEC_VERIFY=auto`` on the MTP launch (``packed`` in the code; the MTP TIS spec sets ``auto`` since
   gates G-X / G-serve passed; ``wide`` is the one-trace fallback): a 64-row verify trace next to the 32-lane one. The
   bridge drafts every live lane once the live lanes reach the generator's ``c*`` (``MotifGenerator.drafts_all_lanes``:
-  about 19 at the acceptance prior 0.85 and the T64 / T32 step ratio r = 1.13; ``MOTIF3_WIDE_MIN_LANES`` overrides
+  about 20 at the acceptance prior 0.85 and the T64 / T32 step ratio r = 1.21; ``MOTIF3_WIDE_MIN_LANES`` overrides
   ``c*``, ``MOTIF3_WIDE_STEP_RATIO`` overrides r), and keeps the idle-lane budget below it, so c = 32 greedy traffic
   speculates too.
 
