@@ -728,7 +728,7 @@ def test_moe_host_router_mask_scatter(monkeypatch):
     assert ROUTER_MASK_MODES == ("gather", "scatter", "fused")
     monkeypatch.delenv("MOTIF3_ROUTER_MASK", raising=False)  # the default, whatever the caller exported (review I-2)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
-    assert cfg.router_mask == "gather"  # default off: the scatter weights are not bitwise equal to the release
+    assert cfg.router_mask == "fused"  # the default since the Phase B eval (B4); gather / scatter are opt-in
     E, K, Mrows = cfg.num_experts, cfg.top_k, 32
     g = torch.Generator().manual_seed(5)
     scores = torch.rand(1, 1, Mrows, E, generator=g)
@@ -1492,10 +1492,10 @@ def test_moe_host_fused_polynorm_dispatch(monkeypatch):
     assert MOE_POLYNORM_MODES == ("composite", "fused")
     monkeypatch.delenv("MOTIF3_MOE_POLYNORM", raising=False)
     cfg = MotifTTConfig.from_hf_config(HF_META, mesh_shape=(4, 8))
-    assert cfg.moe_polynorm == "composite"
+    assert cfg.moe_polynorm == "fused"  # the default since the Phase B eval
     R = M.resolve_moe_polynorm
     ok = dict(decode_polynorm="fp32", combine_mode="fold")
-    assert R(None, cfg, **ok) == "composite" and R("fused", cfg, **ok) == "fused" and R("composite", cfg, **ok) == "composite"
+    assert R(None, cfg, **ok) == "fused" and R("fused", cfg, **ok) == "fused" and R("composite", cfg, **ok) == "composite"
     fz = SimpleNamespace(moe_polynorm="fused")
     assert R(None, fz, **ok) == "fused" and R(None, SimpleNamespace(), **ok) == "composite"
     assert R(None, fz, **ok, gate_up_dtype=ttnn.float32) == "fused"

@@ -42,7 +42,8 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    the 384 columns and extracts this chip's 12 weights with a constant one-hot (same top-8 sets incl. exact ties;
    weights within 1-4 fp32 ulp of the gather path; router + local mask 140 -> 104 us traced at M = 32,
    logs/opt/phaseA/A5).
-   B4 (``router_mask="fused"``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, results logs/opt/phaseB/B4): steps 2-3
+   B4 (``router_mask="fused"``; the default since the Phase B eval, docs/OPT_PHASE_B_EVAL.md; docs/OPTIMIZATION_PLAN.md
+   §3.3, results logs/opt/phaseB/B4; ``MOTIF3_ROUTER_MASK=gather`` restores the release): steps 2-3
    as the router matmul + one ``generic_op`` (:meth:`MotifRouter.route_fused`,
    :class:`~models.demos.motif3.tt.kernels.router_topk.FusedRouterTopK`, one core per gathered row): bias add on the
    fp32 SFPU, top-8 by exact fp32 compares (exact ties: lower id), fp32 normalization, this chip's 12 weights.
@@ -55,8 +56,8 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    Horner ``mac``, fp32 intermediates) with the routing weights folded into ``up`` (``h = poly(g) * (w_loc * u)``,
    rounded to bf16 once; never block float) -> ``@ W_down [1,12,1280,4096]`` (bfp8, ``experts_down_pc``; the PolyNorm
    x0.5 and route_scale x2.0 folded into ``W_down``: net x1.0, exact) -> ``y [1,12,32,4096]`` = weighted expert outputs.
-   B3 (``moe_polynorm="fused"``, ``MOTIF3_MOE_POLYNORM``; off by default, docs/OPTIMIZATION_PLAN.md §3.3, prototype
-   logs/opt/phaseA/M10): the grouped PolyNorm and the routing-weight multiply are one ``generic_op``
+   B3 (``moe_polynorm="fused"``, ``MOTIF3_MOE_POLYNORM``; the default since the Phase B eval, docs/OPT_PHASE_B_EVAL.md,
+   ``composite`` restores the release; docs/OPTIMIZATION_PLAN.md §3.3, prototype logs/opt/phaseA/M10): the grouped PolyNorm and the routing-weight multiply are one ``generic_op``
    (:class:`~models.demos.motif3.tt.kernels.moe_polynorm.FusedGroupedPolyNorm`: fp32 moments + Horner on 48 cores,
    ``h`` rounded to bf16 once; not bitwise equal to the composite) at the decode row counts 32 / 64, dense and B1 sparse.
 5. Combine (MOE-5): ``fast_reduce_nc(y, dims=[1])`` (bf16 terms summed in an fp32 dest, packed in ``combine_dtype``:
@@ -246,7 +247,7 @@ def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str
 def resolve_moe_polynorm(moe_polynorm: Optional[str], cfg, *, decode_polynorm: str, combine_mode: str,
                          gate_up_dtype=None) -> str:
     """B3: the decode routed-expert PolyNorm a :class:`MotifMoE` runs. ``moe_polynorm`` (explicit) or
-    ``cfg.moe_polynorm`` (``MOTIF3_MOE_POLYNORM``; ``None`` = "composite") must be in :data:`MOE_POLYNORM_MODES`.
+    ``cfg.moe_polynorm`` (``MOTIF3_MOE_POLYNORM``, default "fused"; a config without the field = "composite") must be in :data:`MOE_POLYNORM_MODES`.
     "fused" needs the fp32 decode PolyNorm with an fp32 gate_up output (the kernel reads fp32 ``gu``) and
     ``combine_mode="fold"`` (it folds the routing weights): an explicit request raises otherwise, the config default
     falls back to "composite" (diagnostic modules)."""

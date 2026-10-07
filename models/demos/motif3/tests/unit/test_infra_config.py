@@ -791,14 +791,14 @@ def test_flash_mla_swa_mcph_knob(monkeypatch):
 
 def test_router_mask_knob(monkeypatch):
     """A5 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/A5): ``MOTIF3_ROUTER_MASK`` selects the decode routing-weight
-    path, ``gather`` (default: the release), ``scatter`` (``MotifRouter.route_local``) or ``fused`` (B4,
-    ``MotifRouter.route_fused`` + ``kernels/router_topk``); neither is bitwise equal to the release, so both stay off
-    until the Validate gates; case and blanks ignored, anything else refused; ``describe`` shows it."""
+    path, ``fused`` (B4, default since the Phase B eval: ``MotifRouter.route_fused`` + ``kernels/router_topk``),
+    ``gather`` (the release) or ``scatter`` (A5, ``MotifRouter.route_local``); neither is bitwise equal to the
+    release; case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.model_config import ROUTER_MASK_MODES
 
     assert ROUTER_MASK_MODES == ("gather", "scatter", "fused")
-    assert _cfg().router_mask == "gather" and "router_mask=gather" in _cfg().describe()
-    for v, want in (("scatter", "scatter"), (" Scatter ", "scatter"), ("gather", "gather"), ("", "gather"),
+    assert _cfg().router_mask == "fused" and "router_mask=fused" in _cfg().describe()
+    for v, want in (("scatter", "scatter"), (" Scatter ", "scatter"), ("gather", "gather"), (" Gather", "gather"), ("", "fused"),
                     ("fused", "fused"), (" FUSED ", "fused")):
         monkeypatch.setenv("MOTIF3_ROUTER_MASK", v)
         assert _cfg().router_mask == want, v
@@ -807,7 +807,7 @@ def test_router_mask_knob(monkeypatch):
         _cfg()
     monkeypatch.delenv("MOTIF3_ROUTER_MASK")
     assert _cfg(router_mask="scatter").router_mask == "scatter"
-    assert _cfg(router_mask="fused").router_mask == "fused" and "router_mask=fused" in _cfg(router_mask="fused").describe()
+    assert _cfg(router_mask="gather").router_mask == "gather" and "router_mask=gather" in _cfg(router_mask="gather").describe()
     with pytest.raises(ValueError, match="router_mask"):
         _cfg(router_mask="ge")
 
@@ -834,20 +834,21 @@ def test_decode_experts_knob(monkeypatch):
 
 def test_moe_polynorm_knob(monkeypatch):
     """B3 (docs/OPTIMIZATION_PLAN.md §3.3; logs/opt/phaseA/M10): ``MOTIF3_MOE_POLYNORM`` selects the decode routed-expert
-    PolyNorm, ``composite`` (default: the release) or ``fused`` (one generic_op, not bitwise equal: off until the shared
-    eval); case and blanks ignored, anything else refused; ``describe`` shows it."""
+    PolyNorm, ``fused`` (default since the Phase B eval: one generic_op, not bitwise equal to the release) or
+    ``composite`` (the release); case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.model_config import MOE_POLYNORM_MODES
 
     assert MOE_POLYNORM_MODES == ("composite", "fused")
-    assert _cfg().moe_polynorm == "composite" and "moe_polynorm=composite" in _cfg().describe()
-    for v, want in (("fused", "fused"), (" Fused ", "fused"), ("composite", "composite"), ("", "composite")):
+    assert _cfg().moe_polynorm == "fused" and "moe_polynorm=fused" in _cfg().describe()
+    for v, want in (("fused", "fused"), (" Fused ", "fused"), ("composite", "composite"), (" Composite", "composite"),
+                    ("", "fused")):
         monkeypatch.setenv("MOTIF3_MOE_POLYNORM", v)
         assert _cfg().moe_polynorm == want, v
     monkeypatch.setenv("MOTIF3_MOE_POLYNORM", "horner")
     with pytest.raises(ValueError, match="MOTIF3_MOE_POLYNORM"):
         _cfg()
     monkeypatch.delenv("MOTIF3_MOE_POLYNORM")
-    assert _cfg(moe_polynorm="fused").moe_polynorm == "fused"
+    assert _cfg(moe_polynorm="composite").moe_polynorm == "composite"
     with pytest.raises(ValueError, match="moe_polynorm"):
         _cfg(moe_polynorm="kernel")
 

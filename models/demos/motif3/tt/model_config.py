@@ -112,7 +112,8 @@ ROUTER_LOGITS_IMPLS = ("composite", "exact_fp32")  # MotifMoE(router_logits=...)
 # ttnn.gather of the top-8 scores + idx-based local mask) | "scatter" (MotifRouter.route_local: top-8 0/1 mask scattered
 # from topk's idx, local one-hot extraction; same top-8 sets, weights within 1-4 fp32 ulp, -1.7 to -2.0 ms per step) |
 # "fused" (B4: MotifRouter.route_fused, the router matmul + one generic_op kernels/router_topk.py for bias, top-8,
-# normalize and local extraction; same sets except on exact fp32 ties at the 8th value, weights within fp32 rounding).
+# normalize and local extraction; same sets except on exact fp32 ties at the 8th value, weights within fp32 rounding;
+# the default since the Phase B eval passed, docs/OPT_PHASE_B_EVAL.md).
 ROUTER_MASK_MODES = ("gather", "scatter", "fused")
 # Decode routed experts (B1, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(decode_experts=...)): "dense" (the release: every
 # chip runs its 12 local experts on all M gathered rows) | "sparse" (ttnn.sparse_matmul skips the local experts no live
@@ -122,7 +123,8 @@ DECODE_EXPERTS_MODES = ("dense", "sparse")
 # Decode routed-expert PolyNorm (B3, docs/OPTIMIZATION_PLAN.md §3.3; MotifMoE(moe_polynorm=...)): "composite" (the
 # release: tt/polynorm.py's grouped Horner fp32, ~17 ops) | "fused" (tt/kernels/moe_polynorm.py: one generic_op over the
 # gate_up output; fp32 moments + Horner + routing weight, one bf16 rounding; ~5 ms less per T32 step, not bitwise equal
-# to the composite: 1-ulp bf16 differences in ~2e-5 of the values, logs/opt/phaseA/M10). Decode only (M = 32 / 64).
+# to the composite: 1-ulp bf16 differences in ~2e-5 of the values, logs/opt/phaseA/M10; the default since the Phase B
+# eval passed, docs/OPT_PHASE_B_EVAL.md). Decode only (M = 32 / 64).
 MOE_POLYNORM_MODES = ("composite", "fused")
 # Decode shared-expert PolyNorm (B5, docs/OPTIMIZATION_PLAN.md §3.3; PolyNormMLP(shared_polynorm=...)): "composite" (the
 # release: tt/polynorm.py polynorm_tp, 19 small programs incl. the moments all-gather) | "fused"
@@ -1350,16 +1352,17 @@ class MotifTTConfig:
     # FlashMLA decode max_cores_per_head_batch on SWA layers (A2, docs/OPTIMIZATION_PLAN.md §3.3): 4 (bitwise equal to
     # the release's 16 on SWA, -0.2 ms per step); 16 restores the release config. Global layers keep 16.
     flash_mla_swa_mcph: int = FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA  # MOTIF3_FLASH_MLA_SWA_MCPH
-    # Decode routing weights (A5 / B4): "gather" (default, the release) | "scatter" (A5) | "fused" (B4); neither is
-    # bitwise equal to the release: off until the Validate gates decide, ROUTER_MASK_MODES. Prefill always takes the
-    # gather path.
-    router_mask: str = "gather"  # MOTIF3_ROUTER_MASK
+    # Decode routing weights (A5 / B4): "fused" (B4, default since the Phase B eval passed, docs/OPT_PHASE_B_EVAL.md) |
+    # "gather" (the release) | "scatter" (A5, deprecated: B4 selects the same sets and is faster); neither is bitwise
+    # equal to the release, ROUTER_MASK_MODES. Prefill always takes the gather path.
+    router_mask: str = "fused"  # MOTIF3_ROUTER_MASK
     # Decode routed experts (B1): "dense" (default, the release) | "sparse" (skip the local experts no live row routes
     # to; live rows bitwise equal to "dense", DECODE_EXPERTS_MODES). Prefill is not affected.
     decode_experts: str = "dense"  # MOTIF3_DECODE_EXPERTS
-    # Decode routed-expert PolyNorm (B3): "composite" (default, the release) | "fused" (one kernel; not bitwise equal to
-    # the composite: off until the shared eval decides, MOE_POLYNORM_MODES). Prefill is not affected.
-    moe_polynorm: str = "composite"  # MOTIF3_MOE_POLYNORM
+    # Decode routed-expert PolyNorm (B3): "fused" (default since the Phase B eval passed, docs/OPT_PHASE_B_EVAL.md; one
+    # kernel, not bitwise equal to the composite) | "composite" (the release; MOE_POLYNORM_MODES). Prefill is not
+    # affected.
+    moe_polynorm: str = "fused"  # MOTIF3_MOE_POLYNORM
     # Decode shared-expert PolyNorm (B5): "fused" (default: moments kernel + the release's moments all-gather + apply
     # kernel, bitwise equal to the release) | "composite" (the release; SHARED_POLYNORM_MODES). Prefill and the dense
     # MLPs are not affected.
@@ -1545,9 +1548,9 @@ class MotifTTConfig:
             router_logits=(os.environ.get("MOTIF3_ROUTER_LOGITS") or "composite").strip(),
             ring_gather=(os.environ.get("MOTIF3_RING_GATHER") or "safe").strip(),
             flash_mla_swa_mcph=_env_int("MOTIF3_FLASH_MLA_SWA_MCPH", FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH_SWA),
-            router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "gather").strip().lower(),
+            router_mask=(os.environ.get("MOTIF3_ROUTER_MASK") or "fused").strip().lower(),
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "dense").strip().lower(),
-            moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "composite").strip().lower(),
+            moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "fused").strip().lower(),
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
