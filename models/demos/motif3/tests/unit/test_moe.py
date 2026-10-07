@@ -2378,6 +2378,169 @@ def test_moe_host_model_prefill_moe_rows():
     assert m.compact_moes() == [] and m.prefill_moe_rows([4096]) == [] and m.warm_prefill_moe([4096]) == {}
 
 
+def _compact_upload_fast_b2a(idx, g2s, P: int, E: int, mb: int, ladder: Tuple[int, ...], pn_bits, rows_m: int):
+    """The B2a original of ``compact_upload_fast`` (motif3-opt 5a64c022585), kept as the P2 reference."""
+    import numpy as np
+
+    from models.demos.motif3.tt.moe import compact_bucket
+
+    K = int(np.asarray(idx).shape[-1])
+    idx = np.asarray(idx).reshape(-1).astype(np.int64, copy=False)
+    S_K = idx.size
+    pad_key = int(rows_m)
+    if S_K and (int(idx.min()) < 0 or int(idx.max()) >= g2s.size):
+        raise ValueError("a routed expert id is not any chip's local expert")
+    pe = g2s[idx]
+    if S_K and int(pe.min()) < 0:
+        raise ValueError("a routed expert id is not any chip's local expert")
+    cnt = np.bincount(pe, minlength=P * E)
+    nblk = ((cnt + (mb - 1)) // mb).reshape(P, E)
+    need = int(nblk.sum(1).max()) if S_K else 0
+    nb = compact_bucket(need, ladder)
+    if nb is None:
+        return need, None, None
+    rows = int(nb) * int(mb)
+    order = np.argsort(pe, kind="stable")  # flattened order is token-major: tokens ascending within each slot
+    pe_s = pe[order]
+    start = np.cumsum(cnt) - cnt
+    blk_end = np.cumsum(nblk, axis=1)
+    blk_off = (blk_end - nblk).reshape(-1)
+    row = blk_off[pe_s] * mb + (np.arange(S_K) - start[pe_s])
+    flat = (pe_s // E) * (4 * rows) + row
+    t_s = (order // K).astype(np.int32)
+    u = np.zeros((P, 4, rows), dtype=np.int32)
+    u[:, 1, :] = int(pad_key)
+    uf = u.reshape(-1)
+    uf[flat] = t_s
+    uf[flat + rows] = t_s
+    uf[flat + 2 * rows] = (pe_s % E).astype(np.int32) * int(pad_key) + t_s
+    eblk = np.minimum((blk_end[:, :, None] <= np.arange(nb)[None, None, :]).sum(1), E - 1)  # [P, nb]
+    blk = np.zeros((P, int(nb), 32), dtype=np.int32)
+    np.put_along_axis(blk, eblk[:, :, None], 0x3F80, axis=2)  # bf16 1.0 at the block's expert
+    blk[:, :, 16:20] = np.take_along_axis(pn_bits, eblk[:, :, None], axis=1)
+    u[:, 3, : 32 * int(nb)] = blk.reshape(P, -1)
+    return need, int(nb), u
+
+
+@pytest.mark.parametrize("S", [128, 1024, 2048, 4096, 8064])
+def test_moe_host_compact_upload_fast_p2(S):
+    """P2 (logs/opt/phaseC/P2): the rewritten ``compact_upload_fast`` (16-bit radix argsort, one gather per word row)
+    returns word for word what the B2a original returns: uniform and skewed routes, ``need`` beyond the cap, 8 seeds."""
+    import models.demos.motif3.tt.moe as M
+
+    P, E, K = 32, 12, 8
+    G = P * E
+    for seed in range(8):
+        rng = np.random.default_rng(1000 * S + seed)
+        local = rng.permutation(G).reshape(P, E)
+        g2s = np.full(G, -1, dtype=np.int64)
+        g2s[local.reshape(-1)] = np.arange(G)
+        p = (rng.pareto(1.2, G) + 0.02) if seed % 2 else np.ones(G)
+        p = p / p.sum()
+        idx = np.stack([rng.choice(G, K, replace=False, p=p) for _ in range(S)])
+        pn = rng.integers(0, 1 << 16, (P, E, 4)).astype(np.int32)
+        mb = M.compact_block(S, "auto")
+        for ladder in (M.compact_ladder(S, mb, E), (E,)):
+            a = M.compact_upload_fast(idx, g2s, P, E, mb, ladder, pn, S)
+            b = _compact_upload_fast_b2a(idx, g2s, P, E, mb, ladder, pn, S)
+            assert a[0] == b[0] and a[1] == b[1]
+            assert (a[2] is None and b[2] is None) or (a[2].dtype == b[2].dtype and np.array_equal(a[2], b[2]))
+
+
+def test_moe_host_staged_upload(monkeypatch):
+    """P2 ``prefill_moe_upload="staged"`` (``MotifMoE._upload_words``) on a fake (1, 2) mesh: the first call per row
+    count is the B2a ``from_torch`` upload and builds the staging (one host mesh tensor, zero-copy views); later calls
+    write ``u[p]`` into view ``p`` and copy the host tensor into a fresh device tensor -- chip ``p`` receives ``u[p]``
+    exactly (int64 and int32 inputs); a new row count builds its own staging; shards without zero-copy views fall back
+    to ``from_torch`` for that row count; ``"from_torch"`` never stages."""
+    import models.demos.motif3.tt.moe as M
+
+    P = 2
+    calls = []
+
+    class Shard:
+        def __init__(self, n, zero_copy=True):
+            self.buf, self.zero_copy = torch.zeros(n, dtype=torch.int32), zero_copy
+
+        def to_torch_with_padded_shape(self):
+            return self.buf if self.zero_copy else self.buf.clone()
+
+    class Host:
+        def __init__(self, n, zero_copy):
+            self.shards = [Shard(n, zero_copy) for _ in range(P)]
+
+    class Dev:
+        def __init__(self, chips, shape=None):
+            self.chips, self.spec = chips, ("spec", shape)
+
+    zero_copy = {"v": True}
+
+    def from_torch(h, *, dtype, layout, device, memory_config, mesh_mapper):
+        calls.append(("from_torch", tuple(h.shape)))
+        assert dtype == ttnn.uint32 and layout == ttnn.ROW_MAJOR_LAYOUT and h.dtype == torch.int32
+        return Dev([h.reshape(P, -1)[p].clone() for p in range(P)], tuple(h.shape))
+
+    def alloc_host(spec, mesh):
+        calls.append(("alloc_host", spec))
+        return Host(4 * spec[1][-1], zero_copy["v"])
+
+    def alloc_dev(shape, dtype, layout, mesh, mc):
+        calls.append(("alloc_dev", tuple(shape)))
+        return Dev([None] * P)
+
+    def h2d(h, d):
+        calls.append(("h2d",))
+        d.chips = [s.buf.clone() for s in h.shards]
+
+    ns = M.ttnn
+    monkeypatch.setattr(ns, "from_torch", from_torch)
+    monkeypatch.setattr(ns, "allocate_tensor_on_host", alloc_host)
+    monkeypatch.setattr(ns, "allocate_tensor_on_device", alloc_dev)
+    monkeypatch.setattr(ns, "copy_host_to_device_tensor", h2d)
+    monkeypatch.setattr(ns, "get_device_tensors", lambda h: h.shards)
+    monkeypatch.setattr(ns, "Shape", lambda v: list(v))
+
+    moe = M.MotifMoE.__new__(M.MotifMoE)
+    moe.compact_state = M.CompactPrefillState()
+    moe.compact_state.mapper = "SHARD"
+    moe.mesh_device, moe.dram = "MESH", "DRAM"
+    moe._mesh_rc = lambda: (1, P)
+    moe.prefill_moe_upload = "staged"
+    g = torch.Generator().manual_seed(3)
+
+    def words(rows, dt):
+        return torch.randint(0, 2 ** 31 - 1, (P, 4, rows), generator=g, dtype=torch.int64).to(dt)
+
+    for i, (rows, dt) in enumerate([(64, torch.int64), (64, torch.int64), (64, torch.int32), (96, torch.int32),
+                                    (96, torch.int64)]):
+        u = words(rows, dt)
+        n0 = len(calls)
+        U = moe._upload_words(u if i % 2 else u.numpy(), rows)
+        for p in range(P):
+            assert torch.equal(U.chips[p].long(), u[p].reshape(-1).long()), (i, p)
+        kinds = [c[0] for c in calls[n0:]]
+        first = i in (0, 3)
+        assert kinds == (["from_torch", "alloc_host"] if first else ["alloc_dev", "h2d"]), (i, kinds)
+    assert sorted(moe.compact_state.upload_bufs) == [64, 96]
+    # no zero-copy views: that row count uploads with from_torch every time
+    zero_copy["v"] = False
+    for _ in range(2):
+        u = words(32, torch.int32)
+        U = moe._upload_words(u.numpy(), 32)
+        assert all(torch.equal(U.chips[p], u[p].reshape(-1)) for p in range(P))
+    assert moe.compact_state.upload_bufs[32] is False and calls[-1][0] == "from_torch"
+    # "from_torch": never staged
+    moe2 = M.MotifMoE.__new__(M.MotifMoE)
+    moe2.__dict__.update(moe.__dict__)
+    moe2.compact_state = M.CompactPrefillState()
+    moe2.compact_state.mapper = "SHARD"
+    moe2.prefill_moe_upload = "from_torch"
+    n0 = len(calls)
+    for _ in range(2):
+        moe2._upload_words(words(64, torch.int32), 64)
+    assert [c[0] for c in calls[n0:]] == ["from_torch", "from_torch"] and not moe2.compact_state.upload_bufs
+
+
 def test_moe_host_import_clean():
     code = (
         "import sys; import models.demos.motif3.tt.moe as m; "

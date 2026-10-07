@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import ttnn
 
+from .host_env import SHM_TRACKING_MODES, apply_host_env
 from .generator_api import DEFAULT_KV_POOL_TOKENS as _API_DEFAULT_KV_POOL_TOKENS
 from .generator_api import L1_SMALL_SIZE as _API_L1_SMALL_SIZE
 from .generator_api import NUM_LANES, SUPPORTED_BLOCK_SIZES, cdiv, check_block_size, expected_num_blocks
@@ -153,6 +154,11 @@ PREFILL_MOE_DISPATCH_MODES = ("host", "device")
 # | "gather" (tt/kernels/moe_compact.py GatherCombine: each token's rows gathered and added in an fp32 dest with
 # fast_reduce_nc's ops). Bitwise equal to each other and to the dense path.
 PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
+# How the B2a host path uploads its per-chip row words (P2, MOTIF3_PREFILL_MOE_UPLOAD): "staged" (default: the words go
+# into a host mesh tensor allocated once per row count, through zero-copy numpy views, then one
+# copy_host_to_device_tensor into a fresh device tensor; ~0.1 ms of host time per MoE layer) | "from_torch" (B2a: one
+# sharded ttnn.from_torch per MoE layer, ~0.67 ms of host time). The same bytes reach the same ops: bitwise equal.
+PREFILL_MOE_UPLOAD_MODES = ("staged", "from_torch")
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -327,6 +333,7 @@ def open_motif_mesh(
     dispatch_core_config=COL, trace_region_size, l1_small_size)`` with :func:`device_params` defaults -- the same
     values the vLLM plugin uses with ``generator_api.SERVING_TT_CONFIG``. ``mesh_shape`` defaults to ``MESH_DEVICE`` or
     (4, 8). Close with :func:`close_motif_mesh`. Device code: never call at import time."""
+    apply_host_env()
     shape = tuple(int(d) for d in (mesh_shape if mesh_shape is not None else mesh_shape_from_env()))
     p = device_params(fabric, trace_region_size, l1_small_size)
     fc = p.pop("fabric_config")
@@ -1380,6 +1387,8 @@ class MotifTTConfig:
     # ("matmul" | "gather"; PREFILL_MOE_COMBINE_MODES). Defaults: B2a's.
     prefill_moe_dispatch: str = "host"  # MOTIF3_PREFILL_MOE_DISPATCH
     prefill_moe_combine: str = "matmul"  # MOTIF3_PREFILL_MOE_COMBINE
+    # P2: how the B2a host path uploads its row words ("staged" | "from_torch"; PREFILL_MOE_UPLOAD_MODES). Bitwise equal.
+    prefill_moe_upload: str = "staged"  # MOTIF3_PREFILL_MOE_UPLOAD
     # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
     # "release" (the release code); generator_api.HOST_STAGING_MODES. Host only: device programs and inputs unchanged.
     host_staging: str = "fast"  # MOTIF3_HOST_STAGING
@@ -1561,6 +1570,7 @@ class MotifTTConfig:
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
             prefill_moe_dispatch=(os.environ.get("MOTIF3_PREFILL_MOE_DISPATCH") or "host").strip().lower(),
             prefill_moe_combine=(os.environ.get("MOTIF3_PREFILL_MOE_COMBINE") or "matmul").strip().lower(),
+            prefill_moe_upload=(os.environ.get("MOTIF3_PREFILL_MOE_UPLOAD") or "staged").strip().lower(),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "128",
@@ -1749,6 +1759,11 @@ class MotifTTConfig:
             raise ValueError(
                 f"prefill_moe_combine (MOTIF3_PREFILL_MOE_COMBINE) must be one of {PREFILL_MOE_COMBINE_MODES}, got "
                 f"{self.prefill_moe_combine!r}"
+            )
+        if self.prefill_moe_upload not in PREFILL_MOE_UPLOAD_MODES:
+            raise ValueError(
+                f"prefill_moe_upload (MOTIF3_PREFILL_MOE_UPLOAD) must be one of {PREFILL_MOE_UPLOAD_MODES}, got "
+                f"{self.prefill_moe_upload!r}"
             )
         mr = self.prefill_moe_min_rows
         if isinstance(mr, bool) or not isinstance(mr, int) or mr < TILE or mr % TILE:
@@ -2486,7 +2501,7 @@ class MotifTTConfig:
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
             f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} "
-            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine} host_staging={self.host_staging} host_wait={self.host_wait} "
+            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
@@ -2536,6 +2551,9 @@ __all__ = [
     "PREFILL_MOE_BLOCKS",
     "PREFILL_MOE_COMBINE_MODES",
     "PREFILL_MOE_DISPATCH_MODES",
+    "PREFILL_MOE_UPLOAD_MODES",
+    "SHM_TRACKING_MODES",
+    "apply_host_env",
     "DEFAULT_PREFILL_MOE_MIN_ROWS",
     "MOE_POLYNORM_MODES",
     "SHARED_POLYNORM_MODES",
@@ -2580,3 +2598,4 @@ __all__ = [
     "sdpa_prefill_pc",
     "sp1_global_chunks",
 ]
+

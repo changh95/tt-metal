@@ -168,8 +168,8 @@ from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL, device_tensors_to_torch
 from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, PREFILL_MOE_COMBINE_MODES,
-                           PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig,
-                           mcast1d_matmul_pc)
+                           PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES, PREFILL_MOE_UPLOAD_MODES, ROUTER_MASK_MODES,
+                           TILE, MotifTTConfig, mcast1d_matmul_pc)
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -485,20 +485,25 @@ def compact_upload_fast(idx, g2s, P: int, E: int, mb: int, ladder: Tuple[int, ..
     if nb is None:
         return need, None, None
     rows = int(nb) * int(mb)
-    order = np.argsort(pe, kind="stable")  # flattened order is token-major: tokens ascending within each slot
+    PE = P * E
+    # P2: a stable argsort of 16-bit keys (numpy's radix sort; the stable permutation is unique, so the same rows as an
+    # int64 sort), then one gather per word row: ~2.5x less host time at 1K, ~3.3x at 4K (logs/opt/phaseC/P2)
+    order = np.argsort(pe.astype(np.uint16) if PE <= 0xFFFF else pe, kind="stable")  # tokens ascending in each slot
     pe_s = pe[order]
     start = np.cumsum(cnt) - cnt
     blk_end = np.cumsum(nblk, axis=1)
     blk_off = (blk_end - nblk).reshape(-1)
-    row = blk_off[pe_s] * mb + (np.arange(S_K) - start[pe_s])
-    flat = (pe_s // E) * (4 * rows) + row
+    slot = np.arange(PE, dtype=np.int64)
+    base = (slot // E) * (4 * rows) + blk_off * mb - start  # flat word of each slot's first row, less its sorted start
+    flat = base[pe_s] + np.arange(S_K, dtype=np.int64)  # = (p * 4) * rows + blk_off * mb + rank
     t_s = (order // K).astype(np.int32)
     u = np.zeros((P, 4, rows), dtype=np.int32)
     u[:, 1, :] = int(pad_key)
     uf = u.reshape(-1)
     uf[flat] = t_s
     uf[flat + rows] = t_s
-    uf[flat + 2 * rows] = (pe_s % E).astype(np.int32) * int(pad_key) + t_s
+    ekey = ((slot % E) * int(pad_key)).astype(np.int32)
+    uf[flat + 2 * rows] = ekey[pe_s] + t_s
     eblk = np.minimum((blk_end[:, :, None] <= np.arange(nb)[None, None, :]).sum(1), E - 1)  # [P, nb]
     blk = np.zeros((P, int(nb), 32), dtype=np.int32)
     np.put_along_axis(blk, eblk[:, :, None], 0x3F80, axis=2)  # bf16 1.0 at the block's expert
@@ -527,6 +532,7 @@ class CompactPrefillState:
         self.stats: Dict[str, int] = {"compact": 0, "dense_cap": 0, "dense_unwarmed": 0}
         self.blocks: Dict[Tuple[int, int, int], int] = {}  # (rows, mb, nb) -> calls
         self.host_bufs: Dict[tuple, object] = {}  # (shape, dtype, layout) -> host staging tensor of the routes read
+        self.upload_bufs: Dict[int, object] = {}  # P2 "staged": rows -> (device spec args, host mesh tensor, views)
         self.g2s = None  # numpy global expert id -> slot p * E + e
         self.dispatch = None  # B2b: kernels.moe_compact.CompactDispatch (device dispatch; owns the slot table)
         self.combine = None  # B2b: kernels.moe_compact.GatherCombine (gather combine)
@@ -540,6 +546,7 @@ class CompactPrefillState:
             _free(t)
         self.iota = {}
         self.host_bufs = {}
+        self.upload_bufs = {}
         if self.dispatch is not None:
             self.dispatch.deallocate()
             self.dispatch = None
@@ -1267,6 +1274,11 @@ class MotifMoE:
         self.prefill_moe_min_rows = int(getattr(cfg, "prefill_moe_min_rows", 1024))
         self.prefill_moe_dispatch, self.prefill_moe_combine = resolve_prefill_moe_kernels(
             prefill_moe_dispatch, prefill_moe_combine, cfg)
+        # P2: "staged" (host staging + copy_host_to_device_tensor) | "from_torch" (B2a); MOTIF3_PREFILL_MOE_UPLOAD
+        self.prefill_moe_upload = str(getattr(cfg, "prefill_moe_upload", "staged") or "staged")
+        if self.prefill_moe_upload not in PREFILL_MOE_UPLOAD_MODES:
+            raise ValueError(f"prefill_moe_upload must be one of {PREFILL_MOE_UPLOAD_MODES}, got "
+                             f"{self.prefill_moe_upload!r}")
         self._disp_meta = None  # B2b: this layer's per-chip dispatch constants (ids + PolyNorm bits), device
         self.compact_state = CompactPrefillState(owner=self)  # MotifModel hands every layer one shared state
         self._pn_host = None  # [P, 12, 4] fp32 (bf16 values): this layer's c0, c1, c2, b per chip
@@ -1763,9 +1775,7 @@ class MotifMoE:
             u = torch.from_numpy(u)
         if tuple(u.shape) != (R * C, 4, rows):
             raise ValueError(f"compact upload of shape {tuple(u.shape)}, want {(R * C, 4, rows)}")
-        U = ttnn.from_torch(u.reshape(R, C, 4, rows).to(torch.int32), dtype=ttnn.uint32,
-                            layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device, memory_config=dram,
-                            mesh_mapper=st.mapper)  # [1, 1, 4, rows] per chip
+        U = self._upload_words(u, rows)  # [1, 1, 4, rows] uint32 ROW_MAJOR per chip
         # gather the routed rows
         tix = ttnn.slice(U, [0, 0, 0, 0], [1, 1, 1, rows], memory_config=dram)  # uint32 ROW_MAJOR
         x_rm = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
@@ -1811,6 +1821,70 @@ class MotifMoE:
         part = self._compact_combine(y, M, keys=U, key_page=1, keys_f32=keys)
         _free(U)
         return part
+
+    def _upload_words(self, u, rows: int):
+        """The per-chip row words ``u [P, 4, rows]`` (torch int, values < 2^31) -> a device tensor ``[1, 1, 4, rows]``
+        uint32 ROW_MAJOR in DRAM holding chip ``p``'s ``u[p]`` (``p`` = row-major mesh coordinate).
+
+        "from_torch" (B2a): one sharded ``ttnn.from_torch`` (~0.67 ms of host time per call on this Galaxy).
+        "staged" (P2, default): the first call per row count is the "from_torch" upload, and allocates a host mesh
+        tensor of the same spec once (kept in the shared state) with zero-copy numpy views of its 32 shards; later
+        calls write ``u[p]`` into view ``p``, allocate the device tensor and run one ``copy_host_to_device_tensor``
+        (the mesh command queue copies every shard into its issue queue before it returns, so the staging buffer is
+        free again on return). The same bytes either way, so the ops after it are bitwise unchanged."""
+        import numpy as np
+        import torch
+
+        st = self.compact_state
+        R, C = self._mesh_rc()
+        rows = int(rows)
+        staged = getattr(self, "prefill_moe_upload", "from_torch") == "staged"
+        stg = st.upload_bufs.get(rows) if staged else None
+        if stg is None:
+            ut = u if isinstance(u, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(u))
+            U = ttnn.from_torch(ut.reshape(R, C, 4, rows).to(torch.int32), dtype=ttnn.uint32,
+                                layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device, memory_config=self.dram,
+                                mesh_mapper=st.mapper)  # fmt: skip
+            if staged:
+                st.upload_bufs[rows] = self._staging(U, rows)
+            return U
+        if stg is False:  # staging unavailable (no zero-copy views): from_torch every time
+            ut = u if isinstance(u, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(u))
+            return ttnn.from_torch(ut.reshape(R, C, 4, rows).to(torch.int32), dtype=ttnn.uint32,
+                                   layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device, memory_config=self.dram,
+                                   mesh_mapper=st.mapper)  # fmt: skip
+        h, views = stg
+        un = u.numpy() if isinstance(u, torch.Tensor) else u
+        for p in range(R * C):
+            np.copyto(views[p], un[p], casting="unsafe")
+        U = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 4, rows]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT,
+                                           self.mesh_device, self.dram)
+        ttnn.copy_host_to_device_tensor(h, U)
+        return U
+
+    def _staging(self, U, rows: int):
+        """``(host mesh tensor, [32 x int32 numpy view [4, rows]])`` for :meth:`_upload_words`, or False (logged once) when
+        the host shards do not expose zero-copy views (two ``to_torch_with_padded_shape`` calls must return the same
+        memory): the "from_torch" upload then serves this row count."""
+        import numpy as np
+        import torch
+
+        R, C = self._mesh_rc()
+        h = ttnn.allocate_tensor_on_host(U.spec, self.mesh_device)
+        views = []
+        for sh in ttnn.get_device_tensors(h):
+            a, b = sh.to_torch_with_padded_shape(), sh.to_torch_with_padded_shape()
+            if a.data_ptr() != b.data_ptr() or a.numel() != 4 * int(rows) or a.element_size() != 4:
+                views = None
+                break
+            if a.dtype != torch.int32:
+                a = a.view(torch.int32)
+            views.append(a.numpy().reshape(4, int(rows)))
+        if views is None or len(views) != R * C:
+            print(f"[motif3.moe] warning: staged upload unavailable for {rows} rows (no zero-copy host views): "
+                  f"from_torch uploads", flush=True)
+            return False
+        return h, views
 
     def warm_compact(self, rows: int) -> Tuple[int, ...]:
         """Warm-up (before the decode capture): compile the prefill local partial of a ``rows``-row chunk on the dense

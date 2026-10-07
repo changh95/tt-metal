@@ -15,6 +15,8 @@ import inspect
 import json
 import math
 import re
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -2153,3 +2155,39 @@ def test_prefill_trace_knob(monkeypatch):
     assert "prefill_trace=off " in _cfg(prefill_trace="off").describe()
     with pytest.raises(ValueError, match="prefill_trace"):
         _cfg(prefill_trace="2048")
+
+
+def test_p2_host_knobs(monkeypatch):
+    """P2 (logs/opt/phaseC/P2): ``MOTIF3_PREFILL_MOE_UPLOAD`` ("staged" default | "from_torch"; case and blanks ignored,
+    anything else refused; in ``describe``) and ``MOTIF3_SHM_TRACKING`` (``host_env.apply_host_env``: "off" default
+    sets ``TT_METAL_SHM_TRACKING_DISABLED=1`` unless the caller set it; "on" leaves it unset; anything else refused).
+    Importing the package runs it (``tt/__init__.py``)."""
+    from models.demos.motif3.tt.host_env import SHM_TRACKING_MODES, apply_host_env
+    from models.demos.motif3.tt.model_config import PREFILL_MOE_UPLOAD_MODES
+
+    assert PREFILL_MOE_UPLOAD_MODES == ("staged", "from_torch") and SHM_TRACKING_MODES == ("off", "on")
+    monkeypatch.delenv("MOTIF3_PREFILL_MOE_UPLOAD", raising=False)
+    assert _cfg().prefill_moe_upload == "staged" and "/matmul/staged " in _cfg().describe()
+    for v, want in ((" From_Torch ", "from_torch"), ("staged", "staged"), ("", "staged")):
+        monkeypatch.setenv("MOTIF3_PREFILL_MOE_UPLOAD", v)
+        assert _cfg().prefill_moe_upload == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_MOE_UPLOAD", "dma")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_UPLOAD"):
+        _cfg()
+    assert apply_host_env({}) == "off"
+    env = {}
+    apply_host_env(env)
+    assert env == {"TT_METAL_SHM_TRACKING_DISABLED": "1"}
+    env = {"TT_METAL_SHM_TRACKING_DISABLED": "0"}
+    apply_host_env(env)
+    assert env == {"TT_METAL_SHM_TRACKING_DISABLED": "0"}  # the caller's choice wins
+    env = {"MOTIF3_SHM_TRACKING": " ON "}
+    assert apply_host_env(env) == "on" and "TT_METAL_SHM_TRACKING_DISABLED" not in env
+    with pytest.raises(ValueError, match="MOTIF3_SHM_TRACKING"):
+        apply_host_env({"MOTIF3_SHM_TRACKING": "maybe"})
+    code = ("import os; os.environ.pop('TT_METAL_SHM_TRACKING_DISABLED', None); import models.demos.motif3.tt; "
+            "print('SHM', os.environ.get('TT_METAL_SHM_TRACKING_DISABLED'))")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert [ln for ln in r.stdout.splitlines() if ln.startswith("SHM")][-1] == "SHM 1"
+

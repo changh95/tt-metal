@@ -109,6 +109,7 @@ def test_import_rule_torch_only():
     assert set(out["motif3"]) <= {
         "models.demos.motif3",
         "models.demos.motif3.tt",
+        "models.demos.motif3.tt.host_env",  # P2: stdlib only (tt/__init__.py sets the SHM-tracking env)
         "models.demos.motif3.tt.prefill_plan",
         "models.demos.motif3.tt.generator_api",
     }, out["motif3"]
