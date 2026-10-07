@@ -1392,7 +1392,8 @@ class MotifTTConfig:
     prefill_trace: str = "128"  # MOTIF3_PREFILL_TRACE
     # The host thread every trace capture runs on (E3 / B7): "main" (default, the release) | "worker" (a short-lived
     # thread with its own malloc arena: eager sp0 128 after a capture keeps its speed in process, but served 1K / 4K
-    # TTFT with the B7 prefill traces is slower, logs/opt/phaseB/B7/report.md); generator_api.CAPTURE_THREAD_MODES
+    # TTFT with the B7 prefill traces is slower, logs/opt/phaseB/B7/report.md) | "dedicated" (one long-lived capture
+    # thread, B7-FIX: in process it removes the post-capture eager slowdown); generator_api.CAPTURE_THREAD_MODES
     capture_thread: str = "main"  # MOTIF3_CAPTURE_THREAD
 
     # ---- device / mesh ----------------------------------------------------------------------------------------

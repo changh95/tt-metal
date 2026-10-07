@@ -1913,6 +1913,8 @@ class MotifGenerator(api.MotifGenerator):
         per capture), which made every later eager prefill pass of a dispatch-bound shape ~20-30 ms slower per live
         trace (logs/opt/phaseB/B7, E3b-E3d). A worker thread allocates from its own arena, so the main thread's stays
         compact. The device receives the same commands either way. ``"main"``: the calling thread (the release)."""
+        if self.capture_thread == "dedicated":
+            return _dedicated_capture_thread().run(fn)
         if self.capture_thread != "worker":
             return fn()
         box: Dict[str, Any] = {}
@@ -3271,6 +3273,53 @@ class MotifGenerator(api.MotifGenerator):
             self._pool.deallocate()
             self._pool = None
         self.model.deallocate()
+
+
+
+class _CaptureThread:
+    """B7-FIX: one long-lived daemon thread that runs every trace capture of the process (``MOTIF3_CAPTURE_THREAD=
+    dedicated``). It never exits, so glibc never returns its malloc arena to the free list, where a thread started
+    later (the serving engine's I/O threads) would inherit it."""
+
+    def __init__(self) -> None:
+        import queue
+
+        self._q: "queue.Queue" = queue.Queue()
+        self._th = threading.Thread(target=self._loop, name="motif3-trace-capture", daemon=True)
+        self._th.start()
+
+    def _loop(self) -> None:
+        while True:
+            fn, box, done = self._q.get()
+            try:
+                box["result"] = fn()
+            except BaseException as e:  # re-raised on the calling thread
+                box["error"] = e
+            finally:
+                done.set()
+
+    def run(self, fn: Callable[[], Any]) -> Any:
+        if threading.current_thread() is self._th:
+            return fn()
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+        self._q.put((fn, box, done))
+        done.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+
+_CAPTURE_THREAD: Optional[_CaptureThread] = None
+_CAPTURE_THREAD_LOCK = threading.Lock()
+
+
+def _dedicated_capture_thread() -> _CaptureThread:
+    global _CAPTURE_THREAD
+    with _CAPTURE_THREAD_LOCK:
+        if _CAPTURE_THREAD is None:
+            _CAPTURE_THREAD = _CaptureThread()
+        return _CAPTURE_THREAD
 
 
 __all__ = [

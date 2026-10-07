@@ -587,8 +587,11 @@ def async_decode_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
 # E3b-E3d). "worker" = each capture on a short-lived worker thread (its own malloc arena; joined before the capture
 # returns); "main" = the calling thread (the release, and the default: served with MOTIF3_PREFILL_TRACE=128, worker
 # captures cost +60-75 ms TTFT at 1K and +15-30 ms at 4K, logs/opt/phaseB/B7/report.md). The device receives the same
-# commands either way.
-CAPTURE_THREAD_MODES = ("main", "worker")
+# commands either way. "dedicated" (B7-FIX, logs/opt/phaseB2/B7-FIX): every capture on ONE long-lived daemon thread that
+# never exits, so its arena never goes back to glibc's free list (a short-lived "worker" thread's arena is inherited
+# by the next thread started, e.g. the serving engine's I/O threads). In process (E3f, n = 8) eager sp0 128 / 1024 /
+# 4096 after all captures: main +42 / +57 / +17 ms, dedicated +2 / +5 / +2 ms. Served A/B pending (device fault).
+CAPTURE_THREAD_MODES = ("main", "worker", "dedicated")
 DEFAULT_CAPTURE_THREAD = "main"
 
 

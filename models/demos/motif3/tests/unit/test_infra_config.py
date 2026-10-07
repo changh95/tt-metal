@@ -2119,10 +2119,10 @@ def test_capture_thread_knob(monkeypatch):
     lost served 1K / 4K TTFT with the B7 prefill traces), the host thread of every trace capture; case and blanks ignored, anything else refused; ``describe`` shows it."""
     from models.demos.motif3.tt.generator_api import CAPTURE_THREAD_MODES
 
-    assert CAPTURE_THREAD_MODES == ("main", "worker")
+    assert CAPTURE_THREAD_MODES == ("main", "worker", "dedicated")
     c = _cfg()
     assert c.capture_thread == "main" and "capture_thread=main" in c.describe()
-    for v, want in ((" Worker", "worker"), ("main", "main"), (" MAIN", "main"), ("", "main")):
+    for v, want in ((" Worker", "worker"), ("main", "main"), (" MAIN", "main"), ("", "main"), ("Dedicated ", "dedicated")):
         monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", v)
         assert _cfg().capture_thread == want, v
     monkeypatch.setenv("MOTIF3_CAPTURE_THREAD", "thread")

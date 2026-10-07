@@ -1116,15 +1116,15 @@ def _b7_rows(rng, width, bs, blocks):
     return out
 
 
-@pytest.mark.parametrize("mtp, thread", [(False, "main"), (True, "main"), (True, "worker")],
-                         ids=["plain", "mtp", "mtp-worker"])
+@pytest.mark.parametrize("mtp, thread", [(False, "main"), (True, "main"), (True, "worker"), (False, "dedicated")],
+                         ids=["plain", "mtp", "mtp-worker", "plain-dedicated"])
 def test_cpu_prefill_trace_equals_eager(monkeypatch, mtp, thread):
     """B7: with ``MOTIF3_PREFILL_TRACE=128`` the solo sp0 / sp1 chunks of bucket 128 replay their trace (the shape's
     persistent inputs rewritten per chunk: tables, tokens, head position; with the MTP layer its next tokens, the last
     one the argmax stand-in, then the fill trace) and every other chunk runs eagerly. Logits, the emulated KV and MTP
     caches and the per-row checks of the fake model equal the eager generator's (trace off) on the same calls; the
     captures replay once with the warm-up tables (nothing written). ``MOTIF3_CAPTURE_THREAD=worker``: every capture
-    runs on a worker thread (joined), with the same result."""
+    runs on a worker thread (joined), with the same result; ``dedicated``: on the one long-lived capture thread."""
     rng = random.Random(70)
     W, bs = 512, 64
     out, pools, models, stats = {}, {}, {}, {}
@@ -1132,7 +1132,7 @@ def test_cpu_prefill_trace_equals_eager(monkeypatch, mtp, thread):
         cfg = host_cfg(prefill_trace=knob, capture_thread=thread)
         gen, model, pool, freed, tr = trace_generator(cfg, monkeypatch, mtp=mtp)
         threads = []
-        if thread == "worker":
+        if thread in ("worker", "dedicated"):
             import threading
 
             orig_begin = tr.begin
@@ -1153,7 +1153,7 @@ def test_cpu_prefill_trace_equals_eager(monkeypatch, mtp, thread):
             ops0 = len(model.ops)
             gen._capture_prefill_traces(pool)
             assert all(t.traced for t in gen.prefill_traces.values())
-            assert threads == ([True] * len(tr.captures) if thread == "worker" else []), threads
+            assert threads == ([True] * len(tr.captures) if thread in ("worker", "dedicated") else []), threads
             assert (gen.prefill_traces[(PP.SP1, 128)].mtp_trace_id is not None) == mtp
             assert len(tr.captures) == 2 * (2 if mtp else 1)
             assert len(tr.replays) == len(tr.captures)  # one replay each after the capture
@@ -1295,6 +1295,10 @@ def test_cpu_prefill_trace_refusals(monkeypatch):
     with pytest.raises(KeyError, match="device op failed"):
         gen._capture_prefill_traces(pool)
     assert len(tr.released) == n_rel + 1 and tr.capturing is None
+    gen.capture_thread = "dedicated"  # the same on the long-lived capture thread, which keeps serving captures
+    with pytest.raises(KeyError, match="device op failed"):
+        gen._capture_prefill_traces(pool)
+    assert len(tr.released) == n_rel + 2 and tr.capturing is None
     gen._prefill_trace_body = orig
     gen.release_traces()
     # R3: staging after a decode capture
