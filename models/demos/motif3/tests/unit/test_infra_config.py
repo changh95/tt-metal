@@ -2158,7 +2158,7 @@ def test_prefill_trace_knob(monkeypatch):
 
 
 def test_d1_attn_epilogue_knob(monkeypatch):
-    """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("ops" | "fused"; case and blanks ignored, anything
+    """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("fused" default | "ops"; case and blanks ignored, anything
     else refused; in ``describe``) and the fused combine's worker plan (``tt/kernels/attn_combine.plan``)."""
     from models.demos.motif3.tt.kernels import attn_combine as AC
     from models.demos.motif3.tt.model_config import ATTN_EPILOGUE_MODES
@@ -2166,7 +2166,7 @@ def test_d1_attn_epilogue_knob(monkeypatch):
     assert ATTN_EPILOGUE_MODES == ("ops", "fused")
     monkeypatch.delenv("MOTIF3_ATTN_EPILOGUE", raising=False)
     default = _cfg().attn_epilogue
-    assert default in ATTN_EPILOGUE_MODES and f"attn_epilogue={default} " in _cfg().describe()
+    assert default == "fused" and "attn_epilogue=fused " in _cfg().describe()  # the default since the D1 gates
     for v, want in ((" Fused ", "fused"), ("ops", "ops"), ("", default)):
         monkeypatch.setenv("MOTIF3_ATTN_EPILOGUE", v)
         assert _cfg().attn_epilogue == want, v
@@ -2181,6 +2181,17 @@ def test_d1_attn_epilogue_knob(monkeypatch):
     with pytest.raises(ValueError, match="grid"):
         AC.plan(32, 32, (8, 3))
     assert AC.VALUE_BITS == 0xBF800000  # addcmul value=-1.0, as the ternary op packs it
+    from models.demos.motif3.tt.model_config import ATTN_MM_PCS_MODES
+
+    monkeypatch.delenv("MOTIF3_ATTN_EPILOGUE", raising=False)
+    assert ATTN_MM_PCS_MODES == ("tuned", "release")
+    monkeypatch.delenv("MOTIF3_ATTN_MM_PCS", raising=False)
+    assert _cfg().attn_mm_pcs == "tuned" and "attn_mm_pcs=tuned " in _cfg().describe()
+    monkeypatch.setenv("MOTIF3_ATTN_MM_PCS", " Release ")
+    assert _cfg().attn_mm_pcs == "release"
+    monkeypatch.setenv("MOTIF3_ATTN_MM_PCS", "fast")
+    with pytest.raises(ValueError, match="MOTIF3_ATTN_MM_PCS"):
+        _cfg()
 
 
 def test_p2_host_knobs(monkeypatch):

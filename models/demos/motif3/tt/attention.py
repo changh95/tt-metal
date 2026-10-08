@@ -593,10 +593,11 @@ def decode_matmul_program_configs(cfg: MotifTTConfig) -> Dict[str, Any]:
     kv_cols = (cfg.kv_lora_rank + cfg.rope_dim + cfg.n_signal_heads) // TILE  # 20
     qb_cols = H * cfg.head_dim // TILE  # 60
     gate_cols = cfg.signal_heads_per_chip * cfg.v_head_dim // TILE  # 32
+    tuned = getattr(cfg, "attn_mm_pcs", "release") == "tuned"  # Phase C D1: bitwise equal, -4.6 us per layer
     return {
         "q_lat": mc((8, 4), q_cols, 8, K),
-        "kv_lat": mc((5, 4), kv_cols, 16, K),
-        "wq_b": mc((12, 5), qb_cols, 4, Kq),
+        "kv_lat": mc((10, 2) if tuned else (5, 4), kv_cols, 16, K),
+        "wq_b": mc((12, 5), qb_cols, 8 if tuned else 4, Kq),
         "gate": mc((8, 4), gate_cols, 8, Kq),
         "wo": None,  # auto config: 25 us, faster than every 1D config tried
         "w_uk": reuse(cfg.kv_lora_rank // TILE, 4, 2),
@@ -1495,7 +1496,8 @@ class MotifAttention:
         # bitwise equal to the global layers' 16 on a 129-key window), global layers 16
         self.decode_pc = cfg.flash_mla_decode_pc("swa" if self.window is not None else "global")
         self.dtype = cfg.dtypes.activations
-        # decode epilogue (Phase C D1, MOTIF3_ATTN_EPILOGUE): "ops" | "fused" (tt/kernels/attn_combine.py, built lazily)
+        # decode epilogue (Phase C D1, MOTIF3_ATTN_EPILOGUE): "fused" (default; tt/kernels/attn_combine.py, built lazily)
+        # | "ops" (the release op chain)
         self.epilogue = getattr(cfg, "attn_epilogue", "ops")
         self._fused_combine = None
 
@@ -1976,7 +1978,7 @@ class MotifAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )  # [1, 10, T, 128]
         ttnn.deallocate(o_heads)
-        if decode and self.epilogue == "fused" and active is not None:
+        if decode and getattr(self, "epilogue", "ops") == "fused" and active is not None:
             dg = self._fused_epilogue(u, g, lam, active, taps)
             if dg is not None:
                 part = self._linear(dg, self.w_o, ckc=self.ckc_heads, pc=self._pc("wo", decode))
@@ -2004,7 +2006,7 @@ class MotifAttention:
 
     def fused_combine(self):
         """The layer's :class:`~models.demos.motif3.tt.kernels.attn_combine.FusedAttnCombine` (built on first use)."""
-        if self._fused_combine is None:
+        if getattr(self, "_fused_combine", None) is None:
             from .kernels.attn_combine import FusedAttnCombine
 
             self._fused_combine = FusedAttnCombine(

@@ -138,9 +138,13 @@ SHARED_POLYNORM_MODES = ("composite", "fused")
 # nlp_concat_heads, channel split, noise @ X, addcmul, multiply, where; 6 programs) | "fused"
 # (tt/kernels/attn_combine.py: one generic_op that selects the u tiles directly and runs the same LLK sequence as the
 # addcmul / multiply / where ops; the wo input equals the op chain bit for bit up to the sign of exact zeros, the wo
-# output bitwise). Decode only (one 32-row tile, the 1024-wide active mask); prefill and the taps-free sp1 path keep
-# the ops.
+# output bitwise; the default since the D1 gates passed, logs/opt/phaseC/D1). Decode only (one 32-row tile, the
+# 1024-wide active mask); prefill and the sp1 absorbed path keep the ops.
 ATTN_EPILOGUE_MODES = ("ops", "fused")
+# Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
+# Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
+# in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.
+ATTN_MM_PCS_MODES = ("tuned", "release")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
 # the B2a gates passed; token-compacted:
@@ -1034,6 +1038,13 @@ ATTN_DECODE_MCAST: Dict[str, Tuple[Tuple[int, int], int]] = {
     "wq_b": ((12, 5), 4),
     "gate": ((8, 4), 8),
 }
+# Phase C D1 ``attn_mm_pcs="tuned"`` (default): Wkv_lat on 10 x 2 cores, wq_b in0_block_w 8 (bitwise equal, -4.6 us
+# per layer traced, logs/opt/phaseC/D1); "release" keeps ATTN_DECODE_MCAST.
+ATTN_DECODE_MCAST_TUNED: Dict[str, Tuple[Tuple[int, int], int]] = {
+    **ATTN_DECODE_MCAST,
+    "kv_lat": ((10, 2), 16),
+    "wq_b": ((12, 5), 8),
+}
 ATTN_DECODE_BMM = {"w_uk": (4, 2), "w_uv": (4, 2)}  # (in0_block_w, out_subblock_w), per_core_N = all N tiles
 
 
@@ -1049,7 +1060,8 @@ def attn_decode_matmul_pcs(cfg: "MotifTTConfig") -> Dict[str, Any]:
         "gate": (cfg.signal_heads_per_chip * cfg.v_head_dim // TILE, Kq),  # 32
     }
     out: Dict[str, Any] = {}
-    for name, (grid, ibw) in ATTN_DECODE_MCAST.items():
+    table = ATTN_DECODE_MCAST_TUNED if getattr(cfg, "attn_mm_pcs", "release") == "tuned" else ATTN_DECODE_MCAST
+    for name, (grid, ibw) in table.items():
         n_tiles, k_tiles = cols[name]
         out[name] = mcast1d_matmul_pc(grid, n_tiles, ibw, k_tiles) if _fits(grid, (gx, gy)) else None
     out["wo"] = None
@@ -1384,8 +1396,11 @@ class MotifTTConfig:
     # kernel, bitwise equal to the release) | "composite" (the release; SHARED_POLYNORM_MODES). Prefill and the dense
     # MLPs are not affected.
     shared_polynorm: str = "fused"  # MOTIF3_SHARED_POLYNORM
-    # Decode attention epilogue (Phase C D1): "ops" (the release op chain) | "fused" (one program; ATTN_EPILOGUE_MODES).
-    attn_epilogue: str = "ops"  # MOTIF3_ATTN_EPILOGUE
+    # Decode attention epilogue (Phase C D1): "fused" (default: one program, bitwise equal) | "ops" (the release op chain;
+    # ATTN_EPILOGUE_MODES).
+    attn_epilogue: str = "fused"  # MOTIF3_ATTN_EPILOGUE
+    # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
+    attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1464,7 +1479,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1574,7 +1589,8 @@ class MotifTTConfig:
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "sparse").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "fused").strip().lower(),
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
-            attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "ops").strip().lower(),
+            attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "fused").strip().lower(),
+            attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
@@ -1745,6 +1761,10 @@ class MotifTTConfig:
         if self.moe_polynorm not in MOE_POLYNORM_MODES:
             raise ValueError(
                 f"moe_polynorm (MOTIF3_MOE_POLYNORM) must be one of {MOE_POLYNORM_MODES}, got {self.moe_polynorm!r}"
+            )
+        if self.attn_mm_pcs not in ATTN_MM_PCS_MODES:
+            raise ValueError(
+                f"attn_mm_pcs (MOTIF3_ATTN_MM_PCS) must be one of {ATTN_MM_PCS_MODES}, got {self.attn_mm_pcs!r}"
             )
         if self.attn_epilogue not in ATTN_EPILOGUE_MODES:
             raise ValueError(
@@ -2514,7 +2534,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
