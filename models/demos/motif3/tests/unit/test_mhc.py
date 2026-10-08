@@ -40,6 +40,8 @@ Tests:
 * ``test_mhc_decode_trace_latency`` -- decode trace capture / replay with new inputs (trace safety), layout kernel vs
   ttnn glue, and the per-site latency breakdown, eager and traced, for the backend / layout / L1 / finalize / post
   variants.
+* ``test_mhc_decode_fused`` -- Phase C D3: the fused decode site (``decode="fused"``) bitwise against the op path
+  (random sites at T = 8 / 16 / 32, trace replay, the packed tile, real decode sites).
 * ``test_mhc_prefill_latency`` -- prefill S = 128 ... 32768 (no chunking needed): warmed eager latency per stage,
   the kernel finalize / concat-free post against their op forms, and accuracy on 256 sampled tokens.
 * ``test_mhc_probe_*`` -- opt-in (``MOTIF3_MHC_PROBE=1``) numerics / config probes behind the design choices.
@@ -1033,6 +1035,133 @@ def test_mhc_decode_trace_latency(mesh_device):
         print(f"[mhc] LATENCY {tag} {json.dumps({k: round(v, 1) for k, v in lat.items()})}", flush=True)
         _free([p, c, X, O, touts])
         st.release()
+    assert not failures, "\n".join(failures)
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_mhc_decode_fused(mesh_device):
+    """Phase C D3 (``MOTIF3_MHC_DECODE=fused``, ``tt/kernels/mhc_decode.py``): ``MHCSite(decode="fused")`` against
+    ``decode="ops"`` through ``pre`` / ``post`` -- x_red and X' bitwise on all 32 chips, logical AND padded rows -- at
+    T = 8 (T32), 16 (T64 rows) and 32 (the full-tile finalize), random realistic / peaked sites, a trace capture
+    replayed with new inputs; the packed tile against the release weight tiles (all 32 token rows); real weights and
+    streams on the real decode sites (when the captured data and the layers are available); traced site latency."""
+    from models.demos.motif3.tt import mhc as M
+    from models.demos.motif3.tt.kernels import mhc_decode as MD
+
+    log_fabric(mesh_device, "test_mhc_decode_fused")
+    cfg = _cfg(mesh_device)
+    mapper = W.mesh_mapper(mesh_device, cfg.axes, dp_dim=0)
+    failures = []
+
+    def padded(t, shape):
+        return _chips(M._view_logical(t, shape), mesh_device)
+
+    def upload(x, o, L):
+        xh = torch.stack([to_tt_layout(x[L * r : L * r + L])[0] for r in range(4)])
+        oh = torch.stack([o[L * r : L * r + L][None] for r in range(4)])
+        kw = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
+        return xh, oh, kw
+
+    def compare(tag, ops, fus, X, O):
+        a_red, ca = ops.pre(X)
+        a_out = ops.post(X, O, ca)
+        b_red, cb = fus.pre(X)
+        assert cb.packed is not None and cb.w_pre is None, "fused site did not take the fused path"
+        b_out = fus.post(X, O, cb)
+        same = {
+            "x_red": torch.equal(_chips(a_red, mesh_device), _chips(b_red, mesh_device)),
+            "x_out": torch.equal(_chips(a_out, mesh_device), _chips(b_out, mesh_device)),
+            "x_red_padded": torch.equal(padded(a_red, [1, 1, 32, D]), padded(b_red, [1, 1, 32, D])),
+            "x_out_padded": torch.equal(padded(a_out, [1, N, 32, D]), padded(b_out, [1, N, 32, D])),
+        }
+        print(f"[mhc] decode fused {tag}: {same}", flush=True)
+        if not all(same.values()):
+            failures.append(f"{tag}: {same}")
+        _free([a_red, a_out, b_red, b_out])
+
+    for regime, seed in (("realistic", 3), ("peaked", 5)):
+        src = random_site_source(2, "mhc_ffn", seed=seed, regime=regime)
+        ops = M.MHCSite(mesh_device, cfg, 2, "mhc_ffn", source=src, cache=False, decode="ops")
+        fus = M.MHCSite(mesh_device, cfg, 2, "mhc_ffn", source=src, cache=False, decode="fused")
+        assert fus.decode_fused and not ops.decode_fused
+        for L in (8, 16, 32):
+            x, o = random_streams(4 * L, seed=40 + seed + L)
+            xh, oh, kw = upload(x, o, L)
+            X = ttnn.from_torch(xh, device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw)
+            O = ttnn.from_torch(oh, device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw)
+            tag = f"{regime}/T={L}"
+            compare(tag, ops, fus, X, O)
+            # the packed tile == the release weights, every token row (incl. the padding rows)
+            c = ops.coefficients(X)
+            wpre = padded(c.w_pre, [1, N, 32, 1])[..., 0]
+            wpost = padded(c.w_post, [N, N + 1, 32, 1])[..., 0]
+            y, s = fus._partials_decode(X)
+            P = MD.coefficients_packed(y, s, fus.motif_consts, eps=fus.ss_eps, T=L)
+            Ph = _chips(P, mesh_device).reshape(4, 8, MD.DEFAULT_NCOPY, 32, 32)
+            exp = torch.zeros(4, 8, 24, 32, dtype=torch.float64)
+            exp[:, :, 0:4] = wpre[:, :, 0]
+            exp[:, :, 4:8] = wpost[:, :, :, N]
+            for r in range(N):
+                exp[:, :, 8 + 4 * r : 12 + 4 * r] = wpost[:, :, r, 0:N]
+            okp = torch.equal(Ph[:, :, 0, :24], exp) and torch.equal(Ph, Ph[:, :, :1].expand_as(Ph))
+            if not okp:
+                failures.append(f"{tag}: packed tile != release weights")
+            _free([c, y, s, P])
+            # trace: fused captured once, replayed with new inputs == eager ops
+            def step(site):
+                r_, c_ = site.pre(X)
+                return [r_, site.post(X, O, c_)]
+
+            _free(step(fus))
+            ttnn.synchronize_device(mesh_device)
+            with _Capture(mesh_device) as cap:
+                tb = step(fus)
+            try:
+                for it in range(2):
+                    x2, o2 = random_streams(4 * L, seed=200 + it + L)
+                    xh2, oh2, kw2 = upload(x2, o2, L)
+                    ttnn.copy_host_to_device_tensor(ttnn.from_torch(xh2, **kw2), X)
+                    ttnn.copy_host_to_device_tensor(ttnn.from_torch(oh2, **kw2), O)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    e = step(ops)
+                    same = all(torch.equal(_chips(p, mesh_device), _chips(q, mesh_device)) for p, q in zip(tb, e))
+                    print(f"[mhc] decode fused {tag} trace replay it{it}: == eager ops bitwise: {same}", flush=True)
+                    if not same:
+                        failures.append(f"{tag}: trace replay it{it} differs from eager ops")
+                    _free(e)
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+            _free(tb)
+            if regime == "realistic":
+                lat = {k: _traced_us(mesh_device, lambda: step(st), n=16) for k, st in (("ops", ops), ("fused", fus))}
+                print(f"[mhc] LATENCY decode site T={L} {json.dumps({k: round(v, 1) for k, v in lat.items()})}",
+                      flush=True)
+            _free([X, O])
+        ops.release()
+        fus.release()
+
+    # real weights and streams (MHC-5 decode sites): fused == ops bitwise
+    path = DATA / "real_decode_tokens.pt"
+    src = W.HFWeightLoader()
+    n_real = 0
+    if path.is_file():
+        data = torch.load(path, weights_only=True)
+        for key, d in sorted(data["sites"].items()):
+            prompt, layer, site = key.split("|")
+            layer = int(layer)
+            if layer not in (0, 1, 30, 31) or not src.layer_available(layer):
+                continue
+            ops = M.MHCSite(mesh_device, cfg, layer, site, source=src, cache=False, decode="ops")
+            fus = M.MHCSite(mesh_device, cfg, layer, site, source=src, cache=False, decode="fused")
+            xh, oh, kw = upload(d["x"], d["out"], 8)
+            X = ttnn.from_torch(xh, device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw)
+            O = ttnn.from_torch(oh, device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw)
+            compare(f"real/{prompt}/L{layer}/{site}", ops, fus, X, O)
+            n_real += 1
+            _free([X, O])
+            ops.release()
+            fus.release()
+    print(f"[mhc] decode fused: {n_real} real sites compared", flush=True)
     assert not failures, "\n".join(failures)
 
 

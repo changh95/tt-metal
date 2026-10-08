@@ -4,7 +4,11 @@
 
 * ``sinkhorn_motif`` -- exact Motif mHC coefficients (h_pre, h_post, Sinkhorn H; optionally straight into the
   ``attn_res_weighted_reduce_nc`` weight layout) in fp32 SFPU math (WAVE_A_REVIEW MHC-6 "Option B"); kernel sources
-  in ``sinkhorn_motif/``.
+  in ``sinkhorn_motif/`` (the SFPU routine in ``motif_mhc_sfpu.h``, shared with ``mhc_decode``).
+* ``mhc_decode`` -- the fused decode mHC site (D3, ``MOTIF3_MHC_DECODE=fused``): finalize + Sinkhorn + layout in one
+  program writing a packed coefficient tile, and the pre / post stream mixes expanding it locally (bitwise equal to the
+  op path); kernel sources in ``mhc_decode/``.
+* ``attn_combine`` -- the fused decode attention epilogue (D1, ``MOTIF3_ATTN_EPILOGUE=fused``); ``attn_combine/``.
 * ``router_fp32`` -- exact-fp32 router logits (WAVE_A_REVIEW D1(b)); kernel sources in ``router_fp32/``.
 * ``moe_polynorm`` -- fused grouped PolyNorm of the decode routed experts (B3, ``MOTIF3_MOE_POLYNORM=fused``); kernel
   sources in ``moe_polynorm/``.

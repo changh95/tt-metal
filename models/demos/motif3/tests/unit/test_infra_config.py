@@ -2194,6 +2194,72 @@ def test_d1_attn_epilogue_knob(monkeypatch):
         _cfg()
 
 
+def test_d3_mhc_decode_knob(monkeypatch):
+    """Phase C D3 (logs/opt/phaseC/D3): ``MOTIF3_MHC_DECODE`` ("ops" | "fused"; case and blanks ignored, anything else
+    refused; in ``describe``), the packed coefficient tile of ``tt/kernels/mhc_decode.py`` (host golden against the
+    release weight layout ``sinkhorn_motif.wrnc_weights_torch`` + TF32 rounding) and the reader's expansion indices
+    (``wr_expand.h``) against the 32x32 tile face layout."""
+    import torch
+
+    from models.demos.motif3.tt import mhc as M
+    from models.demos.motif3.tt.kernels import mhc_decode as MD
+    from models.demos.motif3.tt.kernels import sinkhorn_motif as km
+    from models.demos.motif3.tt.model_config import MHC_DECODE_MODES
+
+    assert MHC_DECODE_MODES == ("ops", "fused")
+    monkeypatch.delenv("MOTIF3_MHC_DECODE", raising=False)
+    default = _cfg().mhc_decode
+    assert default in MHC_DECODE_MODES and f"mhc_decode={default} " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("ops", "ops"), ("", default)):
+        monkeypatch.setenv("MOTIF3_MHC_DECODE", v)
+        assert _cfg().mhc_decode == want, v
+    monkeypatch.setenv("MOTIF3_MHC_DECODE", "kernel")
+    with pytest.raises(ValueError, match="MOTIF3_MHC_DECODE"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_MHC_DECODE", raising=False)
+
+    # packed tile == the release weights (coefficient_layout: wrnc layout + nearest-even TF32), transposed
+    g = torch.Generator().manual_seed(0)
+    T = 8
+    h_pre, h_post = torch.rand(T, 4, generator=g), torch.rand(T, 4, generator=g)
+    H = torch.rand(T, 16, generator=g)
+    w_pre, w_post = km.wrnc_weights_torch(h_pre, h_post, H)  # [1,4,T,1], [4,5,T,1]
+    P = MD.packed_torch(h_pre, h_post, H, ncopy=3)
+    assert list(P.shape) == [96, 32] and MD.packed_shape(T, 3) == [1, 1, 96, 32]
+    assert torch.equal(P[:32], P[32:64]) and torch.equal(P[:32], P[64:])
+    assert torch.equal(P[0:4, :T], M.tf32_rne(w_pre[0, :, :, 0]))
+    for r in range(4):
+        assert torch.equal(P[4 + r, :T], M.tf32_rne(w_post[r, 4, :, 0]))
+        for c in range(4):
+            assert torch.equal(P[8 + 4 * r + c, :T], M.tf32_rne(w_post[r, c, :, 0]))
+    assert (P[24:32] == 0).all() and (P[:, T:32] == 0).all()
+
+    # wr_expand.h index math against the tile face layout (fp32 word of element (row, col))
+    def widx(r, c):
+        return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15)
+
+    def packed_row(post, r, c):
+        return (8 + 4 * r + c if c < 4 else 4 + r) if post else c
+
+    for post, num_r, num_c in ((False, 1, 4), (True, 4, 5)):
+        rows = set()
+        for r in range(num_r):
+            for c in range(num_c):
+                k = packed_row(post, r, c)
+                rows.add(k)
+                src = (k >> 4) * 512 + (k & 15) * 16
+                for t in range(16):
+                    assert src + t == widx(k, t) and src + 256 + t == widx(k, 16 + t)
+                    assert 16 * t == widx(t, 0) and 512 + 16 * t == widx(16 + t, 0)
+        assert rows == (set(range(4)) if not post else set(range(4, 24)))
+        # the _min reads cover exactly these rows' token columns 0..15: pre bytes [0, 256), post [256, 1024) + [2048, 2560)
+        spans = [(0, 256)] if not post else [(256, 1024), (2048, 2560)]
+        need = {4 * widx(k, t) for k in rows for t in range(16)}
+        have = {b for a, e in spans for b in range(a, e, 4)}
+        assert need <= have
+    assert MD.DEFAULT_EXPAND == "auto" and "split_zero_hi_min" in MD.EXPAND_MODES
+
+
 def test_p2_host_knobs(monkeypatch):
     """P2 (logs/opt/phaseC/P2): ``MOTIF3_PREFILL_MOE_UPLOAD`` ("staged" default | "from_torch"; case and blanks ignored,
     anything else refused; in ``describe``) and ``MOTIF3_SHM_TRACKING`` (``host_env.apply_host_env``: "off" default

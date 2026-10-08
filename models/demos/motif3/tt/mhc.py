@@ -147,7 +147,7 @@ import torch
 import ttnn
 
 from . import weights as W
-from .model_config import COMPUTE_ROLES, ComputeRole, MotifTTConfig
+from .model_config import COMPUTE_ROLES, MHC_DECODE_MODES, ComputeRole, MotifTTConfig
 
 N_STREAMS = 4
 N_MIXES = (2 + N_STREAMS) * N_STREAMS  # 24
@@ -1078,16 +1078,19 @@ class MHCCoeffs:
     weights; TF32-rounded for ``mix="wr"``); ``p`` (raw mixes ``[1,1,T,32]`` fp32, columns 0..23), ``h_pre [T,4]``,
     ``h_post [T,4]``, ``H [T,16]`` (unrounded fp32) are kept only with ``keep=True`` (tests / debugging)."""
 
-    w_pre: ttnn.Tensor
-    w_post: ttnn.Tensor
+    w_pre: Optional[ttnn.Tensor]
+    w_post: Optional[ttnn.Tensor]
     T: int
     p: Optional[ttnn.Tensor] = None
     h_pre: Optional[ttnn.Tensor] = None
     h_post: Optional[ttnn.Tensor] = None
     H: Optional[ttnn.Tensor] = None
+    # fused decode (MOTIF3_MHC_DECODE=fused): the packed coefficient tile (tt/kernels/mhc_decode.py) instead of
+    # w_pre / w_post
+    packed: Optional[ttnn.Tensor] = None
 
     def deallocate(self) -> None:
-        _free(self.w_pre, self.w_post, self.p, self.h_pre, self.h_post, self.H)
+        _free(self.w_pre, self.w_post, self.p, self.h_pre, self.h_post, self.H, self.packed)
 
 
 # =====================================================================================================================
@@ -1115,6 +1118,12 @@ class MHCSite:
         mix_l1: decode stream-mix weights (and the ``post_concat`` concat) in L1 (default; DRAM in prefill always).
         l1_intermediates: decode projection / statistics / coefficient intermediates in L1 (default).
         finalize: ``"kernel"`` (``finalize_mixes``, default) | ``"ttnn"`` (accurate ttnn sums + rsqrt + multiply).
+        decode: ``"ops"`` | ``"fused"`` (``None`` = ``cfg.mhc_decode``, ``MOTIF3_MHC_DECODE``; Phase C D3): the decode
+            site (one 32-row tile) as 5 programs -- projection, statistics, ONE fused coefficients program writing a
+            packed coefficient tile, and the two stream mixes expanding it locally (``tt/kernels/mhc_decode.py``),
+            bitwise equal to "ops". Applies with the production options only (``sinkhorn="motif"``, ``mix="wr"``,
+            ``glue="kernel"``, ``finalize="kernel"``, no ``post_concat``) and not to ``coefficients(keep=True)``; any
+            other combination runs the op path.
 
     Per-site device memory: 1 MB of bf16 projection weights + 8 KB constants.
     """
@@ -1136,6 +1145,7 @@ class MHCSite:
         mix_l1: bool = True,
         l1_intermediates: bool = True,
         finalize: str = "kernel",
+        decode: Optional[str] = None,
     ):
         if site not in SITES:
             raise ValueError(f"site must be one of {SITES}, got {site!r}")
@@ -1147,6 +1157,9 @@ class MHCSite:
             raise ValueError(f"glue must be 'kernel' or 'ttnn', got {glue!r}")
         if finalize not in ("kernel", "ttnn"):
             raise ValueError(f"finalize must be 'kernel' or 'ttnn', got {finalize!r}")
+        decode = (getattr(cfg, "mhc_decode", "ops") if decode is None else decode).strip().lower()
+        if decode not in MHC_DECODE_MODES:
+            raise ValueError(f"decode must be one of {MHC_DECODE_MODES}, got {decode!r}")
         if abs(float(cfg.mhc_h_post_coeff) - 1.0) > 0:
             raise ValueError(f"h_post coefficient {cfg.mhc_h_post_coeff} != 1.0 is not supported")
         if cfg.dtypes.mhc_scalars != ttnn.float32:
@@ -1166,6 +1179,11 @@ class MHCSite:
                 ) from _KM_IMPORT_ERROR
         self.sinkhorn = sinkhorn
         self._km = km
+        self.decode = decode
+        # the fused decode site needs the production options (module docstring of tt/kernels/mhc_decode.py)
+        self.decode_fused = (decode == "fused" and sinkhorn == "motif" and mix == "wr" and glue == "kernel"
+                             and finalize == "kernel" and not post_concat)
+        self._md = None
         self.glue = glue
         self.finalize = finalize
         self.mix = mix
@@ -1347,9 +1365,27 @@ class MHCSite:
         _free(post)
         return pre, h_post, comb
 
+    def _mhc_decode(self):
+        if self._md is None:
+            from .kernels import mhc_decode  # lazy: the kernel module
+
+            self._md = mhc_decode
+        return self._md
+
     def coefficients(self, X: ttnn.Tensor, *, keep: bool = False) -> MHCCoeffs:
         """All per-call coefficients of the site for streams ``X [1,4,T,4096]``."""
         T = int(X.shape[2])
+        if self.decode_fused and not keep and int(X.padded_shape[2]) == TILE:
+            shape = [int(d) for d in X.shape]
+            if len(shape) != 4 or shape[0] != 1 or shape[1] != N_STREAMS or shape[3] != self.hidden:
+                raise ValueError(f"X must be [1, {N_STREAMS}, T, {self.hidden}], got {shape}")
+            y, s = self._partials_decode(X)
+            md = self._mhc_decode()
+            P = md.coefficients_packed(y, s, self.motif_consts, eps=self.ss_eps, T=T, iters=self.iters,
+                                       memory_config=self.mix_mc, fidelity=self.role.fidelity,
+                                       approx=self.role.approx)
+            _free(y, s)
+            return MHCCoeffs(w_pre=None, w_post=None, T=T, packed=P)
         p = self.mixes(X)
         dec = int(X.padded_shape[2]) == TILE
         mmc = self._mix_mc(X)
@@ -1385,6 +1421,9 @@ class MHCSite:
     # ------------------------------------------------------------------------------------------------------------
     def apply_pre(self, X: ttnn.Tensor, coeffs: MHCCoeffs) -> ttnn.Tensor:
         """``x_red = sum_i h_pre_i X_i`` -> ``[1, 1, T, 4096]`` bf16."""
+        if coeffs.packed is not None:
+            return self._mhc_decode().mix_packed(X, coeffs.packed, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                                                 fidelity=self.role.fidelity, approx=self.role.approx)
         if self.mix == "composite":
             prod = ttnn.multiply(X, coeffs.w_pre, dtype=ttnn.float32)
             red = ttnn.sum(prod, dim=1, keepdim=True, compute_kernel_config=self.ckc)
@@ -1399,6 +1438,9 @@ class MHCSite:
     def apply_post(self, X: ttnn.Tensor, out: ttnn.Tensor, coeffs: MHCCoeffs) -> ttnn.Tensor:
         """``X' = H @ X + h_post (x) out`` -> ``[1, 4, T, 4096]`` bf16 (one rounding)."""
         T = int(X.shape[2])
+        if coeffs.packed is not None:
+            return self._mhc_decode().mix_packed(X, coeffs.packed, out, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                                                 fidelity=self.role.fidelity, approx=self.role.approx)
         if self.mix == "wr" and not self.post_concat:
             return post_mix(X, out, coeffs.w_post, memory_config=ttnn.DRAM_MEMORY_CONFIG, compute_role=self.role)
         xc = ttnn.concat([X, out], dim=1, memory_config=self._mix_mc(X))  # [1, 5, T, 4096]

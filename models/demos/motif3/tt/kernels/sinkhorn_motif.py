@@ -130,6 +130,7 @@ READER_SRC = KERNEL_DIR / "reader_sinkhorn_motif.cpp"
 WRITER_SRC = KERNEL_DIR / "writer_sinkhorn_motif.cpp"
 WRITER_WRNC_SRC = KERNEL_DIR / "writer_sinkhorn_motif_wrnc.cpp"
 COMPUTE_SRC = KERNEL_DIR / "compute_sinkhorn_motif.cpp"
+SFPU_HEADER = KERNEL_DIR / "motif_mhc_sfpu.h"  # the SFPU routines, #included by COMPUTE_SRC (and mhc_decode)
 
 N_STREAMS = 4
 N_MIXES = (2 + N_STREAMS) * N_STREAMS  # 24
@@ -161,7 +162,7 @@ def _f32_bits(x: float) -> int:
 def _sources_tag() -> str:
     """Content hash of the kernel sources: a compile define, so an edited kernel never hits a stale JIT build."""
     h = hashlib.sha1()
-    for p in (READER_SRC, WRITER_SRC, WRITER_WRNC_SRC, COMPUTE_SRC):
+    for p in (READER_SRC, WRITER_SRC, WRITER_WRNC_SRC, COMPUTE_SRC, SFPU_HEADER):
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
 

@@ -528,7 +528,8 @@ def test_import_is_self_contained():
     out = json.loads(res.stdout.strip().splitlines()[-1])
     assert out["demos"] == [] and out["other_models"] == [], out
     assert out["heavy"] == [], out
-    assert set(out["motif3"]) == {"models.demos.motif3.tt", *mods}, out["motif3"]
+    # tt/__init__.py applies the host env (P2: tt/host_env.py, stdlib only) before any ttnn import in the package
+    assert set(out["motif3"]) == {"models.demos.motif3.tt", "models.demos.motif3.tt.host_env", *mods}, out["motif3"]
     for marker in ("Opening user mode device driver", "Starting devices in cluster"):
         assert marker not in res.stderr and marker not in res.stdout
 
