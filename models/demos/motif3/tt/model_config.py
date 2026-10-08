@@ -192,14 +192,14 @@ PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
 # sharded ttnn.from_torch per MoE layer, ~0.67 ms of host time). The same bytes reach the same ops: bitwise equal.
 PREFILL_MOE_UPLOAD_MODES = ("staged", "from_torch")
 # DP-row sequence split of the non-MoE prefill (Phase C P4, docs/OPTIMIZATION_PLAN.md §3.3 C1; tt/prefill_sp.py,
-# MOTIF3_PREFILL_SP): "off" (the release: every DP row runs every row of the pass outside the MoE) | "dp" (an sp0
+# MOTIF3_PREFILL_SP): "off" (the release: every DP row runs every row of the pass outside the MoE) | "dp" (default; an sp0
 # non-packed pass of >= prefill_sp_min_rows rows keeps its residual streams split over the 4 DP rows; the attention
 # all-gathers the 576-wide latent, the MoE its input rows; bitwise equal to "off", logs/opt/phaseC/P4).
 PREFILL_SP_MODES = ("off", "dp")
-DEFAULT_PREFILL_SP = "off"
+DEFAULT_PREFILL_SP = "dp"
 # The smallest pass the split serves (MOTIF3_PREFILL_SP_MIN_ROWS): at 1024 rows the eager pass is host-bound and the
-# split is slower (5-layer wrapper 56.1 -> 58.1 ms), at 2048 it gains 12 %, at 4096 33 % (logs/opt/phaseC/P4).
-DEFAULT_PREFILL_SP_MIN_ROWS = 4096
+# split gains nothing (5-layer wrapper 56.1 -> 58.1 ms); 53 layers 2K / 4K / 8K: -17 / -26 / -25 % (logs/opt/phaseC/P4).
+DEFAULT_PREFILL_SP_MIN_ROWS = 2048
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory

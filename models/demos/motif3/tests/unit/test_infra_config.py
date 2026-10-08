@@ -2410,7 +2410,7 @@ def test_p4_prefill_sp_knob(monkeypatch):
     for k in ("MOTIF3_PREFILL_SP", "MOTIF3_PREFILL_SP_MIN_ROWS"):
         monkeypatch.delenv(k, raising=False)
     cfg = _cfg()
-    assert cfg.prefill_sp == DEFAULT_PREFILL_SP and cfg.prefill_sp_min_rows == DEFAULT_PREFILL_SP_MIN_ROWS == 4096
+    assert cfg.prefill_sp == DEFAULT_PREFILL_SP == "dp" and cfg.prefill_sp_min_rows == DEFAULT_PREFILL_SP_MIN_ROWS == 2048
     assert f"prefill_sp={cfg.prefill_sp}/{cfg.prefill_sp_min_rows} " in cfg.describe()
     for v, want in ((" DP ", "dp"), ("off", "off"), ("", DEFAULT_PREFILL_SP)):
         monkeypatch.setenv("MOTIF3_PREFILL_SP", v)
@@ -2425,6 +2425,8 @@ def test_p4_prefill_sp_knob(monkeypatch):
             _cfg()
     monkeypatch.setenv("MOTIF3_PREFILL_SP_MIN_ROWS", "2048")
     cfg = _cfg()
+    assert SPM.sp_applies(_cfg(prefill_sp_min_rows=4096), 4096, "sp0") and not SPM.sp_applies(
+        _cfg(prefill_sp_min_rows=4096), 2048, "sp0")
     assert cfg.prefill_sp == "dp" and cfg.prefill_sp_min_rows == 2048
     # which passes: sp0 / the draft-1 call (path None), >= min rows, R = S / 4 a multiple of 256
     assert SPM.sp_applies(cfg, 2048, "sp0") and SPM.sp_applies(cfg, 4096, None) and SPM.sp_applies(cfg, 8192, "sp0")
@@ -2454,3 +2456,63 @@ def test_p4_prefill_sp_knob(monkeypatch):
             assert torch.equal(kept, torch.arange(p + 1)), (d, i)
             kw = pos_w[d][w[d, 0, i] == 0].sort().values
             assert torch.equal(kw, torch.arange(max(0, p - 128), p + 1)), (d, i)
+
+
+def test_p4_prefill_sp_routing(monkeypatch):
+    """Phase C P4: ``MotifModel.prefill_chunk`` / ``prefill`` take the split path (split, ``forward_prefill_sp`` per layer
+    with the pass's fill table and RoPE rows, gather) exactly when ``PrefillSP.applies``; packed passes never."""
+    from types import SimpleNamespace
+
+    from models.demos.motif3.tt import model as MM
+
+    calls = []
+
+    class SP:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def applies(self, rows, path):
+            calls.append(("applies", rows, path))
+            return self.ok
+
+        def split(self, X):
+            return ("s", X)
+
+        def gather(self, Xs):
+            return ("g", Xs)
+
+    class L:
+        def __init__(self, i):
+            self.i = i
+
+        def forward_prefill(self, X, **kw):
+            calls.append(("full", self.i, sorted(kw)))
+            return X
+
+        def forward_prefill_sp(self, Xs, sp, S, **kw):
+            calls.append(("sp", self.i, S, kw["page_table"], kw["kv_cache"], kw.get("rot")))
+            return Xs
+
+    model = object.__new__(MM.MotifModel)
+    model.layers = [L(0), L(1)]
+    model.embed = SimpleNamespace(forward_prefill=lambda t: "X")
+    monkeypatch.setattr(MM, "_free", lambda *a: None)  # the stub tensors are strings
+    chunk = SimpleNamespace(is_sp1=False, is_packed=False, reads_cache=False, path="sp0", bucket=4096, fill_pt="fpt",
+                            rot=None)
+    tok = SimpleNamespace(shape=(4, 4096))
+    model.prefill_sp = SP(True)
+    out = model.prefill_chunk(tok, chunk=chunk, kv_caches=["k0", "k1"])
+    assert out == ("g", ("s", "X"))
+    assert calls == [("applies", 4096, "sp0"), ("sp", 0, 4096, "fpt", "k0", None), ("sp", 1, 4096, "fpt", "k1", None)]
+    calls.clear()
+    model.prefill_sp = SP(False)
+    assert model.prefill_chunk(tok, chunk=chunk, kv_caches=["k0", "k1"]) == "X"
+    assert [c[0] for c in calls] == ["applies", "full", "full"]
+    calls.clear()
+    model.prefill_sp = SP(True)
+    packed = SimpleNamespace(**{**vars(chunk), "is_packed": True, "path": "pk0"})
+    assert model.prefill_chunk(tok, chunk=packed, kv_caches=["k0", "k1"]) == "X"
+    assert [c[0] for c in calls] == ["full", "full"]
+    calls.clear()
+    out = model.prefill(tok, page_table="pt", kv_caches=None, return_streams=True)
+    assert out == ("g", ("s", "X")) and calls[1:] == [("sp", 0, 4096, None, None, None), ("sp", 1, 4096, None, None, None)]

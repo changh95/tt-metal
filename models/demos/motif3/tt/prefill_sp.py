@@ -33,8 +33,9 @@ The pass is bitwise equal to the release (logs/opt/phaseC/P4). It serves only sp
 "sp0" or the draft-1 ``page_table`` call) whose rows split into 4 whole SDPA chunks of at least 128 rows; sp1, packed
 and traced passes keep the release path.
 
-Measured (5-layer wrapper, 4096 rows, synced stack wall): 127.7 -> 85.8 ms; 2048 rows 71.4 -> 63.1 ms; 1024 rows 56.1
--> 58.1 ms (host-bound: slower), hence the 4096-row default floor (logs/opt/phaseC/P4).
+Measured (logs/opt/phaseC/P4): 5-layer wrapper (synced stack wall) 4096 rows 127.7 -> 85.8 ms, 2048 rows 71.4 -> 63.1
+ms, 1024 rows 56.1 -> 58.1 ms (host-bound), hence the 2048-row default floor; 53 layers, solo prefill 2K / 4K / 8K
+0.958 / 1.696 / 3.409 -> 0.796 / 1.261 / 2.545 s with bitwise logits and KV pages.
 """
 from __future__ import annotations
 

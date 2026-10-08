@@ -901,7 +901,8 @@ class MotifModel:
             what = "an sp1 chunk" if chunk.is_sp1 else f"a {chunk.path} pass"
             raise ValueError(f"{what} reads the cached prefix: prefill_chunk needs kv_caches")
         X = self.embed.forward_prefill(tokens)
-        if not chunk.is_packed and self.prefill_sp.applies(C, chunk.path):
+        sp = getattr(self, "prefill_sp", None)
+        if sp is not None and not getattr(chunk, "is_packed", False) and sp.applies(C, chunk.path):
             return self._prefill_layers_sp(X, n, kvs, C, page_table=chunk.fill_pt, rot=chunk.rot)
         for layer, kv in zip(self.layers[:n], kvs):
             Xn = layer.forward_prefill(X, chunk=chunk, kv_cache=kv)
@@ -992,7 +993,8 @@ class MotifModel:
         kvs = self._check_kv(kv_caches, n)
         X = self.embed.forward_prefill(tokens)
         S = int(tokens.shape[-1])
-        if self.prefill_sp.applies(S, None):
+        sp = getattr(self, "prefill_sp", None)
+        if sp is not None and sp.applies(S, None):
             X = self._prefill_layers_sp(X, n, kvs, S, page_table=page_table)
         else:
             for layer, kv in zip(self.layers[:n], kvs):
