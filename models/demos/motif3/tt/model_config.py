@@ -149,7 +149,8 @@ ATTN_MM_PCS_MODES = ("tuned", "release")
 # statistics, finalize, Sinkhorn, layout, pre reduce, post mix; 7 programs) | "fused" (tt/kernels/mhc_decode.py:
 # finalize + Sinkhorn + layout in ONE program writing a packed coefficient tile, and pre / post mixes that expand it
 # locally instead of every worker reading the whole weight set over the NOC; the same LLK / SFPU operations in the same
-# order, so x_red and X' are bitwise equal, padding rows included). Decode only (one 32-row tile); prefill keeps the ops.
+# order, so x_red and X' are bitwise equal, padding rows included; the default since the D3 gates passed,
+# logs/opt/phaseC/D3). Decode only (one 32-row tile); prefill keeps the ops.
 MHC_DECODE_MODES = ("ops", "fused")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
@@ -1407,8 +1408,9 @@ class MotifTTConfig:
     attn_epilogue: str = "fused"  # MOTIF3_ATTN_EPILOGUE
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
-    # Decode mHC site (Phase C D3): "ops" (the release, 7 programs) | "fused" (MHC_DECODE_MODES).
-    mhc_decode: str = "ops"  # MOTIF3_MHC_DECODE
+    # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
+    # MHC_DECODE_MODES).
+    mhc_decode: str = "fused"  # MOTIF3_MHC_DECODE
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1599,7 +1601,7 @@ class MotifTTConfig:
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "fused").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
-            mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "ops").strip().lower(),
+            mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),

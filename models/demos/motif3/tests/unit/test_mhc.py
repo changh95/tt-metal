@@ -941,8 +941,10 @@ def test_mhc_decode_trace_latency(mesh_device):
         ("stock", "kernel", True, True, "kernel", 32, False),
     ]
     for backend, glue, mix_l1, l1i, fin, nbk, pc in variants:
+        # decode="ops": this test covers the release site's programs (the fused site: test_mhc_decode_fused)
         st = M.MHCSite(mesh_device, cfg, 2, "mhc_attn", source=src, cache=False, sinkhorn=backend, glue=glue,
-                       mix_l1=mix_l1, l1_intermediates=l1i, finalize=fin, decode_split=nbk, post_concat=pc)
+                       mix_l1=mix_l1, l1_intermediates=l1i, finalize=fin, decode_split=nbk, post_concat=pc,
+                       decode="ops")
         tag = f"{backend}/glue={glue}/mix_l1={mix_l1}/l1_int={l1i}/finalize={fin}/split={nbk}/post_concat={pc}"
         x32, o32 = random_streams(32, seed=21)
         xh = torch.stack([to_tt_layout(x32[8 * r : 8 * r + 8])[0] for r in range(4)])
