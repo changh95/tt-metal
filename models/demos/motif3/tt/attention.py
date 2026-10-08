@@ -1495,6 +1495,9 @@ class MotifAttention:
         # bitwise equal to the global layers' 16 on a 129-key window), global layers 16
         self.decode_pc = cfg.flash_mla_decode_pc("swa" if self.window is not None else "global")
         self.dtype = cfg.dtypes.activations
+        # decode epilogue (Phase C D1, MOTIF3_ATTN_EPILOGUE): "ops" | "fused" (tt/kernels/attn_combine.py, built lazily)
+        self.epilogue = getattr(cfg, "attn_epilogue", "ops")
+        self._fused_combine = None
 
         # ---- weights (ATTN-1) -----------------------------------------------------------------------------------
         src = _AttnSource(source, self.layer_idx, self.weight_prefix)
@@ -1973,6 +1976,14 @@ class MotifAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )  # [1, 10, T, 128]
         ttnn.deallocate(o_heads)
+        if decode and self.epilogue == "fused" and active is not None:
+            dg = self._fused_epilogue(u, g, lam, active, taps)
+            if dg is not None:
+                part = self._linear(dg, self.w_o, ckc=self.ckc_heads, pc=self._pc("wo", decode))
+                ttnn.deallocate(dg)
+                out = self.ccl.ar_tp(part)
+                ttnn.deallocate(part)
+                return out
         u_flat = ttnn.experimental.nlp_concat_heads(u, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 1, T, 1280]
         ttnn.deallocate(u)
         u_sig, noise = ttnn.experimental.nlp_create_q_heads_split(
@@ -1990,6 +2001,37 @@ class MotifAttention:
         out = self.ccl.ar_tp(part)
         ttnn.deallocate(part)
         return out
+
+    def fused_combine(self):
+        """The layer's :class:`~models.demos.motif3.tt.kernels.attn_combine.FusedAttnCombine` (built on first use)."""
+        if self._fused_combine is None:
+            from .kernels.attn_combine import FusedAttnCombine
+
+            self._fused_combine = FusedAttnCombine(
+                self.mesh_device, signal_heads=self.Sg, noise_heads=self.G, vdim=self.vdim
+            )
+        return self._fused_combine
+
+    def _fused_epilogue(self, u, g, lam, active, taps):
+        """``epilogue="fused"`` (Phase C D1): ``v = sigmoid(lam @ E)`` (the release's op), then ONE program for the
+        concat / split / noise expansion / addcmul / multiply / where of :meth:`_combine` -> the ``wo`` input
+        ``[1, 1, T, 1024]``. Returns ``None`` (nothing consumed) when the operands are outside the kernel's contract
+        (the op chain then runs); otherwise consumes ``u``, ``g``, ``lam``."""
+        fc = self.fused_combine()
+        T = int(u.shape[-2])
+        if int(active.shape[-1]) != fc.width or int(active.shape[-2]) != T or int(g.shape[-2]) != T:
+            return None
+        v_exp = self._linear(lam, self.lam_expand, ckc=self.ckc_heads, activation="sigmoid")
+        if not fc.supports(u, v_exp, g, active):
+            ttnn.deallocate(v_exp)
+            return None
+        ttnn.deallocate(lam)
+        if taps is not None:
+            taps["u_flat"] = ttnn.experimental.nlp_concat_heads(u, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        dg = fc(u, v_exp, g, active)
+        for t in (u, v_exp, g):
+            ttnn.deallocate(t)
+        return dg
 
     # ==================================================================================================================
     # prefill

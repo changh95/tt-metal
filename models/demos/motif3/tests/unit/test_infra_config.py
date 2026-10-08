@@ -2157,6 +2157,32 @@ def test_prefill_trace_knob(monkeypatch):
         _cfg(prefill_trace="2048")
 
 
+def test_d1_attn_epilogue_knob(monkeypatch):
+    """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("ops" | "fused"; case and blanks ignored, anything
+    else refused; in ``describe``) and the fused combine's worker plan (``tt/kernels/attn_combine.plan``)."""
+    from models.demos.motif3.tt.kernels import attn_combine as AC
+    from models.demos.motif3.tt.model_config import ATTN_EPILOGUE_MODES
+
+    assert ATTN_EPILOGUE_MODES == ("ops", "fused")
+    monkeypatch.delenv("MOTIF3_ATTN_EPILOGUE", raising=False)
+    default = _cfg().attn_epilogue
+    assert default in ATTN_EPILOGUE_MODES and f"attn_epilogue={default} " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("ops", "ops"), ("", default)):
+        monkeypatch.setenv("MOTIF3_ATTN_EPILOGUE", v)
+        assert _cfg().attn_epilogue == want, v
+    monkeypatch.setenv("MOTIF3_ATTN_EPILOGUE", "kernel")
+    with pytest.raises(ValueError, match="MOTIF3_ATTN_EPILOGUE"):
+        _cfg()
+    assert AC.plan(32, 32, (12, 10)) == dict(n=32, per=1, used=32, gx=8, gy=4)
+    assert AC.plan(32, 8, (12, 10)) == dict(n=32, per=4, used=8, gx=8, gy=1)
+    assert AC.plan(32, 16, (12, 10)) == dict(n=32, per=2, used=16, gx=8, gy=2)
+    with pytest.raises(ValueError, match="cores"):
+        AC.plan(32, 3, (12, 10))
+    with pytest.raises(ValueError, match="grid"):
+        AC.plan(32, 32, (8, 3))
+    assert AC.VALUE_BITS == 0xBF800000  # addcmul value=-1.0, as the ternary op packs it
+
+
 def test_p2_host_knobs(monkeypatch):
     """P2 (logs/opt/phaseC/P2): ``MOTIF3_PREFILL_MOE_UPLOAD`` ("staged" default | "from_torch"; case and blanks ignored,
     anything else refused; in ``describe``) and ``MOTIF3_SHM_TRACKING`` (``host_env.apply_host_env``: "off" default

@@ -134,6 +134,13 @@ MOE_POLYNORM_MODES = ("composite", "fused")
 # LLK operations in the same order, so bitwise equal to the composite by construction; the default since the B5 gates
 # passed, logs/opt/phaseB/B5). Decode only (one 32-row tile).
 SHARED_POLYNORM_MODES = ("composite", "fused")
+# Decode attention epilogue (Phase C D1, docs/OPTIMIZATION_PLAN.md §3.3 C3; MotifAttention): "ops" (the release:
+# nlp_concat_heads, channel split, noise @ X, addcmul, multiply, where; 6 programs) | "fused"
+# (tt/kernels/attn_combine.py: one generic_op that selects the u tiles directly and runs the same LLK sequence as the
+# addcmul / multiply / where ops; the wo input equals the op chain bit for bit up to the sign of exact zeros, the wo
+# output bitwise). Decode only (one 32-row tile, the 1024-wide active mask); prefill and the taps-free sp1 path keep
+# the ops.
+ATTN_EPILOGUE_MODES = ("ops", "fused")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
 # the B2a gates passed; token-compacted:
@@ -1377,6 +1384,8 @@ class MotifTTConfig:
     # kernel, bitwise equal to the release) | "composite" (the release; SHARED_POLYNORM_MODES). Prefill and the dense
     # MLPs are not affected.
     shared_polynorm: str = "fused"  # MOTIF3_SHARED_POLYNORM
+    # Decode attention epilogue (Phase C D1): "ops" (the release op chain) | "fused" (one program; ATTN_EPILOGUE_MODES).
+    attn_epilogue: str = "ops"  # MOTIF3_ATTN_EPILOGUE
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1455,7 +1464,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1565,6 +1574,7 @@ class MotifTTConfig:
             decode_experts=(os.environ.get("MOTIF3_DECODE_EXPERTS") or "sparse").strip().lower(),
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "fused").strip().lower(),
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
+            attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "ops").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
@@ -1735,6 +1745,10 @@ class MotifTTConfig:
         if self.moe_polynorm not in MOE_POLYNORM_MODES:
             raise ValueError(
                 f"moe_polynorm (MOTIF3_MOE_POLYNORM) must be one of {MOE_POLYNORM_MODES}, got {self.moe_polynorm!r}"
+            )
+        if self.attn_epilogue not in ATTN_EPILOGUE_MODES:
+            raise ValueError(
+                f"attn_epilogue (MOTIF3_ATTN_EPILOGUE) must be one of {ATTN_EPILOGUE_MODES}, got {self.attn_epilogue!r}"
             )
         if self.shared_polynorm not in SHARED_POLYNORM_MODES:
             raise ValueError(
@@ -2500,7 +2514,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "

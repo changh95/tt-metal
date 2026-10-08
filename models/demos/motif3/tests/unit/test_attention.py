@@ -1934,6 +1934,91 @@ def test_attention_decode_breakdown(mesh_device, device_params):
         del attn
 
 
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_attention_decode_fused_epilogue(mesh_device, device_params):
+    """Phase C D1 (``MOTIF3_ATTN_EPILOGUE=fused``, ``tt/kernels/attn_combine.py``): ``forward_decode`` with the fused
+    combine is bitwise equal to the op chain on every chip (SWA layer 1 and global layer 0, random weights, 5 inactive
+    lanes, 1K context), and so is the written cache (one chip per DP row); the combine alone equals the op chain bit
+    for bit with NaN garbage in an inactive lane's ``u`` rows and exact +-0 in the noise heads, at 32 / 16 / 8
+    workers. Logs the traced ``forward_decode`` cost of both modes."""
+    from models.demos.motif3.tt.kernels.attn_combine import FusedAttnCombine
+
+    cfg, ccl, rope = _setup(mesh_device, "decode fused epilogue")
+    args = ref_args()
+    B, block, ctx = cfg.max_batch, cfg.kv_block_size, 1024
+    Wd = ctx // block
+    pool = 1 + B * Wd
+    g = torch.Generator().manual_seed(3)
+    cache_h = torch.randn(pool, 1, block, cfg.kv_latent_dim, generator=g)
+    pt = (torch.randperm(pool - 1, generator=g) + 1).to(torch.int32).reshape(B, Wd)
+    pos = [ctx - 1 - 29 * i for i in range(B)]
+    for i in (3, 11, 19, 27, 12):
+        pos[i] = -1
+    d = _decode_step_inputs(mesh_device, cfg, rope, pos, torch.randn(B, 4096, generator=g).bfloat16().float(), pt)
+
+    def rep(t, dtype=ttnn.bfloat16):
+        return ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                               memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def words(t, idx=None):
+        ts = ttnn.get_device_tensors(t)
+        return [ttnn.to_torch(ts[i]).float().view(torch.int32) for i in (idx if idx is not None else range(len(ts)))]
+
+    def same(a, b):
+        return all(torch.equal(p, q) for p, q in zip(a, b))
+
+    dp_chips = [_chip_index(cfg, r) for r in range(cfg.dp)]
+    for layer in (1, 0):
+        attn = MotifAttention(mesh_device, cfg, layer, source=hf_source(random_attn_tensors(args, seed=60 + layer),
+                                                                        layer), ccl=ccl, rope=rope, cache=False)
+        outs = {}
+        for mode in ("ops", "fused"):
+            attn.epilogue = mode
+            cache = rep(cache_h, cfg.dtypes.kv_cache)
+            o = attn.forward_decode(d["x"], rot=d["rot"], cur_pos=d["cur"], page_table=d["pt"], kv_cache=cache,
+                                    active=d["act"])
+            outs[mode] = (words(o), words(cache, dp_chips))
+            _free([o, cache])
+        assert same(outs["ops"][0], outs["fused"][0]), f"L{layer}: fused epilogue output differs from the op chain"
+        assert same(outs["ops"][1], outs["fused"][1]), f"L{layer}: fused epilogue cache write differs"
+        cache = rep(cache_h, cfg.dtypes.kv_cache)
+        us = {}
+        for mode in ("ops", "fused"):
+            attn.epilogue = mode
+            us[mode] = _traced_us(mesh_device, lambda: attn.forward_decode(
+                d["x"], rot=d["rot"], cur_pos=d["cur"], page_table=d["pt"], kv_cache=cache, active=d["act"]),
+                n=32, reps=5)["slope_us"]
+        _free(cache)
+        log(f"decode fused epilogue L{layer}: bitwise output + cache; traced forward_decode ops {us['ops']:.1f} us, "
+            f"fused {us['fused']:.1f} us ({us['fused'] - us['ops']:+.1f})")
+        if layer == 1:  # the combine alone: NaN rows of an inactive lane, +-0 in the noise heads
+            L = cfg.lanes_per_row
+            u_h = torch.randn(1, 10, L, 128, generator=g) * 0.5
+            u_h[0, 8:, 0, :7] = 0.0
+            u_h[0, 8:, 1, :5] = -0.0
+            u_h[0, :8, 1, :3] = -0.0
+            u_h[0, :, 3, :] = float("nan")  # lane 3 of every DP row is inactive
+            u, lam = rep(u_h.bfloat16()), rep((torch.randn(1, 1, L, 64, generator=g) * 2.0).bfloat16())
+            gt = rep(torch.sigmoid(torch.randn(1, 1, L, 1024, generator=g)).bfloat16())
+            v = attn._linear(lam, attn.lam_expand, ckc=attn.ckc_heads, activation="sigmoid")
+            uf = ttnn.experimental.nlp_concat_heads(u, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            us_, nz = ttnn.experimental.nlp_create_q_heads_split(uf, num_heads=1, split_head_dim=1024)
+            un = attn._linear(nz, attn.noise_expand, ckc=attn.ckc_heads)
+            dd = ttnn.addcmul(us_, v, un, value=-1.0)
+            dg = ttnn.multiply(dd, gt)
+            ref = ttnn.where(d["act"], dg, 0.0)
+            want = words(ref)
+            for cores in (32, 16, 8):
+                fc = FusedAttnCombine(mesh_device, signal_heads=8, noise_heads=2, vdim=128, cores=cores)
+                f = fc(u, v, gt, d["act"])
+                assert same(want, words(f)), f"fused combine ({cores} workers) differs from the op chain"
+                _free(f)
+            _free([u, lam, gt, v, uf, us_, nz, un, dd, dg, ref])
+            log("decode fused epilogue: combine == op chain bitwise at 32 / 16 / 8 workers (NaN rows, +-0)")
+        del attn
+
+
 # ======================================================================================================================
 # device: long prefill buckets (S = 8K / 16K / 32K; ATTN-7), row-subset golden; default role vs fp32-acc opt-in
 # ======================================================================================================================
