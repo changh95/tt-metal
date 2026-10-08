@@ -186,6 +186,11 @@ PREFILL_MOE_DISPATCH_MODES = ("host", "device")
 # | "gather" (tt/kernels/moe_compact.py GatherCombine: each token's rows gathered and added in an fp32 dest with
 # fast_reduce_nc's ops). Bitwise equal to each other and to the dense path.
 PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
+# B2b defaults (Phase C flip, logs/opt/phaseC2/B2b-FIX-VALIDATE): device dispatch + gather combine, bitwise equal to
+# B2a's "host" / "matmul" on every gate (unit35, CP-L / CP-H / CP9, CP-P, determinism). Chunks outside
+# moe.PREFILL_MOE_DEVICE_ROWS still run host / matmul; chunks whose chips disagree on NB run dense (moe.py).
+DEFAULT_PREFILL_MOE_DISPATCH = "device"
+DEFAULT_PREFILL_MOE_COMBINE = "gather"
 # How the B2a host path uploads its per-chip row words (P2, MOTIF3_PREFILL_MOE_UPLOAD): "staged" (default: the words go
 # into a host mesh tensor allocated once per row count, through zero-copy numpy views, then one
 # copy_host_to_device_tensor into a fresh device tensor; ~0.1 ms of host time per MoE layer) | "from_torch" (B2a: one
@@ -1446,9 +1451,9 @@ class MotifTTConfig:
     prefill_moe_block: str = "auto"  # MOTIF3_PREFILL_MOE_BLOCK
     prefill_moe_min_rows: int = DEFAULT_PREFILL_MOE_MIN_ROWS  # MOTIF3_PREFILL_MOE_MIN_ROWS
     # B2b: who builds the compacted rows ("host" | "device"; PREFILL_MOE_DISPATCH_MODES) and how they are combined
-    # ("matmul" | "gather"; PREFILL_MOE_COMBINE_MODES). Defaults: B2a's.
-    prefill_moe_dispatch: str = "host"  # MOTIF3_PREFILL_MOE_DISPATCH
-    prefill_moe_combine: str = "matmul"  # MOTIF3_PREFILL_MOE_COMBINE
+    # ("matmul" | "gather"; PREFILL_MOE_COMBINE_MODES). Defaults: B2b's device / gather (bitwise equal to B2a).
+    prefill_moe_dispatch: str = DEFAULT_PREFILL_MOE_DISPATCH  # MOTIF3_PREFILL_MOE_DISPATCH
+    prefill_moe_combine: str = DEFAULT_PREFILL_MOE_COMBINE  # MOTIF3_PREFILL_MOE_COMBINE
     # P2: how the B2a host path uploads its row words ("staged" | "from_torch"; PREFILL_MOE_UPLOAD_MODES). Bitwise equal.
     prefill_moe_upload: str = "staged"  # MOTIF3_PREFILL_MOE_UPLOAD
     # Phase C P4: DP-row sequence split of the non-MoE prefill ("off" | "dp"; PREFILL_SP_MODES) and its smallest pass.
@@ -1638,8 +1643,10 @@ class MotifTTConfig:
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
-            prefill_moe_dispatch=(os.environ.get("MOTIF3_PREFILL_MOE_DISPATCH") or "host").strip().lower(),
-            prefill_moe_combine=(os.environ.get("MOTIF3_PREFILL_MOE_COMBINE") or "matmul").strip().lower(),
+            prefill_moe_dispatch=(
+                os.environ.get("MOTIF3_PREFILL_MOE_DISPATCH") or DEFAULT_PREFILL_MOE_DISPATCH
+            ).strip().lower(),
+            prefill_moe_combine=(os.environ.get("MOTIF3_PREFILL_MOE_COMBINE") or DEFAULT_PREFILL_MOE_COMBINE).strip().lower(),
             prefill_moe_upload=(os.environ.get("MOTIF3_PREFILL_MOE_UPLOAD") or "staged").strip().lower(),
             prefill_sp=(os.environ.get("MOTIF3_PREFILL_SP") or DEFAULT_PREFILL_SP).strip().lower(),
             prefill_sp_min_rows=_env_int("MOTIF3_PREFILL_SP_MIN_ROWS", DEFAULT_PREFILL_SP_MIN_ROWS),
@@ -2655,6 +2662,8 @@ __all__ = [
     "PREFILL_MOE_DISPATCH_MODES",
     "PREFILL_MOE_UPLOAD_MODES",
     "PREFILL_SP_MODES",
+    "DEFAULT_PREFILL_MOE_COMBINE",
+    "DEFAULT_PREFILL_MOE_DISPATCH",
     "DEFAULT_PREFILL_SP",
     "DEFAULT_PREFILL_SP_MIN_ROWS",
     "SHM_TRACKING_MODES",

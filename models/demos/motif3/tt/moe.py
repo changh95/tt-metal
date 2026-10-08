@@ -307,8 +307,9 @@ def resolve_prefill_moe(prefill_moe: Optional[str], cfg, *, combine_mode: str, p
 
 def resolve_prefill_moe_kernels(dispatch: Optional[str], combine: Optional[str], cfg) -> Tuple[str, str]:
     """B2b: ``(prefill_moe_dispatch, prefill_moe_combine)`` of a compacted :class:`MotifMoE`: explicit values or
-    ``cfg.prefill_moe_dispatch`` / ``cfg.prefill_moe_combine`` (``MOTIF3_PREFILL_MOE_DISPATCH`` / ``_COMBINE``; a config
-    without the fields = B2a's "host" / "matmul"); each must be in :data:`PREFILL_MOE_DISPATCH_MODES` /
+    ``cfg.prefill_moe_dispatch`` / ``cfg.prefill_moe_combine`` (``MOTIF3_PREFILL_MOE_DISPATCH`` / ``_COMBINE``;
+    :class:`MotifTTConfig` defaults to B2b's "device" / "gather"; a stub config without the fields = B2a's "host" /
+    "matmul"); each must be in :data:`PREFILL_MOE_DISPATCH_MODES` /
     :data:`PREFILL_MOE_COMBINE_MODES`."""
     d = str(dispatch if dispatch is not None else (getattr(cfg, "prefill_moe_dispatch", None) or "host"))
     c = str(combine if combine is not None else (getattr(cfg, "prefill_moe_combine", None) or "matmul"))

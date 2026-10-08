@@ -919,30 +919,34 @@ def test_prefill_moe_knobs(monkeypatch):
 
 def test_prefill_moe_kernel_knobs(monkeypatch):
     """B2b (docs/OPTIMIZATION_PLAN.md §3.3 B2; logs/opt/phaseB/B2b): ``MOTIF3_PREFILL_MOE_DISPATCH`` (``host`` = B2a /
-    ``device``) and ``MOTIF3_PREFILL_MOE_COMBINE`` (``matmul`` = B2a / ``gather``) of the compacted prefill MoE. Case
-    and blanks ignored, anything else refused; ``describe`` shows them after the B2a fields."""
-    from models.demos.motif3.tt.model_config import PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES
+    ``device``) and ``MOTIF3_PREFILL_MOE_COMBINE`` (``matmul`` = B2a / ``gather``) of the compacted prefill MoE. Default
+    ``device`` / ``gather`` since the Phase C flip (logs/opt/phaseC2/B2b-FIX-VALIDATE; bitwise equal to B2a). Case
+    and blanks ignored, an empty value = the default, anything else refused; ``describe`` shows them after the B2a
+    fields."""
+    from models.demos.motif3.tt.model_config import (DEFAULT_PREFILL_MOE_COMBINE, DEFAULT_PREFILL_MOE_DISPATCH,
+                                                     PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES)
 
     assert PREFILL_MOE_DISPATCH_MODES == ("host", "device") and PREFILL_MOE_COMBINE_MODES == ("matmul", "gather")
+    assert (DEFAULT_PREFILL_MOE_DISPATCH, DEFAULT_PREFILL_MOE_COMBINE) == ("device", "gather")
     c = _cfg()
-    assert (c.prefill_moe_dispatch, c.prefill_moe_combine) == ("host", "matmul")
-    assert "prefill_moe=compact/auto/1024/host/matmul" in c.describe()
-    for v, want in ((" Device ", "device"), ("host", "host"), ("", "host")):
+    assert (c.prefill_moe_dispatch, c.prefill_moe_combine) == ("device", "gather")
+    assert "prefill_moe=compact/auto/1024/device/gather" in c.describe()
+    for v, want in ((" Host ", "host"), ("device", "device"), ("", "device")):
         monkeypatch.setenv("MOTIF3_PREFILL_MOE_DISPATCH", v)
         assert _cfg().prefill_moe_dispatch == want, v
     monkeypatch.setenv("MOTIF3_PREFILL_MOE_DISPATCH", "gpu")
     with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_DISPATCH"):
         _cfg()
     monkeypatch.delenv("MOTIF3_PREFILL_MOE_DISPATCH")
-    for v, want in (("GATHER", "gather"), (" matmul", "matmul"), ("", "matmul")):
+    for v, want in ((" MATMUL", "matmul"), ("gather", "gather"), ("", "gather")):
         monkeypatch.setenv("MOTIF3_PREFILL_MOE_COMBINE", v)
         assert _cfg().prefill_moe_combine == want, v
     monkeypatch.setenv("MOTIF3_PREFILL_MOE_COMBINE", "scatter")
     with pytest.raises(ValueError, match="MOTIF3_PREFILL_MOE_COMBINE"):
         _cfg()
     monkeypatch.delenv("MOTIF3_PREFILL_MOE_COMBINE")
-    c = _cfg(prefill_moe_dispatch="device", prefill_moe_combine="gather")
-    assert "prefill_moe=compact/auto/1024/device/gather" in c.describe()
+    c = _cfg(prefill_moe_dispatch="host", prefill_moe_combine="matmul")
+    assert "prefill_moe=compact/auto/1024/host/matmul" in c.describe()
     with pytest.raises(ValueError, match="prefill_moe_dispatch"):
         _cfg(prefill_moe_dispatch="fast")
 
@@ -2371,7 +2375,7 @@ def test_p2_host_knobs(monkeypatch):
 
     assert PREFILL_MOE_UPLOAD_MODES == ("staged", "from_torch") and SHM_TRACKING_MODES == ("off", "on")
     monkeypatch.delenv("MOTIF3_PREFILL_MOE_UPLOAD", raising=False)
-    assert _cfg().prefill_moe_upload == "staged" and "/matmul/staged " in _cfg().describe()
+    assert _cfg().prefill_moe_upload == "staged" and "/gather/staged " in _cfg().describe()
     for v, want in ((" From_Torch ", "from_torch"), ("staged", "staged"), ("", "staged")):
         monkeypatch.setenv("MOTIF3_PREFILL_MOE_UPLOAD", v)
         assert _cfg().prefill_moe_upload == want, v
