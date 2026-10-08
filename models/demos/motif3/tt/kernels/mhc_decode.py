@@ -290,7 +290,7 @@ _CO_HASH: Dict[tuple, int] = {}
 def coefficients_packed(y: ttnn.Tensor, s: ttnn.Tensor, consts: ttnn.Tensor, *, eps: float, T: int,
                         P: Optional[ttnn.Tensor] = None, ncopy: int = DEFAULT_NCOPY, iters: int = 20,
                         half: Optional[bool] = None, chunk: int = 8, memory_config=None, fidelity: str = "HiFi4",
-                        approx: bool = False) -> ttnn.Tensor:
+                        approx: bool = False, debug_defines=()) -> ttnn.Tensor:
     """The packed coefficient tile ``P`` (module docstring) of one decode site from the split-K partials ``y`` /
     ``s`` (``[1, NB, 32, 32]`` fp32, ``MHCSite._partials_decode``) and the site's Motif constants (``[64, 32]`` fp32,
     ``sinkhorn_motif.build_consts``), in one single-core program: release ``finalize_mixes`` + ``motif_sinkhorn`` +
@@ -324,7 +324,7 @@ def coefficients_packed(y: ttnn.Tensor, s: ttnn.Tensor, consts: ttnn.Tensor, *, 
     wr_ct = [int(ncopy)] + _accessor(P)
     cp_ct = [nb, chunk, f32_bits(eps), 1 if half else 0, int(iters), halves, f32_bits(km.PRE_POST_CLAMP),
              f32_bits(km.RES_CLAMP), f32_bits(km.SUM_FLOOR), f32_bits(km.H_POST_COEFF), 0]
-    defines = [("MOTIF_MHC_DECODE_SRC", _tag("co"))]
+    defines = [("MOTIF_MHC_DECODE_SRC", _tag("co"))] + [(str(k), str(v)) for k, v in debug_defines]
     fp = ttnn.KernelDescriptor.SourceType.FILE_PATH
     kernels = [
         ttnn.KernelDescriptor(kernel_source=str(CO_SOURCES["reader"]), source_type=fp, core_ranges=cores,
@@ -346,7 +346,8 @@ def coefficients_packed(y: ttnn.Tensor, s: ttnn.Tensor, consts: ttnn.Tensor, *, 
         _cb(CO_CB_OUT, 1, cores, ttnn.float32, F32_TILE),
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    key = (tuple(rd_ct), tuple(wr_ct), tuple(cp_ct), int(grid.x), int(grid.y), fidelity, bool(approx), _tag("co"))
+    key = (tuple(rd_ct), tuple(wr_ct), tuple(cp_ct), int(grid.x), int(grid.y), fidelity, bool(approx), _tag("co"),
+           tuple(defines))
     h = _CO_HASH.get(key)
     if h is None:
         h = _CO_HASH[key] = ttnn.compute_program_descriptor_hash(desc)

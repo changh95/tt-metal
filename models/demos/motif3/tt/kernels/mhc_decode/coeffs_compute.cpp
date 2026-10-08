@@ -121,18 +121,29 @@ void kernel_main() {
         cy.wait_front(chunk);
         for (uint32_t i = 0; i < chunk; ++i) {
             const uint32_t k = b + i;
+#ifdef MHC_CO_DEBUG_NO_Y
+            if (k != 0) {
+                continue;
+            }
+#endif
             if (k == 0) {
                 copy_tile(CB_Y, i, 0);
             } else {
                 const uint32_t tmp = (k & 1) ? 1 : 3;
                 copy_tile(CB_Y, i, tmp);
+#ifdef MHC_CO_DEBUG_NO_ADD
+                if constexpr (false) {
+#else
                 if constexpr (HALF) {
+#endif
                     MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sfpu_binary,
                                            (APPROX, ckernel::BinaryOp::ADD, 8, DST_ACCUM_MODE,
                                             ckernel::DstRoundingMode::Default),
                                            0, tmp, 0, VectorMode::R)));
                 } else {
+#ifndef MHC_CO_DEBUG_NO_ADD
                     add_binary_tile(0, tmp, 0);
+#endif
                 }
             }
         }
@@ -144,18 +155,29 @@ void kernel_main() {
         cs.wait_front(chunk);
         for (uint32_t i = 0; i < chunk; ++i) {
             const uint32_t k = b + i;
+#ifdef MHC_CO_DEBUG_NO_S
+            if (k != 0) {
+                continue;
+            }
+#endif
             if (k == 0) {
                 copy_tile(CB_S, i, 2);
             } else {
                 const uint32_t tmp = (k & 1) ? 3 : 1;
                 copy_tile(CB_S, i, tmp);
+#ifdef MHC_CO_DEBUG_NO_ADD
+                if constexpr (false) {
+#else
                 if constexpr (HALF) {
+#endif
                     MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sfpu_binary,
                                            (APPROX, ckernel::BinaryOp::ADD, 8, DST_ACCUM_MODE,
                                             ckernel::DstRoundingMode::Default),
                                            2, tmp, 2, VectorMode::RC_custom)));
                 } else {
+#ifndef MHC_CO_DEBUG_NO_ADD
                     add_binary_tile(2, tmp, 2);
+#endif
                 }
             }
         }
@@ -195,9 +217,11 @@ void kernel_main() {
     copy_tile(CB_C, 0, 1);
     copy_tile(CB_C, 1, 2);
     MATH((ckernel::llk_math_eltwise_unary_sfpu_init<SfpuType::unused>(ckernel::sfpu::motif_mhc::motif_mhc_init)));
+#ifndef MHC_CO_DEBUG_NO_SINKHORN
     MATH((_llk_math_eltwise_unary_sfpu_params_(
         ckernel::sfpu::motif_mhc::motif_mhc_tile<ITERS, HALVES, CPP, CRES, FLOOR, HPOST, 0, REFINE>, 0,
         VectorMode::RC_custom)));
+#endif
     // ---- 3. packed tile ----
     MATH((_llk_math_eltwise_unary_sfpu_params_(ckernel::sfpu::motif_mhc_pack::packed_tile, 0, VectorMode::RC_custom)));
     tile_regs_commit();
