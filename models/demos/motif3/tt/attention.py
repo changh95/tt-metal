@@ -2133,12 +2133,13 @@ class MotifAttention:
         R = int(x.shape[-2])
         if R * int(self.cfg.dp) != int(S):
             raise ValueError(f"forward_prefill_sp: {R} rows per DP row for a pass of {S}")
-        cos, sin = sp.cos_sin(self.kind, S, None if rot is None else self._rot_tables(rot))
+        cs = sp.cos_sin(self.kind, S, None if rot is None else self._rot_tables(rot))
+        cos, sin = cs
         q, g, n, kpe, lam = self._project(x, decode=False)
         q_full = self._q_expanded(q, cos, sin)  # [1, 10, R, 192], HF head order
         k_pe = self._rope(kpe, cos, sin)  # [1, 1, R, 64]
         ttnn.deallocate(kpe)
-        if not sp.is_cached_rot((cos, sin)):
+        if not sp.is_cached_rot(cs):
             ttnn.deallocate(cos)
             ttnn.deallocate(sin)
         lat = ttnn.concat([n, k_pe], dim=-1)  # [1, 1, R, 576]: this row's rows of the cache-fill latent
