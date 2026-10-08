@@ -111,6 +111,7 @@ from .lm_head import MotifLMHead
 from .model_config import DEFAULT_HF_META_DIR, MotifTTConfig
 from .moe import CompactPrefillState, MotifMoE
 from .mtp import MotifMTP
+from .prefill_sp import PrefillSP
 from .rope import MotifRope
 
 CACHE_POLICIES = ("auto", "write", "off")
@@ -522,6 +523,8 @@ class MotifModel:
             self._note_dram(tag, d0)
             self.load_seconds[tag] = time.time() - t1
             self.log(f"MTP layer {L} (model.mtp_layers.0) loaded in {self.load_seconds[tag]:.1f} s (TT cache: {desc})")
+        # Phase C P4: the DP-row split of sp0 prefill passes (tt/prefill_sp.py; used when cfg.prefill_sp == "dp")
+        self.prefill_sp = PrefillSP(mesh_device, cfg, self.ccl, self.rope)
         # B2a: one compacted-prefill state for every MoE layer (upload mapper, local expert ids, combine columns, the
         # shapes compiled so far)
         self.prefill_moe_state = CompactPrefillState(owner=self)
@@ -898,10 +901,28 @@ class MotifModel:
             what = "an sp1 chunk" if chunk.is_sp1 else f"a {chunk.path} pass"
             raise ValueError(f"{what} reads the cached prefix: prefill_chunk needs kv_caches")
         X = self.embed.forward_prefill(tokens)
+        if not chunk.is_packed and self.prefill_sp.applies(C, chunk.path):
+            return self._prefill_layers_sp(X, n, kvs, C, page_table=chunk.fill_pt, rot=chunk.rot)
         for layer, kv in zip(self.layers[:n], kvs):
             Xn = layer.forward_prefill(X, chunk=chunk, kv_cache=kv)
             _free(X)
             X = Xn
+        return X
+
+    def _prefill_layers_sp(self, X, n: int, kvs, S: int, *, page_table, rot=None):
+        """Phase C P4 (``tt/prefill_sp.py``): the first ``n`` layers of an sp0 pass of ``S`` rows split over the DP
+        rows: split the embedding's streams, run :meth:`MotifDecoderLayer.forward_prefill_sp`, gather the streams.
+        Consumes ``X``; returns ``[1, 4, S, 4096]``, bitwise the release's."""
+        sp = self.prefill_sp
+        Xs = sp.split(X)
+        _free(X)
+        for layer, kv in zip(self.layers[:n], kvs):
+            Xn = layer.forward_prefill_sp(Xs, sp, S, page_table=page_table if kv is not None else None, kv_cache=kv,
+                                          rot=rot)
+            _free(Xs)
+            Xs = Xn
+        X = sp.gather(Xs)
+        _free(Xs)
         return X
 
     def attention_warm_layers(self) -> Tuple[int, ...]:
@@ -970,10 +991,14 @@ class MotifModel:
         n = self._stop(stop_after)
         kvs = self._check_kv(kv_caches, n)
         X = self.embed.forward_prefill(tokens)
-        for layer, kv in zip(self.layers[:n], kvs):
-            Xn = layer.forward_prefill(X, page_table=page_table if kv is not None else None, kv_cache=kv)
-            _free(X)
-            X = Xn
+        S = int(tokens.shape[-1])
+        if self.prefill_sp.applies(S, None):
+            X = self._prefill_layers_sp(X, n, kvs, S, page_table=page_table)
+        else:
+            for layer, kv in zip(self.layers[:n], kvs):
+                Xn = layer.forward_prefill(X, page_table=page_table if kv is not None else None, kv_cache=kv)
+                _free(X)
+                X = Xn
         if return_streams:
             return X
         if last_index is None:
@@ -994,6 +1019,9 @@ class MotifModel:
         free_tensors(self.embed)
         free_tensors(self.head)
         self.head.close()
+        sp = getattr(self, "prefill_sp", None)
+        if sp is not None:
+            sp.release()
         self.rope.release_prefill_tables()
         free_tensors(self.rope)
         st = getattr(self, "prefill_moe_state", None)

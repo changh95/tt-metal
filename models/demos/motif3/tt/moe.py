@@ -2229,6 +2229,23 @@ class MotifMoE:
             out = o2
         return out
 
+    def forward_prefill_rows(self, f, *, add_partial=None):
+        """Phase C P4 (``tt/prefill_sp.py``): the prefill MoE of a pass split over the DP rows. ``f [1, 1, R, 4096]`` =
+        this DP row's rows of the FFN input (``R = S / 4``); ``add_partial`` = this row's TP partial of the same rows.
+        All-gathers ``f`` over DP (the replicated input of :meth:`forward_prefill`), runs it up to RS(dp) + the partial,
+        then AR(tp) as there, without the final AG(dp). Returns ``[1, 1, R, 4096]`` bf16: bitwise this row's rows of
+        :meth:`forward_prefill`'s output. Never frees ``f`` / ``add_partial``."""
+        f_all = self.ccl.ag_dp(f, 2, race_free=True)
+        rs = self.forward_prefill(f_all, add_partial=add_partial, reduce_tp=False)
+        _free(f_all)
+        out = self.ccl.ar_tp(rs, race_free=True)
+        _free(rs)
+        if out.dtype != ttnn.bfloat16:
+            o2 = ttnn.typecast(out, ttnn.bfloat16, memory_config=self.dram)
+            _free(out)
+            out = o2
+        return out
+
     # ==========================================================================================================
     # misc
     # ==========================================================================================================

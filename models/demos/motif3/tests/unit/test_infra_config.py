@@ -2395,3 +2395,62 @@ def test_p2_host_knobs(monkeypatch):
     assert r.returncode == 0, r.stderr[-2000:]
     assert [ln for ln in r.stdout.splitlines() if ln.startswith("SHM")][-1] == "SHM 1"
 
+
+
+def test_p4_prefill_sp_knob(monkeypatch):
+    """Phase C P4 (logs/opt/phaseC/P4; tt/prefill_sp.py): ``MOTIF3_PREFILL_SP`` ("off" | "dp"; case and blanks ignored,
+    anything else refused; in ``describe``), ``MOTIF3_PREFILL_SP_MIN_ROWS`` (multiples of 512), which passes the split
+    serves, and the per-DP-row masks: every query keeps exactly the keys of the release's causal / window-129 SDPA."""
+    import torch
+
+    from models.demos.motif3.tt import prefill_sp as SPM
+    from models.demos.motif3.tt.model_config import DEFAULT_PREFILL_SP, DEFAULT_PREFILL_SP_MIN_ROWS, PREFILL_SP_MODES
+
+    assert PREFILL_SP_MODES == ("off", "dp") and SPM.PREFILL_SP_MODES is PREFILL_SP_MODES
+    for k in ("MOTIF3_PREFILL_SP", "MOTIF3_PREFILL_SP_MIN_ROWS"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = _cfg()
+    assert cfg.prefill_sp == DEFAULT_PREFILL_SP and cfg.prefill_sp_min_rows == DEFAULT_PREFILL_SP_MIN_ROWS == 4096
+    assert f"prefill_sp={cfg.prefill_sp}/{cfg.prefill_sp_min_rows} " in cfg.describe()
+    for v, want in ((" DP ", "dp"), ("off", "off"), ("", DEFAULT_PREFILL_SP)):
+        monkeypatch.setenv("MOTIF3_PREFILL_SP", v)
+        assert _cfg().prefill_sp == want, v
+    monkeypatch.setenv("MOTIF3_PREFILL_SP", "seq")
+    with pytest.raises(ValueError, match="MOTIF3_PREFILL_SP"):
+        _cfg()
+    monkeypatch.setenv("MOTIF3_PREFILL_SP", "dp")
+    for bad in ("256", "1000", "0"):
+        monkeypatch.setenv("MOTIF3_PREFILL_SP_MIN_ROWS", bad)
+        with pytest.raises(ValueError, match="MOTIF3_PREFILL_SP_MIN_ROWS"):
+            _cfg()
+    monkeypatch.setenv("MOTIF3_PREFILL_SP_MIN_ROWS", "2048")
+    cfg = _cfg()
+    assert cfg.prefill_sp == "dp" and cfg.prefill_sp_min_rows == 2048
+    # which passes: sp0 / the draft-1 call (path None), >= min rows, R = S / 4 a multiple of 256
+    assert SPM.sp_applies(cfg, 2048, "sp0") and SPM.sp_applies(cfg, 4096, None) and SPM.sp_applies(cfg, 8192, "sp0")
+    assert not SPM.sp_applies(cfg, 1024, "sp0")  # below the floor
+    assert not SPM.sp_applies(cfg, 4096, "sp1") and not SPM.sp_applies(cfg, 4096, "pk0")
+    assert not SPM.sp_applies(cfg, 2048 + 512, "sp0")  # R = 640: not whole 256-row chunks
+    assert not SPM.sp_applies(_cfg(prefill_sp="off"), 4096, "sp0")
+    assert SPM.sp_rows_ok(cfg, 1024) and not SPM.sp_rows_ok(cfg, 512)  # 512 = the largest traced bucket: never split
+    monkeypatch.delenv("MOTIF3_PREFILL_SP", raising=False)
+    monkeypatch.delenv("MOTIF3_PREFILL_SP_MIN_ROWS", raising=False)
+    assert all(L.window in (None, SPM.SP_TAIL + 1) for L in cfg.layers)
+
+    # masks: DP row d's query i is position p = d R + i; global keys = positions 0..S-1, SWA keys = the 3 tails
+    # [k R - 128, k R) then the row's own R positions. Kept keys must be exactly {0..p} / {max(0, p - 128)..p}, each once.
+    dp, S = 4, 2048
+    R = S // dp
+    g, w = SPM._masks_host(dp, S)
+    assert list(g.shape) == [dp, 1, R, S] and list(w.shape) == [dp, 1, R, 3 * 128 + R]
+    assert set(torch.unique(g).tolist()) == {0.0, float("-inf")} and set(torch.unique(w).tolist()) == {0.0, float("-inf")}
+    assert torch.equal(g.to(torch.bfloat16).float(), g) and torch.equal(w.to(torch.bfloat16).float(), w)
+    pos_w = [torch.cat([torch.arange(k * R - 128, k * R) for k in range(1, dp)] + [d * R + torch.arange(R)])
+             for d in range(dp)]
+    for d in range(dp):
+        for i in (0, 1, 127, 128, 129, R - 1):
+            p = d * R + i
+            kept = torch.nonzero(g[d, 0, i] == 0).flatten()
+            assert torch.equal(kept, torch.arange(p + 1)), (d, i)
+            kw = pos_w[d][w[d, 0, i] == 0].sort().values
+            assert torch.equal(kw, torch.arange(max(0, p - 128), p + 1)), (d, i)

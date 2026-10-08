@@ -296,6 +296,7 @@ from .ccl import MotifCCL
 from .generator_api import PACK_BATCHES, PACK_SEG_BUCKETS, PACK_SP1_SEG_BUCKETS, PACKED_PASS_KINDS, PK1_TAIL_VARIANTS
 from .model_config import TILE, LayerSpec, MotifTTConfig, make_compute_kernel_config, mcast1d_matmul_pc
 from .rope import MotifRope, decode_rows_per_dp
+from .prefill_sp import SP_TAIL
 
 # Packed prefill passes (P5, docs/p5_t64/P5_T64_DESIGN.md §3): "pk0" = sp0 segments, "pk1" = sp1 segments at one start.
 PK0, PK1 = PACKED_PASS_KINDS
@@ -2121,6 +2122,73 @@ class MotifAttention:
             self._fill_latent(n, k_pe, page_table, kv_cache)
         ttnn.deallocate(n)
         ttnn.deallocate(k_pe)
+        return out
+
+    def forward_prefill_sp(self, x, sp, S: int, *, page_table=None, kv_cache=None, rot: RotArg = None):
+        """Phase C P4 (``tt/prefill_sp.py``, ``MOTIF3_PREFILL_SP=dp``): the sp0 prefill of a pass of ``S`` rows split
+        over the DP rows. ``x [1, 1, R, 4096]`` = this DP row's rows ``[d R, d R + R)`` (``R = S / 4``) ->
+        ``[1, 1, R, 4096]``, bitwise the rows of :meth:`forward_prefill`'s output. ``sp``: the model's
+        :class:`~models.demos.motif3.tt.prefill_sp.PrefillSP`. The latent of all S rows is all-gathered over DP and
+        filled through ``page_table`` exactly as :meth:`forward_prefill` fills it. ``rot`` as there (sp0: ``None``)."""
+        R = int(x.shape[-2])
+        if R * int(self.cfg.dp) != int(S):
+            raise ValueError(f"forward_prefill_sp: {R} rows per DP row for a pass of {S}")
+        cos, sin = sp.cos_sin(self.kind, S, None if rot is None else self._rot_tables(rot))
+        q, g, n, kpe, lam = self._project(x, decode=False)
+        q_full = self._q_expanded(q, cos, sin)  # [1, 10, R, 192], HF head order
+        k_pe = self._rope(kpe, cos, sin)  # [1, 1, R, 64]
+        ttnn.deallocate(kpe)
+        if not sp.is_cached_rot((cos, sin)):
+            ttnn.deallocate(cos)
+            ttnn.deallocate(sin)
+        lat = ttnn.concat([n, k_pe], dim=-1)  # [1, 1, R, 576]: this row's rows of the cache-fill latent
+        ttnn.deallocate(n)
+        ttnn.deallocate(k_pe)
+        lat_all = self.ccl.ag_dp(lat, 2, race_free=True)  # [1, 1, S, 576] on every chip
+        masks = sp.masks(S)
+        rank, w = self.rank, self.rank + self.rope_dim
+        if self.window is None:
+            src, mask = lat_all, masks["global"]
+        else:  # [tail_1 | tail_2 | tail_3 | own R rows] (tt/prefill_sp.py)
+            T = SP_TAIL
+            parts = [ttnn.slice(lat_all, [0, 0, k * R - T, 0], [1, 1, k * R, w]) for k in range(1, int(self.cfg.dp))]
+            src = ttnn.concat(parts + [lat], dim=2)
+            for t in parts:
+                ttnn.deallocate(t)
+            mask = masks["swa"]
+        ttnn.deallocate(lat)
+        Kn = int(src.shape[-2])
+        n_k = ttnn.slice(src, [0, 0, 0, 0], [1, 1, Kn, rank])
+        kpe_k = ttnn.slice(src, [0, 0, 0, rank], [1, 1, Kn, w])
+        if src is not lat_all:
+            ttnn.deallocate(src)
+        k_full, v_pad = self._expanded_kv(n_k, kpe_k)  # [1, 2, Kn, 192] each
+        ttnn.deallocate(n_k)
+        ttnn.deallocate(kpe_k)
+        _, ckc = self.prefill_sdpa_window_and_config(S)  # the release call's compute config (bitwise)
+        o = ttnn.transformer.scaled_dot_product_attention(
+            q_full,
+            k_full,
+            v_pad,
+            is_causal=False,
+            attn_mask=mask,
+            scale=1.0,
+            program_config=self.cfg.sdpa_prefill_pc(self.spec, seq_len=S),
+            compute_kernel_config=ckc,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )  # [1, 10, R, 192]
+        ttnn.deallocate(q_full)
+        ttnn.deallocate(k_full)
+        ttnn.deallocate(v_pad)
+        o_v = ttnn.slice(o, [0, 0, 0, 0], [1, self.H, R, self.vdim])
+        ttnn.deallocate(o)
+        out = self._expanded_epilogue(o_v, g, lam, None)
+        if kv_cache is not None:
+            if page_table is None:
+                raise ValueError("forward_prefill_sp: kv_cache given without page_table")
+            self._fill_rows(lat_all, page_table, kv_cache, keep=False)
+        else:
+            ttnn.deallocate(lat_all)
         return out
 
     # ---- shared prefill building blocks (the draft-1 op sequence, split into helpers) --------------------------------

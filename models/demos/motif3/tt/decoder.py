@@ -264,6 +264,27 @@ class MotifDecoderLayer:
             _free(x_red, a, o, y_red, f, u, X1)
         return X2
 
+    def forward_prefill_sp(self, Xs, sp, S: int, *, page_table=None, kv_cache=None, rot=None):
+        """Phase C P4 (``tt/prefill_sp.py``): :meth:`forward_prefill` of an sp0 pass of ``S`` rows split over the DP
+        rows. ``Xs [1, 4, R, 4096]`` = this DP row's rows ``[d R, d R + R)`` -> ``[1, 4, R, 4096]``, bitwise the same
+        rows of :meth:`forward_prefill`'s output (``page_table`` = the pass's fill table, ``rot`` = ``chunk.rot``)."""
+        x_red, c1 = self.mhc_attn.pre(Xs)
+        a = self._norm_prefill(x_red, self.input_norm)
+        o = self.attn.forward_prefill_sp(a, sp, S, page_table=page_table if kv_cache is not None else None,
+                                         kv_cache=kv_cache, rot=rot)
+        X1 = self.mhc_attn.post(Xs, o, c1)
+        y_red, c2 = self.mhc_ffn.pre(X1)
+        f = self._norm_prefill(y_red, self.post_attn_norm)
+        if self.is_moe:
+            part = self.shared.forward_prefill(f, all_reduce=False)  # this row's rows: the release's dp_slice(f)
+            u = self.moe.forward_prefill_rows(f, add_partial=part)
+            _free(part)
+        else:
+            u = self.mlp.forward_prefill(f)
+        X2 = self.mhc_ffn.post(X1, u, c2)
+        _free(x_red, a, o, y_red, f, u, X1)
+        return X2
+
     # ------------------------------------------------------------------------------------------------------------
     def deallocate(self) -> None:
         """Free this layer's device weights (the shared ccl / rope stay)."""

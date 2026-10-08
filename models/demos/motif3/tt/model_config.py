@@ -191,6 +191,15 @@ PREFILL_MOE_COMBINE_MODES = ("matmul", "gather")
 # copy_host_to_device_tensor into a fresh device tensor; ~0.1 ms of host time per MoE layer) | "from_torch" (B2a: one
 # sharded ttnn.from_torch per MoE layer, ~0.67 ms of host time). The same bytes reach the same ops: bitwise equal.
 PREFILL_MOE_UPLOAD_MODES = ("staged", "from_torch")
+# DP-row sequence split of the non-MoE prefill (Phase C P4, docs/OPTIMIZATION_PLAN.md §3.3 C1; tt/prefill_sp.py,
+# MOTIF3_PREFILL_SP): "off" (the release: every DP row runs every row of the pass outside the MoE) | "dp" (an sp0
+# non-packed pass of >= prefill_sp_min_rows rows keeps its residual streams split over the 4 DP rows; the attention
+# all-gathers the 576-wide latent, the MoE its input rows; bitwise equal to "off", logs/opt/phaseC/P4).
+PREFILL_SP_MODES = ("off", "dp")
+DEFAULT_PREFILL_SP = "off"
+# The smallest pass the split serves (MOTIF3_PREFILL_SP_MIN_ROWS): at 1024 rows the eager pass is host-bound and the
+# split is slower (5-layer wrapper 56.1 -> 58.1 ms), at 2048 it gains 12 %, at 4096 33 % (logs/opt/phaseC/P4).
+DEFAULT_PREFILL_SP_MIN_ROWS = 4096
 # MotifCCL(ring_gather=...): "safe" (DEFAULT, lead decision 2026-10-03: the native single-page decode gathers still race
 # ~1 event per 1e4 decode steps -- silent stale tiles, docs/determinism/FIX.md -- and +0.26-0.45 ms per decode step is
 # cheap; T64 also requires it) reroutes every race-prone gather. "lean" routes every all-gather that ttnn would run on its multicast factory
@@ -1442,6 +1451,9 @@ class MotifTTConfig:
     prefill_moe_combine: str = "matmul"  # MOTIF3_PREFILL_MOE_COMBINE
     # P2: how the B2a host path uploads its row words ("staged" | "from_torch"; PREFILL_MOE_UPLOAD_MODES). Bitwise equal.
     prefill_moe_upload: str = "staged"  # MOTIF3_PREFILL_MOE_UPLOAD
+    # Phase C P4: DP-row sequence split of the non-MoE prefill ("off" | "dp"; PREFILL_SP_MODES) and its smallest pass.
+    prefill_sp: str = DEFAULT_PREFILL_SP  # MOTIF3_PREFILL_SP
+    prefill_sp_min_rows: int = DEFAULT_PREFILL_SP_MIN_ROWS  # MOTIF3_PREFILL_SP_MIN_ROWS
     # Per-decode-step host input staging (B6a): "fast" (default: the same device inputs with fewer host ops) |
     # "release" (the release code); generator_api.HOST_STAGING_MODES. Host only: device programs and inputs unchanged.
     host_staging: str = "fast"  # MOTIF3_HOST_STAGING
@@ -1511,7 +1523,7 @@ class MotifTTConfig:
           ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
-          ``MOTIF3_PREFILL_MAX_BUCKET``,
+          ``MOTIF3_PREFILL_SP``, ``MOTIF3_PREFILL_SP_MIN_ROWS``, ``MOTIF3_PREFILL_MAX_BUCKET``,
           ``MOTIF3_PACKED_PREFILL_MAX_SEG`` / ``_MAX_TOKENS`` / ``_PK1``, ``MOTIF3_WEIGHTS_DIR`` /
           ``HF_MODEL``, ``TT_MODEL_WEIGHTS_REVISION``.
         * Explicit ``overrides`` win (any field, plus ``kv_cache_dtype="bfp8"|"bf16"`` mapped onto ``dtypes``).
@@ -1629,6 +1641,8 @@ class MotifTTConfig:
             prefill_moe_dispatch=(os.environ.get("MOTIF3_PREFILL_MOE_DISPATCH") or "host").strip().lower(),
             prefill_moe_combine=(os.environ.get("MOTIF3_PREFILL_MOE_COMBINE") or "matmul").strip().lower(),
             prefill_moe_upload=(os.environ.get("MOTIF3_PREFILL_MOE_UPLOAD") or "staged").strip().lower(),
+            prefill_sp=(os.environ.get("MOTIF3_PREFILL_SP") or DEFAULT_PREFILL_SP).strip().lower(),
+            prefill_sp_min_rows=_env_int("MOTIF3_PREFILL_SP_MIN_ROWS", DEFAULT_PREFILL_SP_MIN_ROWS),
             host_staging=(os.environ.get("MOTIF3_HOST_STAGING") or "fast").strip().lower(),
             host_wait=(os.environ.get("MOTIF3_HOST_WAIT") or "spin").strip().lower(),
             prefill_trace=os.environ.get("MOTIF3_PREFILL_TRACE") or "128",
@@ -1844,6 +1858,14 @@ class MotifTTConfig:
             raise ValueError(
                 f"prefill_moe_upload (MOTIF3_PREFILL_MOE_UPLOAD) must be one of {PREFILL_MOE_UPLOAD_MODES}, got "
                 f"{self.prefill_moe_upload!r}"
+            )
+        if self.prefill_sp not in PREFILL_SP_MODES:
+            raise ValueError(f"prefill_sp (MOTIF3_PREFILL_SP) must be one of {PREFILL_SP_MODES}, got {self.prefill_sp!r}")
+        spr = self.prefill_sp_min_rows
+        if isinstance(spr, bool) or not isinstance(spr, int) or spr < 512 or spr % 512:
+            raise ValueError(
+                f"prefill_sp_min_rows (MOTIF3_PREFILL_SP_MIN_ROWS) must be a multiple of 512 (4 DP rows of whole 128-row "
+                f"SDPA chunks), got {spr!r}"
             )
         mr = self.prefill_moe_min_rows
         if isinstance(mr, bool) or not isinstance(mr, int) or mr < TILE or mr % TILE:
@@ -2581,7 +2603,7 @@ class MotifTTConfig:
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
             f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} ag_rows_layout={self.ag_rows_layout} "
-            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
+            f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} prefill_sp={self.prefill_sp}/{self.prefill_sp_min_rows} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
@@ -2632,6 +2654,9 @@ __all__ = [
     "PREFILL_MOE_COMBINE_MODES",
     "PREFILL_MOE_DISPATCH_MODES",
     "PREFILL_MOE_UPLOAD_MODES",
+    "PREFILL_SP_MODES",
+    "DEFAULT_PREFILL_SP",
+    "DEFAULT_PREFILL_SP_MIN_ROWS",
     "SHM_TRACKING_MODES",
     "apply_host_env",
     "DEFAULT_PREFILL_MOE_MIN_ROWS",
