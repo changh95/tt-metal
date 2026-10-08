@@ -861,3 +861,60 @@ def test_ag_dp_rows_kernel_layout(mesh_device, device_params):
         ttnn.deallocate(out)
         ttnn.deallocate(x)
     assert not failures, failures
+
+
+@pytest.mark.parametrize("mesh_device, device_params", [MESH_4x8[0]], indirect=True)
+def test_partition_rows_kernel(mesh_device, device_params):
+    """Phase C D4 (``MOTIF3_AG_ROWS_LAYOUT=kernel``): ``MotifCCL.partition(x, 2, "dp")`` of a TILE ``[1, 1, 4 L, W]``
+    (L = 8 / 16: the decode MoE combine's slice of the AR(dp) output) through ``rm_tile/pick_rows.cpp`` is bitwise the
+    release's untilize + mesh_partition + tilize, padding rows included (zero), for DRAM / L1 inputs and outputs, and
+    traced replays with new inputs equal the eager ops."""
+    log_fabric(mesh_device, "partition_rows_kernel")
+    cfg = MotifTTConfig.from_hf_config(mesh_device=mesh_device)
+    ops = MotifCCL(mesh_device, cfg, rows_layout="ops")
+    ker = MotifCCL(mesh_device, cfg, rows_layout="kernel")
+    R, C = (int(s) for s in tuple(mesh_device.shape))
+    mapper = ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C))
+    g = torch.Generator().manual_seed(46)
+    failures = []
+
+    def padded(t, W):  # all 32 rows of the output tile row (a metadata view: the padded shape is unchanged)
+        return device_tensors_to_torch(ttnn.reshape(t, (1, 1, 32, W), (1, 1, 32, W)), mesh_device)
+
+    for L, W in ((8, 4096), (16, 4096), (8, 576)):
+        for imc in (ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG):
+            for omc in (ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG):
+                x = ttnn.from_torch(torch.randn(R, C, 4 * L, W, generator=g), dtype=ttnn.bfloat16,
+                                    layout=ttnn.TILE_LAYOUT, device=mesh_device, mesh_mapper=mapper, memory_config=imc)
+                a = ker.partition(x, 2, "dp", memory_config=omc)
+                b = ops.partition(x, 2, "dp", memory_config=omc)
+                ok = bool(torch.equal(padded(a, W), padded(b, W)))
+                tag = f"L={L} W={W} in {imc.buffer_type} out {omc.buffer_type}"
+                print(f"[infra] D4 partition kernel == ops bitwise incl. padding rows ({tag}): {ok}")
+                if not ok:
+                    failures.append(tag)
+                for t in (a, b, x):
+                    ttnn.deallocate(t)
+    x = ttnn.from_torch(torch.randn(R, C, 32, 4096, generator=g), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        device=mesh_device, mesh_mapper=mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(ker.partition(x, 2, "dp"))
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    out = ker.partition(x, 2, "dp")
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    try:
+        for it in range(3):
+            new = ttnn.from_torch(torch.randn(R, C, 32, 4096, generator=g), dtype=ttnn.bfloat16,
+                                  layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
+            ttnn.copy_host_to_device_tensor(new, x)
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
+            ref = ops.partition(x, 2, "dp")
+            ok = bool(torch.equal(padded(out, 4096), padded(ref, 4096)))
+            ttnn.deallocate(ref)
+            print(f"[infra] D4 partition kernel traced replay {it} == eager ops bitwise: {ok}")
+            if not ok:
+                failures.append(f"trace replay {it}")
+    finally:
+        ttnn.release_trace(mesh_device, tid)
+        ttnn.deallocate(out)
+        ttnn.deallocate(x)
+    assert not failures, failures

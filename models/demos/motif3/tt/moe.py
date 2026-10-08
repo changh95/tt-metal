@@ -1296,6 +1296,10 @@ class MotifMoE:
         if self.decode_ccl not in MOE_DECODE_CCL_MODES:
             raise ValueError(f"decode_ccl must be one of {MOE_DECODE_CCL_MODES}, got {self.decode_ccl!r}")
         self._row_fold = None  # the shared tt/kernels/row_fold.RowFold of this mesh (built on first use)
+        # D4 (MOTIF3_AG_ROWS_LAYOUT=kernel): build the CCL's row-layout kernels (and the partition kernel's per-chip
+        # axis index tensor, a host write) now, before any trace capture can run this layer's decode
+        if getattr(ccl, "rows_layout", "ops") == "kernel" and hasattr(ccl, "_rows_kernel"):
+            ccl._rows_kernel()
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)

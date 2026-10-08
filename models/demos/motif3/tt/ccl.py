@@ -834,6 +834,9 @@ class MotifCCL:
         tile_unaligned = x.layout == ttnn.TILE_LAYOUT and d >= len(shape) - 2 and (shape[d] // n) % 32 != 0
         if not tile_unaligned:
             return ttnn.mesh_partition(x, dim, ca, memory_config=mc)
+        rl = self._rows_kernel()
+        if rl is not None and len(shape) == 4 and d == 2 and rl.pick_supported(x, n, mc):
+            return rl.pick_rows(x, n, ca, memory_config=mc)  # D4: two NoC reads per tile, bitwise the ops below
         rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=mc)
         part = ttnn.mesh_partition(rm, dim, ca, memory_config=mc)
         ttnn.deallocate(rm)
@@ -928,13 +931,18 @@ class MotifCCL:
 
     def _rows_kernel(self):
         """D4 (``rows_layout="kernel"``, ``MOTIF3_AG_ROWS_LAYOUT``): the mesh's :class:`~.kernels.rm_tile.RowLayout`
-        for :meth:`ag_dp_rows`' untilize / tilize (bf16; other dtypes keep ``ttnn.to_layout``), else ``None``."""
+        for :meth:`ag_dp_rows`' untilize / tilize and :meth:`partition`'s 8 / 16-row TILE slices (bf16; anything else
+        keeps the ops), else ``None``. Built on first use (the decode warmup, before any trace capture)."""
         if getattr(self, "rows_layout", "ops") != "kernel":
             return None
         if self._row_layout is None:
             from .kernels.rm_tile import RowLayout  # lazy: generic_op kernels
 
-            self._row_layout = RowLayout(self.mesh_device)
+            rl = RowLayout(self.mesh_device)
+            for ca in (0, 1):  # the partition kernel's per-chip axis index, allocated here (before any trace capture)
+                if self.axes.mesh_shape[ca] > 1:
+                    rl.axis_index(ca)
+            self._row_layout = rl
         return self._row_layout
 
     def rs_dp(self, x, dim: int = 2, **kw):

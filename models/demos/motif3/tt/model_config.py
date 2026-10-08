@@ -157,11 +157,14 @@ MHC_DECODE_MODES = ("ops", "fused")
 # | "rs" (tt/kernels/row_fold.py: fold each DP row's L x 4096 block into 4 L x 1024 (whole tiles), ONE reduce-scatter
 # over DP on dim 1 (no DP all-gather), + the folded add_partial, AR(tp) on the folded rows (4x fewer tiles), unfold back
 # to [1, 1, L, 4096]). The same terms are summed in another order (the RS reduces on the row's own chip, the AR on the
-# column block's; the TP owner of an element changes too), so "rs" is not bitwise equal to "ar".
+# column block's; the TP owner of an element changes too), so "rs" is not bitwise equal to "ar", and its DP order
+# depends on the lane's DP row: NOT lane-position invariant (fails the spec lane-relocation / lossless gates).
+# Experimental; never the default.
 MOE_DECODE_CCL_MODES = ("ar", "rs")
 # Layout changes of the decode row gather MotifCCL.ag_dp_rows (Phase C D4 "fewer to_layouts"; MotifCCL(rows_layout=...)):
 # "ops" (ttnn.to_layout untilize / tilize: 4.6 + 11 us at [8 | 32, 4096]) | "kernel" (tt/kernels/rm_tile.py: pure data
-# movement on 64 cores, bitwise equal; bf16 TILE <-> L1 ROW_MAJOR only, anything else keeps the ops).
+# movement on 64 cores, bitwise equal; bf16 TILE <-> L1 ROW_MAJOR only, anything else keeps the ops; also
+# MotifCCL.partition's 8 / 16-row TILE slices, e.g. the decode MoE combine after AR(dp)).
 AG_ROWS_LAYOUT_MODES = ("ops", "kernel")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
