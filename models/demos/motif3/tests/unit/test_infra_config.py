@@ -2260,6 +2260,93 @@ def test_d3_mhc_decode_knob(monkeypatch):
     assert MD.DEFAULT_EXPAND == "auto" and "split_zero_hi_min" in MD.EXPAND_MODES
 
 
+def test_d4_moe_decode_ccl_knob(monkeypatch):
+    """Phase C D4 (logs/opt/phaseC/D4): ``MOTIF3_MOE_DECODE_CCL`` ("ar" default | "rs"; case and blanks ignored,
+    anything else refused; in ``describe``), ``RowFold.supports_shape``, and the index math of
+    ``tt/kernels/row_fold/{fold,unfold}.cpp`` emulated on tile-face memory against the logical reshapes they implement."""
+    import torch
+
+    from models.demos.motif3.tt.kernels.row_fold import RowFold
+    from models.demos.motif3.tt.model_config import MOE_DECODE_CCL_MODES
+
+    assert MOE_DECODE_CCL_MODES == ("ar", "rs")
+    monkeypatch.delenv("MOTIF3_MOE_DECODE_CCL", raising=False)
+    default = _cfg().moe_decode_ccl
+    assert default == "ar" and f"moe_decode_ccl={default} " in _cfg().describe()
+    for v, want in ((" RS ", "rs"), ("ar", "ar"), ("", default)):
+        monkeypatch.setenv("MOTIF3_MOE_DECODE_CCL", v)
+        assert _cfg().moe_decode_ccl == want, v
+    monkeypatch.setenv("MOTIF3_MOE_DECODE_CCL", "rs_dp")
+    with pytest.raises(ValueError, match="MOTIF3_MOE_DECODE_CCL"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_MOE_DECODE_CCL", raising=False)
+    assert RowFold.supports_shape(8, 4096) and RowFold.supports_shape(16, 4096) and RowFold.supports_shape(32, 4096)
+    assert not RowFold.supports_shape(4, 4096) and not RowFold.supports_shape(8, 4000)
+    assert not RowFold.supports_shape(8, 4096, n=8) and not RowFold.supports_shape(40, 4096)
+
+    # tile-face memory: tensor [rows, cols] (multiples of 32) -> pages of 1024 words, face-major within a tile
+    def to_tiles(t):
+        R, C = t.shape
+        tt_ = t.reshape(R // 32, 2, 16, C // 32, 2, 16).permute(0, 3, 1, 4, 2, 5)  # tr, tc, fr, fc, r, c
+        return tt_.reshape(-1, 1024).clone()
+
+    def from_tiles(p, R, C):
+        return p.reshape(R // 32, C // 32, 2, 2, 16, 16).permute(0, 2, 4, 1, 3, 5).reshape(R, C)
+
+    def fold_emul(P, N, L, H):  # fold.cpp, element-wise (one face row = 16 words)
+        F, HT, FT, RT = H // N, H // 32, H // N // 32, L * N // 32
+        KB = 32 // N
+        pt = to_tiles(P)
+        out = torch.zeros(N * RT * FT, 1024, dtype=P.dtype)
+        for o in range(out.shape[0]):
+            b, rem = divmod(o, RT * FT)
+            rt, ct = divmod(rem, FT)
+            srow = L * b + KB * rt
+            srr = srow % 32
+            band_off = (srr // 16) * 2 * 256 + (srr % 16) * 16
+            bands = {}
+            for q in range(N):
+                page = (srow // 32) * HT + q * FT + ct
+                for half in range(2):
+                    bands[(q, half)] = pt[page, band_off + half * 256: band_off + half * 256 + KB * 16]
+            for rr in range(32):
+                q, k = rr % N, rr // N
+                d = (rr // 16) * 2 * 256 + (rr % 16) * 16
+                for half in range(2):
+                    out[o, d + half * 256: d + half * 256 + 16] = bands[(q, half)][k * 16: k * 16 + 16]
+        return out  # pages of Q [1, N, L N, F]: (b, rt, ct)
+
+    def unfold_emul(Rm, N, L, F):  # unfold.cpp
+        FT, RT = F // 32, L * N // 32
+        rt_ = to_tiles(Rm)
+        out = torch.zeros(N * FT, 1024, dtype=Rm.dtype)
+        for o in range(N * FT):
+            q, ct = divmod(o, FT)
+            for j in range(L):
+                s_ = N * j + q
+                sr = s_ % 32
+                so = (sr // 16) * 2 * 256 + (sr % 16) * 16
+                d = (j // 16) * 2 * 256 + (j % 16) * 16
+                for half in range(2):
+                    out[o, d + half * 256: d + half * 256 + 16] = rt_[(s_ // 32) * FT + ct, so + half * 256:
+                                                                      so + half * 256 + 16]
+        return out
+
+    g = torch.Generator().manual_seed(0)
+    N, H = 4, 512  # (the kernels' index math does not depend on H beyond H % 128 == 0)
+    for L in (8, 16):
+        P = torch.randn(N * L, H, generator=g)
+        Q = P.reshape(N, L * N, H // N)  # the logical reshape [1, 1, N L, H] -> [1, N, L N, F]
+        got = fold_emul(P, N, L, H)
+        want = torch.cat([to_tiles(Q[b]) for b in range(N)])
+        assert torch.equal(got, want), L
+        Rm = torch.randn(L * N, H // N, generator=g)
+        got_u = unfold_emul(Rm, N, L, H // N)
+        full = from_tiles(got_u, 32, H)
+        assert torch.equal(full[:L], Rm.reshape(L, H)), L  # the logical reshape [1, 1, L N, F] -> [1, 1, L, H]
+        assert (full[L:] == 0).all()
+
+
 def test_p2_host_knobs(monkeypatch):
     """P2 (logs/opt/phaseC/P2): ``MOTIF3_PREFILL_MOE_UPLOAD`` ("staged" default | "from_torch"; case and blanks ignored,
     anything else refused; in ``describe``) and ``MOTIF3_SHM_TRACKING`` (``host_env.apply_host_env``: "off" default

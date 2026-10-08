@@ -160,16 +160,16 @@ the host and on a (1, 8) submesh (``test_moe_device_submesh_1x8``).
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import ttnn
 
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL, device_tensors_to_torch
-from .model_config import (DECODE_EXPERTS_MODES, MOE_POLYNORM_MODES, PREFILL_MOE_COMBINE_MODES,
-                           PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES, PREFILL_MOE_UPLOAD_MODES, ROUTER_MASK_MODES,
-                           TILE, MotifTTConfig, mcast1d_matmul_pc)
+from .model_config import (DECODE_EXPERTS_MODES, MOE_DECODE_CCL_MODES, MOE_POLYNORM_MODES,
+                           PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES,
+                           PREFILL_MOE_UPLOAD_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc)
 
 POLYNORM_MODES = ("fp32", "bf16")
 POLYNORM_IMPLS = ("horner", "rms", "local")  # tt/polynorm.py impls + this file's G6 copy
@@ -189,6 +189,9 @@ def _free(*ts) -> None:
     for t in ts:
         if t is not None:
             ttnn.deallocate(t)
+
+
+_ROW_FOLDS: Dict[int, Any] = {}  # id(mesh_device) -> the D4 RowFold of that mesh (MotifMoE.row_fold)
 
 
 class _Keep:
@@ -1116,6 +1119,7 @@ class MotifMoE:
         prefill_moe: Optional[str] = None,
         prefill_moe_dispatch: Optional[str] = None,
         prefill_moe_combine: Optional[str] = None,
+        decode_ccl: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -1283,6 +1287,11 @@ class MotifMoE:
         self.compact_state = CompactPrefillState(owner=self)  # MotifModel hands every layer one shared state
         self._pn_host = None  # [P, 12, 4] fp32 (bf16 values): this layer's c0, c1, c2, b per chip
         self._pn_bits = None  # the same as int32 bf16 bit patterns (numpy), for compact_upload_fast
+        # D4: "ar" (AR(dp) + partition, the release) | "rs" (row fold + RS(dp) + unfold); MOTIF3_MOE_DECODE_CCL
+        self.decode_ccl = str(decode_ccl if decode_ccl is not None else getattr(cfg, "moe_decode_ccl", "ar") or "ar")
+        if self.decode_ccl not in MOE_DECODE_CCL_MODES:
+            raise ValueError(f"decode_ccl must be one of {MOE_DECODE_CCL_MODES}, got {self.decode_ccl!r}")
+        self._row_fold = None  # the shared tt/kernels/row_fold.RowFold of this mesh (built on first use)
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
@@ -1416,7 +1425,7 @@ class MotifMoE:
         return part
 
     def local_partial(self, f, *, polynorm: str, decode: bool, taps: Optional[dict] = None, memory_config=None,
-                      lane_mask=None):
+                      lane_mask=None, part_memory_config=None):
         """This chip's routed partial for the tokens ``f [1, 1, M, 4096]`` (identical on all chips): route, mask,
         experts, combine -> ``[1, 1, M, 4096]`` in ``combine_dtype``, DRAM (still to be summed over all 32 chips).
         ``memory_config``: intermediates (decode: L1). ``taps`` (tests) receives ``idx``, ``w`` (unscaled when
@@ -1428,8 +1437,11 @@ class MotifMoE:
         step's live rows in gathered order; :meth:`decode_lane_mask`) zeroes the routing weights of inactive rows
         first (``None``: no masking -- still exact on every row, only fewer experts are skipped), then
         :meth:`sparse_experts` skips the local experts with no routed row. ``taps`` then also get ``sparsity`` and
-        ``w_loc`` is the masked one. ``lane_mask`` is ignored on the dense path (it is the caller's; never freed)."""
+        ``w_loc`` is the masked one. ``lane_mask`` is ignored on the dense path (it is the caller's; never freed).
+        ``part_memory_config``: where the decode partial goes (default DRAM; D4's ``decode_ccl="rs"`` keeps it in L1
+        for the fold kernel)."""
         mc = memory_config or self.dram
+        pmc = part_memory_config or self.dram
         M = int(f.shape[-2])
         consts = getattr(self, "scatter_consts", {}).get(M) if decode else None
         fused = getattr(self, "router_fused", None) if decode and M in getattr(self, "decode_rows", ()) else None
@@ -1465,10 +1477,10 @@ class MotifMoE:
             y = self.sparse_experts(f, s, polynorm=polynorm, row_scale=w_loc, memory_config=mc)
             if taps is None:
                 _free(s)
-            part = self.reduce_experts(y, memory_config=self.dram)
+            part = self.reduce_experts(y, memory_config=pmc)
         elif self.combine_mode == "fold":
             y = self.experts(f, polynorm=polynorm, decode=decode, row_scale=w_loc, memory_config=mc)
-            part = self.reduce_experts(y, memory_config=self.dram)
+            part = self.reduce_experts(y, memory_config=pmc if decode else self.dram)
         else:
             y = self.experts(f, polynorm=polynorm, decode=decode, memory_config=mc)
             part = self.combine(y, w_loc, memory_config=self.dram)
@@ -2065,18 +2077,53 @@ class MotifMoE:
                 f"its 64-row constants exist before any trace capture, F3N rule R3)"
             )
         f_all = self.ccl.ag_dp_rows(x, memory_config=self.decode_mc)  # [1, 1, 4 L, 4096], natural order L dp + j
+        rs = self.decode_rs_applies(rows)
+        kw = dict(part_memory_config=self.decode_mc) if rs else {}  # D4: the partial stays in L1 for the fold
         part = self.local_partial(f_all, polynorm=self.decode_polynorm, decode=True, taps=taps,
-                                  memory_config=self.decode_mc, lane_mask=lane_mask)
+                                  memory_config=self.decode_mc, lane_mask=lane_mask, **kw)
         if taps is not None:
             taps["f_all"] = f_all
             taps["part"] = part
         keep = _Keep(x, add_partial, lane_mask, *(taps.values() if taps is not None else ()))
         keep.drop(f_all)  # (is x itself when the DP axis has size 1)
+        if rs:  # D4: fold -> RS(dp) on dim 1 -> unfold (module docstring of tt/kernels/row_fold.py)
+            rf = self.row_fold()
+            q = rf.fold(part, rows, memory_config=self.decode_mc)  # [1, 4, 4 L, 1024]
+            keep.drop(part, q)
+            r = self.ccl.reduce_scatter(q, 1, "dp", memory_config=self.decode_mc)  # [1, 1, 4 L, 1024]: this row, summed
+            keep.drop(q, r)
+            mine = rf.unfold(r, rows, memory_config=self.decode_mc)  # [1, 1, L, 4096]
+            keep.drop(r, mine)
+            return self._close_tp(mine, add_partial, reduce_tp, keep)
         red = self.ccl.ar_dp(part)  # sum over the 4 chips of this column (all 4 L tokens)
         keep.drop(part, red)
         mine = self.ccl.partition(red, 2, "dp")  # this row's L rows
         keep.drop(red, mine)
         return self._close_tp(mine, add_partial, reduce_tp, keep)
+
+    def decode_rs_applies(self, rows: int) -> bool:
+        """D4 (``decode_ccl="rs"``): whether this decode call takes the fold + RS(dp) + unfold path: bf16 partials, a
+        4-chip DP axis, ``rows`` (L per DP row) a multiple of 8 up to 32, the hidden size a multiple of 128. Anything
+        else (e.g. a size-1 DP axis on a test mesh, fp32 ``combine_dtype``) keeps the AR(dp) + partition path."""
+        if getattr(self, "decode_ccl", "ar") != "rs" or self.combine_dtype != ttnn.bfloat16 \
+                or self.ccl.axis_size("dp") != 4:
+            return False
+        from .kernels.row_fold import RowFold  # lazy: generic_op kernels
+
+        return RowFold.supports_shape(int(rows), int(self.hidden), 4)
+
+    def row_fold(self):
+        """The mesh's shared :class:`~models.demos.motif3.tt.kernels.row_fold.RowFold` (program descriptors shared by
+        every layer: the layer's tensors are runtime args)."""
+        if getattr(self, "_row_fold", None) is None:
+            from .kernels.row_fold import RowFold  # lazy: generic_op kernels
+
+            key = id(self.mesh_device)
+            rf = _ROW_FOLDS.get(key)
+            if rf is None or rf.mesh_device is not self.mesh_device:
+                rf = _ROW_FOLDS[key] = RowFold(self.mesh_device)
+            self._row_fold = rf
+        return self._row_fold
 
     def _close_tp(self, part, add_partial, reduce_tp, keep: _Keep):
         if add_partial is not None:

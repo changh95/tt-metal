@@ -735,7 +735,15 @@ RACE_PAYLOADS = [
     ("moe_combine_bucket_128", "ar", [1, 1, 32, 4096], ttnn.bfloat16, 1, True, "27 / 3000 (the [32, 512] gather)"),
     ("moments_bucket_128_and_decode", "ag", [1, 3, 32, 32], ttnn.float32, 1, False, "0 / 3000"),
     ("ar_tp_decode", "ar", [1, 1, 8, 4096], ttnn.bfloat16, 1, False, "27 / 3000 (the padded [32, 512] gather)"),
+    # Phase C D4 (MOTIF3_MOE_DECODE_CCL=rs): the new DP-axis collective, a direct reduce-scatter on dim 1 of the folded
+    # decode partial [1, 4, 32, 1024] (no gather, so no alternate routes), and the whole D4 chain (fold, RS(dp),
+    # unfold, AR(tp)) of a [1, 1, 32, 4096] partial. Always asserted (pages / race_free do not apply: "-").
+    ("d4_rs_dp_decode", "rs_dp_d4", [1, 4, 32, 1024], ttnn.bfloat16, None, False, "- (new)"),
+    ("d4_chain_decode", "d4_chain", [1, 1, 32, 4096], ttnn.bfloat16, None, False, "- (new)"),
 ]
+
+
+_D4_FOLD: dict = {}  # id(mesh) -> the D4 RowFold (tt/kernels/row_fold.py) of the race test's d4_chain payload
 
 
 @pytest.mark.timeout(1200)
@@ -749,7 +757,9 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
     ``ring_gather`` reroutes must show no stale read in ``MOTIF3_DET_RACE_ITERS`` (300) iterations; the payloads it
     leaves native (single-CB-page gathers without ``race_free``: decode, and the bucket-128 / 256 PolyNorm moments) are
     counted and reported, not asserted. ``MOTIF3_DET_NATIVE_CONTROL=1`` also counts the native gather of every
-    payload (reported: the race is timing dependent)."""
+    payload (reported: the race is timing dependent). ``MOTIF3_DET_RACE_ONLY=name,...`` runs only those payloads.
+    Phase C D4's payloads (``d4_*``: the direct RS(dp) on dim 1 and the fold / RS / unfold / AR(tp) chain) are always
+    asserted."""
     from collections import Counter
 
     from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric, native_ag_cb_pages_per_link
@@ -776,15 +786,19 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
     ccls = {m: MotifCCL(mesh_device, cfg, ring_gather=m) for m in dict.fromkeys(modes)}
     failures = []
     try:
+        only = [n_ for n_ in os.environ.get("MOTIF3_DET_RACE_ONLY", "").split(",") if n_]  # payload names (default all)
         for name, op, (_, m, rows, width), dt, pages, race_free, measured in RACE_PAYLOADS:
+            if only and name not in only:
+                continue
             xs = [ttnn.from_torch(torch.randn(R, m * C, rows, width, generator=g) * 100 + 1000 * (k + 1), dtype=dt,
                                   layout=ttnn.TILE_LAYOUT, device=mesh_device, memory_config=DR, mesh_mapper=mapper)
                   for k in range(2)]  # fmt: skip
             gshape = [1, m, max(rows, 32), width if op == "ag" else width // C]  # the gathered per-chip payload
             dt_name = getattr(xs[0].dtype, "name", str(xs[0].dtype).split(".")[-1])
-            assert native_ag_cb_pages_per_link(gshape, dt_name, True) == pages, name
+            d4 = op in ("rs_dp_d4", "d4_chain")
+            assert d4 or native_ag_cb_pages_per_link(gshape, dt_name, True) == pages, name
             for mode, ccl in ccls.items():
-                rerouted = mode == "safe" or (mode == "lean" and (pages > 1 or race_free))
+                rerouted = d4 or mode == "safe" or (mode == "lean" and (pages > 1 or race_free))
 
                 def step(x):
                     rs = ccl.rs_dp(big, 2)  # the MoE combine: DP-line reduce-scatter, TP all-reduce, DP all-gather
@@ -794,6 +808,19 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                     ttnn.deallocate(ar)
                     if op == "ag":
                         o = ccl.all_gather(x, 3, "tp", race_free=race_free)
+                    elif op == "rs_dp_d4":
+                        o = ccl.reduce_scatter(x, 1, "dp", memory_config=ttnn.L1_MEMORY_CONFIG)
+                    elif op == "d4_chain":
+                        from models.demos.motif3.tt.kernels.row_fold import RowFold
+
+                        rf = _D4_FOLD.setdefault(id(mesh_device), RowFold(mesh_device))
+                        q = rf.fold(x, 8, memory_config=ttnn.L1_MEMORY_CONFIG)
+                        r_ = ccl.reduce_scatter(q, 1, "dp", memory_config=ttnn.L1_MEMORY_CONFIG)
+                        ttnn.deallocate(q)
+                        u = rf.unfold(r_, 8, memory_config=ttnn.L1_MEMORY_CONFIG)
+                        ttnn.deallocate(r_)
+                        o = ccl.ar_tp(u)
+                        ttnn.deallocate(u)
                     else:
                         o = ccl.ar_tp(x, race_free=race_free)
                     return o, ttnn.clone(o)  # the consumer, enqueued right behind the gather

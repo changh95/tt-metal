@@ -3947,6 +3947,166 @@ def test_moe_device_t64_rows(mesh_device, device_params, router_logits):
     assert not failures, "\n".join(failures)
 
 
+@pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
+@torch.no_grad()
+def test_moe_device_decode_ccl_rs(mesh_device, device_params):
+    """Phase C D4 (``decode_ccl="rs"``, ``MOTIF3_MOE_DECODE_CCL``; logs/opt/phaseC/D4): the decode combine as row fold +
+    ONE reduce-scatter over DP + unfold (``tt/kernels/row_fold.py``) instead of AR(dp) + partition. Real layer-2 weights
+    from the serving TT cache, a T64-staged config (M = 32 and 64), 64 real tokens, a random bf16 TP ``add_partial``:
+
+    * the fold / unfold kernels bitwise equal to the logical reshapes (``ttnn.reshape``), unfold padding rows zero;
+    * "rs" vs "ar": the same DP sums in another order (not bitwise): max |diff| and the differing-word fraction reported,
+      PCC >= 0.99999; both vs the fp32 reference routed output (PCC >= 0.995);
+    * "rs": replicas over TP identical, finite; T64 rows (16 per DP row) bitwise equal to the 32-lane rows (the T32 / T64
+      contract: a row's DP sum is reduced on its own chip in both);
+    * "rs": a trace replayed with new inputs == eager bitwise; determinism soak: ``MOTIF3_D4_SOAK`` (default 200) replays
+      of one captured trace, every output bitwise equal to the first;
+    * traced cost of the module (rs vs ar, M = 32 and 64; informational)."""
+    from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric
+    from models.demos.motif3.tt.kernels.row_fold import RowFold
+
+    cfg = t64_cfg(mesh_device)
+    log_fabric(mesh_device, "moe_d4_rs")
+    ccl = MotifCCL(mesh_device, cfg)
+    pin = l1_pin(mesh_device)
+    failures = []
+    # ---- kernels vs ttnn.reshape (pure data movement) ----
+    rf = RowFold(mesh_device)
+    mapper = ttnn.create_mesh_mapper(mesh_device, ttnn.MeshMapperConfig(
+        [ttnn.PlacementShard(0), ttnn.PlacementShard(1)], ttnn.MeshShape(*cfg.axes.mesh_shape)))
+    R, C = cfg.axes.mesh_shape
+    g = torch.Generator().manual_seed(4)
+    for L in (8, 16):
+        for mc in (ttnn.L1_MEMORY_CONFIG, ttnn.DRAM_MEMORY_CONFIG):
+            Ph = torch.randn(R, C, 4 * L, H, generator=g).bfloat16()
+            P = ttnn.from_torch(Ph, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                                mesh_mapper=mapper, memory_config=mc)
+            Rt = ttnn.from_torch(Ph[..., : H // 4].contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                 device=mesh_device, mesh_mapper=mapper, memory_config=mc)
+            q, u = rf.fold(P, L, memory_config=mc), rf.unfold(Rt, L, memory_config=mc)
+            qh = device_tensors_to_torch(q, mesh_device)
+            uh = device_tensors_to_torch(u, mesh_device)
+            v = ttnn.reshape(u, (1, 1, 32, H), (1, 1, 32, H))  # a view with the padding rows logical
+            pad = device_tensors_to_torch(v, mesh_device)[..., L:, :]
+            ok_q = bool(torch.equal(qh, Ph.reshape(R, C, 1, 4, 4 * L, H // 4)))
+            ok_u = bool(torch.equal(uh, Ph[..., : H // 4].reshape(R, C, 1, 1, L, H)))
+            ok_p = bool((pad == 0).all())
+            print(f"[moe] D4 row fold L={L} {mc.buffer_type}: fold == reshape {ok_q}, unfold == reshape {ok_u}, "
+                  f"unfold padding zero {ok_p}")
+            if not (ok_q and ok_u and ok_p):
+                failures.append(f"row fold L={L} {mc.buffer_type}: fold {ok_q} unfold {ok_u} padding {ok_p}")
+            _free([P, Rt, q, u])
+    # ---- the module ----
+    layer = 2
+    moe_ar = moe_from_tt_cache(mesh_device, cfg, ccl, layer, decode_ccl="ar")
+    moe_rs = moe_from_tt_cache(mesh_device, cfg, ccl, layer, decode_ccl="rs")
+    assert moe_rs.decode_rs_applies(8) and moe_rs.decode_rs_applies(16) and not moe_ar.decode_rs_applies(8)
+    data = load_real_inputs()
+    xs = data["layers"][layer]["x"]
+    n = xs.shape[0]
+    sel = spread_tokens(n, 64)
+    x64 = xs[sel]
+    tp_mapper = ttnn.create_mesh_mapper(mesh_device, ttnn.MeshMapperConfig(
+        [ttnn.PlacementShard(0), ttnn.PlacementShard(1)], ttnn.MeshShape(R, C)))
+
+    def partial(L, seed):
+        t = (torch.randn(R, C, L, H, generator=torch.Generator().manual_seed(seed)) * 0.02).bfloat16()
+        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                               mesh_mapper=tp_mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    x32 = upload_lanes(x64[:32], cfg, mesh_device)
+    x32d = upload_lanes(x64[32:], cfg, mesh_device)
+    x16 = upload_rows16(x64, cfg, mesh_device)
+    ap8 = partial(8, 11)
+    ap8d = partial(8, 12)
+    # T64 add_partial = [the anchors' partial | the drafts' partial] per DP row
+    a8h = device_tensors_to_torch(ap8, mesh_device).reshape(R, C, 8, H)
+    a8dh = device_tensors_to_torch(ap8d, mesh_device).reshape(R, C, 8, H)
+    ap16 = ttnn.from_torch(torch.cat([a8h, a8dh], dim=2).bfloat16(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                           device=mesh_device, mesh_mapper=tp_mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def run(moe, x, ap):
+        o = moe.forward_decode(x, add_partial=ap)
+        t = device_tensors_to_torch(o, mesh_device)
+        _free(o)
+        return t
+
+    for ap_name, (a, ad) in (("none", (None, None)), ("partial", (ap8, ap8d))):
+        o_ar = run(moe_ar, x32, a)
+        o_rs = run(moe_rs, x32, a)
+        o_rs_d = run(moe_rs, x32d, ad)
+        diff = (o_rs.float() - o_ar.float()).abs()
+        frac = float((o_rs != o_ar).float().mean())
+        s = stats(o_ar.float().reshape(-1, H), o_rs.float().reshape(-1, H))
+        rep_tp = all(bool(torch.equal(o_rs[r, c], o_rs[r, 0])) for r in range(R) for c in range(C))
+        finite = bool(torch.isfinite(o_rs.float()).all())
+        print(f"[moe] D4 rs vs ar (add_partial {ap_name}): max |diff| {float(diff.max()):.3e}, words differing "
+              f"{frac:.4f}, {fmt(s)}; rs replicas over TP identical {rep_tp}, finite {finite}")
+        if s["pcc"] < 0.99999 or not rep_tp or not finite:
+            failures.append(f"rs vs ar ({ap_name}): pcc {s['pcc']:.7f}, replicas {rep_tp}, finite {finite}")
+        # T64 rows == the 32-lane rows (rs)
+        t16 = run(moe_rs, x16, ap16 if a is not None else None)
+        anchors, drafts = rows16_to_halves(t16, cfg)
+        rows_eq = (bool(torch.equal(anchors, o_rs)), bool(torch.equal(drafts, o_rs_d)))
+        print(f"[moe] D4 rs T64 rows bitwise == 32-lane rows (anchors, drafts; add_partial {ap_name}): {rows_eq}")
+        if not all(rows_eq):
+            failures.append(f"rs T64 rows ({ap_name}): {rows_eq}")
+        if a is None:  # accuracy vs the fp32 reference routed output
+            golden = GOLDEN_DIR / f"ref_routed_L{layer:02d}_v1.pt"
+            if golden.is_file():
+                gref = torch.load(golden, weights_only=True)
+                if gref["n"] == n and torch.equal(gref["x_sum"], xs.float().sum(0)):
+                    want = gref["routed"][sel][:32]
+                    for nm, t in (("ar", o_ar), ("rs", o_rs)):
+                        got = torch.cat([t[cfg.axes.coord(dp, 0)].reshape(-1, H) for dp in range(cfg.dp)])
+                        sr = stats(want, got.float())
+                        print(f"[moe] D4 {nm} vs the fp32 reference routed output (32 tokens): {fmt(sr)}")
+                        if sr["pcc"] < 0.995:
+                            failures.append(f"{nm}: PCC vs reference {sr['pcc']:.6f}")
+    # ---- trace: replay with new inputs == eager; determinism soak ----
+    with _Capture(mesh_device) as cap:
+        out_t = moe_rs.forward_decode(x32, add_partial=ap8)
+    try:
+        for it, s0 in enumerate((1, 2)):
+            x_new = xs[spread_tokens(n - s0, 32) + s0]
+            ttnn.copy_host_to_device_tensor(upload_lanes(x_new, cfg, mesh_device, device=False), x32)
+            ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+            got_t = device_tensors_to_torch(out_t, mesh_device)
+            out_e = moe_rs.forward_decode(x32, add_partial=ap8)
+            got_e = device_tensors_to_torch(out_e, mesh_device)
+            _free(out_e)
+            exact = bool(torch.equal(got_t, got_e))
+            print(f"[moe] D4 rs trace replay {it}: traced == eager bitwise {exact}")
+            if not exact:
+                failures.append(f"rs trace replay {it} differs from eager")
+        n_soak = int(os.environ.get("MOTIF3_D4_SOAK", "200"))
+        ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+        first = device_tensors_to_torch(out_t, mesh_device)
+        bad = 0
+        t0 = time.time()
+        for _ in range(n_soak):
+            ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+            if not torch.equal(device_tensors_to_torch(out_t, mesh_device), first):
+                bad += 1
+        print(f"[moe] D4 rs determinism soak: {n_soak} trace replays, {bad} differ from the first "
+              f"({time.time() - t0:.1f} s)")
+        if bad:
+            failures.append(f"rs determinism soak: {bad} / {n_soak} replays differ")
+    finally:
+        ttnn.release_trace(mesh_device, cap.tid)
+        _free(out_t)
+    # ---- traced cost (informational) ----
+    for nm, moe in (("ar", moe_ar), ("rs", moe_rs)):
+        st32 = traced_stats(mesh_device, lambda: moe.forward_decode(x32, add_partial=ap8), n=8, reps=5, adapt_to=16)
+        st64 = traced_stats(mesh_device, lambda: moe.forward_decode(x16, add_partial=ap16), n=8, reps=5, adapt_to=16)
+        print(f"[moe] D4 {nm} traced forward_decode (+ add_partial): M = 32 {fmt_traced(st32)} us, M = 64 "
+              f"{fmt_traced(st64)} us")
+    _free([x32, x32d, x16, ap8, ap8d, ap16, pin])
+    moe_ar.deallocate()
+    moe_rs.deallocate()
+    assert not failures, "\n".join(failures)
+
+
 @pytest.mark.parametrize("router_logits", ["composite", "exact_fp32"])
 @pytest.mark.parametrize("mesh_device, device_params", MESH_PARAMS, indirect=True)
 @torch.no_grad()
