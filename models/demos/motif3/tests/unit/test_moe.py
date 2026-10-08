@@ -2146,6 +2146,8 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
         return ((i_.reshape(-1, 1, Kk) == local[p].double().reshape(1, El, 1)).double()
                 * w_.reshape(-1, 1, Kk)).sum(-1).t()
 
+    split_nb = {}  # P1diag: chip -> the NB its (emulated) dispatch kernel reports instead of chip 0's
+
     class FakeDispatch:  # the kernel's contract (kernels/moe_compact.py) on the emulated chips
         def __call__(self, idx, w, meta, *, M, mb, ladder, w_is_loc=True):
             calls.append(("dispatch", M, mb, tuple(ladder), w_is_loc, meta))
@@ -2175,12 +2177,13 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
                 wcol.append(wc)
                 sp.append(spv)
                 blk.append(b)
-            nd = torch.tensor([need, nb or 0, 0, 0, 0, 0, 0, 0]).reshape(1, 1, 1, 8)
+            nds = [torch.tensor([need, split_nb.get(p, nb or 0), 0, 0, 0, 0, 0, 0]).reshape(1, 1, 1, 8)
+                   for p in range(P)]
             return CompactRows(new(rows, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT),
                                new(wcol, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT),
                                new(sp, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT),
                                new(blk, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
-                               new([nd] * P, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT))
+                               new(nds, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT))
 
     class FakeCombine:
         def __call__(self, y_rm, keys, *, M, key_page, out_dtype, memory_config=None):
@@ -2294,6 +2297,18 @@ def test_moe_host_prefill_compact_kernels_emulated(monkeypatch, combo):
     part2 = moe.local_partial(f, polynorm="bf16", decode=False)
     assert all(torch.equal(a, b) for a, b in zip(part.chips, part2.chips))
     st.frozen = lambda: False
+    if disp_mode == "device":
+        # P1diag: a chip whose own routes give another NB than chip 0's (non-replicated router input) would leave sp
+        # blocks unwritten and deadlock sparse_matmul(nnz=NB): the chunk runs dense, before any post-dispatch program
+        split_nb[P - 1] = lad[0] if nb != lad[0] else lad[-1]
+        calls.clear()
+        dense_calls.clear()
+        assert moe.local_partial(f, polynorm="bf16", decode=False) == "PART"
+        assert dense_calls == ["local_weights", "experts", "reduce"] and st.stats["nb_split"] == 1
+        assert [c[0] for c in calls if c[0] in ("dispatch", "sparse_matmul", "combine", "embedding")] == ["dispatch"]
+        split_nb.clear()
+        part4 = moe.local_partial(f, polynorm="bf16", decode=False)
+        assert all(torch.equal(a, b) for a, b in zip(part.chips, part4.chips)) and st.stats["nb_split"] == 1
     # a chunk size outside PREFILL_MOE_DEVICE_ROWS (not validated on device) never reaches the B2b kernels, frozen or
     # not: B2a's host dispatch (one route read + upload) and the one-hot matmul combine, the same partial
     monkeypatch.setattr(M, "PREFILL_MOE_DEVICE_ROWS", (1024, 2048, 4096))

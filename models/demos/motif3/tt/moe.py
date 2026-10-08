@@ -537,7 +537,8 @@ class CompactPrefillState:
         self.iota: Dict[int, object] = {}  # rows -> [1, 1, rows, 1] fp32 TILE (0 .. rows-1), replicated
         self.warmed = set()  # (rows, mb, nb)
         self.frozen = lambda: False
-        self.stats: Dict[str, int] = {"compact": 0, "dense_cap": 0, "dense_unwarmed": 0}
+        # nb_split (B2b): chunks run dense because the chips' dispatch kernels disagreed on NB (MotifMoE._read_need)
+        self.stats: Dict[str, int] = {"compact": 0, "dense_cap": 0, "dense_unwarmed": 0, "nb_split": 0}
         self.blocks: Dict[Tuple[int, int, int], int] = {}  # (rows, mb, nb) -> calls
         self.host_bufs: Dict[tuple, object] = {}  # (shape, dtype, layout) -> host staging tensor of the routes read
         self.upload_bufs: Dict[int, object] = {}  # P2 "staged": rows -> (device spec args, host mesh tensor, views)
@@ -1606,16 +1607,32 @@ class MotifMoE:
         return part
 
     def _read_need(self, need) -> Tuple[int, int]:
-        """The dispatch kernel's ``need [1, 1, 1, 8]`` -> ``(need, NB)`` of chip 0 (every chip computes the same):
-        one blocking copy into a host staging tensor allocated once."""
+        """The dispatch kernel's ``need [1, 1, 1, 8]`` -> ``(need, NB)`` of chip 0: one blocking copy (every chip's
+        words) into a host staging tensor allocated once. ``NB = -1`` when the chips disagree on NB.
+
+        Each chip's dispatch kernel counts the routes of its OWN ``idx``. When the router's input is not bitwise
+        replicated (seen in long-context sp1 passes, logs/opt/phaseC/P1diag), a near tie can route one token differently
+        on some chips and move their busiest-chip count across a ladder step. A chip whose own NB is smaller than chip
+        0's leaves blocks ``[NB_chip, NB)`` of its ``sp`` unwritten (stale DRAM), so ``sparse_matmul(nnz=NB)`` sees
+        ``count_nonzero(sp) != nnz`` and deadlocks (the device hang of P1 / P1diag). With one NB on every chip, every
+        chip writes all of ``[0, NB)`` (its own blocks are ``<= need_chip <= NB``), so the nnz contract holds on every
+        chip; the caller runs the dense path otherwise."""
         st = self.compact_state
         key = (tuple(need.shape), need.dtype, need.layout)
         h = st.host_bufs.get(key)
         if h is None:
             h = st.host_bufs[key] = ttnn.allocate_tensor_on_host(need.spec, self.mesh_device)
         ttnn.copy_device_to_host_tensor(need, h, blocking=True)
-        v = ttnn.to_torch(ttnn.get_device_tensors(h)[0]).reshape(-1)
-        return int(v[0]), int(v[1])
+        words = [ttnn.to_torch(t).reshape(-1) for t in ttnn.get_device_tensors(h)]
+        need0, nb0 = int(words[0][0]), int(words[0][1])
+        if any(int(v[1]) != nb0 for v in words[1:]):
+            n = st.stats.get("nb_split", 0)
+            if n < 8:  # the first few per process: the evidence (per-chip need / NB) in the log
+                per = " ".join(f"{int(v[0])}/{int(v[1])}" for v in words)
+                print(f"[motif3.moe] L{getattr(self, 'layer_idx', '?')}: chips disagree on the B2b block count (need/NB per chip: {per}); "
+                      f"this chunk runs the dense path", flush=True)
+            return need0, -1
+        return need0, nb0
 
     def _compact_partial_device(self, f, idx, w, M: int, mb: int):
         """B2b: ``_compact_partial`` with the rows built on device (:class:`CompactDispatch` from ``idx`` and the
@@ -1633,6 +1650,10 @@ class MotifMoE:
             debug_sync(self.mesh_device, f"moe L{self.layer_idx} M={M} pre-dispatch")
         rows = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
         need, nb = self._read_need(rows.need)
+        if nb < 0:  # the chips' routes disagree on NB: sparse_matmul(nnz=NB) would deadlock on some chips (_read_need)
+            rows.free()
+            st.stats["nb_split"] = st.stats.get("nb_split", 0) + 1
+            return None
         if nb == 0:
             rows.free()
             st.stats["dense_cap"] += 1
