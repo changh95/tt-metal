@@ -105,6 +105,7 @@ import ttnn
 from . import weights as W
 from .attention import ChunkHostTables, MotifAttention, PackedHostTables, PrefillChunkInputs
 from .ccl import MotifCCL
+from .debug_sync import debug_sync, debug_sync_on
 from .decoder import MotifDecoderLayer, free_tensors
 from .embedding import MotifEmbedding
 from .lm_head import MotifLMHead
@@ -904,10 +905,15 @@ class MotifModel:
         sp = getattr(self, "prefill_sp", None)
         if sp is not None and not getattr(chunk, "is_packed", False) and sp.applies(C, chunk.path):
             return self._prefill_layers_sp(X, n, kvs, C, page_table=chunk.fill_pt, rot=chunk.rot)
+        dbg = debug_sync_on(C)  # MOTIF3_DEBUG_SYNC (P1diag): per-layer device sync + marker; off by default
+        if dbg:
+            debug_sync(self.mesh_device, f"prefill_chunk {chunk.path} C={C} start")
         for layer, kv in zip(self.layers[:n], kvs):
             Xn = layer.forward_prefill(X, chunk=chunk, kv_cache=kv)
             _free(X)
             X = Xn
+            if dbg:
+                debug_sync(self.mesh_device, f"prefill_chunk {chunk.path} C={C} L{layer.layer_idx}")
         return X
 
     def _prefill_layers_sp(self, X, n: int, kvs, S: int, *, page_table, rot=None):
@@ -917,11 +923,16 @@ class MotifModel:
         sp = self.prefill_sp
         Xs = sp.split(X)
         _free(X)
+        dbg = debug_sync_on(S)  # MOTIF3_DEBUG_SYNC (P1diag)
+        if dbg:
+            debug_sync(self.mesh_device, f"prefill_sp S={S} start")
         for layer, kv in zip(self.layers[:n], kvs):
             Xn = layer.forward_prefill_sp(Xs, sp, S, page_table=page_table if kv is not None else None, kv_cache=kv,
                                           rot=rot)
             _free(Xs)
             Xs = Xn
+            if dbg:
+                debug_sync(self.mesh_device, f"prefill_sp S={S} L{layer.layer_idx}")
         X = sp.gather(Xs)
         _free(Xs)
         return X

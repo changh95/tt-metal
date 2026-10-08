@@ -171,6 +171,7 @@ import ttnn
 from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL, device_tensors_to_torch
+from .debug_sync import debug_sync, debug_sync_on
 from .model_config import (DECODE_EXPERTS_MODES, MOE_DECODE_CCL_MODES, MOE_POLYNORM_MODES,
                            PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES,
                            PREFILL_MOE_UPLOAD_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc)
@@ -1628,6 +1629,8 @@ class MotifMoE:
             # (F3N rule R2) -- the dense path, before any device work (B2a decides the same after its host pass)
             st.stats["dense_unwarmed"] += 1
             return None
+        if debug_sync_on(M):  # MOTIF3_DEBUG_SYNC (P1diag): every earlier op done before the dispatch kernel runs
+            debug_sync(self.mesh_device, f"moe L{self.layer_idx} M={M} pre-dispatch")
         rows = st.dispatch(idx, w, self._disp_meta, M=M, mb=mb, ladder=ladder, w_is_loc=False)
         need, nb = self._read_need(rows.need)
         if nb == 0:
@@ -1715,6 +1718,8 @@ class MotifMoE:
         if getattr(self, "prefill_moe_combine", "matmul") == "gather" and b2b_rows_ok(M):
             y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
             _free(y)
+            if debug_sync_on(M):  # MOTIF3_DEBUG_SYNC (P1diag): embedding, experts and untilize done
+                debug_sync(self.mesh_device, f"moe L{self.layer_idx} M={M} pre-combine")
             part = self.compact_state.combine(y_rm, keys, M=M, key_page=key_page, out_dtype=self.combine_dtype,
                                               memory_config=dram)
             _free(y_rm, keys_f32)

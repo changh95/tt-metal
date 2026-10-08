@@ -2517,3 +2517,49 @@ def test_p4_prefill_sp_routing(monkeypatch):
     calls.clear()
     out = model.prefill(tok, page_table="pt", kv_caches=None, return_streams=True)
     assert out == ("g", ("s", "X")) and calls[1:] == [("sp", 0, 4096, None, None, None), ("sp", 1, 4096, None, None, None)]
+
+
+def test_p1diag_debug_sync_knob(monkeypatch):
+    """Phase C P1diag (logs/opt/phaseC/P1diag): ``MOTIF3_DEBUG_SYNC`` ("off" default | "layer"; case and blanks ignored,
+    anything else refused). Off: no call site syncs. On: passes of more than 512 rows only (traced buckets never sync),
+    and :meth:`MotifModel.prefill_chunk` syncs once before the first layer and after every layer."""
+    from types import SimpleNamespace
+
+    from models.demos.motif3.tt import debug_sync as DS
+    from models.demos.motif3.tt import model as MM
+
+    assert DS.DEBUG_SYNC_MODES == ("off", "layer") and DS.MAX_TRACED_ROWS == 512
+    monkeypatch.delenv("MOTIF3_DEBUG_SYNC", raising=False)
+    assert DS.debug_sync_mode() == "off" and not DS.debug_sync_on(4096)
+    for v, want in ((" Layer ", "layer"), ("off", "off"), ("", "off")):
+        assert DS.debug_sync_mode({"MOTIF3_DEBUG_SYNC": v}) == want, v
+    with pytest.raises(ValueError, match="MOTIF3_DEBUG_SYNC"):
+        DS.debug_sync_mode({"MOTIF3_DEBUG_SYNC": "op"})
+
+    syncs = []
+    monkeypatch.setattr(MM, "debug_sync", lambda mesh, tag: syncs.append((mesh, tag)))
+    monkeypatch.setattr(MM, "_free", lambda *a: None)
+
+    class L:
+        def __init__(self, i):
+            self.layer_idx = i
+
+        def forward_prefill(self, X, **kw):
+            return X
+
+    model = object.__new__(MM.MotifModel)
+    model.mesh_device = "mesh"
+    model.layers = [L(0), L(1)]
+    model.embed = SimpleNamespace(forward_prefill=lambda t: "X")
+    model.prefill_sp = None
+    for C in (512, 4096):
+        chunk = SimpleNamespace(is_sp1=False, is_packed=False, reads_cache=False, path="sp0", bucket=C, fill_pt="fpt",
+                                rot=None)
+        tok = SimpleNamespace(shape=(4, C))
+        monkeypatch.delenv("MOTIF3_DEBUG_SYNC", raising=False)
+        assert model.prefill_chunk(tok, chunk=chunk, kv_caches=["k0", "k1"]) == "X" and syncs == []
+        monkeypatch.setenv("MOTIF3_DEBUG_SYNC", "layer")
+        assert model.prefill_chunk(tok, chunk=chunk, kv_caches=["k0", "k1"]) == "X"
+        want = [] if C <= 512 else [("mesh", f"prefill_chunk sp0 C={C} {s}") for s in ("start", "L0", "L1")]
+        assert syncs == want, (C, syncs)
+        syncs.clear()
