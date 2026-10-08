@@ -154,9 +154,10 @@ ATTN_MM_PCS_MODES = ("tuned", "release")
 MHC_DECODE_MODES = ("ops", "fused")
 # Decode MoE combine collectives (Phase C D4, docs/OPTIMIZATION_PLAN.md §3.3 C4; MotifMoE(decode_ccl=...)): "ar" (the
 # release: AR(dp) of the [1, 1, 4 L, 4096] routed partial, then partition(2, "dp") = untilize + mesh_partition + tilize)
-# | "rs" (tt/kernels/row_fold.py: fold each DP row's L x 4096 block into L 4 x 1024 (whole tiles), ONE reduce-scatter
-# over DP on dim 1, unfold back to [1, 1, L, 4096]; no DP all-gather). The DP sums are the same 4 terms added in another
-# order (the RS reduces on the row's own chip, the AR on the column block's), so "rs" is not bitwise equal to "ar".
+# | "rs" (tt/kernels/row_fold.py: fold each DP row's L x 4096 block into 4 L x 1024 (whole tiles), ONE reduce-scatter
+# over DP on dim 1 (no DP all-gather), + the folded add_partial, AR(tp) on the folded rows (4x fewer tiles), unfold back
+# to [1, 1, L, 4096]). The same terms are summed in another order (the RS reduces on the row's own chip, the AR on the
+# column block's; the TP owner of an element changes too), so "rs" is not bitwise equal to "ar".
 MOE_DECODE_CCL_MODES = ("ar", "rs")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since

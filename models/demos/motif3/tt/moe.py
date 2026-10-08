@@ -2086,15 +2086,31 @@ class MotifMoE:
             taps["part"] = part
         keep = _Keep(x, add_partial, lane_mask, *(taps.values() if taps is not None else ()))
         keep.drop(f_all)  # (is x itself when the DP axis has size 1)
-        if rs:  # D4: fold -> RS(dp) on dim 1 -> unfold (module docstring of tt/kernels/row_fold.py)
+        if rs:  # D4 (module docstring of tt/kernels/row_fold.py): fold -> RS(dp) -> (+ fold(add_partial)) -> AR(tp) on
+            # the folded rows -> unfold. Every step stays in the folded [1, 1, 4 L, 1024] layout until the end.
             rf = self.row_fold()
             q = rf.fold(part, rows, memory_config=self.decode_mc)  # [1, 4, 4 L, 1024]
             keep.drop(part, q)
             r = self.ccl.reduce_scatter(q, 1, "dp", memory_config=self.decode_mc)  # [1, 1, 4 L, 1024]: this row, summed
             keep.drop(q, r)
-            mine = rf.unfold(r, rows, memory_config=self.decode_mc)  # [1, 1, L, 4096]
-            keep.drop(r, mine)
-            return self._close_tp(mine, add_partial, reduce_tp, keep)
+            if add_partial is not None:
+                other = add_partial
+                if other.dtype != ttnn.bfloat16:
+                    other = ttnn.typecast(add_partial, ttnn.bfloat16, memory_config=self.dram)
+                s = rf.fold_add(r, other, rows, memory_config=self.decode_mc)  # r + fold(add_partial)
+                if other is not add_partial:
+                    _free(other)
+                keep.drop(r, s)
+                r = s
+            if not reduce_tp:
+                out = rf.unfold(r, rows, memory_config=self.dram)
+                keep.drop(r, out)
+                return out
+            red = self.ccl.ar_tp(r)  # [1, 1, 4 L, 1024]: 4x fewer tiles than the padded [1, 1, L, 4096]
+            keep.drop(r, red)
+            out = rf.unfold(red, rows, memory_config=self.dram)  # [1, 1, L, 4096] bf16 DRAM
+            keep.drop(red, out)
+            return out
         red = self.ccl.ar_dp(part)  # sum over the 4 chips of this column (all 4 L tokens)
         keep.drop(part, red)
         mine = self.ccl.partition(red, 2, "dp")  # this row's L rows

@@ -3955,6 +3955,7 @@ def test_moe_device_decode_ccl_rs(mesh_device, device_params):
     from the serving TT cache, a T64-staged config (M = 32 and 64), 64 real tokens, a random bf16 TP ``add_partial``:
 
     * the fold / unfold kernels bitwise equal to the logical reshapes (``ttnn.reshape``), unfold padding rows zero;
+      ``fold_add`` bitwise ``ttnn.add(R, ttnn.reshape(S))``; ``reduce_tp=False`` + ``ar_tp`` close to the output;
     * "rs" vs "ar": the same DP sums in another order (not bitwise): max |diff| and the differing-word fraction reported,
       PCC >= 0.99999; both vs the fp32 reference routed output (PCC >= 0.995);
     * "rs": replicas over TP identical, finite; T64 rows (16 per DP row) bitwise equal to the 32-lane rows (the T32 / T64
@@ -3988,6 +3989,17 @@ def test_moe_device_decode_ccl_rs(mesh_device, device_params):
             uh = device_tensors_to_torch(u, mesh_device)
             v = ttnn.reshape(u, (1, 1, 32, H), (1, 1, 32, H))  # a view with the padding rows logical
             pad = device_tensors_to_torch(v, mesh_device)[..., L:, :]
+            Sh = torch.randn(R, C, L, H, generator=g).bfloat16()
+            St = ttnn.from_torch(Sh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                                 mesh_mapper=mapper, memory_config=mc)
+            fa = device_tensors_to_torch(rf.fold_add(Rt, St, L, memory_config=mc), mesh_device)
+            sf = ttnn.reshape(St, (1, 1, 4 * L, H // 4))
+            ad = ttnn.add(Rt, sf, memory_config=mc)
+            ok_a = bool(torch.equal(fa, device_tensors_to_torch(ad, mesh_device)))
+            _free([St, sf, ad])
+            print(f"[moe] D4 fold_add L={L} {mc.buffer_type}: == ttnn.add(R, reshape(S)) bitwise {ok_a}")
+            if not ok_a:
+                failures.append(f"fold_add L={L} {mc.buffer_type}")
             ok_q = bool(torch.equal(qh, Ph.reshape(R, C, 1, 4, 4 * L, H // 4)))
             ok_u = bool(torch.equal(uh, Ph[..., : H // 4].reshape(R, C, 1, 1, L, H)))
             ok_p = bool((pad == 0).all())
@@ -4063,6 +4075,16 @@ def test_moe_device_decode_ccl_rs(mesh_device, device_params):
                         print(f"[moe] D4 {nm} vs the fp32 reference routed output (32 tokens): {fmt(sr)}")
                         if sr["pcc"] < 0.995:
                             failures.append(f"{nm}: PCC vs reference {sr['pcc']:.6f}")
+    # reduce_tp=False: the unfolded column partial; closing it with AR(tp) gives the module output up to rounding
+    pt = moe_rs.forward_decode(x32, add_partial=ap8, reduce_tp=False)
+    closed = ccl.ar_tp(pt)
+    o_close = device_tensors_to_torch(closed, mesh_device)
+    o_full = run(moe_rs, x32, ap8)
+    _free([pt, closed])
+    s_close = stats(o_full.float().reshape(-1, H), o_close.float().reshape(-1, H))
+    print(f"[moe] D4 rs reduce_tp=False + ar_tp vs the module output: {fmt(s_close)}")
+    if s_close["pcc"] < 0.99999:
+        failures.append(f"rs reduce_tp=False: pcc {s_close['pcc']:.7f}")
     # ---- trace: replay with new inputs == eager; determinism soak ----
     with _Capture(mesh_device) as cap:
         out_t = moe_rs.forward_decode(x32, add_partial=ap8)
