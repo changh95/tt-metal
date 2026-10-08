@@ -159,6 +159,10 @@ MHC_DECODE_MODES = ("ops", "fused")
 # to [1, 1, L, 4096]). The same terms are summed in another order (the RS reduces on the row's own chip, the AR on the
 # column block's; the TP owner of an element changes too), so "rs" is not bitwise equal to "ar".
 MOE_DECODE_CCL_MODES = ("ar", "rs")
+# Layout changes of the decode row gather MotifCCL.ag_dp_rows (Phase C D4 "fewer to_layouts"; MotifCCL(rows_layout=...)):
+# "ops" (ttnn.to_layout untilize / tilize: 4.6 + 11 us at [8 | 32, 4096]) | "kernel" (tt/kernels/rm_tile.py: pure data
+# movement on 64 cores, bitwise equal; bf16 TILE <-> L1 ROW_MAJOR only, anything else keeps the ops).
+AG_ROWS_LAYOUT_MODES = ("ops", "kernel")
 # Prefill routed experts (B2a, docs/OPTIMIZATION_PLAN.md §3.3 B2; MotifMoE(prefill_moe=...)): "dense" (the release: every
 # chip runs its 12 local experts on all rows of the chunk, masked by the routing weights) | "compact" (the default since
 # the B2a gates passed; token-compacted:
@@ -1420,6 +1424,8 @@ class MotifTTConfig:
     mhc_decode: str = "fused"  # MOTIF3_MHC_DECODE
     # Decode MoE combine collectives (Phase C D4): "ar" (default, the release) | "rs" (MOE_DECODE_CCL_MODES).
     moe_decode_ccl: str = "ar"  # MOTIF3_MOE_DECODE_CCL
+    # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "ops" | "kernel" (AG_ROWS_LAYOUT_MODES; bitwise equal).
+    ag_rows_layout: str = "ops"  # MOTIF3_AG_ROWS_LAYOUT
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1498,7 +1504,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1612,6 +1618,7 @@ class MotifTTConfig:
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
+            ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "ops").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),
@@ -1795,6 +1802,11 @@ class MotifTTConfig:
             raise ValueError(
                 f"moe_decode_ccl (MOTIF3_MOE_DECODE_CCL) must be one of {MOE_DECODE_CCL_MODES}, got "
                 f"{self.moe_decode_ccl!r}"
+            )
+        if self.ag_rows_layout not in AG_ROWS_LAYOUT_MODES:
+            raise ValueError(
+                f"ag_rows_layout (MOTIF3_AG_ROWS_LAYOUT) must be one of {AG_ROWS_LAYOUT_MODES}, got "
+                f"{self.ag_rows_layout!r}"
             )
         if self.attn_epilogue not in ATTN_EPILOGUE_MODES:
             raise ValueError(
@@ -2564,7 +2576,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} ag_rows_layout={self.ag_rows_layout} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "

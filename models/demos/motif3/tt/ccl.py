@@ -137,7 +137,7 @@ import torch
 import ttnn
 
 from .model_config import COMPUTE_ROLES, MeshAxes, MotifTTConfig, active_fabric_name, make_compute_kernel_config
-from .model_config import RING_GATHER_MODES, mesh_l1_small_bytes
+from .model_config import AG_ROWS_LAYOUT_MODES, RING_GATHER_MODES, mesh_l1_small_bytes
 
 Axis = Union[str, int]
 
@@ -394,6 +394,7 @@ class MotifCCL:
         memory_config=None,
         l1_small_semaphores: Optional[bool] = None,
         ring_gather: Optional[str] = None,
+        rows_layout: Optional[str] = None,
     ):
         global _WARNED_NO_L1_SMALL
         self.mesh_device = mesh_device
@@ -431,6 +432,12 @@ class MotifCCL:
         if ring_gather is None:
             ring_gather = getattr(cfg, "ring_gather", None) or "safe"
         self.ring_gather = ring_gather  # validated (property)
+        # D4: the layout changes of ag_dp_rows: "ops" (ttnn.to_layout) | "kernel" (tt/kernels/rm_tile.py, bitwise equal)
+        rows_layout = (rows_layout if rows_layout is not None else getattr(cfg, "ag_rows_layout", None) or "ops")
+        if rows_layout not in AG_ROWS_LAYOUT_MODES:
+            raise ValueError(f"rows_layout must be one of {AG_ROWS_LAYOUT_MODES}, got {rows_layout!r}")
+        self.rows_layout = rows_layout
+        self._row_layout = None  # tt/kernels/rm_tile.RowLayout, built on first use
         self._race_free_depth = 0  # > 0 inside race_free_scope()
         self._ring_axis: Dict[int, bool] = {}  # cluster_axis -> usable topology is a ring / torus
         self._plans: Dict[tuple, Any] = {}  # (op, cluster_axis, tensor spec) -> dispatch decision (host-side cache)
@@ -888,7 +895,13 @@ class MotifCCL:
         imc = intermediate_memory_config if intermediate_memory_config is not None else ttnn.L1_MEMORY_CONFIG
         if self.axis_size("dp") == 1:
             return self._fresh(x, mc) if x.layout == out_layout else ttnn.to_layout(x, out_layout, memory_config=mc)
-        rm = x if x.layout == ttnn.ROW_MAJOR_LAYOUT else ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=imc)
+        rl = self._rows_kernel()
+        if x.layout == ttnn.ROW_MAJOR_LAYOUT:
+            rm = x
+        elif rl is not None and rl.untilize_supported(x, imc):
+            rm = rl.untilize(x, memory_config=imc)  # D4: pure data movement, bitwise to_layout
+        else:
+            rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=imc)
         if h == 1:
             g = self.all_gather(rm, 2, "dp", memory_config=imc)
         else:  # split order: [1, h, L/h, W] views (same last dim: metadata only), gathered on dim 2
@@ -905,9 +918,23 @@ class MotifCCL:
             out = ttnn.to_memory_config(g, mc)
             ttnn.deallocate(g)
             return out
-        out = ttnn.to_layout(g, out_layout, memory_config=mc)
+        if rl is not None and out_layout == ttnn.TILE_LAYOUT and rl.tilize_supported(g, mc):
+            out = rl.tilize(g, memory_config=mc)  # D4: pure data movement, bitwise to_layout
+        else:
+            out = ttnn.to_layout(g, out_layout, memory_config=mc)
         ttnn.deallocate(g)
         return out
+
+    def _rows_kernel(self):
+        """D4 (``rows_layout="kernel"``, ``MOTIF3_AG_ROWS_LAYOUT``): the mesh's :class:`~.kernels.rm_tile.RowLayout`
+        for :meth:`ag_dp_rows`' untilize / tilize (bf16; other dtypes keep ``ttnn.to_layout``), else ``None``."""
+        if getattr(self, "rows_layout", "ops") != "kernel":
+            return None
+        if self._row_layout is None:
+            from .kernels.rm_tile import RowLayout  # lazy: generic_op kernels
+
+            self._row_layout = RowLayout(self.mesh_device)
+        return self._row_layout
 
     def rs_dp(self, x, dim: int = 2, **kw):
         """Reduce-scatter across DP groups (prefill MoE combine)."""

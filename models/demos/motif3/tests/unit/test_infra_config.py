@@ -2261,8 +2261,8 @@ def test_d3_mhc_decode_knob(monkeypatch):
 
 
 def test_d4_moe_decode_ccl_knob(monkeypatch):
-    """Phase C D4 (logs/opt/phaseC/D4): ``MOTIF3_MOE_DECODE_CCL`` ("ar" default | "rs"; case and blanks ignored,
-    anything else refused; in ``describe``), ``RowFold.supports_shape``, and the index math of
+    """Phase C D4 (logs/opt/phaseC/D4): ``MOTIF3_MOE_DECODE_CCL`` ("ar" default | "rs") and ``MOTIF3_AG_ROWS_LAYOUT``
+    ("ops" | "kernel"; case and blanks ignored, anything else refused; in ``describe``), ``RowFold.supports_shape``, and the index math of
     ``tt/kernels/row_fold/{fold,unfold}.cpp`` emulated on tile-face memory against the logical reshapes they implement."""
     import torch
 
@@ -2280,6 +2280,20 @@ def test_d4_moe_decode_ccl_knob(monkeypatch):
     with pytest.raises(ValueError, match="MOTIF3_MOE_DECODE_CCL"):
         _cfg()
     monkeypatch.delenv("MOTIF3_MOE_DECODE_CCL", raising=False)
+    # MOTIF3_AG_ROWS_LAYOUT ("ops" | "kernel"; tt/kernels/rm_tile.py)
+    from models.demos.motif3.tt.model_config import AG_ROWS_LAYOUT_MODES
+
+    assert AG_ROWS_LAYOUT_MODES == ("ops", "kernel")
+    monkeypatch.delenv("MOTIF3_AG_ROWS_LAYOUT", raising=False)
+    dflt = _cfg().ag_rows_layout
+    assert dflt in AG_ROWS_LAYOUT_MODES and f"ag_rows_layout={dflt} " in _cfg().describe()
+    for v, want in ((" Kernel ", "kernel"), ("ops", "ops"), ("", dflt)):
+        monkeypatch.setenv("MOTIF3_AG_ROWS_LAYOUT", v)
+        assert _cfg().ag_rows_layout == want, v
+    monkeypatch.setenv("MOTIF3_AG_ROWS_LAYOUT", "fast")
+    with pytest.raises(ValueError, match="MOTIF3_AG_ROWS_LAYOUT"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_AG_ROWS_LAYOUT", raising=False)
     assert RowFold.supports_shape(8, 4096) and RowFold.supports_shape(16, 4096) and RowFold.supports_shape(32, 4096)
     assert not RowFold.supports_shape(4, 4096) and not RowFold.supports_shape(8, 4000)
     assert not RowFold.supports_shape(8, 4096, n=8) and not RowFold.supports_shape(40, 4096)

@@ -804,3 +804,60 @@ def test_program_configs_reproduce_gates(mesh_device, device_params):
                 report.append("INFO " + msg)
     print("\n[infra] gates-repro " + "\n[infra] gates-repro ".join(report))
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.parametrize("mesh_device, device_params", [MESH_4x8[0]], indirect=True)
+def test_ag_dp_rows_kernel_layout(mesh_device, device_params):
+    """Phase C D4 (``MOTIF3_AG_ROWS_LAYOUT=kernel``, ``MotifCCL(rows_layout="kernel")``; logs/opt/phaseC/D4):
+    ``ag_dp_rows`` with the ``tt/kernels/rm_tile.py`` untilize / tilize is bitwise the ``ttnn.to_layout`` path for
+    every decode payload (bf16 [L, W] with L = 8 / 16, W = 4096 / 576 / 32, natural and split order, L1 and DRAM
+    outputs; bfp8 falls back to the ops), eager and traced (a trace replayed with new inputs == the eager ops path)."""
+    log_fabric(mesh_device, "ag_dp_rows_kernel_layout")
+    cfg = MotifTTConfig.from_hf_config(mesh_device=mesh_device)
+    ops = MotifCCL(mesh_device, cfg, rows_layout="ops")
+    ker = MotifCCL(mesh_device, cfg, rows_layout="kernel")
+    R, C = (int(s) for s in tuple(mesh_device.shape))
+    mapper = ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C))
+    g = torch.Generator().manual_seed(45)
+    failures = []
+    for L, W, halves, dt in ((8, 4096, 1, ttnn.bfloat16), (16, 4096, 1, ttnn.bfloat16), (16, 4096, 2, ttnn.bfloat16),
+                             (8, 576, 1, ttnn.bfloat16), (16, 576, 2, ttnn.bfloat16), (8, 32, 1, ttnn.bfloat16),
+                             (8, 576, 1, ttnn.bfloat8_b)):
+        for mc in (ttnn.L1_MEMORY_CONFIG, ttnn.DRAM_MEMORY_CONFIG):
+            xh = torch.randn(R, C, L, W, generator=g)
+            x = ttnn.from_torch(xh, dtype=dt, layout=ttnn.TILE_LAYOUT, device=mesh_device, mesh_mapper=mapper,
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            a = ker.ag_dp_rows(x, memory_config=mc, halves=halves)
+            b = ops.ag_dp_rows(x, memory_config=mc, halves=halves)
+            ok = bool(torch.equal(device_tensors_to_torch(a, mesh_device), device_tensors_to_torch(b, mesh_device)))
+            tag = f"L={L} W={W} halves={halves} {dt} out {mc.buffer_type}"
+            print(f"[infra] D4 ag_dp_rows kernel == ops bitwise ({tag}): {ok}")
+            if not ok:
+                failures.append(tag)
+            ttnn.deallocate(a)
+            ttnn.deallocate(b)
+            ttnn.deallocate(x)
+    # trace: kernel path captured, replayed with a new input, == the eager ops path
+    x = ttnn.from_torch(torch.randn(R, C, 8, 4096, generator=g), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        device=mesh_device, mesh_mapper=mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(ker.ag_dp_rows(x, memory_config=ttnn.L1_MEMORY_CONFIG))
+    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+    out = ker.ag_dp_rows(x, memory_config=ttnn.L1_MEMORY_CONFIG)
+    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+    try:
+        for it in range(3):
+            new = ttnn.from_torch(torch.randn(R, C, 8, 4096, generator=g), dtype=ttnn.bfloat16,
+                                  layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper)
+            ttnn.copy_host_to_device_tensor(new, x)
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
+            ref = ops.ag_dp_rows(x, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ok = bool(torch.equal(device_tensors_to_torch(out, mesh_device), device_tensors_to_torch(ref, mesh_device)))
+            ttnn.deallocate(ref)
+            print(f"[infra] D4 ag_dp_rows kernel traced replay {it} == eager ops bitwise: {ok}")
+            if not ok:
+                failures.append(f"trace replay {it}")
+    finally:
+        ttnn.release_trace(mesh_device, tid)
+        ttnn.deallocate(out)
+        ttnn.deallocate(x)
+    assert not failures, failures
