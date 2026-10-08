@@ -2431,6 +2431,7 @@ def test_p4_prefill_sp_knob(monkeypatch):
     # which passes: sp0 / the draft-1 call (path None), >= min rows, R = S / 4 a multiple of 256
     assert SPM.sp_applies(cfg, 2048, "sp0") and SPM.sp_applies(cfg, 4096, None) and SPM.sp_applies(cfg, 8192, "sp0")
     assert not SPM.sp_applies(cfg, 1024, "sp0")  # below the floor
+    assert cfg.max_prefill_span == 8192 and not SPM.sp_applies(cfg, 16384, "sp0")  # above the serving pass cap
     assert not SPM.sp_applies(cfg, 4096, "sp1") and not SPM.sp_applies(cfg, 4096, "pk0")
     assert not SPM.sp_applies(cfg, 2048 + 512, "sp0")  # R = 640: not whole 256-row chunks
     assert not SPM.sp_applies(_cfg(prefill_sp="off"), 4096, "sp0")

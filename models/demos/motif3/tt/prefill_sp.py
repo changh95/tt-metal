@@ -63,12 +63,16 @@ def sp_rows_ok(cfg: MotifTTConfig, rows: int) -> bool:
 
 def sp_applies(cfg: MotifTTConfig, rows: int, path: Optional[str] = "sp0") -> bool:
     """``prefill_sp == "dp"``, an sp0 non-packed pass (``path`` "sp0"; ``None`` = the draft-1 page-table call) of
-    ``rows >= prefill_sp_min_rows`` rows, :func:`sp_rows_ok`, and every SWA window at most ``SP_TAIL + 1`` keys."""
+    ``prefill_sp_min_rows <= rows <= max_prefill_span`` rows (the serving pass cap, 8192: masks of 39 MB per chip; a
+    32K single shot would need 0.65 GB), :func:`sp_rows_ok`, and every SWA window at most ``SP_TAIL + 1`` keys."""
     if getattr(cfg, "prefill_sp", "off") != "dp":
         return False
     if path not in (None, "sp0"):
         return False
     if int(rows) < int(getattr(cfg, "prefill_sp_min_rows", DEFAULT_PREFILL_SP_MIN_ROWS)):
+        return False
+    cap = getattr(cfg, "max_prefill_span", None)
+    if cap is not None and int(rows) > int(cap):  # the masks grow as S^2 / 4 (32K: 0.5 GB per chip): serving passes only
         return False
     if any(L.window is not None and int(L.window) > SP_TAIL + 1 for L in cfg.layers):
         return False
