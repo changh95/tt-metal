@@ -85,6 +85,13 @@ WR_CB_IN, WR_CB_W, WR_CB_P, WR_CB_FLAG, WR_CB_OUT = 0, 1, 2, 3, 16
 EXPAND_MODES = ("reader", "split", "split_zero_hi", "zero_hi", "split_zero_hi_min", "zero_hi_min", "skip",
                 "skip_min", "skip_none")
 DEFAULT_EXPAND = "auto"
+# Work split of the mixes over the cores (wr_expand.h): "positions" (the release split: a core does every output row
+# of its tile positions; post: 128 positions on 120 cores, so 8 cores do two) | "rows" ((position, output row) items:
+# post 512 items, at most 5 per core) | "auto" (default: positions; the rows split measured no faster at 8 and 16
+# lanes, logs/opt/phaseC/D3/probe/probe8.json: the post mix is not MAC-bound). Every output keeps its MAC order, so the
+# split does not change a bit.
+SPLITS = ("positions", "rows", "auto")
+DEFAULT_SPLIT = "auto"
 
 _TAGS: Dict[str, str] = {}
 
@@ -177,7 +184,7 @@ _WR_HASH: Dict[tuple, int] = {}
 
 def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None, *, ncopy: int = DEFAULT_NCOPY,
                memory_config=None, fidelity: str = "HiFi4", approx: bool = False, expand: str = DEFAULT_EXPAND,
-               ) -> ttnn.Tensor:
+               split: str = DEFAULT_SPLIT) -> ttnn.Tensor:
     """Decode stream mixing with the packed coefficients ``P``:
 
     * ``out is None`` (pre): ``x_red [1, 1, T, D]`` = ``attn_res_weighted_reduce_nc(X, w_pre, dim=1)`` bitwise;
@@ -203,6 +210,10 @@ def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None
     if expand == "auto":
         small = int(X.shape[2]) <= 16
         expand = ("split_zero_hi_min" if small else "split") if post else ("zero_hi_min" if small else "reader")
+    if split == "auto":
+        split = "positions"
+    if split not in SPLITS[:2]:
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
     if expand not in EXPAND_MODES:
         raise ValueError(f"expand must be one of {EXPAND_MODES}, got {expand!r}")
     if ("zero_hi" in expand or expand.endswith("_min")) and int(X.shape[2]) > 16:
@@ -217,7 +228,8 @@ def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None
     y = ttnn.allocate_tensor_on_device(ttnn.Shape([1, num_r, xs[2], D]), ttnn.bfloat16, ttnn.TILE_LAYOUT, dev, mc)
     grid = dev.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
-    n_cores = min(inner, gx * gy)
+    total = inner * (num_r if split == "rows" else 1)
+    n_cores = min(total, gx * gy)
     cores = _first_cores(grid, n_cores)
     rd_ct = [inner, Wt, N_STREAMS, 1 if post else 0, num_r, int(ncopy)] + _accessor(X)
     if post:
@@ -225,7 +237,7 @@ def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None
     rd_ct += _accessor(P)
     cp_ct = [num_c, Wt, num_r]
     wr_ct = [inner, num_r] + _accessor(y)
-    split = [inner, n_cores, gy]
+    work = [total, n_cores, gy]
     split_x = expand.startswith("split")
     defines = [
         ("MOTIF_MHC_DECODE_SRC", _tag("wr")),
@@ -236,20 +248,21 @@ def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None
         ("MHC_P_READ_NONE", "1" if expand.endswith("_none") else "0"),
         ("MHC_WR_NUM_C", str(num_c)),
         ("MHC_WR_HAS_OUT", "1" if post else "0"),
+        ("MHC_WR_ITEMS", "1" if split == "rows" else "0"),
     ]
     fp = ttnn.KernelDescriptor.SourceType.FILE_PATH
     kernels = [
         ttnn.KernelDescriptor(kernel_source=str(WR_SOURCES["reader"]), source_type=fp, core_ranges=cores,
                               compile_time_args=rd_ct, defines=defines,
                               common_runtime_args=[X.buffer_address(), out.buffer_address() if post else 0,
-                                                   P.buffer_address()] + split,
+                                                   P.buffer_address()] + work,
                               config=ttnn.ReaderConfigDescriptor()),
         ttnn.KernelDescriptor(kernel_source=str(WR_SOURCES["writer"]), source_type=fp, core_ranges=cores,
                               compile_time_args=wr_ct, defines=defines,
-                              common_runtime_args=[y.buffer_address()] + split,
+                              common_runtime_args=[y.buffer_address()] + work,
                               config=ttnn.WriterConfigDescriptor()),
         ttnn.KernelDescriptor(kernel_source=str(WR_SOURCES["compute"]), source_type=fp, core_ranges=cores,
-                              compile_time_args=cp_ct, defines=defines, common_runtime_args=split,
+                              compile_time_args=cp_ct, defines=defines, common_runtime_args=work,
                               config=_compute_descriptor(fidelity, approx)),
     ]
     cbs = [  # post_mix's CBs (candidates double-buffered, one weight set, outputs double-buffered) + the packed tile
@@ -260,7 +273,7 @@ def mix_packed(X: ttnn.Tensor, P: ttnn.Tensor, out: Optional[ttnn.Tensor] = None
         _cb(WR_CB_OUT, 2 * num_r, cores, ttnn.bfloat16, BF16_TILE),
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    key = (tuple(rd_ct), tuple(wr_ct), tuple(cp_ct), gx, gy, n_cores, fidelity, bool(approx), _tag("wr"), expand)
+    key = (tuple(rd_ct), tuple(wr_ct), tuple(cp_ct), gx, gy, n_cores, fidelity, bool(approx), _tag("wr"), expand, split)
     h = _WR_HASH.get(key)
     if h is None:
         h = _WR_HASH[key] = ttnn.compute_program_descriptor_hash(desc)

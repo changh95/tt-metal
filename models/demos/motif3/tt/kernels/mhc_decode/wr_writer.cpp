@@ -5,7 +5,8 @@
 // Motif-3 mHC decode stream mixing (D3): writer. Verbatim tt/mhc.py post_mix's writer: output row r of position i ->
 // page r * inner + i of the [1, NUM_R, T, D] output (NUM_R = 1: x_red [1, 1, T, D], page i).
 //
-// CT args: 0 inner, 1 NUM_R, 2.. TensorAccessorArgs(out). Common RT args: 0 out_addr, 1 total, 2 num_cores, 3 grid_y.
+// CT args: 0 inner, 1 NUM_R, 2.. TensorAccessorArgs(out). Common RT args: 0 out_addr, 1 total items, 2 num_cores,
+// 3 grid_y (wr_expand.h wr_split; MHC_WR_ITEMS: only the rows r_lo .. r_hi - 1 of a position).
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -24,9 +25,11 @@ void kernel_main() {
     constexpr uint32_t out_bytes = get_tile_size(cb_out);
     const auto s_y = TensorAccessor(a_y, y_addr, out_bytes);
     const uint32_t core_i = static_cast<uint32_t>(get_absolute_logical_x()) * grid_y + get_absolute_logical_y();
-    const uint32_t q = total / num_cores, rem = total % num_cores;
-    const uint32_t n = q + (core_i < rem ? 1 : 0);
-    const uint32_t start = core_i * q + (core_i < rem ? core_i : rem);
+    const WrSplit sp = wr_split(total, num_cores, core_i);
+    const uint32_t n = sp.n;
+    constexpr uint32_t ipp = items_per_position<MHC_WR_ITEMS, num_r>();
+    const uint32_t p_first = sp.start / ipp;
+    const uint32_t p_end = n ? (sp.start + n - 1) / ipp + 1 : p_first;
     CircularBuffer co(cb_out);
 #if MHC_EXPAND_SPLIT
     // second half of the weight-set expansion (decode: one token tile row, one set): the reader has reserved the
@@ -46,14 +49,16 @@ void kernel_main() {
         cf.push_back(1);
     }
 #endif
-    for (uint32_t i = start; i < start + n; ++i) {
-        co.wait_front(num_r);
+    for (uint32_t i = p_first; i < p_end; ++i) {
+        uint32_t r_lo, r_hi;
+        row_range<MHC_WR_ITEMS, num_r>(sp, i, r_lo, r_hi);
+        co.wait_front(r_hi - r_lo);
         uint32_t l1 = co.get_read_ptr();
-        for (uint32_t r = 0; r < num_r; ++r) {
+        for (uint32_t r = r_lo; r < r_hi; ++r) {
             noc_async_write(l1, s_y.get_noc_addr(r * inner + i), out_bytes);
             l1 += out_bytes;
         }
         noc_async_write_barrier();
-        co.pop_front(num_r);
+        co.pop_front(r_hi - r_lo);
     }
 }

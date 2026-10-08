@@ -8,12 +8,13 @@
 // tile_regs_release(). NUM_R = 1 / NUM_C = 4 is the pre reduce (the stock op with one site), NUM_R = 4 / NUM_C = 5 the
 // post mix.
 //
-// CT args: 0 NUM_C, 1 Wt, 2 NUM_R. Common RT args: 0 total positions, 1 num_cores, 2 grid_y.
+// CT args: 0 NUM_C, 1 Wt, 2 NUM_R. Common RT args: 0 total items, 1 num_cores, 2 grid_y (wr_expand.h wr_split).
 
 #include <cstdint>
 #include "api/compute/common.h"
 #include "api/compute/bcast.h"
 #include "api/dataflow/circular_buffer.h"
+#include "wr_expand.h"
 
 using namespace ckernel;
 
@@ -25,12 +26,13 @@ void kernel_main() {
     const uint32_t num_cores = get_common_arg_val<uint32_t>(1);
     const uint32_t grid_y = get_common_arg_val<uint32_t>(2);
     const uint32_t core_i = static_cast<uint32_t>(get_absolute_logical_x()) * grid_y + get_absolute_logical_y();
-    const uint32_t q = total / num_cores, rem = total % num_cores;
-    const uint32_t n = q + (core_i < rem ? 1 : 0);
-    const uint32_t start = core_i * q + (core_i < rem ? core_i : rem);
-    if (n == 0) {
+    const WrSplit sp = wr_split(total, num_cores, core_i);
+    if (sp.n == 0) {
         return;
     }
+    constexpr uint32_t ipp = items_per_position<MHC_WR_ITEMS, num_r>();
+    const uint32_t p_first = sp.start / ipp;
+    const uint32_t p_end = (sp.start + sp.n - 1) / ipp + 1;
     constexpr auto cb_in0 = tt::CBIndex::c_0;
     constexpr auto cb_in1 = tt::CBIndex::c_1;
     constexpr auto cb_out0 = tt::CBIndex::c_16;
@@ -41,30 +43,32 @@ void kernel_main() {
         cb_in0, cb_in1, 1 /*acc_to_dest*/)));
     reconfig_data_format(cb_in0, cb_in1);
     constexpr uint32_t wset = num_r * num_c;
-    uint32_t width_index = start % Wt;
+    uint32_t width_index = p_first % Wt;
     c1.wait_front(wset);
-    for (uint32_t i = 0; i < n; ++i) {
-        if (i != 0 && width_index == 0) {
+    for (uint32_t p = p_first; p < p_end; ++p) {
+        if (p != p_first && width_index == 0) {
             c1.pop_front(wset);
             c1.wait_front(wset);
         }
+        uint32_t r_lo, r_hi;
+        row_range<MHC_WR_ITEMS, num_r>(sp, p, r_lo, r_hi);
         c0.wait_front(num_c);
         tile_regs_acquire();
         for (uint32_t c = 0; c < num_c; ++c) {
-            for (uint32_t s = 0; s < num_r; ++s) {
-                mul_tiles_bcast_cols(cb_in0, cb_in1, c, s * num_c + c, s);
+            for (uint32_t s = r_lo; s < r_hi; ++s) {  // output row s accumulates c = 0, 1, ... in order (DEST s - r_lo)
+                mul_tiles_bcast_cols(cb_in0, cb_in1, c, s * num_c + c, s - r_lo);
             }
         }
         tile_regs_commit();
         c0.pop_front(num_c);
-        co.reserve_back(num_r);
+        co.reserve_back(r_hi - r_lo);
         pack_reconfig_data_format(cb_out0);
         tile_regs_wait();
-        for (uint32_t s = 0; s < num_r; ++s) {
+        for (uint32_t s = 0; s < r_hi - r_lo; ++s) {
             pack_tile(s, cb_out0);
         }
         tile_regs_release();
-        co.push_back(num_r);
+        co.push_back(r_hi - r_lo);
         if (++width_index == Wt) {
             width_index = 0;
         }

@@ -24,8 +24,9 @@
 //
 // CT args: 0 inner (= Ht * Wt), 1 Wt, 2 NUM_X (4), 3 HAS_OUT, 4 NUM_R, 5 NCOPY,
 //          6.. TensorAccessorArgs(X), (out) [HAS_OUT only], (P)
-// Common RT args: 0 x_addr, 1 out_addr (ignored for pre), 2 p_addr, 3 total positions, 4 num_cores, 5 grid_y
-// Core i = x * grid_y + y owns positions [start, start + n), the split of post_mix / sinkhorn_motif.
+// Common RT args: 0 x_addr, 1 out_addr (ignored for pre), 2 p_addr, 3 total items, 4 num_cores, 5 grid_y
+// Core i = x * grid_y + y owns items [start, start + n) (wr_expand.h wr_split: positions, the split of post_mix, or
+// (position, output row) pairs with MHC_WR_ITEMS) and reads the candidates of every position they touch.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -57,14 +58,15 @@ void kernel_main() {
     const auto s_x = TensorAccessor(a_x, x_addr, in_bytes);
     const auto s_p = TensorAccessor(a_p, p_addr, p_bytes);
     const uint32_t core_i = static_cast<uint32_t>(get_absolute_logical_x()) * grid_y + get_absolute_logical_y();
-    const uint32_t q = total / num_cores, rem = total % num_cores;
-    const uint32_t n = q + (core_i < rem ? 1 : 0);
-    const uint32_t start = core_i * q + (core_i < rem ? core_i : rem);
+    const WrSplit sp = wr_split(total, num_cores, core_i);
+    constexpr uint32_t ipp = items_per_position<MHC_WR_ITEMS, num_r>();
+    const uint32_t p_first = sp.start / ipp;
+    const uint32_t p_end = sp.n ? (sp.start + sp.n - 1) / ipp + 1 : p_first;
     CircularBuffer c0(cb_in0), c1(cb_in1), cp(cb_p);
     cp.reserve_back(1);
     const uint32_t p_l1 = cp.get_write_ptr();
-    for (uint32_t i = start; i < start + n; ++i) {
-        const bool new_row = (i == start || i % Wt == 0);
+    for (uint32_t i = p_first; i < p_end; ++i) {
+        const bool new_row = (i == p_first || i % Wt == 0);
         // candidates of position i (issued first: they overlap the packed-tile read and the expansion)
         c0.reserve_back(num_c);
         uint32_t l1 = c0.get_write_ptr();

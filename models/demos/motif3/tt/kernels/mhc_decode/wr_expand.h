@@ -21,12 +21,41 @@
 #ifndef MHC_P_READ_NONE
 #define MHC_P_READ_NONE 0
 #endif
+#ifndef MHC_WR_ITEMS
+#define MHC_WR_ITEMS 0
+#endif
 #ifndef MHC_EXPAND_SKIP
 #define MHC_EXPAND_SKIP 0
 #endif
 
 namespace {
 constexpr uint32_t FP32_TILE_WORDS = 1024;
+
+// Work split (MHC_WR_ITEMS): items are positions (0: every core does all NUM_R output rows of its positions, the
+// release split) or (position, output row) pairs, item = p * NUM_R + r (1: the MACs spread evenly over the cores; a
+// core covers at most a few positions, each with a contiguous row range [r_lo, r_hi)).
+struct WrSplit {
+    uint32_t start, n;  // items [start, start + n)
+};
+inline WrSplit wr_split(uint32_t total, uint32_t num_cores, uint32_t core_i) {
+    const uint32_t q = total / num_cores, rem = total % num_cores;
+    return {core_i * q + (core_i < rem ? core_i : rem), q + (core_i < rem ? 1u : 0u)};
+}
+template <uint32_t ITEMS, uint32_t NUM_R>
+constexpr uint32_t items_per_position() {
+    return ITEMS ? NUM_R : 1;
+}
+template <uint32_t ITEMS, uint32_t NUM_R>
+inline void row_range(const WrSplit& s, uint32_t p, uint32_t& r_lo, uint32_t& r_hi) {
+    if constexpr (ITEMS) {
+        const uint32_t a = p * NUM_R, b = a + NUM_R;
+        r_lo = (s.start > a ? s.start : a) - a;
+        r_hi = ((s.start + s.n) < b ? (s.start + s.n) : b) - a;
+    } else {
+        r_lo = 0;
+        r_hi = NUM_R;
+    }
+}
 template <uint32_t HAS_OUT, uint32_t NUM_X>
 constexpr uint32_t packed_row(uint32_t r, uint32_t c) {
     if constexpr (HAS_OUT == 0) {
