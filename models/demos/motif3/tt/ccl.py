@@ -433,6 +433,7 @@ class MotifCCL:
             ring_gather = getattr(cfg, "ring_gather", None) or "safe"
         self.ring_gather = ring_gather  # validated (property)
         # D4: the layout changes of ag_dp_rows: "ops" (ttnn.to_layout) | "kernel" (tt/kernels/rm_tile.py, bitwise equal)
+        # (no cfg, or a cfg without the field: "ops"; MotifTTConfig defaults to "kernel")
         rows_layout = (rows_layout if rows_layout is not None else getattr(cfg, "ag_rows_layout", None) or "ops")
         if rows_layout not in AG_ROWS_LAYOUT_MODES:
             raise ValueError(f"rows_layout must be one of {AG_ROWS_LAYOUT_MODES}, got {rows_layout!r}")

@@ -1424,8 +1424,9 @@ class MotifTTConfig:
     mhc_decode: str = "fused"  # MOTIF3_MHC_DECODE
     # Decode MoE combine collectives (Phase C D4): "ar" (default, the release) | "rs" (MOE_DECODE_CCL_MODES).
     moe_decode_ccl: str = "ar"  # MOTIF3_MOE_DECODE_CCL
-    # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "ops" | "kernel" (AG_ROWS_LAYOUT_MODES; bitwise equal).
-    ag_rows_layout: str = "ops"  # MOTIF3_AG_ROWS_LAYOUT
+    # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "kernel" (default since the D4 E1: 53-layer logits bitwise,
+    # row and KV-R write) | "ops" (AG_ROWS_LAYOUT_MODES).
+    ag_rows_layout: str = "kernel"  # MOTIF3_AG_ROWS_LAYOUT
     # Prefill routed experts (B2a): "compact" (default: token-compacted, bitwise equal to "dense",
     # logs/opt/phaseB/B2a) | "dense" (the release; PREFILL_MOE_MODES), its block rows ("auto" | "32" | "64" | "128")
     # and the smallest chunk it serves.
@@ -1618,7 +1619,7 @@ class MotifTTConfig:
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
-            ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "ops").strip().lower(),
+            ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "kernel").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
             prefill_moe_min_rows=_env_int("MOTIF3_PREFILL_MOE_MIN_ROWS", DEFAULT_PREFILL_MOE_MIN_ROWS),

@@ -15,6 +15,9 @@
 * ``shared_polynorm`` -- fused decode PolyNorm of the MoE shared expert (B5, ``MOTIF3_SHARED_POLYNORM=fused``; a
   moments kernel + the release's TP all-gather + an apply kernel, bitwise equal to the composite); kernel sources in
   ``shared_polynorm/``.
+* ``row_fold`` -- the decode MoE combine's row fold / unfold / fold-add (D4, ``MOTIF3_MOE_DECODE_CCL=rs``; ``row_fold/``).
+* ``rm_tile`` -- bf16 untilize / tilize of ``MotifCCL.ag_dp_rows`` as data movement (D4, ``MOTIF3_AG_ROWS_LAYOUT``;
+  ``rm_tile/``; bitwise ``ttnn.to_layout``).
 * ``moe_compact`` -- the compacted prefill MoE's on-device row dispatch (B2b, ``MOTIF3_PREFILL_MOE_DISPATCH=device``;
   ``moe_dispatch/``) and gather combine (``MOTIF3_PREFILL_MOE_COMBINE=gather``; ``moe_combine/``), both exact.
 

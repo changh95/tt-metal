@@ -65,6 +65,10 @@ Decode (:meth:`MotifMoE.forward_decode`; EP32 gather path, GPT-OSS BH pattern; p
    is a true fp32 sum) -> ``[1,1,32,4096]`` -> ``ccl.ar_dp`` (sum over the 4 chips of the column) ->
    ``ccl.partition(2, "dp")`` (this row's 8 lanes) -> ``+ add_partial`` -> ``ccl.ar_tp`` (sum over the 8 columns) ->
    ``[1,1,8,4096]`` bf16 DRAM: the full routed MoE output, replicated in the row.
+   D4 (``decode_ccl="rs"``, ``MOTIF3_MOE_DECODE_CCL``; default "ar" = the chain above; logs/opt/phaseC/D4): the partial
+   (kept in L1) is folded to ``[1,4,32,1024]`` (each DP row's 8 x 4096 block as 32 x 1024 whole tiles,
+   ``tt/kernels/row_fold.py``) -> ONE ``reduce_scatter`` over DP on dim 1 -> ``+ fold(add_partial)`` -> ``ccl.ar_tp``
+   on the folded ``[1,1,32,1024]`` -> unfold to ``[1,1,8,4096]``: 80 -> 53 us traced, not bitwise equal to "ar".
    All decode intermediates live in L1 (freed inside the call; ~220 us faster than DRAM); CCL payloads and the output
    are DRAM.
 

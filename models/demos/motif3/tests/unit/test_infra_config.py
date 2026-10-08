@@ -2286,7 +2286,7 @@ def test_d4_moe_decode_ccl_knob(monkeypatch):
     assert AG_ROWS_LAYOUT_MODES == ("ops", "kernel")
     monkeypatch.delenv("MOTIF3_AG_ROWS_LAYOUT", raising=False)
     dflt = _cfg().ag_rows_layout
-    assert dflt in AG_ROWS_LAYOUT_MODES and f"ag_rows_layout={dflt} " in _cfg().describe()
+    assert dflt == "kernel" and f"ag_rows_layout={dflt} " in _cfg().describe()
     for v, want in ((" Kernel ", "kernel"), ("ops", "ops"), ("", dflt)):
         monkeypatch.setenv("MOTIF3_AG_ROWS_LAYOUT", v)
         assert _cfg().ag_rows_layout == want, v
