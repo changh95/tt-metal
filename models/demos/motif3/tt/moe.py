@@ -172,7 +172,7 @@ from . import polynorm as _pn
 from . import weights as W
 from .ccl import MotifCCL, device_tensors_to_torch
 from .debug_sync import debug_sync, debug_sync_on
-from .model_config import (DECODE_EXPERTS_MODES, MOE_DECODE_CCL_MODES, MOE_POLYNORM_MODES,
+from .model_config import (DECODE_EXPERT_MM_MODES, DECODE_EXPERTS_MODES, MOE_DECODE_CCL_MODES, MOE_POLYNORM_MODES,
                            PREFILL_MOE_COMBINE_MODES, PREFILL_MOE_DISPATCH_MODES, PREFILL_MOE_MODES,
                            PREFILL_MOE_UPLOAD_MODES, ROUTER_MASK_MODES, TILE, MotifTTConfig, mcast1d_matmul_pc)
 
@@ -249,6 +249,28 @@ def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str
                 f"output, so a skipped expert's zero slice is its exact contribution), got {combine_mode!r}"
             )
         return "dense"
+    return mode
+
+
+def resolve_decode_expert_mm(decode_expert_mm: Optional[str], cfg, *, decode_experts: str, experts_dtype=None) -> str:
+    """Phase D (DESIGN-3 stage 1): the decode routed-expert matmuls of the sparse path. ``decode_expert_mm`` (explicit)
+    or ``cfg.decode_expert_mm`` (``MOTIF3_DECODE_EXPERT_MM``, default "stock"; a config without the field = "stock")
+    must be in :data:`DECODE_EXPERT_MM_MODES`. "dualnoc" needs ``decode_experts="sparse"`` and bfp8 expert weights (the
+    kernel's tile reads): an explicit request raises otherwise, the config value falls back to "stock"."""
+    explicit = decode_expert_mm is not None
+    mode = str(decode_expert_mm if explicit else (getattr(cfg, "decode_expert_mm", None) or "stock"))
+    if mode not in DECODE_EXPERT_MM_MODES:
+        raise ValueError(f"decode_expert_mm must be one of {DECODE_EXPERT_MM_MODES}, got {mode!r}")
+    if mode == "dualnoc":
+        why = None
+        if decode_experts != "sparse":
+            why = f"decode_experts='sparse' (got {decode_experts!r})"
+        elif experts_dtype is not None and experts_dtype != ttnn.bfloat8_b:
+            why = f"bfp8 expert weights (got {experts_dtype})"
+        if why is not None:
+            if explicit:
+                raise ValueError(f"decode_expert_mm='dualnoc' needs {why}")
+            return "stock"
     return mode
 
 
@@ -1095,6 +1117,11 @@ class MotifMoE:
             "dense" (the release) | "sparse" (the config default; ``ttnn.sparse_matmul`` skips the local experts no live row routes to;
             live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
             constants: the sparsity tensor is built per call, the lane mask per step (:meth:`decode_lane_mask`).
+        decode_expert_mm: the sparse path's two expert matmuls (Phase D; ``None`` = ``cfg.decode_expert_mm``,
+            ``MOTIF3_DECODE_EXPERT_MM``): "stock" (``ttnn.sparse_matmul``) | "dualnoc" (one ``generic_op`` each,
+            :class:`~models.demos.motif3.tt.kernels.moe_sparse_mm.DualNocSparseMM`: all 120 cores stream weights on both
+            NoCs; bitwise equal to "stock" in the kernel unit test; :func:`resolve_decode_expert_mm`). Decode row counts
+            32 / 64 only; program descriptors only, no device memory.
     """
 
     def __init__(
@@ -1127,6 +1154,7 @@ class MotifMoE:
         prefill_moe_dispatch: Optional[str] = None,
         prefill_moe_combine: Optional[str] = None,
         decode_ccl: Optional[str] = None,
+        decode_expert_mm: Optional[str] = None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -1260,6 +1288,18 @@ class MotifMoE:
 
         # ---- B1 decode experts: "dense" | "sparse" (no device constants) ----------------------------------------------
         self.decode_experts = resolve_decode_experts(decode_experts, cfg, self.combine_mode)
+
+        # ---- Phase D decode expert matmuls: "stock" | "dualnoc" (program descriptors only; no device memory) -----------
+        self.decode_expert_mm = resolve_decode_expert_mm(decode_expert_mm, cfg, decode_experts=self.decode_experts,
+                                                         experts_dtype=self.experts_dtype)
+        self._smm = {}  # (kind, out dtype) -> DualNocSparseMM, built lazily (host objects only)
+        if self.decode_expert_mm == "dualnoc":
+            try:
+                self._dualnoc_mm("down", self.down_dtype)
+            except ValueError:
+                if decode_expert_mm is not None:
+                    raise
+                self.decode_expert_mm = "stock"
 
         # ---- B3 fused decode PolyNorm: "composite" | "fused" (program descriptors only; no device memory) ---------------
         self.moe_polynorm = resolve_moe_polynorm(moe_polynorm, cfg, decode_polynorm=self.decode_polynorm,
@@ -2026,6 +2066,18 @@ class MotifMoE:
         _free(b)
         return _reshape(r, (1, 1, 1, self.e_loc))
 
+    def _dualnoc_mm(self, kind: str, out_dtype):
+        """The cached :class:`DualNocSparseMM` for ``kind`` ("gate_up" / "down") and the output dtype (host object;
+        raises ``ValueError`` when the weights or the grid do not fit the kernel)."""
+        key = (kind, out_dtype)
+        op = self._smm.get(key)
+        if op is None:
+            from .kernels.moe_sparse_mm import DualNocSparseMM  # lazy: generic_op kernel, decode shapes only
+
+            w = self.w_gate_up if kind == "gate_up" else self.w_down
+            op = self._smm[key] = DualNocSparseMM(self.mesh_device, w, kind=kind, out_dtype=out_dtype)
+        return op
+
     def sparse_experts(self, f, sparsity, *, polynorm: str, row_scale, memory_config=None):
         """:meth:`experts` at a decode row count with the local experts whose ``sparsity`` entry is 0 skipped:
         ``f [1, 1, M, 4096]`` -> ``y [1, 12, M, 4096]`` (skipped experts' slices exactly 0). The same program configs,
@@ -2038,19 +2090,27 @@ class MotifMoE:
         if gu_dtype is None:
             gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
         pc_gu, pc_dn = (self.pc_gate_up, self.pc_down) if M == TILE else self.pc_wide[M]
-        gu = ttnn.sparse_matmul(
-            f, self.w_gate_up, sparsity=sparsity, program_config=pc_gu, nnz=None, is_input_a_sparse=False,
-            is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=gu_dtype,
-        )  # [1, 1, 1, 12, M, 2560]
-        gu = _reshape(gu, (1, self.e_loc, M, 2 * self.inter))
+        op_gu = self._dualnoc_mm("gate_up", gu_dtype) if self.decode_expert_mm == "dualnoc" else None
+        if op_gu is not None and op_gu.supports(f, sparsity):
+            gu = op_gu(f, sparsity, memory_config=mc)  # [1, 12, M, 2560], inactive slices 0
+        else:
+            gu = ttnn.sparse_matmul(
+                f, self.w_gate_up, sparsity=sparsity, program_config=pc_gu, nnz=None, is_input_a_sparse=False,
+                is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=gu_dtype,
+            )  # [1, 1, 1, 12, M, 2560]
+            gu = _reshape(gu, (1, self.e_loc, M, 2 * self.inter))
         h = self._decode_fused(gu, row_scale, mc)
         if h is None:
             h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc, impl=self.polynorm_impl)
         _free(gu)
-        y = ttnn.sparse_matmul(
-            h, self.w_down, sparsity=sparsity, program_config=pc_dn, nnz=None, is_input_a_sparse=True,
-            is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype,
-        )
+        op_dn = self._dualnoc_mm("down", self.down_dtype) if self.decode_expert_mm == "dualnoc" else None
+        if op_dn is not None and op_dn.supports(h, sparsity):
+            y = op_dn(h, sparsity, memory_config=mc)
+        else:
+            y = ttnn.sparse_matmul(
+                h, self.w_down, sparsity=sparsity, program_config=pc_dn, nnz=None, is_input_a_sparse=True,
+                is_input_b_sparse=True, memory_config=mc, compute_kernel_config=self.ckc_experts, dtype=self.down_dtype,
+            )
         _free(h)
         if len(y.shape) != 4:
             y = _reshape(y, (1, self.e_loc, M, self.hidden))
@@ -2299,6 +2359,9 @@ class MotifMoE:
         if getattr(self, "router_fused", None) is not None:
             self.router_fused.deallocate()
             self.router_fused = None
+        for op in getattr(self, "_smm", {}).values():
+            op.deallocate()
+        self._smm = {}
         _free(getattr(self, "_disp_meta", None))
         self._disp_meta = None
         st = getattr(self, "compact_state", None)
@@ -2311,5 +2374,5 @@ __all__ = ["COMBINE_MODES", "CompactPrefillState", "DECODE_EXPERTS_MODES", "DECO
            "compact_bucket", "compact_ladder", "compact_need_blocks", "compact_prefill_meta", "compact_upload_fast",
            "PREFILL_MOE_DISPATCH_MAX_ROWS", "PREFILL_MOE_DEVICE_ROWS", "b2b_rows_ok", "resolve_prefill_moe_kernels",
            "grouped_polynorm",
-           "prefill_experts_pc", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
+           "prefill_experts_pc", "resolve_decode_expert_mm", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
            "wide_decode_rows"]

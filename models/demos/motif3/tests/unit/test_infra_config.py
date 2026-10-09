@@ -2567,3 +2567,75 @@ def test_p1diag_debug_sync_knob(monkeypatch):
         want = [] if C <= 512 else [("mesh", f"prefill_chunk sp0 C={C} {s}") for s in ("start", "L0", "L1")]
         assert syncs == want, (C, syncs)
         syncs.clear()
+
+
+def test_d3_decode_expert_mm_knob(monkeypatch):
+    """Phase D DESIGN-3 (logs/opt/phaseD/D3BUILD): ``MOTIF3_DECODE_EXPERT_MM`` ("stock" default | "dualnoc"; case and
+    blanks ignored, anything else refused; in ``describe``) and :func:`resolve_decode_expert_mm` (explicit requests
+    that cannot run raise, the config value falls back to "stock")."""
+    import ttnn
+
+    from models.demos.motif3.tt.model_config import DECODE_EXPERT_MM_MODES
+    from models.demos.motif3.tt.moe import resolve_decode_expert_mm
+
+    assert DECODE_EXPERT_MM_MODES == ("stock", "dualnoc")
+    monkeypatch.delenv("MOTIF3_DECODE_EXPERT_MM", raising=False)
+    default = _cfg().decode_expert_mm
+    assert default == "stock" and f"decode_expert_mm={default} " in _cfg().describe()
+    for v, want in ((" DualNoC ", "dualnoc"), ("stock", "stock"), ("", default)):
+        monkeypatch.setenv("MOTIF3_DECODE_EXPERT_MM", v)
+        assert _cfg().decode_expert_mm == want, v
+    monkeypatch.setenv("MOTIF3_DECODE_EXPERT_MM", "dual")
+    with pytest.raises(ValueError, match="MOTIF3_DECODE_EXPERT_MM"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_DECODE_EXPERT_MM", raising=False)
+
+    class C:
+        decode_expert_mm = "dualnoc"
+
+    class Old:  # a config without the field
+        pass
+
+    assert resolve_decode_expert_mm(None, C(), decode_experts="sparse") == "dualnoc"
+    assert resolve_decode_expert_mm(None, Old(), decode_experts="sparse") == "stock"
+    assert resolve_decode_expert_mm(None, C(), decode_experts="dense") == "stock"  # config value: falls back
+    assert resolve_decode_expert_mm(None, C(), decode_experts="sparse", experts_dtype=ttnn.bfloat4_b) == "stock"
+    assert resolve_decode_expert_mm("stock", C(), decode_experts="sparse") == "stock"
+    with pytest.raises(ValueError, match="decode_experts='sparse'"):
+        resolve_decode_expert_mm("dualnoc", C(), decode_experts="dense")
+    with pytest.raises(ValueError, match="bfp8"):
+        resolve_decode_expert_mm("dualnoc", C(), decode_experts="sparse", experts_dtype=ttnn.bfloat4_b)
+    with pytest.raises(ValueError, match="decode_expert_mm must be one of"):
+        resolve_decode_expert_mm("fast", C(), decode_experts="sparse")
+
+
+def test_d3_moe_sparse_mm_plan_and_unit_order():
+    """Phase D DESIGN-3: :func:`moe_sparse_mm.plan` (the production shapes fit, the CB budget, unsupported shapes refused)
+    and :func:`moe_sparse_mm.unit_order` (the host mirror of the kernels' ``UnitOrder``): for every active-expert count
+    k = 0..12 the workers' units cover each (expert, column) unit exactly once, never exceed the output CB
+    (``max_units``), and in the down mode touch at most 2 experts, each in one contiguous run (one in0 load per
+    expert, the in0 CB holds 2)."""
+    from models.demos.motif3.tt.kernels import moe_sparse_mm as SMM
+
+    E = 12
+    for kind, K, N, ob in (("gate_up", 4096, 2560, 4), ("down", 1280, 4096, 2)):
+        for M in (32, 64):
+            p = SMM.plan(kind, E, K, N, M, ob)
+            assert p["ncores"] == 120 and p["nc"] == 120 and p["w0"] == 0
+            assert p["KH"] % p["batch"] == 0 and p["KH"] % p["chunk"] == 0
+            assert p["l1_bytes"] < 700 * 1024, (kind, M, p["l1_bytes"])
+            for k in range(E + 1):
+                seen = []
+                for w in range(p["nc"]):
+                    us = SMM.unit_order(p["mode"], w, p["nc"], k, p["NT"])
+                    assert len(us) <= p["max_units"]
+                    seen += us
+                    if p["mode"] == 1 and us:
+                        js = [u // p["NT"] for u in us]
+                        assert len(set(js)) <= 2 and js == sorted(js), (k, w, js)
+                assert sorted(seen) == list(range(k * p["NT"])), (kind, M, k)
+    for bad in (dict(kind="up"), dict(M=96), dict(M=16), dict(K=4000), dict(E=17)):
+        a = dict(kind="gate_up", E=E, K=4096, N=2560, M=32, out_bytes=4)
+        a.update(bad)
+        with pytest.raises(ValueError):
+            SMM.plan(**a)

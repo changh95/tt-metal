@@ -161,6 +161,13 @@ MHC_DECODE_MODES = ("ops", "fused")
 # depends on the lane's DP row: NOT lane-position invariant (fails the spec lane-relocation / lossless gates).
 # Experimental; never the default.
 MOE_DECODE_CCL_MODES = ("ar", "rs")
+# Decode routed-expert matmuls of the sparse path (Phase D, DESIGN-3 stage 1; MotifMoE(decode_expert_mm=...)): "stock"
+# (ttnn.sparse_matmul, 1D in0 multicast, weights read on one RISC / NoC per core) | "dualnoc"
+# (tt/kernels/moe_sparse_mm.py: one generic_op per matmul, (expert, column) units over all 120 cores, weights streamed on
+# both RISCs / NoCs, the inactive experts' slices zero-filled in-kernel; the same products accumulated in the same order
+# in an fp32 DEST, bitwise equal to "stock" in the kernel unit test, logs/opt/phaseD/D3BUILD). Needs
+# decode_experts="sparse"; decode row counts 32 / 64 only.
+DECODE_EXPERT_MM_MODES = ("stock", "dualnoc")
 # Layout changes of the decode row gather MotifCCL.ag_dp_rows (Phase C D4 "fewer to_layouts"; MotifCCL(rows_layout=...)):
 # "ops" (ttnn.to_layout untilize / tilize: 4.6 + 11 us at [8 | 32, 4096]) | "kernel" (tt/kernels/rm_tile.py: pure data
 # movement on 64 cores, bitwise equal; bf16 TILE <-> L1 ROW_MAJOR only, anything else keeps the ops; also
@@ -1441,6 +1448,9 @@ class MotifTTConfig:
     mhc_decode: str = "fused"  # MOTIF3_MHC_DECODE
     # Decode MoE combine collectives (Phase C D4): "ar" (default, the release) | "rs" (MOE_DECODE_CCL_MODES).
     moe_decode_ccl: str = "ar"  # MOTIF3_MOE_DECODE_CCL
+    # Decode routed-expert matmuls of the sparse path (Phase D DESIGN-3): "stock" (default, ttnn.sparse_matmul) |
+    # "dualnoc" (DECODE_EXPERT_MM_MODES).
+    decode_expert_mm: str = "stock"  # MOTIF3_DECODE_EXPERT_MM
     # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "kernel" (default since the D4 E1: 53-layer logits bitwise,
     # row and KV-R write) | "ops" (AG_ROWS_LAYOUT_MODES).
     ag_rows_layout: str = "kernel"  # MOTIF3_AG_ROWS_LAYOUT
@@ -1525,7 +1535,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_DECODE_EXPERT_MM``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_SP``, ``MOTIF3_PREFILL_SP_MIN_ROWS``, ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1639,6 +1649,7 @@ class MotifTTConfig:
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
+            decode_expert_mm=(os.environ.get("MOTIF3_DECODE_EXPERT_MM") or "stock").strip().lower(),
             ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "kernel").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),
@@ -1827,6 +1838,11 @@ class MotifTTConfig:
             raise ValueError(
                 f"moe_decode_ccl (MOTIF3_MOE_DECODE_CCL) must be one of {MOE_DECODE_CCL_MODES}, got "
                 f"{self.moe_decode_ccl!r}"
+            )
+        if self.decode_expert_mm not in DECODE_EXPERT_MM_MODES:
+            raise ValueError(
+                f"decode_expert_mm (MOTIF3_DECODE_EXPERT_MM) must be one of {DECODE_EXPERT_MM_MODES}, got "
+                f"{self.decode_expert_mm!r}"
             )
         if self.ag_rows_layout not in AG_ROWS_LAYOUT_MODES:
             raise ValueError(
@@ -2609,7 +2625,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} ag_rows_layout={self.ag_rows_layout} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} decode_expert_mm={self.decode_expert_mm} ag_rows_layout={self.ag_rows_layout} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} prefill_sp={self.prefill_sp}/{self.prefill_sp_min_rows} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "
