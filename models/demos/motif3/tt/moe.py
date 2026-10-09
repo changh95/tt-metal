@@ -2090,7 +2090,8 @@ class MotifMoE:
         if gu_dtype is None:
             gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
         pc_gu, pc_dn = (self.pc_gate_up, self.pc_down) if M == TILE else self.pc_wide[M]
-        op_gu = self._dualnoc_mm("gate_up", gu_dtype) if self.decode_expert_mm == "dualnoc" else None
+        dualnoc = getattr(self, "decode_expert_mm", "stock") == "dualnoc"  # host tests build modules without __init__
+        op_gu = self._dualnoc_mm("gate_up", gu_dtype) if dualnoc else None
         if op_gu is not None and op_gu.supports(f, sparsity):
             gu = op_gu(f, sparsity, memory_config=mc)  # [1, 12, M, 2560], inactive slices 0
         else:
@@ -2103,7 +2104,7 @@ class MotifMoE:
         if h is None:
             h = self.polynorm(gu, mode=polynorm, row_scale=row_scale, memory_config=mc, impl=self.polynorm_impl)
         _free(gu)
-        op_dn = self._dualnoc_mm("down", self.down_dtype) if self.decode_expert_mm == "dualnoc" else None
+        op_dn = self._dualnoc_mm("down", self.down_dtype) if dualnoc else None
         if op_dn is not None and op_dn.supports(h, sparsity):
             y = op_dn(h, sparsity, memory_config=mc)
         else:
