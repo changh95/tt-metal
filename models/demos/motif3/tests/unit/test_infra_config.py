@@ -2401,6 +2401,53 @@ def test_p2_host_knobs(monkeypatch):
 
 
 
+def test_pgd_env(tmp_path):
+    """Phase D (MOTIF3_PGD, ``host_env.apply_pgd_env``): a wheel install (no PGD under TT_METAL_HOME) on a BH Galaxy gets
+    TT_METAL_PHYSICAL_GROUPING_DESCRIPTOR_PATH = the shipped copy tt-metal would pick (rev C if board id bits [35:32] >= 3,
+    else rev A/B); a dev tree, a caller's value, "off", another card or disagreeing boards leave it unset."""
+    import hashlib
+
+    from models.demos.motif3.tt import host_env as H
+
+    assert H.PGD_MODES == ("auto", "off")
+    metal = Path(__file__).resolve().parents[5]
+    for name in (H.PGD_REV_C, H.PGD_REV_AB):  # byte-identical to tt-metal's own copies
+        src = metal / "tests" / "tt_metal" / "tt_fabric" / "physical_groupings" / name
+        assert hashlib.md5((H.PGD_DIR / name).read_bytes()).digest() == hashlib.md5(src.read_bytes()).digest(), name
+
+    def sysfs(serials, card="galaxy-blackhole"):
+        root = tmp_path / f"sys{len(list(tmp_path.iterdir()))}"
+        for i, s in enumerate(serials):
+            d = root / f"tenstorrent!{i}"
+            d.mkdir(parents=True)
+            (d / "tt_card_type").write_text(card + "\n")
+            (d / "tt_serial").write_text(s + "\n")
+        return root
+
+    rev_c, rev_b = sysfs(["0000047331831011"] * 4), sysfs(["0000047231831011"] * 4)
+    assert H.bh_galaxy_pgd_name(rev_c) == H.PGD_REV_C and H.bh_galaxy_pgd_name(rev_b) == H.PGD_REV_AB
+    assert H.bh_galaxy_pgd_name(sysfs(["0000047331831011", "0000047231831011"])) is None
+    assert H.bh_galaxy_pgd_name(sysfs(["0000047331831011"], card="p150")) is None
+    assert H.bh_galaxy_pgd_name(tmp_path / "missing") is None
+    wheel = tmp_path / "site-packages" / "ttnn"
+    wheel.mkdir(parents=True)
+    env = {"TT_METAL_HOME": str(wheel)}
+    assert H.apply_pgd_env(env, rev_c) == str(H.PGD_DIR / H.PGD_REV_C) == env[H.PGD_ENV]
+    env = {"TT_METAL_HOME": str(wheel)}
+    assert H.apply_pgd_env(env, rev_b) == str(H.PGD_DIR / H.PGD_REV_AB)
+    env = {"TT_METAL_HOME": str(wheel), H.PGD_ENV: "/x.textproto"}
+    assert H.apply_pgd_env(env, rev_c) is None and env[H.PGD_ENV] == "/x.textproto"  # the caller's choice wins
+    env = {"TT_METAL_HOME": str(wheel), "MOTIF3_PGD": " OFF "}
+    assert H.apply_pgd_env(env, rev_c) is None and H.PGD_ENV not in env
+    env = {"TT_METAL_HOME": str(metal)}  # dev tree: tt-metal finds its own file
+    assert H.apply_pgd_env(env, rev_c) is None and H.PGD_ENV not in env
+    with pytest.raises(ValueError, match="MOTIF3_PGD"):
+        H.apply_pgd_env({"MOTIF3_PGD": "rev_c"}, rev_c)
+    env = {"TT_METAL_HOME": str(wheel)}
+    H.apply_host_env(env)  # apply_host_env applies it (with the real sysfs: set on this BH Galaxy, unset elsewhere)
+    assert env.get(H.PGD_ENV) in (None, str(H.PGD_DIR / H.PGD_REV_C), str(H.PGD_DIR / H.PGD_REV_AB))
+
+
 def test_p4_prefill_sp_knob(monkeypatch):
     """Phase C P4 (logs/opt/phaseC/P4; tt/prefill_sp.py): ``MOTIF3_PREFILL_SP`` ("off" | "dp"; case and blanks ignored,
     anything else refused; in ``describe``), ``MOTIF3_PREFILL_SP_MIN_ROWS`` (multiples of 512), which passes the split
