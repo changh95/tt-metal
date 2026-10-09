@@ -165,8 +165,9 @@ MOE_DECODE_CCL_MODES = ("ar", "rs")
 # (ttnn.sparse_matmul, 1D in0 multicast, weights read on one RISC / NoC per core) | "dualnoc"
 # (tt/kernels/moe_sparse_mm.py: one generic_op per matmul, (expert, column) units over all 120 cores, weights streamed on
 # both RISCs / NoCs, the inactive experts' slices zero-filled in-kernel; the same products accumulated in the same order
-# in an fp32 DEST, bitwise equal to "stock" in the kernel unit test, logs/opt/phaseD/D3BUILD). Needs
-# decode_experts="sparse"; decode row counts 32 / 64 only.
+# in an fp32 DEST, bitwise equal to "stock": kernel unit test, 53-layer E1 logits at c = 1 / 8 / 16 / 32 row and KV-R
+# write, spec T32 / T64 gates; logs/opt/phaseD/D3BUILD). Needs decode_experts="sparse"; decode row counts 32 / 64 only.
+# "dualnoc" is the default since the D3BUILD gates (bitwise neutral); "stock" restores ttnn.sparse_matmul.
 DECODE_EXPERT_MM_MODES = ("stock", "dualnoc")
 # Layout changes of the decode row gather MotifCCL.ag_dp_rows (Phase C D4 "fewer to_layouts"; MotifCCL(rows_layout=...)):
 # "ops" (ttnn.to_layout untilize / tilize: 4.6 + 11 us at [8 | 32, 4096]) | "kernel" (tt/kernels/rm_tile.py: pure data
@@ -1448,9 +1449,9 @@ class MotifTTConfig:
     mhc_decode: str = "fused"  # MOTIF3_MHC_DECODE
     # Decode MoE combine collectives (Phase C D4): "ar" (default, the release) | "rs" (MOE_DECODE_CCL_MODES).
     moe_decode_ccl: str = "ar"  # MOTIF3_MOE_DECODE_CCL
-    # Decode routed-expert matmuls of the sparse path (Phase D DESIGN-3): "stock" (default, ttnn.sparse_matmul) |
-    # "dualnoc" (DECODE_EXPERT_MM_MODES).
-    decode_expert_mm: str = "stock"  # MOTIF3_DECODE_EXPERT_MM
+    # Decode routed-expert matmuls of the sparse path (Phase D DESIGN-3): "dualnoc" (default since the D3BUILD gates:
+    # bitwise equal) | "stock" (ttnn.sparse_matmul; DECODE_EXPERT_MM_MODES).
+    decode_expert_mm: str = "dualnoc"  # MOTIF3_DECODE_EXPERT_MM
     # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "kernel" (default since the D4 E1: 53-layer logits bitwise,
     # row and KV-R write) | "ops" (AG_ROWS_LAYOUT_MODES).
     ag_rows_layout: str = "kernel"  # MOTIF3_AG_ROWS_LAYOUT
@@ -1649,7 +1650,7 @@ class MotifTTConfig:
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
-            decode_expert_mm=(os.environ.get("MOTIF3_DECODE_EXPERT_MM") or "stock").strip().lower(),
+            decode_expert_mm=(os.environ.get("MOTIF3_DECODE_EXPERT_MM") or "dualnoc").strip().lower(),
             ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "kernel").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
             prefill_moe_block=(os.environ.get("MOTIF3_PREFILL_MOE_BLOCK") or "auto").strip().lower(),

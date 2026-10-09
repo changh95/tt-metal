@@ -254,7 +254,7 @@ def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str
 
 def resolve_decode_expert_mm(decode_expert_mm: Optional[str], cfg, *, decode_experts: str, experts_dtype=None) -> str:
     """Phase D (DESIGN-3 stage 1): the decode routed-expert matmuls of the sparse path. ``decode_expert_mm`` (explicit)
-    or ``cfg.decode_expert_mm`` (``MOTIF3_DECODE_EXPERT_MM``, default "stock"; a config without the field = "stock")
+    or ``cfg.decode_expert_mm`` (``MOTIF3_DECODE_EXPERT_MM``, default "dualnoc"; a config without the field = "stock")
     must be in :data:`DECODE_EXPERT_MM_MODES`. "dualnoc" needs ``decode_experts="sparse"`` and bfp8 expert weights (the
     kernel's tile reads): an explicit request raises otherwise, the config value falls back to "stock"."""
     explicit = decode_expert_mm is not None
@@ -1118,7 +1118,7 @@ class MotifMoE:
             live rows bitwise equal to "dense"; needs ``combine_mode="fold"``). Prefill always runs masked dense. No
             constants: the sparsity tensor is built per call, the lane mask per step (:meth:`decode_lane_mask`).
         decode_expert_mm: the sparse path's two expert matmuls (Phase D; ``None`` = ``cfg.decode_expert_mm``,
-            ``MOTIF3_DECODE_EXPERT_MM``): "stock" (``ttnn.sparse_matmul``) | "dualnoc" (one ``generic_op`` each,
+            ``MOTIF3_DECODE_EXPERT_MM``): "stock" (``ttnn.sparse_matmul``) | "dualnoc" (the config default; one ``generic_op`` each,
             :class:`~models.demos.motif3.tt.kernels.moe_sparse_mm.DualNocSparseMM`: all 120 cores stream weights on both
             NoCs; bitwise equal to "stock" in the kernel unit test; :func:`resolve_decode_expert_mm`). Decode row counts
             32 / 64 only; program descriptors only, no device memory.
