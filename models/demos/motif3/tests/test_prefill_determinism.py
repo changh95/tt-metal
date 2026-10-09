@@ -740,10 +740,46 @@ RACE_PAYLOADS = [
     # unfold, AR(tp)) of a [1, 1, 32, 4096] partial. Always asserted (pages / race_free do not apply: "-").
     ("d4_rs_dp_decode", "rs_dp_d4", [1, 4, 32, 1024], ttnn.bfloat16, None, False, "- (new)"),
     ("d4_chain_decode", "d4_chain", [1, 1, 32, 4096], ttnn.bfloat16, None, False, "- (new)"),
+    # Phase D DESIGN-3 (MOTIF3_DECODE_EXPERT_MM=dualnoc): the dual-NoC expert matmul pair (tt/kernels/moe_sparse_mm.py,
+    # both NoCs saturated with DRAM reads on all 120 cores) with a different active-expert count per chip (k = 0..12:
+    # the chips skew), then immediately the decode AR(tp) of [1, 1, 8, 4096]: the CCL's fabric writes land while the
+    # slower chips still stream on NoC0 / NoC1. Always asserted.
+    ("d3_smm_ar_tp_decode", "d3_smm", [1, 1, 8, 4096], ttnn.bfloat16, None, False, "- (new)"),
 ]
 
 
 _D4_FOLD: dict = {}  # id(mesh) -> the D4 RowFold (tt/kernels/row_fold.py) of the race test's d4_chain payload
+_D3_SMM: dict = {}  # id(mesh) -> (gate_up op, down op, x, h, per-chip sparsity, weights) of the d3_smm payload
+
+
+def _d3_smm_setup(mesh_device):
+    """The d3_smm race payload's dual-NoC expert matmul pair: random bfp8 weights in the production layouts, M = 32
+    inputs, and a per-chip sparsity with k = (chip index) % 13 active experts (so the chips finish at different times)."""
+    st = _D3_SMM.get(id(mesh_device))
+    if st is None:
+        from models.demos.motif3.tt.kernels.moe_sparse_mm import DualNocSparseMM
+
+        R, C = (int(s) for s in tuple(mesh_device.shape))
+        g = torch.Generator().manual_seed(33)
+        rep_ = ttnn.ReplicateTensorToMesh(mesh_device)
+
+        def up(t, dt, mc=ttnn.DRAM_MEMORY_CONFIG, layout=ttnn.TILE_LAYOUT, mapper=rep_):
+            return ttnn.from_torch(t, dtype=dt, layout=layout, device=mesh_device, memory_config=mc, mesh_mapper=mapper)
+
+        wg = up(torch.randn(1, 12, 4096, 2560, generator=g) * 0.02, ttnn.bfloat8_b)
+        wd = up(torch.randn(1, 12, 1280, 4096, generator=g) * 0.02, ttnn.bfloat8_b)
+        x = up(torch.randn(1, 1, 32, 4096, generator=g), ttnn.bfloat16, ttnn.L1_MEMORY_CONFIG)
+        h = up(torch.randn(1, 12, 32, 1280, generator=g), ttnn.bfloat16, ttnn.L1_MEMORY_CONFIG)
+        sp = torch.zeros(R, C, 1, 12)
+        for r in range(R):
+            for q in range(C):
+                sp[r, q, 0, : (r * C + q) % 13] = 0.5
+        spd = up(sp.to(torch.bfloat16), ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                 mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C)))
+        st = _D3_SMM[id(mesh_device)] = (DualNocSparseMM(mesh_device, wg, kind="gate_up", out_dtype=ttnn.float32),
+                                         DualNocSparseMM(mesh_device, wd, kind="down", out_dtype=ttnn.bfloat16),
+                                         x, h, spd, (wg, wd))
+    return st
 
 
 @pytest.mark.timeout(1200)
@@ -758,7 +794,8 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
     leaves native (single-CB-page gathers without ``race_free``: decode, and the bucket-128 / 256 PolyNorm moments) are
     counted and reported, not asserted. ``MOTIF3_DET_NATIVE_CONTROL=1`` also counts the native gather of every
     payload (reported: the race is timing dependent). ``MOTIF3_DET_RACE_ONLY=name,...`` runs only those payloads.
-    Phase C D4's payloads (``d4_*``: the direct RS(dp) on dim 1 and the fold / RS / unfold / AR(tp) chain) are always
+    Phase C D4's payloads (``d4_*``: the direct RS(dp) on dim 1 and the fold / RS / unfold / AR(tp) chain) and Phase D's
+    ``d3_smm_ar_tp_decode`` (the dual-NoC expert matmuls, skewed per chip, then the decode AR(tp)) are always
     asserted."""
     from collections import Counter
 
@@ -795,7 +832,7 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                   for k in range(2)]  # fmt: skip
             gshape = [1, m, max(rows, 32), width if op == "ag" else width // C]  # the gathered per-chip payload
             dt_name = getattr(xs[0].dtype, "name", str(xs[0].dtype).split(".")[-1])
-            d4 = op in ("rs_dp_d4", "d4_chain")
+            d4 = op in ("rs_dp_d4", "d4_chain", "d3_smm")
             assert d4 or native_ag_cb_pages_per_link(gshape, dt_name, True) == pages, name
             for mode, ccl in ccls.items():
                 rerouted = d4 or mode == "safe" or (mode == "lean" and (pages > 1 or race_free))
@@ -821,6 +858,11 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                         ttnn.deallocate(r_)
                         o = ccl.ar_tp(u)
                         ttnn.deallocate(u)
+                    elif op == "d3_smm":
+                        gu_op, dn_op, xg, hh, spd, _ = _d3_smm_setup(mesh_device)
+                        ttnn.deallocate(gu_op(xg, spd, memory_config=ttnn.L1_MEMORY_CONFIG))
+                        ttnn.deallocate(dn_op(hh, spd, memory_config=ttnn.L1_MEMORY_CONFIG))
+                        o = ccl.ar_tp(x)
                     else:
                         o = ccl.ar_tp(x, race_free=race_free)
                     return o, ttnn.clone(o)  # the consumer, enqueued right behind the gather
