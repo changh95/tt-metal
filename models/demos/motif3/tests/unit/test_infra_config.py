@@ -2225,7 +2225,7 @@ def test_f2_attn_out_knob(monkeypatch):
 
 
 def test_f3_moe_local_knob(monkeypatch):
-    """Phase F F3 (logs/opt/phaseF/F3): ``MOTIF3_MOE_LOCAL`` ("ops" default | "shared"; case and blanks ignored,
+    """Phase F F3 (logs/opt/phaseF/F3): ``MOTIF3_MOE_LOCAL`` ("shared" default | "ops"; case and blanks ignored,
     anything else refused; in ``describe``) and the fused shared tail's core layout (``tt/kernels/shared_tail``): the
     5 APPLY cores (one h tile each) sit in one column outside the 8 x 4 DOWN rectangle, whose 32 cores cover the 128
     output tiles of the [160, 4096] down linear (the stock config's grid and per_core_N)."""
@@ -2235,8 +2235,8 @@ def test_f3_moe_local_knob(monkeypatch):
 
     assert MOE_LOCAL_MODES == ("ops", "shared")
     monkeypatch.delenv("MOTIF3_MOE_LOCAL", raising=False)
-    assert _cfg().moe_local == "ops" and "moe_local=ops " in _cfg().describe()
-    for v, want in ((" Shared ", "shared"), ("OPS", "ops"), ("", "ops")):
+    assert _cfg().moe_local == "shared" and "moe_local=shared " in _cfg().describe()
+    for v, want in ((" Shared ", "shared"), ("OPS", "ops"), ("", "shared")):
         monkeypatch.setenv("MOTIF3_MOE_LOCAL", v)
         assert _cfg().moe_local == want, v
     monkeypatch.setenv("MOTIF3_MOE_LOCAL", "fused_all")
