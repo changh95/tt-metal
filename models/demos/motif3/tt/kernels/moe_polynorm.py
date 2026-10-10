@@ -35,6 +35,11 @@ to the composite (different moment summation order and the routing weight folded
 all chips; every output row depends only on its own input row (per-row moments), with the same ``G`` at M = 32 and 64,
 so the T64 step's rows equal the T32 rows bitwise (M10 ``t64_rows0_31_bitwise_eq_t32``).
 
+Phase F F3 (``MOTIF3_MOE_LOCAL=fused``; ``skip_inactive=True``, ``MOTIF_PN_FAST``): every core reads its slot's ``w``
+column first; a slot with no nonzero weight (the stage-2 gate_up kernel's sparsity rule) is skipped by its whole
+group (no reads, no exchange, its ``h`` slice unwritten: the stage-2 ``down_sum`` never reads it). The computed
+slices are bitwise the same.
+
 Trace safety: no host round trip; the output is a fresh device allocation per call; the program (one per buffer-type
 combination and M) is built on the first eager call and its hash is memoized, so a traced call only patches the
 common runtime args (buffer addresses). No persistent L1: receive buffers are per-program CBs, the semaphore is
@@ -65,6 +70,7 @@ DEFAULT_GROUP = 4  # cores per expert: the M10 best at M = 32 (25.3 us); M = 64 
 MAX_ROW_TILES = 2  # M <= 64 (the T32 and T64 decode steps); larger M would need a smaller CB footprint
 NOC_TABLE = 16  # NoC coordinate table entries (logical columns / rows) passed to the writer
 CB_G, CB_U, CB_W, CB_PART, CB_RECV, CB_COEF, CB_OUT, CB_K = 0, 1, 2, 3, 4, 5, 6, 7
+CB_CTL, CB_CTL2 = 8, 9  # MOTIF_PN_FAST (skip_inactive): the slot's active flag for compute / the writer
 SEM_ID = 0
 OUT_TILES = 4  # bf16 output tiles in flight (the compute kernel packs 2 per DEST round)
 FP32_TILE_BYTES, BF16_TILE_BYTES = 4096, 2048
@@ -300,10 +306,12 @@ class FusedGroupedPolyNorm:
             self._noc = (xs, ys)
         return self._noc
 
-    def _build(self, p, gu, w, h):
+    def _build(self, p, gu, w, h, skip: bool = False):
         cores = _core_range_set(p["n_workers"], self.grid[0])
         dts = {CB_OUT: ttnn.bfloat16}
         cbs = [_cb(i, t, dts.get(i, ttnn.float32), cores) for i, (t, _) in sorted(p["cb_tiles"].items())]
+        if skip:  # MOTIF_PN_FAST: the active flag for compute (CB 8) and the writer (CB 9)
+            cbs += [_cb(CB_CTL, 1, ttnn.float32, cores), _cb(CB_CTL2, 1, ttnn.float32, cores)]
         sems = [ttnn.SemaphoreDescriptor(id=SEM_ID, core_ranges=cores, initial_value=0)]
         from ..model_config import compute_config_descriptor  # lazy: keeps this module's import light
 
@@ -311,6 +319,8 @@ class FusedGroupedPolyNorm:
                                        dst_full_sync_en=True)
         nx, ny = self._noc_tables()
         defines = [("MOTIF_PN_SRC", self._tag)]
+        if skip:
+            defines.append(("MOTIF_PN_FAST", "1"))
         n, R, G, IT = p["n"], p["R"], p["G"], p["IT"]
         reader_ct = ([CB_G, CB_U, CB_W, CB_RECV, CB_K, SEM_ID, n, R, G, 3 * R * G, IT, self.e_loc, self.grid[0]]
                      + _accessor(gu) + _accessor(w) + _accessor(self.D) + _accessor(self.Ec) + _accessor(self.b))
@@ -331,16 +341,16 @@ class FusedGroupedPolyNorm:
                 common_runtime_args=[], config=cc),
         ]
         desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-        return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"])
+        return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"], bool(skip))
 
-    def _program(self, M, gu, w, h):
+    def _program(self, M, gu, w, h, skip: bool = False):
         """The cached descriptor for these tensors' buffer types and M, patched with this call's addresses (common
         runtime args only: a cache hit rebuilds nothing)."""
-        key = (M,) + tuple(tuple(_accessor(t)) for t in (gu, w, h, self.D, self.Ec, self.b))
+        key = (M, bool(skip)) + tuple(tuple(_accessor(t)) for t in (gu, w, h, self.D, self.Ec, self.b))
         desc = self._desc.get(key)
         if desc is None:
             p = plan(self.e_loc, self.inter, M, self.group, self.grid)
-            desc, prog_key = self._build(p, gu, w, h)
+            desc, prog_key = self._build(p, gu, w, h, skip)
             if hasattr(ttnn, "compute_program_descriptor_hash"):
                 hv = self._hash.get(prog_key)
                 if hv is None:
@@ -352,9 +362,14 @@ class FusedGroupedPolyNorm:
         desc.kernels[1].common_runtime_args = [h.buffer_address()]
         return desc
 
-    def __call__(self, gu, w, *, memory_config=None):
+    def __call__(self, gu, w, *, memory_config=None, skip_inactive: bool = False):
         """``gu [1, E, M, 2 I]`` fp32, ``w [1, E, M, 1]`` fp32 -> ``h [1, E, M, I]`` bf16 TILE in ``memory_config``
-        (interleaved; default L1). Consumes nothing."""
+        (interleaved; default L1). Consumes nothing.
+
+        ``skip_inactive`` (Phase F F3, ``MOTIF3_MOE_LOCAL=fused``; ``MOTIF_PN_FAST``): an expert slot whose column of
+        ``w`` holds no nonzero weight (``|w|`` bits != 0 on no row: the sparsity rule of the stage-2 gate_up kernel) is
+        not computed; its ``h`` slice is left unwritten. Only for callers whose down matmul skips exactly those experts
+        (the stage-2 ``down_sum``, the sparse stage-1 path); every computed value is bitwise the same."""
         M = self._check(gu, w)
         mc = memory_config or ttnn.L1_MEMORY_CONFIG
         if not _is_interleaved(mc):
@@ -362,7 +377,7 @@ class FusedGroupedPolyNorm:
         h = ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, self.e_loc, M, self.inter]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.mesh_device, mc
         )
-        desc = self._program(M, gu, w, h)
+        desc = self._program(M, gu, w, h, skip_inactive)
         ttnn.generic_op([gu, w, self.D, self.Ec, self.b, h], desc)
         return h
 

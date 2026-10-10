@@ -159,8 +159,10 @@ ATTN_OUT_MODES = ("ops", "uv", "fused")
 # Decode MoE local chain (Phase F F3, docs/OPTIMIZATION_PLAN.md "Phase F"; PolyNormMLP / MotifMoE): "ops" (the Phase E
 # chain) | "shared" (tt/kernels/shared_tail.py: the shared expert's B5 apply, down linear and row slice as ONE
 # generic_op, and no row pad before its gate_up linear; the default since the F3 gates passed bitwise: E1 53 layers row
-# + KV-R, spec_t32 / t64, logs/opt/phaseF/F3). Bitwise the same rows. Decode only.
-MOE_LOCAL_MODES = ("ops", "shared")
+# + KV-R, spec_t32 / t64, logs/opt/phaseF/F3) | "fused" ("shared" plus the router tail kernels, B4 router_fused and the
+# DESIGN-2 replica tail, with batched L1 loads in the top-K / assignment code: the same selections and weights).
+# Bitwise the same rows. Decode only.
+MOE_LOCAL_MODES = ("ops", "shared", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
 # in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.

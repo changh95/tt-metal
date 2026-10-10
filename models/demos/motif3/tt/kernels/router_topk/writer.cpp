@@ -36,7 +36,26 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+#ifndef MOTIF_RT_EXP
+#define MOTIF_RT_EXP 0  // experiments only: 256 = timeline (wall-clock stamps -> the tl tensor, row 2 q + RISC)
+#endif
+
+#ifndef MOTIF_RT_FAST
+#define MOTIF_RT_FAST 0  // Phase F F3 (MOTIF3_MOE_LOCAL=fused): the same selections / assignment with batched L1 loads
+#endif
+
 namespace {
+constexpr bool FAST = MOTIF_RT_FAST != 0;
+constexpr bool RT_TL = (MOTIF_RT_EXP & 256) != 0;
+volatile tt_l1_ptr uint32_t* rt_tl = nullptr;
+uint32_t rt_n = 0;
+inline void rt_stamp() {
+    if constexpr (RT_TL) {
+        if (rt_n < 16) {
+            rt_tl[rt_n++] = reg_read(RISCV_DEBUG_REG_WALL_CLOCK_L);
+        }
+    }
+}
 inline float as_float(uint32_t u) {
     union {
         uint32_t u;
@@ -105,6 +124,7 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
         // 2. worker 0: all M records, then the assignment (tt/replicas.py assign, bit for bit)
         volatile tt_l1_ptr uint32_t* semg = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_g_id));
         wait_min(semg, M);
+        rt_stamp();
         *semg = 0;
         invalidate_l1_cache();
         const uint32_t* g = reinterpret_cast<const uint32_t*>(gbuf);
@@ -120,17 +140,38 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
         for (uint32_t w = 0; w <= NE_REP / 32; ++w) {
             act[w] = 0;
         }
-        for (uint32_t t = 0; t < M; ++t) {
-            const uint32_t* r = g + t * 16;
-            if (r[15] != 0) {
+        if constexpr (FAST) {  // the same bits; each record's K ids and live flag loaded together (latency overlap)
+            for (uint32_t t = 0; t < M; ++t) {
+                const uint32_t* r = g + t * 16;
+                uint32_t e8[K];
+#pragma GCC unroll 16
                 for (uint32_t j = 0; j < K; ++j) {
-                    const uint32_t e = r[j];
-                    if (e < NE_REP) {
-                        act[e >> 5] |= 1u << (e & 31);
+                    e8[j] = r[j];
+                }
+                if (r[15] != 0) {
+#pragma GCC unroll 16
+                    for (uint32_t j = 0; j < K; ++j) {
+                        const uint32_t e = e8[j];
+                        if (e < NE_REP) {
+                            act[e >> 5] |= 1u << (e & 31);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (uint32_t t = 0; t < M; ++t) {
+                const uint32_t* r = g + t * 16;
+                if (r[15] != 0) {
+                    for (uint32_t j = 0; j < K; ++j) {
+                        const uint32_t e = r[j];
+                        if (e < NE_REP) {
+                            act[e >> 5] |= 1u << (e & 31);
+                        }
                     }
                 }
             }
         }
+        rt_stamp();  // act built
         uint32_t cm[N_CHIPS];
         uint32_t load[N_CHIPS];
         for (uint32_t c = 0; c < N_CHIPS; ++c) {  // chip c's experts = bits [12 c, 12 c + 12)
@@ -143,6 +184,74 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
             cm[c] = v & 0xFFFu;
             load[c] = __builtin_popcount(cm[c] & ~rmask[c]);  // experts without a replica: their home
         }
+        rt_stamp();  // cm / load
+        if constexpr (FAST) {
+            // The same greedy assignment (passes 1 and 2, the keep mask, the where[] output) on a local copy of the
+            // flex list (loaded 8 words at a time) and a local where[]; L1 is written once at the end.
+            uint32_t fl[NF_MAX];
+            uint8_t wh[NF_MAX];  // 0xFF = NONE (chips < 64)
+            for (uint32_t i0 = 0; i0 < nf; i0 += 8) {
+                uint32_t v8[8];
+#pragma GCC unroll 8
+                for (uint32_t t = 0; t < 8; ++t) {
+                    v8[t] = flex[i0 + t];  // (the table holds NF_MAX words: reading past nf stays inside it)
+                }
+#pragma GCC unroll 8
+                for (uint32_t t = 0; t < 8; ++t) {
+                    fl[i0 + t] = v8[t];
+                }
+            }
+            for (uint32_t i = 0; i < nf; ++i) {
+                const uint32_t v = fl[i];
+                const uint32_t h = (v >> 6) & 63u, r = v & 63u, lb = (v >> 12) & 15u;
+                uint32_t c = 0xFFu;
+                if ((cm[h] >> lb) & 1u) {
+                    c = load[h] <= load[r] ? h : r;
+                    load[c] += 1;
+                }
+                wh[i] = static_cast<uint8_t>(c);
+            }
+            for (uint32_t i = 0; i < nf; ++i) {
+                const uint32_t c = wh[i];
+                if (c == 0xFFu) {
+                    continue;
+                }
+                const uint32_t v = fl[i];
+                const uint32_t h = (v >> 6) & 63u, r = v & 63u;
+                const uint32_t o = c == h ? r : h;
+                if (load[o] + 1 < load[c]) {
+                    load[c] -= 1;
+                    load[o] += 1;
+                    wh[i] = static_cast<uint8_t>(o);
+                }
+            }
+            rt_stamp();  // pass 2
+            keep = cm[me] & ~rmask[me];
+            uint32_t rep_e[NREP];
+#pragma GCC unroll 4
+            for (uint32_t rj = 0; rj < NREP; ++rj) {
+                rep_e[rj] = tab[E_LOC + rj];
+            }
+            for (uint32_t i = 0; i < nf; ++i) {
+                if (wh[i] != me) {
+                    continue;
+                }
+                const uint32_t v = fl[i];
+                if (((v >> 6) & 63u) == me) {
+                    keep |= 1u << ((v >> 12) & 15u);
+                } else {
+                    const uint32_t e = v >> 16;
+                    for (uint32_t rj = 0; rj < NREP; ++rj) {
+                        if (rep_e[rj] == e) {
+                            keep |= 1u << (E_LOC + rj);
+                        }
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < nf; ++i) {
+                where[i] = wh[i] == 0xFFu ? NONE : wh[i];
+            }
+        } else {
         for (uint32_t i = 0; i < nf; ++i) {  // replicated, ascending id: the less loaded holder, ties home
             const uint32_t v = flex[i];
             const uint32_t h = (v >> 6) & 63u, r = v & 63u, lb = (v >> 12) & 15u;
@@ -153,6 +262,7 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
             }
             where[i] = c;
         }
+        rt_stamp();  // pass 1
         for (uint32_t i = 0; i < nf; ++i) {  // replicas.PASSES = 1: move to the other holder when that helps
             const uint32_t c = where[i];
             if (c == NONE) {
@@ -167,6 +277,7 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
                 where[i] = o;
             }
         }
+        rt_stamp();  // pass 2
         keep = cm[me] & ~rmask[me];  // active natives without a replica
         for (uint32_t i = 0; i < nf; ++i) {
             if (where[i] != me) {
@@ -184,6 +295,7 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
                 }
             }
         }
+        }  // (FAST)
         for (uint32_t i = nf; i < NF_MAX; ++i) {
             where[i] = NONE;
         }
@@ -191,6 +303,7 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
             lout[c] = load[c];
         }
         asm volatile("" ::: "memory");
+        rt_stamp();
         const auto as = TensorAccessor(a_args, a_addr, (NF_MAX + N_CHIPS) * 4);
         noc_async_write(sc, as.get_noc_addr(0, 0), (NF_MAX + N_CHIPS) * 4);
         // 3. keep -> every other worker (data, then the linked flag), per rectangle of the worker grid
@@ -260,6 +373,13 @@ void kernel_main() {
 
     const uint32_t w_addr = get_common_arg_val<uint32_t>(0);
     const uint32_t q = static_cast<uint32_t>(get_absolute_logical_y()) * GX + get_absolute_logical_x();
+    if constexpr (RT_TL) {
+        rt_tl = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(8));  // CB 8 (router_topk.py CB_TL)
+        for (uint32_t i = 0; i < 16; ++i) {
+            rt_tl[i] = 0;
+        }
+    }
+    rt_stamp();
     const uint32_t tr = q >> 5;
     const uint32_t rr = q & 31;
     const uint32_t row_off = ((rr >> 4) * 2) * 1024 + (rr & 15) * 64;
@@ -268,6 +388,7 @@ void kernel_main() {
     cb_wait_front(cb_id, 1);
     invalidate_l1_cache();
     asm volatile("fence" ::: "memory");  // and a compiler barrier: no L1 load is hoisted above the waits
+    rt_stamp();
     const uint32_t* bk = reinterpret_cast<const uint32_t*>(get_read_ptr(cb_o));
     const uint32_t* sv = reinterpret_cast<const uint32_t*>(get_read_ptr(cb_s));  // never advanced on this RISC
 
@@ -275,8 +396,7 @@ void kernel_main() {
     uint32_t key[K];
     uint32_t ids[K];
     uint32_t n = 0;
-    for (uint32_t i = 0; i < NE; ++i) {
-        const uint32_t u = bk[i];
+    auto insert = [&](uint32_t u, uint32_t i) {
         const uint32_t k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
         uint32_t j;
         if (n < K) {
@@ -284,7 +404,7 @@ void kernel_main() {
         } else if (k > key[K - 1]) {
             j = K - 1;
         } else {
-            continue;
+            return;
         }
         while (j > 0 && key[j - 1] < k) {
             key[j] = key[j - 1];
@@ -293,8 +413,27 @@ void kernel_main() {
         }
         key[j] = k;
         ids[j] = i;
+    };
+    if constexpr (FAST) {  // the same insertions in the same order; 8 scores loaded together (latency overlap)
+        static_assert(NE % 8 == 0, "router_topk FAST: NE must be a multiple of 8");
+        for (uint32_t i0 = 0; i0 < NE; i0 += 8) {
+            uint32_t u8[8];
+#pragma GCC unroll 8
+            for (uint32_t t = 0; t < 8; ++t) {
+                u8[t] = bk[i0 + t];
+            }
+#pragma GCC unroll 8
+            for (uint32_t t = 0; t < 8; ++t) {
+                insert(u8[t], i0 + t);
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < NE; ++i) {
+            insert(bk[i], i);
+        }
     }
 
+    rt_stamp();
     // ---- 2. weights from the unbiased scores (fp32, rank order) ----
     float s[K];
     float den = 0.0f;
@@ -305,6 +444,7 @@ void kernel_main() {
     const float r = 1.0f / (den + 1e-20f);
     const uint32_t base = static_cast<uint32_t>(as_float(reinterpret_cast<const uint32_t*>(get_read_ptr(cb_id))[0]));
 
+    rt_stamp();
     // ---- 3. stage the E_TOT row halves (column 0 = weight) + a zero half, then write ----
     cb_reserve_back(cb_st, 1);
     const uint32_t st = get_write_ptr(cb_st);
@@ -323,6 +463,7 @@ void kernel_main() {
                             BX0, BY0, BX1, BY1, BN>(q, ids, live, base, idw, st + 64 * (E_TOT + 2), a_args,
                                                     get_common_arg_val<uint32_t>(2));
     }
+    rt_stamp();
     for (uint32_t j = 0; j < K; ++j) {
         uint32_t slot = ids[j] - base;  // unsigned: ids below base wrap to >= E_LOC
         if (slot >= E_LOC) {
@@ -368,4 +509,13 @@ void kernel_main() {
     noc_async_write_barrier();
     cb_pop_front(cb_o, 1);
     cb_pop_front(cb_id, 1);
+#if MOTIF_RT_EXP & 256
+    rt_stamp();
+    {
+        constexpr auto tl_args = TensorAccessorArgs<a_args.next_compile_time_args_offset()>();
+        const auto tls = TensorAccessor(tl_args, get_common_arg_val<uint32_t>(3), 64);
+        noc_async_write(get_write_ptr(8), tls.get_noc_addr(2 * q, 0), 64);
+        noc_async_write_barrier();
+    }
+#endif
 }

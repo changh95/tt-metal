@@ -1427,6 +1427,24 @@ class MotifMoE:
         if self.moe_replicas != "off":
             self._init_replicas(replica_plan if replica_plan is not None else getattr(cfg, "moe_replica_plan", None),
                                 cache=cache)
+        # ---- Phase F F3 (MOTIF3_MOE_LOCAL): "fused" runs the router tails (B4 / DESIGN-2) with batched L1 loads ------
+        self.set_moe_local(getattr(cfg, "moe_local", "ops"))
+
+    def _skip_inactive(self, taps) -> bool:
+        """F3 ``moe_local="fused"``: the fused PolyNorm skips the slots no row routes to (their ``h`` is never read by
+        the stage-2 ``down_sum``); never with taps (tests read the whole ``h``)."""
+        return getattr(self, "moe_local", "ops") == "fused" and taps is None
+
+    def set_moe_local(self, mode: str) -> None:
+        """Phase F F3 (``MOTIF3_MOE_LOCAL``): "fused" = the router tail kernels (B4 ``router_fused``, DESIGN-2
+        ``router_fused_rep``) built with ``MOTIF_RT_FAST`` (the same top-K, replica assignment and weights, bitwise;
+        batched L1 loads); "ops" / "shared" = without. The shared expert's part of the knob lives in
+        :class:`~models.demos.motif3.tt.mlp.PolyNormMLP`. Descriptors are cached per mode (switchable between
+        captures)."""
+        self.moe_local = str(mode or "ops")
+        for k in (getattr(self, "router_fused", None), getattr(self, "router_fused_rep", None)):
+            if k is not None:
+                k.fast = self.moe_local == "fused"
 
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
@@ -1515,7 +1533,7 @@ class MotifMoE:
         _free(g, u)
         return h
 
-    def _decode_fused(self, gu, row_scale, mc):
+    def _decode_fused(self, gu, row_scale, mc, *, skip_inactive: bool = False):
         """B3: ``h`` from the fused kernel when this module runs it (``moe_polynorm="fused"``), the call is at a decode
         row count with routing weights and ``gu`` / ``row_scale`` meet its contract (fp32 TILE interleaved); else
         ``None`` (the caller runs the composite)."""
@@ -1524,7 +1542,8 @@ class MotifMoE:
             return None
         if not fused.supports(gu, row_scale):
             return None
-        return fused(gu, row_scale, memory_config=mc)
+        kw = {"skip_inactive": True} if skip_inactive else {}  # (F3 "fused" only: older callables lack the kwarg)
+        return fused(gu, row_scale, memory_config=mc, **kw)
 
     def reduce_experts(self, y, *, memory_config=None):
         """``sum_e y[e]``: ``[1, 12, M, 4096]`` (already weighted) -> ``[1, 1, M, 4096]`` in ``combine_dtype``
@@ -2273,7 +2292,8 @@ class MotifMoE:
         gu, sp = op_gu.gate_up_routed(f, w_loc, memory_config=mc)
         if taps is not None:
             taps["sparsity"] = sp
-        h = self.pn_fused_rep(gu, w_loc, memory_config=mc)
+        kw = {"skip_inactive": True} if self._skip_inactive(taps) else {}
+        h = self.pn_fused_rep(gu, w_loc, memory_config=mc, **kw)
         _free(gu)
         part = op_dn.down_sum(h, sp, part_dtype=self.combine_dtype, memory_config=part_memory_config or self.dram)
         _free(h)
@@ -2328,7 +2348,7 @@ class MotifMoE:
         gu, s = op_gu.gate_up_routed(f, w_loc, memory_config=mc)  # [1, 12, M, 2560], inactive slices 0
         if taps is not None:
             taps["sparsity"] = s
-        h = self._decode_fused(gu, w_loc, mc)
+        h = self._decode_fused(gu, w_loc, mc, skip_inactive=self._skip_inactive(taps))
         if h is None:
             h = self.polynorm(gu, mode=polynorm, row_scale=w_loc, memory_config=mc, impl=self.polynorm_impl)
         _free(gu)

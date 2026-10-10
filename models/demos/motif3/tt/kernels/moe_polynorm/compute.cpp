@@ -256,6 +256,17 @@ void kernel_main() {
     constexpr uint32_t G = get_compile_time_arg_val(10);
     constexpr uint32_t DEBUG = get_compile_time_arg_val(11);
 
+#if MOTIF_PN_FAST
+    {  // reader.cpp MOTIF_PN_FAST: an inactive slot computes nothing
+        constexpr uint32_t cb_ctl = 8;
+        cb_wait_front(cb_ctl, 1);
+        const uint32_t active = read_tile_value(cb_ctl, 0, 0);
+        cb_pop_front(cb_ctl, 1);
+        if (!active) {
+            return;
+        }
+    }
+#endif
     compute_kernel_hw_startup(cb_g, cb_part);
 
     // ---------------- phase 1: local moment partials ----------------

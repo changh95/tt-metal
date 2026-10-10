@@ -463,7 +463,8 @@ class PolyNormMLP:
         """F3 (``moe_local="shared"``): this decode call takes the fused tail (:meth:`_rows_tail`): the shared expert's
         partial (no all-reduce, bf16, no taps) with the B5 fused PolyNorm on its release settings and the tail's shapes
         (n_local 160, bfp8 W_down [160, 4096], T = 8 / 16 / 32 rows)."""
-        if getattr(self, "moe_local", "ops") != "shared" or all_reduce or taps is not None or out_dtype != ttnn.bfloat16:
+        if getattr(self, "moe_local", "ops") not in ("shared", "fused") or all_reduce or taps is not None \
+                or out_dtype != ttnn.bfloat16:
             return False
         from .kernels.shared_tail import NA, ROWS
 

@@ -28,6 +28,13 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+#ifndef MOTIF_PN_FAST
+#define MOTIF_PN_FAST 0  // Phase F F3 (MOTIF3_MOE_LOCAL=fused): skip the slots no row routes to (see below)
+#endif
+// MOTIF_PN_FAST: the w tiles are read first; when column 0 holds no nonzero weight (|w| bits != 0, the sparsity rule
+// of moe_sparse_mm SP_MODE: such an expert is inactive and the down kernels never read its h), the whole group
+// skips the slot (no reads, no exchange, no h). The flag goes to compute (CB 8) and the writer (CB 9).
+
 void kernel_main() {
     constexpr uint32_t cb_g = get_compile_time_arg_val(0);
     constexpr uint32_t cb_u = get_compile_time_arg_val(1);
@@ -65,6 +72,37 @@ void kernel_main() {
     const auto es = TensorAccessor(e_args, e_addr, kb);
     const auto bs = TensorAccessor(b_args, b_addr, kb);
 
+#if MOTIF_PN_FAST
+    constexpr uint32_t cb_ctl = 8, cb_ctl2 = 9;
+    cb_reserve_back(cb_w, R);
+    {
+        uint32_t wd = get_write_ptr(cb_w);
+        for (uint32_t tr = 0; tr < R; ++tr) {
+            noc_async_read_page(e * R + tr, ws, wd);
+            wd += get_tile_size(cb_w);
+        }
+    }
+    noc_async_read_barrier();
+    uint32_t any = 0;
+    {
+        const volatile tt_l1_ptr uint32_t* wt = reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_w));
+        for (uint32_t tr = 0; tr < R; ++tr) {
+            for (uint32_t r = 0; r < 16; ++r) {
+                any |= wt[tr * 1024 + r * 16] | wt[tr * 1024 + 512 + r * 16];  // column 0, rows r and 16 + r
+            }
+        }
+    }
+    const uint32_t active = (any & 0x7FFFFFFFu) != 0 ? 1u : 0u;
+    cb_reserve_back(cb_ctl, 1);
+    cb_reserve_back(cb_ctl2, 1);
+    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_ctl))[0] = active;
+    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_ctl2))[0] = active;
+    cb_push_back(cb_ctl, 1);
+    cb_push_back(cb_ctl2, 1);
+    if (!active) {
+        return;
+    }
+#endif
     // the 7 per-expert constants: one aligned 64 B read of each constant tile's first bytes into tile j of CB_K
     cb_reserve_back(cb_k, 7);
     const uint32_t kdst = get_write_ptr(cb_k);
@@ -110,12 +148,14 @@ void kernel_main() {
             dst += tb;
         }
     }
+#if !MOTIF_PN_FAST
     cb_reserve_back(cb_w, R);
     uint32_t wdst = get_write_ptr(cb_w);
     for (uint32_t tr = 0; tr < R; ++tr) {
         noc_async_read_page(e * R + tr, ws, wdst);
         wdst += get_tile_size(cb_w);
     }
+#endif
     noc_async_read_barrier();
     cb_push_back(cb_u, n * R);
     cb_push_back(cb_w, R);

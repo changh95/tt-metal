@@ -18,6 +18,10 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+#ifndef MOTIF_PN_FAST
+#define MOTIF_PN_FAST 0
+#endif
+
 namespace {
 constexpr uint32_t NX0 = 9;
 constexpr uint32_t NY0 = 25;
@@ -49,6 +53,17 @@ void kernel_main() {
     constexpr uint32_t GX = get_compile_time_arg_val(8);
     constexpr auto h_args = TensorAccessorArgs<41>();
 
+#if MOTIF_PN_FAST
+    {  // reader.cpp MOTIF_PN_FAST: an inactive slot (no nonzero weight) skips the exchange and h
+        constexpr uint32_t cb_ctl2 = 9;
+        cb_wait_front(cb_ctl2, 1);
+        const uint32_t active = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_ctl2))[0];
+        cb_pop_front(cb_ctl2, 1);
+        if (!active) {
+            return;
+        }
+    }
+#endif
     const uint32_t h_addr = get_common_arg_val<uint32_t>(0);
     const uint32_t q = static_cast<uint32_t>(get_absolute_logical_y()) * GX + get_absolute_logical_x();
     const uint32_t e = q / G;

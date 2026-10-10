@@ -36,6 +36,13 @@ from the gather path's by fp32 rounding (sum order, a correctly rounded division
 not bitwise equal to the release. Deterministic and identical on all chips; a row's outputs depend only on its own
 scores (one worker per row, same code at every M), so the T64 step's rows equal the T32 rows bitwise.
 
+Phase F F3 (``MOTIF3_MOE_LOCAL=fused``; ``fast=True``, writer.cpp ``MOTIF_RT_FAST``): the same top-K scan, replica
+assignment and weights with batched L1 loads (8 scores / one record's ids at a time, the flex list copied to local
+memory once, a local ``where``); integer code, every output bitwise the same (108 synthetic score sets x plain / r4
+kernels, M = 32 / 64, lane masks, and real layer-2 scores: ``logs/opt/phaseF/F3/rt_fast1.json``). Traced at M = 32,
+layer 2 [M]: r4 tail 27.5 -> 23.8 us, plain tail 12.8 -> 10.0 us. Experiments only: ``MOTIF3_RT_EXP`` (256 = a
+per-worker wall-clock timeline in ``last_timeline``).
+
 Trace safety: no host round trip; outputs are fresh device allocations per call; the program (one per buffer-type
 combination, M and scale) is built on the first eager call and its hash memoized, so a traced call only
 patches the common runtime args (buffer addresses). L1 per worker: 5 pages of 4 KB (CBs only).
@@ -193,7 +200,8 @@ class FusedRouterTopK:
         n_rep: replica slots per chip (with ``replica_table``).
     """
 
-    def __init__(self, mesh_device, bias, local_ids, *, top_k: int, replica_table=None, n_rep: int = 0):
+    def __init__(self, mesh_device, bias, local_ids, *, top_k: int, replica_table=None, n_rep: int = 0,
+                 fast: bool = False):
         self.mesh_device = mesh_device
         self.bias, self.ids = bias, local_ids
         bshape = tuple(int(v) for v in bias.shape)
@@ -226,6 +234,14 @@ class FusedRouterTopK:
         self._desc: Dict[tuple, object] = {}
         self._hash: Dict[tuple, int] = {}
         self._tag = _sources_tag()
+        import os
+
+        # experiments only (writer.cpp MOTIF_RT_EXP; 256 = per-worker wall-clock timeline -> self.last_timeline)
+        self.exp = int(os.environ.get("MOTIF3_RT_EXP", "0") or 0)
+        # Phase F F3 (MOTIF3_MOE_LOCAL=fused): writer.cpp MOTIF_RT_FAST, the same top-K / assignment / weights with
+        # batched L1 loads (integer code; every output bitwise the same). Mutable: the descriptor cache keys on it.
+        self.fast = bool(fast)
+        self.last_timeline = None
 
     def supports(self, scores) -> bool:
         """True iff ``scores`` has the call contract (fp32 TILE interleaved ``[1, 1, M, NE]``, M placeable)."""
@@ -282,6 +298,11 @@ class FusedRouterTopK:
 
         cc = compute_config_descriptor("router", fp32_unpack_cbs=[CB_S, CB_B])
         defines = [("MOTIF_RT_SRC", self._tag)]
+        if self.fast:
+            defines.append(("MOTIF_RT_FAST", "1"))
+        if self.exp:
+            defines.append(("MOTIF_RT_EXP", str(self.exp)))
+            cbs.append(_cb(8, cores))  # CB_TL (writer.cpp; experiments only)
         gx = self.grid[0]
         reader_ct = [CB_S, CB_B, CB_ID, p["NT"], gx] + _accessor(scores) + _accessor(self.bias) + _accessor(self.ids)
         reader_ct += [int(repl), int(lane is not None)] + _accessor(lane if lane is not None else self.ids) \
@@ -291,6 +312,8 @@ class FusedRouterTopK:
                       1] + _accessor(w_loc) + _accessor(idx)
                      + [int(repl), int(lane is not None), self.n_rep, p["M"], CB_G, CB_K, CB_SC, SEM_G, SEM_K, cx, cy]
                      + list(ra) + list(rb) + _accessor(assign if assign is not None else idx))
+        if self.exp & 256:
+            writer_ct += _accessor(self._tl)
         compute_ct = [CB_S, CB_B, CB_O]
         kernels = [
             ttnn.KernelDescriptor(
@@ -300,20 +323,21 @@ class FusedRouterTopK:
             ttnn.KernelDescriptor(
                 kernel_source=str(WRITER_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores, compile_time_args=writer_ct, defines=defines, runtime_args=[],
-                common_runtime_args=[0] * 3, config=ttnn.WriterConfigDescriptor()),
+                common_runtime_args=[0] * (4 if self.exp & 256 else 3), config=ttnn.WriterConfigDescriptor()),
             ttnn.KernelDescriptor(
                 kernel_source=str(COMPUTE_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores, compile_time_args=compute_ct, defines=defines, runtime_args=[],
                 common_runtime_args=[], config=cc),
         ]
         desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-        return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"])
+        return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"], self.exp, self.fast)
 
     def _program(self, M, scale_bits, scores, w_loc, idx, lane=None, assign=None):
         """The cached descriptor for these tensors' buffer types, M and scale, patched with this call's
         addresses (common runtime args only: a cache hit rebuilds nothing)."""
         ts = (scores, w_loc, self.bias, self.ids, idx) + tuple(t for t in (lane, self.table, assign) if t is not None)
-        key = (M, scale_bits, lane is not None, self.table is not None) + tuple(tuple(_accessor(t)) for t in ts)
+        key = (M, scale_bits, lane is not None, self.table is not None, self.fast) + \
+            tuple(tuple(_accessor(t)) for t in ts)
         desc = self._desc.get(key)
         if desc is None:
             p = plan(M, self.n_experts, self.top_k, self.e_tot, self.grid)
@@ -329,7 +353,8 @@ class FusedRouterTopK:
                                                lane.buffer_address() if lane is not None else 0,
                                                self.table.buffer_address() if self.table is not None else 0]
         desc.kernels[1].common_runtime_args = [w_loc.buffer_address(), idx.buffer_address(),
-                                               assign.buffer_address() if assign is not None else 0]
+                                               assign.buffer_address() if assign is not None else 0] + \
+            ([self._tl.buffer_address()] if self.exp & 256 else [])
         return desc
 
     def __call__(self, scores, *, scale: float = 1.0, memory_config=None, want_idx: bool = False, lane_mask=None,
@@ -365,9 +390,13 @@ class FusedRouterTopK:
                 ttnn.Shape([1, 1, 1, ASSIGN_WORDS]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
                 ttnn.L1_MEMORY_CONFIG,
             )
+        if self.exp & 256:  # timeline experiment: [1, 1, 2 M, 16] uint32 RM (row 2 q: worker q's writer stamps)
+            self._tl = self.last_timeline = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, 2 * M, 16]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
+                ttnn.DRAM_MEMORY_CONFIG)
         desc = self._program(M, _f32_bits(scale), scores, w_loc, idx, lane, assign)
         io = [scores, self.bias, self.ids] + [t for t in (lane, self.table) if t is not None] + [idx] \
-            + ([assign] if assign is not None else []) + [w_loc]
+            + ([assign] if assign is not None else []) + ([self._tl] if self.exp & 256 else []) + [w_loc]
         ttnn.generic_op(io, desc)
         out = [w_loc]
         if want_idx:
