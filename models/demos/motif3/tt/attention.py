@@ -1828,18 +1828,19 @@ class MotifAttention:
 
     def fused_input(self):
         """The layer's :class:`~models.demos.motif3.tt.kernels.attn_in.FusedAttnIn` (built on first use)."""
-        if self._fused_input is None:
+        if getattr(self, "_fused_input", None) is None:
             from .kernels.attn_in import FusedAttnIn
 
             self._fused_input = FusedAttnIn(self.mesh_device, eps=self.cfg.rms_norm_eps)
         return self._fused_input
 
     def _fused_input_chain(self, x, cos, sin, kv_write):
-        """``attn_in="fused"`` (Phase F F1): the two latent projections (the release's ops), then ONE program for the
-        rest of the input chain -> ``(q_mla [1, L, 10, 576], g, lam, kv)`` with ``kv`` the draft-1 update input
+        """``attn_in="post"`` (Phase F F1): the two latent projections (the release's ops), then ONE program for the
+        rest of the input chain; ``attn_in="fused"``: the projections in that program too -> ``(q_mla [1, L, 10, 576], g, lam, kv)`` with ``kv`` the draft-1 update input
         (``kv_write=None``: :attr:`update_mc`) or ``kv_row [1, 1, L, 576]`` for the writer. ``None`` (nothing run) when
         the mode is off or the operands are outside the kernel's contract (the op chain then runs)."""
-        if self.attn_in != "fused" or self.rope_mode != "hf":
+        mode = getattr(self, "attn_in", "ops")  # (host tests build the module without __init__)
+        if mode not in ("post", "fused") or getattr(self, "rope_mode", "hf") != "hf":
             return None
         L = int(x.shape[-2])
         grid = self.mesh_device.compute_with_storage_grid_size()
@@ -1847,10 +1848,16 @@ class MotifAttention:
             return None
         if int(cos.padded_shape[-2]) != TILE or int(cos.shape[-1]) != self.rope_dim:
             return None
+        umc = self.update_mc if kv_write is None else None
+        if mode == "fused":  # the latent projections in the same program
+            if x.dtype != ttnn.bfloat16 or x.layout != ttnn.TILE_LAYOUT \
+                    or x.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
+                return None
+            return self.fused_input().full(x, self.w_q_lat, self.w_kv_lat, cos, sin, self.w_q_b, self.w_gate,
+                                           self.w_uk, update_mc=umc)
         cq = self._linear(x, self.w_q_lat, ckc=self.ckc_latent, pc=self._pc("q_lat", True), dtype=ttnn.float32)
         kvl = self._kv_latent(x, True)
-        out = self.fused_input()(cq, kvl, cos, sin, self.w_q_b, self.w_gate, self.w_uk,
-                                 update_mc=self.update_mc if kv_write is None else None)
+        out = self.fused_input()(cq, kvl, cos, sin, self.w_q_b, self.w_gate, self.w_uk, update_mc=umc)
         ttnn.deallocate(cq)
         ttnn.deallocate(kvl)
         return out

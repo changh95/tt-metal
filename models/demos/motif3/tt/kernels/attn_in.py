@@ -55,11 +55,18 @@ QN_CORE, KN_CORE = (11, 9), (10, 9)
 # CB ids (attn_in/common.h)
 (CB_CQN, CB_WA, CB_WB, CB_QOUT, CB_QSEND, CB_GOUT, CB_NOPE, CB_WUK, CB_UKOUT, CB_PEPART, CB_COS, CB_SIN, CB_SCAL,
  CB_ROT, CB_CI, CB_SI, CB_ROPE, CB_QMLA, CB_KVROW, CB_QX, CB_XMM2, CB_EX2, CB_EX2PE, CB_RSCAL, CB_EPS, CB_KIN,
- CB_ROTIN, CB_KPEX, CB_LAM) = range(29)
-N_SEMS = 5
+ CB_ROTIN, CB_KPEX, CB_LAM, CB_X, CB_LW0, CB_LW1, CB_LOQ, CB_LOK) = range(34)
+N_SEMS = 8
 H, HT, NQ, NG, KQ, UKN, NCOL, KVT = 10, 6, 60, 32, 32, 16, 18, 18
-NQB, NUK, OWN0 = NQ + NG, 80, 92
+NQB, NUK = NQ + NG, 80
+KL, NLQ, NLK, LB, LW_SLOTS = 128, 32, 20, 8, 4
 KV_MODES = ("dram", "shard")
+# core layout per mode: QB0 / UK0 / OWN0 (first core of the role), the cq_n multicast rows (QB cores) and the x
+# multicast rows (latent cores 0..51; LAT only)
+LAYOUT = {
+    "post": dict(LAT=0, QB0=0, UK0=0, OWN0=92, cqn_rows=(0, 7), x_rows=(0, 4)),
+    "full": dict(LAT=1, QB0=26, UK0=0, OWN0=100, cqn_rows=(2, 9), x_rows=(0, 4)),
+}
 
 
 def _sources_tag() -> str:
@@ -115,6 +122,9 @@ class FusedAttnIn:
         self.mesh_device = mesh_device
         self.eps = float(eps)
         self.debug = int(debug)
+        import os
+
+        self.exp = int(os.environ.get("MOTIF3_AIN_EXP", "0") or 0)  # experiments only (kernel-cost breakdown)
         self._desc: Dict[tuple, object] = {}
         self._hash: Dict[tuple, int] = {}
         self._tag = _sources_tag()
@@ -165,6 +175,10 @@ class FusedAttnIn:
         L = shp[2]
         self._check_t("cq", cq, (1, 1, L, KQ * TILE), ttnn.float32)
         self._check_t("kvl", kvl, (1, 1, L, 640), ttnn.bfloat16)
+        self._check_rope_weights(cos, sin, w_q_b, w_gate, w_uk)
+        return L
+
+    def _check_rope_weights(self, cos, sin, w_q_b, w_gate, w_uk) -> None:
         for name, t in (("cos", cos), ("sin", sin)):
             if tuple(int(v) for v in t.shape)[-1] != 64 or int(t.padded_shape[-2]) != TILE or t.dtype != ttnn.bfloat16:
                 raise ValueError(f"fused attention input: {name} must be [1, 1, 32, 64] bf16, got {tuple(t.shape)}")
@@ -175,14 +189,17 @@ class FusedAttnIn:
                 raise ValueError(f"fused attention input: {name} must be {shape} bf16, got {tuple(t.shape)}")
         if tuple(int(v) for v in w_uk.shape) != (1, H, 128, 512) or w_uk.dtype != ttnn.bfloat16:
             raise ValueError(f"fused attention input: w_uk must be [1, 10, 128, 512] bf16, got {tuple(w_uk.shape)}")
-        return L
 
     # ---- program ----------------------------------------------------------------------------------------------------
-    def _program(self, L, kvmode, ins, outs):
-        cq, kvl, cos, sin, wqb, wg, wuk = ins
-        qmla, g, lam, kvo, dbg = outs
-        ts = (cq, kvl, cos, sin, wqb, wg, wuk, qmla, g, lam, kvo, dbg)
-        key = (L, kvmode) + tuple(tuple(_accessor(t)) for t in ts)
+    def _rect_noc(self, y0, y1):
+        a = self.mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(0, y0))
+        b = self.mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(GRID[0] - 1, y1))
+        return int(a.x), int(a.y), int(b.x), int(b.y)
+
+    def _program(self, mode, L, kvmode, ts):
+        """``ts`` = (cq, kvl, cos, sin, wqb, wgate, wuk, qmla, g, lam, kvout, dbg, x, wqlat, wkvlat)."""
+        lay = LAYOUT[mode]
+        key = (mode, L, kvmode) + tuple(tuple(_accessor(t)) for t in ts)
         desc = self._desc.get(key)
         gx, gy = GRID
         ncores = gx * gy
@@ -193,54 +210,58 @@ class FusedAttnIn:
             qn = _rect(*QN_CORE, *QN_CORE)
             kn = _rect(*KN_CORE, *KN_CORE)
             norm_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(*KN_CORE), ttnn.CoreCoord(*QN_CORE))})
+            xr0, xr1 = lay["x_rows"]
+            lat_cores = _rect(0, xr0, gx - 1, xr1)
+            xq_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, xr0), ttnn.CoreCoord(gx - 1, xr1)),
+                                          ttnn.CoreRange(ttnn.CoreCoord(*KN_CORE), ttnn.CoreCoord(*QN_CORE))})
+
+            def cb(i, n, page, dt, cores):
+                return ttnn.CBDescriptor(total_size=n * page, core_ranges=cores, format_descriptors=[
+                    ttnn.CBFormatDescriptor(buffer_index=i, data_format=dt, page_size=page)])
+
+            bf, f32 = ttnn.bfloat16, ttnn.float32
             # uniform CBs (every core; the remotely written ones need one address everywhere) first, then per role
-            spec = [
-                (CB_CQN, KQ, FP32, ttnn.float32, all_cores),
-                (CB_KVROW, KVT, BF16, ttnn.bfloat16, all_cores),
-                (CB_QMLA, max(L, 1), BF16, ttnn.bfloat16, all_cores),
-                (CB_NOPE, 4, BF16, ttnn.bfloat16, all_cores),
-                (CB_PEPART, 1, BF16, ttnn.bfloat16, all_cores),
-                (CB_COS, 2, BF16, ttnn.bfloat16, all_cores),
-                (CB_SIN, 2, BF16, ttnn.bfloat16, all_cores),
-                (CB_SCAL, 1, BF16, ttnn.bfloat16, all_cores),
-                (CB_ROT, 1, BF16, ttnn.bfloat16, all_cores),
-                (CB_CI, 1, BF16, ttnn.bfloat16, all_cores),
-                (CB_SI, 1, BF16, ttnn.bfloat16, all_cores),
-                (CB_WA, 16, BF16, ttnn.bfloat16, main),
-                (CB_WB, 16, BF16, ttnn.bfloat16, main),
-                (CB_QOUT, 1, BF16, ttnn.bfloat16, main),
-                (CB_QSEND, 1, BF16, ttnn.bfloat16, main),
-                (CB_GOUT, 1, BF16, ttnn.bfloat16, main),
-                (CB_WUK, 8, BF16, ttnn.bfloat16, main),
-                (CB_UKOUT, 2, BF16, ttnn.bfloat16, main),
-                (CB_ROPE, 1, BF16, ttnn.bfloat16, main),
-                (CB_QX, KQ, FP32, ttnn.float32, qn),
-                (CB_XMM2, KQ, FP32, ttnn.float32, norm_cores),
-                (CB_EX2, 1, FP32, ttnn.float32, norm_cores),
-                (CB_EX2PE, 1, FP32, ttnn.float32, norm_cores),
-                (CB_RSCAL, 1, BF16, ttnn.bfloat16, norm_cores),
-                (CB_EPS, 1, BF16, ttnn.bfloat16, norm_cores),
-                (CB_KIN, 16, BF16, ttnn.bfloat16, kn),
-                (CB_ROTIN, 2, BF16, ttnn.bfloat16, kn),
-                (CB_KPEX, 2, BF16, ttnn.bfloat16, kn),
-                (CB_LAM, 2, BF16, ttnn.bfloat16, kn),
-            ]
-            cbs = [ttnn.CBDescriptor(total_size=n * page, core_ranges=cores, format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=i, data_format=dt, page_size=page)]) for i, n, page, dt, cores in spec]
-            sems = [ttnn.SemaphoreDescriptor(id=s, core_ranges=all_cores, initial_value=0) for s in range(N_SEMS)]
-            x0, y0, x1, y1 = self._mcast_rect()
+            cbs = [cb(CB_CQN, KQ, FP32, f32, all_cores), cb(CB_KVROW, KVT, BF16, bf, all_cores),
+                   cb(CB_QMLA, max(L, 1), BF16, bf, all_cores), cb(CB_NOPE, 4, BF16, bf, all_cores),
+                   cb(CB_PEPART, 1, BF16, bf, all_cores), cb(CB_COS, 2, BF16, bf, all_cores),
+                   cb(CB_SIN, 2, BF16, bf, all_cores), cb(CB_SCAL, 1, BF16, bf, all_cores),
+                   cb(CB_ROT, 1, BF16, bf, all_cores), cb(CB_CI, 1, BF16, bf, all_cores),
+                   cb(CB_SI, 1, BF16, bf, all_cores)]
+            # one region (one address on the latent rows and the QN / KN cores): latent in0 x (bf16 128 tiles), and the
+            # landing zones of the latent outputs: cq (QN, fp32 32 tiles), kvl (KN, bf16 20 tiles)
+            cbs.append(ttnn.CBDescriptor(total_size=KL * BF16, core_ranges=xq_cores, format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=CB_X, data_format=bf, page_size=BF16),
+                ttnn.CBFormatDescriptor(buffer_index=CB_QX, data_format=f32, page_size=FP32),
+                ttnn.CBFormatDescriptor(buffer_index=CB_KIN, data_format=bf, page_size=BF16)]))
+            cbs += [cb(CB_WA, 16, BF16, bf, main), cb(CB_WB, 16, BF16, bf, main), cb(CB_QOUT, 1, BF16, bf, main),
+                    cb(CB_QSEND, 1, BF16, bf, main), cb(CB_GOUT, 1, BF16, bf, main), cb(CB_WUK, 8, BF16, bf, main),
+                    cb(CB_UKOUT, 2, BF16, bf, main), cb(CB_ROPE, 1, BF16, bf, main)]
+            if lay["LAT"]:
+                cbs += [cb(CB_LW0, LW_SLOTS * LB, BF16, bf, lat_cores), cb(CB_LW1, LW_SLOTS * LB, BF16, bf, lat_cores),
+                        cb(CB_LOQ, 1, FP32, f32, lat_cores), cb(CB_LOK, 1, BF16, bf, lat_cores)]
+            cbs += [cb(CB_XMM2, KQ, FP32, f32, norm_cores), cb(CB_EX2, 1, FP32, f32, norm_cores),
+                    cb(CB_EX2PE, 1, FP32, f32, norm_cores), cb(CB_RSCAL, 1, BF16, bf, norm_cores),
+                    cb(CB_EPS, 1, BF16, bf, norm_cores), cb(CB_ROTIN, 2, BF16, bf, kn), cb(CB_KPEX, 2, BF16, bf, kn),
+                    cb(CB_LAM, 2, BF16, bf, kn)]
+            sems = [ttnn.SemaphoreDescriptor(id=s_, core_ranges=all_cores, initial_value=0) for s_ in range(N_SEMS)]
+            m = self._rect_noc(*lay["cqn_rows"])
+            qn_in = lay["cqn_rows"][1] == gy - 1  # the QN core sits inside the cq_n rectangle (not a destination)
+            m_nd = gx * (lay["cqn_rows"][1] - lay["cqn_rows"][0] + 1) - (1 if qn_in else 0)
+            xm = self._rect_noc(*lay["x_rows"])
+            xm_nd = gx * (xr1 - xr0 + 1)
             acc = []
             for t in ts:
                 acc += _accessor(t)
             defines = [("MOTIF_AIN_SRC", self._tag)]
-            n_common = 12 + ncores + (8 if kvmode == "shard" else 0)
+            if self.exp:
+                defines.append(("MOTIF_AIN_EXP", str(int(self.exp))))
+            n_common = len(ts) + ncores + (8 if kvmode == "shard" else 0)
             kvm = 1 if kvmode == "shard" else 0
-            from ..model_config import NUM_CB_SLOTS  # noqa: F401  (import check)
-
             kernels = []
             for role, cores, wt, w in ((0, main, 0, 0), (1, qn, KQ, KQ * TILE), (2, kn, 16, 512)):
                 for risc in (0, 1):
-                    ct = [role, risc, gx, L, kvm, x0, y0, x1, y1, 96, _f32_bits(self.eps), self.debug, ncores] + acc
+                    ct = ([role, risc, gx, L, kvm, *m, m_nd, _f32_bits(self.eps), self.debug, ncores, lay["LAT"],
+                           lay["QB0"], lay["UK0"], lay["OWN0"], *xm, xm_nd] + acc)
                     cfg = ttnn.ReaderConfigDescriptor() if risc == 0 else ttnn.WriterConfigDescriptor()
                     kernels.append(ttnn.KernelDescriptor(
                         kernel_source=str(SOURCES["dataflow"]), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -248,11 +269,11 @@ class FusedAttnIn:
                         common_runtime_args=[0] * n_common, config=cfg))
                 kernels.append(ttnn.KernelDescriptor(
                     kernel_source=str(SOURCES["compute"]), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-                    core_ranges=cores, compile_time_args=[role, gx, wt, w], defines=defines, runtime_args=[],
-                    common_runtime_args=[], config=compute_config()))
+                    core_ranges=cores, compile_time_args=[role, gx, wt, w, lay["LAT"], lay["QB0"], lay["UK0"]],
+                    defines=defines, runtime_args=[], common_runtime_args=[], config=compute_config()))
             desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
             if hasattr(ttnn, "compute_program_descriptor_hash"):
-                hk = (L, kvmode, tuple(acc), self.debug, self._mc, _f32_bits(self.eps))
+                hk = (mode, L, kvmode, tuple(acc), self.debug, m, xm, _f32_bits(self.eps), self.exp, self._tag)
                 hv = self._hash.get(hk)
                 if hv is None:
                     hv = self._hash[hk] = ttnn.compute_program_descriptor_hash(desc)
@@ -260,21 +281,27 @@ class FusedAttnIn:
             self._desc[key] = desc
         args = [t.buffer_address() for t in ts] + self._core_xy()
         if kvmode == "shard":
-            args += self._shard_xy(kvo)
+            args += self._shard_xy(ts[10])
         for k in desc.kernels:
             if k.common_runtime_args:
                 k.common_runtime_args = args
         return desc
 
+    def check_full(self, x, w_q_lat, w_kv_lat) -> int:
+        """``x [1, 1, L <= 32, 4096]`` bf16, ``Wq_lat [4096, 1024]`` / ``Wkv_lat [4096, 640]`` bf16 (interleaved TILE)."""
+        shp = tuple(int(v) for v in x.shape)
+        if len(shp) != 4 or shp[:2] != (1, 1) or shp[3] != KL * TILE or not 1 <= shp[2] <= TILE:
+            raise ValueError(f"fused attention input: x must be [1, 1, L <= 32, 4096], got {shp}")
+        self._check_t("x", x, shp, ttnn.bfloat16)
+        for name, t, shape in (("w_q_lat", w_q_lat, (KL * TILE, NLQ * TILE)),
+                               ("w_kv_lat", w_kv_lat, (KL * TILE, NLK * TILE))):
+            if tuple(int(v) for v in t.shape)[-2:] != shape or t.dtype != ttnn.bfloat16 \
+                    or t.layout != ttnn.TILE_LAYOUT or not _is_interleaved(t.memory_config()):
+                raise ValueError(f"fused attention input: {name} must be {shape} bf16 TILE interleaved")
+        return shp[2]
+
     # ---- call -------------------------------------------------------------------------------------------------------
-    def __call__(self, cq, kvl, cos, sin, w_q_b, w_gate, w_uk, *, update_mc=None):
-        """``(q_mla [1, L, 10, 576], g [1, 1, L, 1024], lam [1, 1, L, 64], kv)`` bf16 from ``cq [1, 1, L, 1024]``
-        fp32 and ``kvl [1, 1, L, 640]`` bf16 (the two latent projections), the step's RoPE tables (``[1, 1, 32, 64]``)
-        and the layer's weights. ``kv``: with ``update_mc`` (the draft-1 height-sharded update layout, L = 8) the
-        ``paged_update_cache`` input ``[1, L, 1, 576]`` in that layout (only row 0 of each lane tile is written: the
-        rows the update reads); otherwise ``kv_row [1, 1, L, 576]`` DRAM. Consumes nothing. With ``debug`` the
-        returned tuple has a 5th entry, cq_n ``[1, 1, L, 1024]`` fp32."""
-        L = self.check(cq, kvl, cos, sin, w_q_b, w_gate, w_uk)
+    def _outputs(self, L, update_mc):
         dram = ttnn.DRAM_MEMORY_CONFIG
         dev = self.mesh_device
 
@@ -287,20 +314,44 @@ class FusedAttnIn:
         if update_mc is not None:
             if L != 8:
                 raise ValueError("fused attention input: the shard write serves the 8-lane draft-1 update")
-            kvmode = "shard"
             kvo = alloc([1, L, 1, KVT * TILE], mc=update_mc)
         else:
-            kvmode = "dram"
             kvo = alloc([1, 1, L, KVT * TILE])
-        dbg = alloc([1, 1, L, KQ * TILE], ttnn.float32) if self.debug else cq
-        ins = (cq, kvl, cos, sin, w_q_b, w_gate, w_uk)
-        outs = (qmla, g, lam, kvo, dbg)
-        desc = self._program(L, kvmode, ins, outs)
-        io = [cq, kvl, cos, sin, w_q_b, w_gate, w_uk, qmla, g, lam, kvo] + ([dbg] if self.debug else [])
-        ttnn.generic_op(io, desc)
-        if self.debug:
-            return qmla, g, lam, kvo, dbg
-        return qmla, g, lam, kvo
+        dbg = alloc([1, 1, L, KQ * TILE], ttnn.float32) if self.debug else None
+        return qmla, g, lam, kvo, dbg
+
+    def _run(self, mode, L, update_mc, cq, kvl, cos, sin, w_q_b, w_gate, w_uk, x, w_q_lat, w_kv_lat):
+        qmla, g, lam, kvo, dbg = self._outputs(L, update_mc)
+        kvmode = "shard" if update_mc is not None else "dram"
+        ts = (cq, kvl, cos, sin, w_q_b, w_gate, w_uk, qmla, g, lam, kvo, dbg if dbg is not None else cq, x, w_q_lat,
+              w_kv_lat)
+        desc = self._program(mode, L, kvmode, ts)
+        io = [t for t in (cq, kvl, cos, sin, w_q_b, w_gate, w_uk, x, w_q_lat, w_kv_lat) if t is not None]
+        seen, uniq = set(), []
+        for t in io:  # inputs passed once each (post: x / w_q_lat / w_kv_lat are cq's; full: cq / kvl are x's)
+            if id(t) not in seen:
+                seen.add(id(t))
+                uniq.append(t)
+        outs = [qmla, g, lam, kvo] + ([dbg] if dbg is not None else [])
+        ttnn.generic_op(uniq + outs, desc)
+        return tuple(outs)
+
+    def __call__(self, cq, kvl, cos, sin, w_q_b, w_gate, w_uk, *, update_mc=None):
+        """Stage "post": ``(q_mla [1, L, 10, 576], g [1, 1, L, 1024], lam [1, 1, L, 64], kv)`` bf16 from ``cq [1, 1, L,
+        1024]`` fp32 and ``kvl [1, 1, L, 640]`` bf16 (the two latent projections), the step's RoPE tables (``[1, 1, 32,
+        64]``) and the layer's weights. ``kv``: with ``update_mc`` (the draft-1 height-sharded update layout, L = 8) the
+        ``paged_update_cache`` input ``[1, L, 1, 576]`` in that layout (only row 0 of each lane tile is written: the
+        rows the update reads); otherwise ``kv_row [1, 1, L, 576]`` DRAM. Consumes nothing. With ``debug`` the returned
+        tuple has a 5th entry, cq_n ``[1, 1, L, 1024]`` fp32."""
+        L = self.check(cq, kvl, cos, sin, w_q_b, w_gate, w_uk)
+        return self._run("post", L, update_mc, cq, kvl, cos, sin, w_q_b, w_gate, w_uk, cq, cq, cq)
+
+    def full(self, x, w_q_lat, w_kv_lat, cos, sin, w_q_b, w_gate, w_uk, *, update_mc=None):
+        """Stage "full": as :meth:`__call__` from the attention input ``x [1, 1, L, 4096]`` bf16 itself (the two latent
+        projections run in the same program: 52 cores, one output column each, the weights streamed on both RISCs)."""
+        L = self.check_full(x, w_q_lat, w_kv_lat)
+        self._check_rope_weights(cos, sin, w_q_b, w_gate, w_uk)
+        return self._run("full", L, update_mc, x, x, cos, sin, w_q_b, w_gate, w_uk, x, w_q_lat, w_kv_lat)
 
     def deallocate(self) -> None:
         self._desc.clear()

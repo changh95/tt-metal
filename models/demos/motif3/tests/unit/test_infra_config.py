@@ -2161,6 +2161,41 @@ def test_prefill_trace_knob(monkeypatch):
         _cfg(prefill_trace="2048")
 
 
+def test_f1_attn_in_knob(monkeypatch):
+    """Phase F F1 (logs/opt/phaseF/F1): ``MOTIF3_ATTN_IN`` ("ops" default | "post" | "fused"; case and blanks ignored,
+    anything else refused; in ``describe``) and the fused input chain's core layouts (``tt/kernels/attn_in.LAYOUT``):
+    every role fits the 12 x 10 grid next to the QN (11, 9) / KN (10, 9) cores, and the cq_n multicast rows cover every
+    QB core."""
+    from models.demos.motif3.tt.kernels import attn_in as AI
+    from models.demos.motif3.tt.model_config import ATTN_IN_MODES
+
+    assert ATTN_IN_MODES == ("ops", "post", "fused")
+    monkeypatch.delenv("MOTIF3_ATTN_IN", raising=False)
+    assert _cfg().attn_in == "ops" and "attn_in=ops " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("post", "post"), ("OPS", "ops"), ("", "ops")):
+        monkeypatch.setenv("MOTIF3_ATTN_IN", v)
+        assert _cfg().attn_in == want, v
+    monkeypatch.setenv("MOTIF3_ATTN_IN", "kernel")
+    with pytest.raises(ValueError, match="MOTIF3_ATTN_IN"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_ATTN_IN", raising=False)
+    gx, gy = AI.GRID
+    qn = AI.QN_CORE[1] * gx + AI.QN_CORE[0]
+    kn = AI.KN_CORE[1] * gx + AI.KN_CORE[0]
+    assert (qn, kn) == (gx * gy - 1, gx * gy - 2)  # the kernels address QN / KN as the last two cores
+    for mode, lay in AI.LAYOUT.items():
+        qb = range(lay["QB0"], lay["QB0"] + AI.NQB)
+        uk = range(lay["UK0"], lay["UK0"] + AI.NUK)
+        own = range(lay["OWN0"], lay["OWN0"] + AI.NCOL)
+        for name, r in (("QB", qb), ("UK", uk), ("OWN", own)):
+            assert r.stop <= kn, (mode, name)
+        r0, r1 = lay["cqn_rows"]
+        assert all(r0 <= c // gx <= r1 for c in qb), mode
+        if lay["LAT"]:
+            x0, x1 = lay["x_rows"]
+            assert all(x0 <= c // gx <= x1 for c in range(AI.NLQ + AI.NLK)), mode
+
+
 def test_d1_attn_epilogue_knob(monkeypatch):
     """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("fused" default | "ops"; case and blanks ignored, anything
     else refused; in ``describe``) and the fused combine's worker plan (``tt/kernels/attn_combine.plan``)."""

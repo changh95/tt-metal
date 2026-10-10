@@ -19,7 +19,9 @@
 //       pe: rotary_embedding_hf of tile p (p = 0: rotated = -partner; p = 1: rotated = partner).
 //     UK unit: one output tile of the per-head W_UK bmm (K = 4, one block), packed bf16.
 //
-// CT: 0 ROLE, 1 GX, 2 Wt (norm), 3 W (norm logical width)
+// CT: 0 ROLE, 1 GX, 2 Wt (norm), 3 W (norm logical width), 4 LAT, 5 QB0, 6 UK0
+//   LAT (main, c < 52): one output tile of the latent 1D-mcast linear (x @ Wq_lat -> fp32, x @ Wkv_lat -> bf16), K = 128
+//       in order in the fp32 DEST.
 
 #include <cstdint>
 
@@ -55,6 +57,10 @@ namespace numeric = norm::kernel_util::compute::numeric;
 namespace policies = norm::kernel_util::compute::policies;
 
 using namespace motif_ain;
+
+#ifndef MOTIF_AIN_EXP
+#define MOTIF_AIN_EXP 0  // experiments only: bit 2 = QN skips the norm (pushes cb_cqn unwritten)
+#endif
 
 struct FusedActivation : ckl::UnaryOp<FusedActivation, ckl::Dst::D0> {
     static ALWI void init() {}
@@ -156,6 +162,13 @@ void kernel_main() {
     constexpr uint32_t NW = get_compile_time_arg_val(3);
 
     if constexpr (ROLE == 1) {  // QN
+        if constexpr ((MOTIF_AIN_EXP & 4) != 0) {
+            for (uint32_t b = 0; b < KQ / 4; ++b) {
+                cb_reserve_back(CB_CQN, 4);
+                cb_push_back(CB_CQN, 4);
+            }
+            return;
+        }
         rms_norm_row<CB_QX, CB_CQN, NWt, NW>();
         return;
     }
@@ -171,87 +184,130 @@ void kernel_main() {
     }
 
     // ---- main grid ------------------------------------------------------------------------------------------------
+    constexpr uint32_t LAT = get_compile_time_arg_val(4);
+    constexpr uint32_t QB0 = get_compile_time_arg_val(5);
+    constexpr uint32_t UK0 = get_compile_time_arg_val(6);
     const uint32_t c = static_cast<uint32_t>(get_absolute_logical_y()) * GX + get_absolute_logical_x();
-    const bool qb = c < NQB;
-    const bool is_gate = qb && c >= NQ;
-    const uint32_t qk = c % HT;
+    const bool lat = LAT && c < NLAT;
+    const bool lat_q = lat && c < NLQ;
+    const bool qb = c >= QB0 && c < QB0 + NQB;
+    const uint32_t u = c - QB0;
+    const bool is_gate = qb && u >= NQ;
+    const uint32_t qk = u % HT;
     const bool is_nope = qb && !is_gate && qk < NOPE_T;
     const bool is_pe = qb && !is_gate && qk >= NOPE_T;
-    const bool uk = c < NUK;
-    if (!qb) {
-        return;  // owners / idle: no compute (every UK core is a QB core)
+    const bool uk = c >= UK0 && c < UK0 + NUK;
+    bool started = false;
+
+    // ---- latent unit: one output tile of the 1D-mcast linear x @ Wq_lat (fp32 out) / x @ Wkv_lat (bf16 out), K = 128
+    // in order in the fp32 DEST; weight batches alternate between the two rings (even b: cb_lw0, odd b: cb_lw1)
+    if (lat) {
+        const uint32_t cb_out = lat_q ? CB_LOQ : CB_LOK;
+        compute_kernel_hw_startup<SrcOrder::Reverse>(CB_X, CB_LW0, cb_out);
+        started = true;
+        matmul_block_init(CB_X, CB_LW0, 0, 1, 1, LB);
+        tile_regs_acquire();
+        for (uint32_t b = 0; b < NLB; ++b) {
+            const uint32_t cb_w = (b & 1u) ? CB_LW1 : CB_LW0;
+            cb_wait_front(CB_X, (b + 1) * LB);
+            cb_wait_front(cb_w, LB);
+            for (uint32_t i = 0; i < LB; ++i) {
+                matmul_block(CB_X, cb_w, b * LB + i, i, 0, 0, 1, 1, LB);
+            }
+            cb_pop_front(cb_w, LB);
+        }
+        tile_regs_commit();
+        cb_reserve_back(cb_out, 1);
+        tile_regs_wait();
+        pack_tile(0, cb_out);
+        tile_regs_release();
+        cb_push_back(cb_out, 1);
+        cb_pop_front(CB_X, KL);
     }
 
     // ---- QB: one output tile, K = 32 in order --------------------------------------------------------------------
-    compute_kernel_hw_startup<SrcOrder::Reverse>(CB_CQN, CB_WA, CB_QOUT);
-    matmul_block_init(CB_CQN, CB_WA, 0, 1, 1, KH);
-    cb_wait_front(CB_WA, KH);
-    cb_wait_front(CB_WB, KH);
-    tile_regs_acquire();
-    for (uint32_t k = 0; k < KQ; ++k) {
-        if ((k & 3u) == 0) {
-            cb_wait_front(CB_CQN, k + 4);
-        }
-        if (k < KH) {
-            matmul_block(CB_CQN, CB_WA, k, k, 0, 0, 1, 1, KH);
+    if (qb) {
+        if (!started) {
+            compute_kernel_hw_startup<SrcOrder::Reverse>(CB_CQN, CB_WA, CB_QOUT);
+            started = true;
         } else {
-            matmul_block(CB_CQN, CB_WB, k, k - KH, 0, 0, 1, 1, KH);
+            reconfig_data_format(CB_WA, CB_CQN);
+            pack_reconfig_data_format(CB_QOUT);
         }
-    }
-    tile_regs_commit();
-    if (is_nope) {
-        cb_reserve_back(CB_QSEND, 1);
-        tile_regs_wait();
-        pack_tile(0, CB_QSEND);
-        tile_regs_release();
-        cb_push_back(CB_QSEND, 1);
-    } else if (is_pe) {
-        cb_reserve_back(CB_QOUT, 1);
-        cb_reserve_back(CB_QSEND, 1);
-        tile_regs_wait();
-        pack_tile(0, CB_QOUT);
-        pack_tile(0, CB_QSEND);
-        tile_regs_release();
-        cb_push_back(CB_QOUT, 1);
-        cb_push_back(CB_QSEND, 1);
-    } else {
-        cb_reserve_back(CB_QOUT, 1);
-        tile_regs_wait();
-        pack_tile(0, CB_QOUT);
-        tile_regs_release();
-        cb_push_back(CB_QOUT, 1);
-    }
-    cb_pop_front(CB_WA, KH);
-    cb_pop_front(CB_WB, KH);
-    cb_pop_front(CB_CQN, KQ);
-
-    if (is_gate) {  // the stock unary sigmoid on the bf16 linear output
-        reconfig_data_format_srca(CB_QOUT);
-        pack_reconfig_data_format(CB_GOUT);
-        copy_init(CB_QOUT);
-        cb_wait_front(CB_QOUT, 1);
-        cb_reserve_back(CB_GOUT, 1);
+        matmul_block_init(CB_CQN, CB_WA, 0, 1, 1, KH);
+        cb_wait_front(CB_WA, KH);
+        cb_wait_front(CB_WB, KH);
         tile_regs_acquire();
-        copy_tile(CB_QOUT, 0, 0);
-        sigmoid_tile_init<false>();
-        sigmoid_tile<VectorMode::RC, false, false>(0);
+        for (uint32_t k = 0; k < KQ; ++k) {
+            if ((k & 3u) == 0) {
+                cb_wait_front(CB_CQN, k + 4);
+            }
+            if (k < KH) {
+                matmul_block(CB_CQN, CB_WA, k, k, 0, 0, 1, 1, KH);
+            } else {
+                matmul_block(CB_CQN, CB_WB, k, k - KH, 0, 0, 1, 1, KH);
+            }
+        }
         tile_regs_commit();
-        tile_regs_wait();
-        pack_tile(0, CB_GOUT);
-        tile_regs_release();
-        cb_pop_front(CB_QOUT, 1);
-        cb_push_back(CB_GOUT, 1);
-    } else if (is_pe) {  // rotary_embedding_hf of tile p = qk - 4 with the partner's tile
-        cb_wait_front(CB_SCAL, 1);
-        reconfig_data_format(CB_PEPART, CB_SCAL);
-        pack_reconfig_data_format(CB_ROT);
-        rope_tile<CB_QOUT, CB_PEPART, CB_COS, CB_SIN, CB_ROPE>(qk == NOPE_T);
+        if (is_nope) {
+            cb_reserve_back(CB_QSEND, 1);
+            tile_regs_wait();
+            pack_tile(0, CB_QSEND);
+            tile_regs_release();
+            cb_push_back(CB_QSEND, 1);
+        } else if (is_pe) {
+            cb_reserve_back(CB_QOUT, 1);
+            cb_reserve_back(CB_QSEND, 1);
+            tile_regs_wait();
+            pack_tile(0, CB_QOUT);
+            pack_tile(0, CB_QSEND);
+            tile_regs_release();
+            cb_push_back(CB_QOUT, 1);
+            cb_push_back(CB_QSEND, 1);
+        } else {
+            cb_reserve_back(CB_QOUT, 1);
+            tile_regs_wait();
+            pack_tile(0, CB_QOUT);
+            tile_regs_release();
+            cb_push_back(CB_QOUT, 1);
+        }
+        cb_pop_front(CB_WA, KH);
+        cb_pop_front(CB_WB, KH);
+        cb_pop_front(CB_CQN, KQ);
+
+        if (is_gate) {  // the stock unary sigmoid on the bf16 linear output
+            reconfig_data_format_srca(CB_QOUT);
+            pack_reconfig_data_format(CB_GOUT);
+            copy_init(CB_QOUT);
+            cb_wait_front(CB_QOUT, 1);
+            cb_reserve_back(CB_GOUT, 1);
+            tile_regs_acquire();
+            copy_tile(CB_QOUT, 0, 0);
+            sigmoid_tile_init<false>();
+            sigmoid_tile<VectorMode::RC, false, false>(0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, CB_GOUT);
+            tile_regs_release();
+            cb_pop_front(CB_QOUT, 1);
+            cb_push_back(CB_GOUT, 1);
+        } else if (is_pe) {  // rotary_embedding_hf of tile p = qk - 4 with the partner's tile
+            cb_wait_front(CB_SCAL, 1);
+            reconfig_data_format(CB_PEPART, CB_SCAL);
+            pack_reconfig_data_format(CB_ROT);
+            rope_tile<CB_QOUT, CB_PEPART, CB_COS, CB_SIN, CB_ROPE>(qk == NOPE_T);
+        }
     }
 
     // ---- UK: per-head W_UK bmm, 2 output tiles --------------------------------------------------------------------
     if (uk) {
-        reconfig_data_format(CB_WUK, CB_NOPE);
-        pack_reconfig_data_format(CB_UKOUT);
+        if (!started) {
+            compute_kernel_hw_startup<SrcOrder::Reverse>(CB_NOPE, CB_WUK, CB_UKOUT);
+            started = true;
+        } else {
+            reconfig_data_format(CB_WUK, CB_NOPE);
+            pack_reconfig_data_format(CB_UKOUT);
+        }
         matmul_block_init(CB_NOPE, CB_WUK, 0, 1, 1, NOPE_T);
         cb_wait_front(CB_WUK, UK_PER * NOPE_T);
         cb_wait_front(CB_NOPE, NOPE_T);

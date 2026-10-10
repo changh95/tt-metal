@@ -143,9 +143,10 @@ SHARED_POLYNORM_MODES = ("composite", "fused")
 ATTN_EPILOGUE_MODES = ("ops", "fused")
 # Decode attention input chain (Phase F F1, docs/OPTIMIZATION_PLAN.md "Phase F"; MotifAttention): "ops" (q_a norm, q_b,
 # gate + sigmoid, kv split + norm, q heads split, W_UK bmm, 2 RoPEs, concats, transposes: 15 programs after the two
-# latent projections) | "fused" (tt/kernels/attn_in.py: ONE generic_op over the 12 x 10 grid that runs the same LLK
-# sequences with the ops' configurations and writes q_mla, g, lam and the kv update input directly). Decode only.
-ATTN_IN_MODES = ("ops", "fused")
+# latent projections) | "post" (tt/kernels/attn_in.py: those 15 as ONE generic_op over the 12 x 10 grid that runs the
+# same LLK sequences with the ops' configurations and writes q_mla, g, lam and the kv update input directly) | "fused"
+# ("post" plus the two latent projections x @ Wq_lat / x @ Wkv_lat in the same program). Decode only.
+ATTN_IN_MODES = ("ops", "post", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
 # in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.
@@ -1461,7 +1462,8 @@ class MotifTTConfig:
     # Decode attention epilogue (Phase C D1): "fused" (default: one program, bitwise equal) | "ops" (the release op chain;
     # ATTN_EPILOGUE_MODES).
     attn_epilogue: str = "fused"  # MOTIF3_ATTN_EPILOGUE
-    # Decode attention input chain (Phase F F1): "ops" (default, the op chain) | "fused" (one program; ATTN_IN_MODES).
+    # Decode attention input chain (Phase F F1): "ops" (default, the op chain) | "post" | "fused" (one program;
+    # ATTN_IN_MODES).
     attn_in: str = "ops"  # MOTIF3_ATTN_IN
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS

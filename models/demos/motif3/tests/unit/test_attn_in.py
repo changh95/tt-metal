@@ -130,6 +130,32 @@ def test_attn_in_kernel_bitwise(mesh_device, device_params):
                 log(f"attn_in L{layer} rows {rows} dram: {k} {'bitwise' if nd == 0 else f'{nd} words differ'}")
                 if nd:
                     fails.append(f"L{layer} rows {rows} dram {k}: {nd} words differ")
+            # stage "full": the latent projections in the same program, from x
+            _poison(mesh_device, rows)
+            o = fi.full(x, attn.w_q_lat, attn.w_kv_lat, cos, sin, attn.w_q_b, attn.w_gate, attn.w_uk, update_mc=umc)
+            names = ("q_mla", "g", "lam", "kv_upd" if umc is not None else "kv_row", "cq_n")
+            got = {k: words(v) for k, v in zip(names, o)}
+            keep += list(o)
+            for k, v in got.items():
+                nd = ndiff(want[k], v)
+                log(f"attn_in L{layer} rows {rows} full: {k} {'bitwise' if nd == 0 else f'{nd} words differ'}")
+                if nd:
+                    fails.append(f"L{layer} rows {rows} full {k}: {nd} words differ")
+            if umc is not None:  # determinism of the full program: 20 repeated calls
+                first, bad = None, 0
+                for _ in range(20):
+                    _poison(mesh_device, rows)
+                    o = fi0.full(x, attn.w_q_lat, attn.w_kv_lat, cos, sin, attn.w_q_b, attn.w_gate, attn.w_uk,
+                                 update_mc=umc)
+                    w = [words(t) for t in o]
+                    _free(list(o))
+                    if first is None:
+                        first = w
+                    elif any(ndiff(a, b) for a, b in zip(first, w)):
+                        bad += 1
+                log(f"attn_in L{layer} full: 20 repeated calls, {bad} differ from the first")
+                if bad:
+                    fails.append(f"L{layer} full: {bad} / 19 repeated calls differ")
             if umc is not None:  # draft-1 shard mode
                 _poison(mesh_device, rows)
                 qm, gg, lam, kvu = fi0(cq, kvl, cos, sin, attn.w_q_b, attn.w_gate, attn.w_uk, update_mc=umc)
@@ -189,28 +215,29 @@ def test_attn_in_forward_decode(mesh_device, device_params):
         attn = MotifAttention(mesh_device, cfg, layer, source=hf_source(random_attn_tensors(args, seed=80 + layer),
                                                                         layer), ccl=ccl, rope=rope, cache=False)
         outs = {}
-        for mode in ("ops", "fused"):
+        for mode in ("ops", "post", "fused"):
             attn.attn_in = mode
             cache = rep(cache_h, cfg.dtypes.kv_cache)
             o = attn.forward_decode(d["x"], rot=d["rot"], cur_pos=d["cur"], page_table=d["pt"], kv_cache=cache,
                                     active=d["act"])
             outs[mode] = (words(o), words(cache, dp_chips))
             _free([o, cache])
-        n_o = ndiff(outs["ops"][0], outs["fused"][0])
-        n_c = ndiff(outs["ops"][1], outs["fused"][1])
-        log(f"attn_in forward_decode L{layer}: output {n_o} words differ, cache {n_c} words differ")
-        if n_o or n_c:
-            fails.append(f"L{layer}: output {n_o} / cache {n_c} words differ")
+        for mode in ("post", "fused"):
+            n_o = ndiff(outs["ops"][0], outs[mode][0])
+            n_c = ndiff(outs["ops"][1], outs[mode][1])
+            log(f"attn_in forward_decode L{layer} {mode}: output {n_o} words differ, cache {n_c} words differ")
+            if n_o or n_c:
+                fails.append(f"L{layer} {mode}: output {n_o} / cache {n_c} words differ")
         cache = rep(cache_h, cfg.dtypes.kv_cache)
         us = {}
-        for mode in ("ops", "fused"):
+        for mode in ("ops", "post", "fused"):
             attn.attn_in = mode
             us[mode] = _traced_us(mesh_device, lambda: attn.forward_decode(
                 d["x"], rot=d["rot"], cur_pos=d["cur"], page_table=d["pt"], kv_cache=cache, active=d["act"]),
                 n=32, reps=5)["slope_us"]
         _free(cache)
-        log(f"attn_in forward_decode L{layer}: traced ops {us['ops']:.1f} us, fused {us['fused']:.1f} us "
-            f"({us['fused'] - us['ops']:+.1f})")
+        log(f"attn_in forward_decode L{layer}: traced ops {us['ops']:.1f} us, post {us['post']:.1f} us "
+            f"({us['post'] - us['ops']:+.1f}), fused {us['fused']:.1f} us ({us['fused'] - us['ops']:+.1f})")
         del attn
     _free_step(d)
     assert not fails, "; ".join(fails)
