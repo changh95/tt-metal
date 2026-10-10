@@ -1509,6 +1509,125 @@ def test_mlp_device_fused_shared_polynorm(mesh_device, device_params):
     assert not failures, "\n".join(failures)
 
 
+@pytest.mark.timeout(2400)
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+@torch.no_grad()
+def test_mlp_device_moe_local_shared_tail(mesh_device, device_params):
+    """Phase F F3 (``MOTIF3_MOE_LOCAL=shared``, ``tt/kernels/shared_tail.py``): the shared expert's decode partial with
+    the fused tail (no row pad; gate_up; B5 moments; the moments all-gather; ONE program for apply + down + row slice)
+    vs the Phase E path (``moe_local="ops"``), shared experts from the serving TT cache, real MoE inputs, every chip:
+
+    * bitwise equal on every logical row: two 32-lane sets (8 rows per DP row) and one T64-shaped set (16 rows), on the
+      layers of ``MOTIF3_F3_LAYERS`` (comma list; default 2, 3, 4, 27, 52; ``all`` = every MoE layer);
+    * first layer: 20 repeated fused calls identical; the 16-row call's rows == the two 8-lane calls' rows; trace
+      capture with persistent ``x``, replays with new lanes == eager ``ops`` bitwise, two replays equal;
+    * traced cost of ``forward_decode(all_reduce=False)`` ops -> shared (informational)."""
+    if not REAL_MOE_INPUTS.is_file():
+        pytest.skip(f"{REAL_MOE_INPUTS} missing (tests/unit/test_moe.py capture)")
+    data = torch.load(REAL_MOE_INPUTS, weights_only=True)
+    cfg = _cfg(mesh_device)
+    fab = check_fabric(mesh_device, "mlp_f3")
+    assert str(fab.get("committed")) == "TORUS_XY", fab
+    ccl = MotifCCL(mesh_device, cfg)
+    env = os.environ.get("MOTIF3_F3_LAYERS", "").strip()
+    moe_layers = [l for l in range(cfg.num_layers) if cfg.layer(l).is_moe]
+    layers = moe_layers if env == "all" else ([int(v) for v in env.split(",")] if env else [2, 3, 4, 27, 52])
+    gen = torch.Generator().manual_seed(33)
+    failures, checked, skipped = [], [], []
+
+    def chips(t):
+        return [ttnn.to_torch(c) for c in ttnn.get_device_tensors(t)]
+
+    def same(a, b):
+        return len(a) == len(b) and all(torch.equal(x, y) for x, y in zip(a, b))
+
+    def run(mlp, x, mode):
+        mlp.moe_local = mode
+        y = mlp.forward_decode(x, all_reduce=False)
+        out = chips(y)
+        _free(y)
+        return out
+
+    for layer in layers:
+        mlp = _shared_from_tt_cache(mesh_device, cfg, ccl, layer, shared_polynorm="fused")
+        if mlp is None:
+            skipped.append(layer)
+            continue
+        assert mlp.pn_fused is not None
+        src_l = min(data["layers"], key=lambda l: abs(l - layer))
+        xs = data["layers"][src_l]["x"].float()
+        pick = xs[torch.randperm(xs.shape[0], generator=gen)[:64]]
+        inputs = [("lanes A", _rows_input(pick[:32], mesh_device, cfg)), ("lanes B", _rows_input(pick[32:], mesh_device, cfg)),
+                  ("rows16", _rows16_input(pick, mesh_device, cfg))]
+        bad, outs = [], {}
+        for name, x in inputs:
+            ys1 = run(mlp, x, "shared")  # first: x's tile padding as uploaded
+            yo = run(mlp, x, "ops")  # pads x in place
+            ys2 = run(mlp, x, "shared")
+            mlp.moe_local = "shared"
+            applies = mlp._tail_applies(x, all_reduce=False, out_dtype=ttnn.bfloat16, taps=None)
+            if not applies:
+                bad.append(f"{name}: the fused tail does not apply")
+            for tag, ys in (("before pad", ys1), ("after pad", ys2)):
+                if not same(yo, ys):
+                    nd = sum(int((a != b).sum()) for a, b in zip(yo, ys))
+                    bad.append(f"{name} ({tag}): {nd} values differ")
+            outs[name] = ys1
+        checked.append(layer)
+        print(f"[mlp] F3 L{layer} (inputs of L{src_l}): shared tail == ops bitwise "
+              f"{'yes' if not bad else 'NO: ' + '; '.join(bad)}", flush=True)
+        failures += [f"L{layer} {b}" for b in bad]
+        if layer == layers[0]:
+            x0 = inputs[0][1]
+            reps = [run(mlp, x0, "shared") for _ in range(20)]
+            det = all(same(r, outs["lanes A"]) for r in reps)
+            L = cfg.lanes_per_row
+            rows_eq = all(torch.equal(c16[..., :L, :], ca) and torch.equal(c16[..., L:, :], cb)
+                          for c16, ca, cb in zip(outs["rows16"], outs["lanes A"], outs["lanes B"]))
+            print(f"[mlp] F3 L{layer}: 20 fused calls bitwise {det}; 16-row rows == 8-lane calls {rows_eq}", flush=True)
+            if not (det and rows_eq):
+                failures.append(f"L{layer} determinism {det} / T64 rows {rows_eq}")
+            mlp.moe_local = "shared"
+            _free(mlp.forward_decode(x0, all_reduce=False))
+            ttnn.synchronize_device(mesh_device)
+            with _Capture(mesh_device) as cap:
+                y_t = mlp.forward_decode(x0, all_reduce=False)
+            try:
+                for it in range(3):
+                    xn = xs[torch.randperm(xs.shape[0], generator=gen)[:32]]
+                    ttnn.copy_host_to_device_tensor(_rows_input(xn, mesh_device, cfg, device=False), x0)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t1 = chips(y_t)
+                    ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+                    t2 = chips(y_t)
+                    te = run(mlp, x0, "ops")
+                    ok = same(t1, te) and same(t1, t2)
+                    print(f"[mlp] F3 L{layer} trace replay {it}: traced shared == eager ops {same(t1, te)}, "
+                          f"2 replays equal {same(t1, t2)}", flush=True)
+                    if not ok:
+                        failures.append(f"L{layer} trace replay {it}")
+            finally:
+                ttnn.release_trace(mesh_device, cap.tid)
+                _free(y_t)
+            res = {}
+            for mode in ("ops", "shared", "ops", "shared"):
+                mlp.moe_local = mode
+                res.setdefault(mode, []).append(traced_us(mesh_device, lambda: mlp.forward_decode(x0, all_reduce=False)))
+            x16 = inputs[2][1]
+            for mode in ("ops", "shared"):
+                mlp.moe_local = mode
+                res[mode + "_rows16"] = traced_us(mesh_device, lambda: mlp.forward_decode(x16, all_reduce=False))
+            record("mlp_f3", f"L{layer} traced", **{k: (min(v) if isinstance(v, list) else v) for k, v in res.items()})
+            print(f"[mlp] F3 L{layer} traced forward_decode(partial): ops {res['ops']} -> shared {res['shared']} us; "
+                  f"16 rows {res['ops_rows16']:.1f} -> {res['shared_rows16']:.1f} us", flush=True)
+        _free([x for _, x in inputs])
+        mlp.deallocate()
+    print(f"[mlp] F3 summary: {len(checked)} layers bitwise-checked {checked}; not converted {skipped}; "
+          f"{len(failures)} failures", flush=True)
+    assert checked, "no layer converted in the TT cache"
+    assert not failures, "\n".join(failures)
+
+
 # ============================================================================================================
 # device: opt-in sweep (PolyNorm variants, decode matmul program configs)
 # ============================================================================================================

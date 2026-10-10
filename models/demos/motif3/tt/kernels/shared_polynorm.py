@@ -235,9 +235,10 @@ class FusedSharedPolyNorm:
         except ValueError:
             return False
 
-    def _check(self, gu) -> None:
+    def _check(self, gu, *, any_rows: bool = False) -> None:
         shp = tuple(int(v) for v in gu.shape)
-        if shp != (1, 1, TILE, 2 * self.n_local):
+        rows_ok = (1 <= shp[2] <= TILE) if (any_rows and len(shp) == 4) else (len(shp) == 4 and shp[2] == TILE)
+        if len(shp) != 4 or shp[:2] != (1, 1) or shp[3] != 2 * self.n_local or not rows_ok:
             raise ValueError(f"fused shared PolyNorm: gu must be [1, 1, {TILE}, {2 * self.n_local}], got {shp}")
         if gu.dtype != ttnn.float32 or gu.layout != ttnn.TILE_LAYOUT:
             raise ValueError(f"fused shared PolyNorm: gu must be fp32 TILE, got {gu.dtype} {gu.layout}")
@@ -316,9 +317,11 @@ class FusedSharedPolyNorm:
         return desc
 
     # ---- calls ----------------------------------------------------------------------------------------------------
-    def moments(self, gu, *, memory_config=None):
-        """``gu [1, 1, 32, 2 n_local]`` fp32 -> ``s [1, 3, 32, 32]`` fp32 (this chip's moment sums in column 0)."""
-        self._check(gu)
+    def moments(self, gu, *, memory_config=None, any_rows: bool = False):
+        """``gu [1, 1, 32, 2 n_local]`` fp32 -> ``s [1, 3, 32, 32]`` fp32 (this chip's moment sums in column 0).
+        ``any_rows`` (Phase F F3, ``kernels/shared_tail.py``): ``gu`` may hold T <= 32 logical rows (one padded tile
+        row; the kernel reads whole tiles and every row's moments depend on that row only)."""
+        self._check(gu, any_rows=any_rows)
         mc = memory_config or ttnn.L1_MEMORY_CONFIG
         s = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 3, TILE, TILE]), ttnn.float32, ttnn.TILE_LAYOUT,
                                            self.mesh_device, mc)

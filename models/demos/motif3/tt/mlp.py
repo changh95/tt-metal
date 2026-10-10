@@ -135,6 +135,9 @@ def resolve_shared_polynorm(shared_polynorm: Optional[str], cfg, *, kind: str, s
     return mode
 
 
+_SHARED_TAILS = {}  # id(mesh_device) -> FusedSharedTail (F3)
+
+
 def _free(*ts) -> None:
     for t in ts:
         if t is not None:
@@ -383,6 +386,9 @@ class PolyNormMLP:
             from .kernels.shared_polynorm import FusedSharedPolyNorm
 
             self.pn_fused = FusedSharedPolyNorm(mesh_device, self.pn, ccl, n_local=self.n_local)
+        # Phase F F3 (MOTIF3_MOE_LOCAL): "shared" = the decode tail (B5 apply + down + row slice) as one generic_op
+        # (tt/kernels/shared_tail.py) and no row pad before gate_up; "ops" = the Phase E path. Shared expert only.
+        self.moe_local = str(getattr(cfg, "moe_local", "ops") or "ops") if kind == "shared" else "ops"
 
     @property
     def coeffs(self) -> PolyNormCoefficients:
@@ -453,6 +459,47 @@ class PolyNormMLP:
         _free(y)
         return out
 
+    def _tail_applies(self, x, *, all_reduce: bool, out_dtype, taps) -> bool:
+        """F3 (``moe_local="shared"``): this decode call takes the fused tail (:meth:`_rows_tail`): the shared expert's
+        partial (no all-reduce, bf16, no taps) with the B5 fused PolyNorm on its release settings and the tail's shapes
+        (n_local 160, bfp8 W_down [160, 4096], T = 8 / 16 / 32 rows)."""
+        if getattr(self, "moe_local", "ops") != "shared" or all_reduce or taps is not None or out_dtype != ttnn.bfloat16:
+            return False
+        from .kernels.shared_tail import NA, ROWS
+
+        if int(x.shape[-2]) not in ROWS or not self._fused_now(self.decode_polynorm, True, TILE):
+            return False
+
+        return (self.n_local == NA * TILE and self.hidden == 4096 and self.w_down.dtype == ttnn.bfloat8_b
+                and x.layout == ttnn.TILE_LAYOUT and x.dtype == ttnn.bfloat16)
+
+    def _shared_tail(self):
+        """The mesh's shared :class:`~models.demos.motif3.tt.kernels.shared_tail.FusedSharedTail` (descriptors shared by
+        every layer: the layer's tensors are runtime args)."""
+        from .kernels.shared_tail import FusedSharedTail  # lazy: generic_op kernels
+
+        key = id(self.mesh_device)
+        st = _SHARED_TAILS.get(key)
+        if st is None or st.mesh_device is not self.mesh_device:
+            st = _SHARED_TAILS[key] = FusedSharedTail(self.mesh_device, tp=int(self.ccl.axis_size("tp")))
+        return st
+
+    def _rows_tail(self, x, *, out_mc):
+        """F3 decode partial: ``x [1, 1, T, 4096]`` (T logical rows; NOT padded: its tile-padding rows reach only
+        padding rows, every op is row-local) -> gate_up linear (fp32) -> B5 moments -> the release's TP moments
+        all-gather -> ONE generic_op (B5 apply per h tile, the down linear, rows 0..T-1) -> ``[1, 1, T, 4096]`` bf16.
+        Bitwise the Phase E path's rows (pad + gate_up + moments + all-gather + apply + down + slice)."""
+        imc = self.decode_imc
+        T = int(x.shape[-2])
+        gu = ttnn.linear(x, self.w_gate_up, dtype=ttnn.float32, memory_config=imc, compute_kernel_config=self.ckc_mm,
+                         program_config=self.decode_pc.get("gate_up"))
+        s = self.pn_fused.moments(gu, memory_config=imc, any_rows=True)
+        gat = self.ccl.all_gather(s, 3, "tp", memory_config=imc)
+        _free(s)
+        y = self._shared_tail()(gat, gu, self.w_down, self.pn, rows=T, memory_config=out_mc)
+        _free(gat, gu)
+        return y
+
     def forward_decode(self, x, *, all_reduce: bool = True, out_dtype=ttnn.bfloat16, memory_config=None, taps=None):
         """Decode: ``x [1, 1, T, 4096]`` bf16 (T <= 32; 8 lanes of this DP row) -> ``[1, 1, T, 4096]`` ``out_dtype`` in
         DRAM (or ``memory_config``). ``all_reduce=False`` returns this chip's TP partial (the shared expert's
@@ -464,6 +511,8 @@ class PolyNormMLP:
         if T > TILE:
             raise ValueError(f"decode expects at most {TILE} rows, got {T}; use forward_prefill")
         out_mc = memory_config or ttnn.DRAM_MEMORY_CONFIG
+        if self._tail_applies(x, all_reduce=all_reduce, out_dtype=out_dtype, taps=taps):
+            return self._rows_tail(x, out_mc=out_mc)
         if not self.pad_decode_rows or T == TILE:
             return self._rows(x, mode=self.decode_polynorm, decode=True, all_reduce=all_reduce, out_dtype=out_dtype,
                               out_mc=out_mc, imc=self.decode_imc, taps=taps)
