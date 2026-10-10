@@ -2162,7 +2162,7 @@ def test_prefill_trace_knob(monkeypatch):
 
 
 def test_f1_attn_in_knob(monkeypatch):
-    """Phase F F1 (logs/opt/phaseF/F1): ``MOTIF3_ATTN_IN`` ("ops" default | "post" | "fused"; case and blanks ignored,
+    """Phase F F1 (logs/opt/phaseF/F1): ``MOTIF3_ATTN_IN`` ("fused" default | "post" | "ops"; case and blanks ignored,
     anything else refused; in ``describe``) and the fused input chain's core layouts (``tt/kernels/attn_in.LAYOUT``):
     every role fits the 12 x 10 grid next to the QN (11, 9) / KN (10, 9) cores, and the cq_n multicast rows cover every
     QB core."""
@@ -2171,8 +2171,8 @@ def test_f1_attn_in_knob(monkeypatch):
 
     assert ATTN_IN_MODES == ("ops", "post", "fused")
     monkeypatch.delenv("MOTIF3_ATTN_IN", raising=False)
-    assert _cfg().attn_in == "ops" and "attn_in=ops " in _cfg().describe()
-    for v, want in ((" Fused ", "fused"), ("post", "post"), ("OPS", "ops"), ("", "ops")):
+    assert _cfg().attn_in == "fused" and "attn_in=fused " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("post", "post"), ("OPS", "ops"), ("", "fused")):
         monkeypatch.setenv("MOTIF3_ATTN_IN", v)
         assert _cfg().attn_in == want, v
     monkeypatch.setenv("MOTIF3_ATTN_IN", "kernel")

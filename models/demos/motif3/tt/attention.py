@@ -1501,7 +1501,7 @@ class MotifAttention:
         # | "ops" (the release op chain)
         self.epilogue = getattr(cfg, "attn_epilogue", "ops")
         self._fused_combine = None
-        # decode input chain (Phase F F1, MOTIF3_ATTN_IN): "ops" (default, the op chain) | "fused"
+        # decode input chain (Phase F F1, MOTIF3_ATTN_IN): "fused" (default, one program) | "post" | "ops" (the op chain)
         # (tt/kernels/attn_in.py, one program after the latent projections, built lazily)
         self.attn_in = getattr(cfg, "attn_in", "ops")
         self._fused_input = None
