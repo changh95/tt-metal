@@ -168,7 +168,11 @@ MOE_DECODE_CCL_MODES = ("ar", "rs")
 # in an fp32 DEST, bitwise equal to "stock": kernel unit test, 53-layer E1 logits at c = 1 / 8 / 16 / 32 row and KV-R
 # write, spec T32 / T64 gates; logs/opt/phaseD/D3BUILD). Needs decode_experts="sparse"; decode row counts 32 / 64 only.
 # "dualnoc" is the default since the D3BUILD gates (bitwise neutral); "stock" restores ttnn.sparse_matmul.
-DECODE_EXPERT_MM_MODES = ("stock", "dualnoc")
+# "fused" (Phase E, D3 stage 2): "dualnoc" plus the sparsity build inside the gate_up kernel (from the lane-masked
+# routing weights; replaces MotifMoE.decode_sparsity's 4 ops), the expert sum inside the down kernel (replaces the y
+# tensor, its zero-fill and fast_reduce_nc; same add sequence in the fp32 DEST) and the down h multicast (one L1 read per
+# expert instead of one per core); logs/opt/phaseE/D3S2.
+DECODE_EXPERT_MM_MODES = ("stock", "dualnoc", "fused")
 # Layout changes of the decode row gather MotifCCL.ag_dp_rows (Phase C D4 "fewer to_layouts"; MotifCCL(rows_layout=...)):
 # "ops" (ttnn.to_layout untilize / tilize: 4.6 + 11 us at [8 | 32, 4096]) | "kernel" (tt/kernels/rm_tile.py: pure data
 # movement on 64 cores, bitwise equal; bf16 TILE <-> L1 ROW_MAJOR only, anything else keeps the ops; also

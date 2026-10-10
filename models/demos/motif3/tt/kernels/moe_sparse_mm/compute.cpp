@@ -8,9 +8,13 @@
 // The stock 1D-mcast op accumulates the same products in the same order, spilling the fp32 DEST to a Float32 CB and
 // reloading it with UnpackToDestFp32 between K blocks (lossless), so the results are expected to be bitwise equal.
 // The same init (hw startup with SrcOrder::Reverse, matmul_block_init / matmul_block with rt_dim = ct_dim = 1).
+// SUM_MODE 1 (phase E stage 2, down): after its units an owner core sums its columns over the experts from cb_stage
+// (the bf16 y tiles the producers wrote, slot (s E + e) MT + mt) exactly as fast_reduce_nc does: per output tile
+// add_init(acc_to_dest), then add_tiles(y_e, zero) for the active e in expert order into one fp32 DEST tile, packed once
+// to cb_part (the stock y holds +0 for an inactive expert, an exact identity add, skipped here).
 //
 // CT: 0 KT, 1 NT, 2 MT, 3 NC, 4 W0, 5 GX, 6 BATCH, 7 IN0_MODE, 8 cb_in0a, 9 cb_in0b, 10 cb_wa, 11 cb_wb, 12 cb_out,
-//     13 cb_ctrl
+//     13 cb_ctrl, 14 E, 15 SUM_MODE, 16 cb_stage, 17 cb_zero, 18 cb_part, 19 SLOTS, 20 NCORES
 
 #include <cstdint>
 
@@ -18,6 +22,7 @@
 #include "api/compute/common.h"
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/eltwise_binary.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
 
@@ -76,75 +81,120 @@ void kernel_main() {
     constexpr uint32_t cb_wb = get_compile_time_arg_val(11);
     constexpr uint32_t cb_out = get_compile_time_arg_val(12);
     constexpr uint32_t cb_ctrl = get_compile_time_arg_val(13);
+    constexpr uint32_t E = get_compile_time_arg_val(14);
+    constexpr uint32_t SUM_MODE = get_compile_time_arg_val(15);
+    constexpr uint32_t cb_stage = get_compile_time_arg_val(16);
+    constexpr uint32_t cb_zero = get_compile_time_arg_val(17);
+    constexpr uint32_t cb_part = get_compile_time_arg_val(18);
+    constexpr uint32_t SLOTS = get_compile_time_arg_val(19);
+    constexpr uint32_t NCORES = get_compile_time_arg_val(20);
     constexpr uint32_t KH = KT / 2;
     constexpr uint32_t SEG = KH * MT;
 
     cb_wait_front(cb_ctrl, 1);
     const uint32_t k = read_tile_value(cb_ctrl, 0, 0);
+    const uint32_t mask = read_tile_value(cb_ctrl, 0, 1);
     cb_pop_front(cb_ctrl, 1);
 
     const uint32_t c = static_cast<uint32_t>(get_absolute_logical_y()) * GX + get_absolute_logical_x();
-    if (c < W0 || c >= W0 + NC) {
-        return;
-    }
-    const uint32_t U = k * NT;
     UnitOrder ord;
-    ord.init(IN0_MODE, c - W0, NC, U, NT);
-    if (ord.n == 0) {
+    if (c >= W0 && c < W0 + NC) {
+        ord.init(IN0_MODE, c - W0, NC, k * NT, NT);
+    }
+    const uint32_t nslots = (SUM_MODE && c < NT) ? (NT - 1 - c) / NCORES + 1 : 0;
+    if (ord.n == 0 && nslots == 0) {
         return;
     }
 
-    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0a, cb_wa, cb_out);
-    matmul_block_init(cb_in0a, cb_wa, 0, 1, 1, BATCH);
+    if (ord.n > 0) {
+        compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0a, cb_wa, cb_out);
+        matmul_block_init(cb_in0a, cb_wa, 0, 1, 1, BATCH);
 
-    uint32_t cur_j = 0xFFFFFFFFu;
-    for (uint32_t i = 0; i < ord.n; ++i) {
-        const uint32_t u = ord.at(i);
-        const uint32_t j = u / NT;
-        if (j != cur_j) {
-            if constexpr (IN0_MODE == 1) {
-                if (cur_j != 0xFFFFFFFFu) {
-                    cb_pop_front(cb_in0a, SEG);
-                    cb_pop_front(cb_in0b, SEG);
+        uint32_t cur_j = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < ord.n; ++i) {
+            const uint32_t u = ord.at(i);
+            const uint32_t j = u / NT;
+            if (j != cur_j) {
+                if constexpr (IN0_MODE == 1) {
+                    if (cur_j != 0xFFFFFFFFu) {
+                        cb_pop_front(cb_in0a, SEG);
+                        cb_pop_front(cb_in0b, SEG);
+                    }
+                    cb_wait_front(cb_in0a, SEG);
+                    cb_wait_front(cb_in0b, SEG);
+                } else if (cur_j == 0xFFFFFFFFu) {
+                    cb_wait_front(cb_in0a, SEG);
+                    cb_wait_front(cb_in0b, SEG);
                 }
-                cb_wait_front(cb_in0a, SEG);
-                cb_wait_front(cb_in0b, SEG);
-            } else if (cur_j == 0xFFFFFFFFu) {
-                cb_wait_front(cb_in0a, SEG);
-                cb_wait_front(cb_in0b, SEG);
+                cur_j = j;
             }
-            cur_j = j;
-        }
-        tile_regs_acquire();
-        for (uint32_t b = 0; b < KH / BATCH; ++b) {
-            cb_wait_front(cb_wa, BATCH);
-            for (uint32_t i = 0; i < BATCH; ++i) {
-                const uint32_t kk = b * BATCH + i;
-                for (uint32_t mt = 0; mt < MT; ++mt) {
-                    matmul_block(cb_in0a, cb_wa, kk * MT + mt, i, mt, 0, 1, 1, BATCH);
+            tile_regs_acquire();
+            for (uint32_t b = 0; b < KH / BATCH; ++b) {
+                cb_wait_front(cb_wa, BATCH);
+                for (uint32_t i = 0; i < BATCH; ++i) {
+                    const uint32_t kk = b * BATCH + i;
+                    for (uint32_t mt = 0; mt < MT; ++mt) {
+                        matmul_block(cb_in0a, cb_wa, kk * MT + mt, i, mt, 0, 1, 1, BATCH);
+                    }
                 }
+                cb_pop_front(cb_wa, BATCH);
             }
-            cb_pop_front(cb_wa, BATCH);
-        }
-        for (uint32_t b = 0; b < KH / BATCH; ++b) {
-            cb_wait_front(cb_wb, BATCH);
-            for (uint32_t i = 0; i < BATCH; ++i) {
-                const uint32_t kk = b * BATCH + i;
-                for (uint32_t mt = 0; mt < MT; ++mt) {
-                    matmul_block(cb_in0b, cb_wb, kk * MT + mt, i, mt, 0, 1, 1, BATCH);
+            for (uint32_t b = 0; b < KH / BATCH; ++b) {
+                cb_wait_front(cb_wb, BATCH);
+                for (uint32_t i = 0; i < BATCH; ++i) {
+                    const uint32_t kk = b * BATCH + i;
+                    for (uint32_t mt = 0; mt < MT; ++mt) {
+                        matmul_block(cb_in0b, cb_wb, kk * MT + mt, i, mt, 0, 1, 1, BATCH);
+                    }
                 }
+                cb_pop_front(cb_wb, BATCH);
             }
-            cb_pop_front(cb_wb, BATCH);
+            tile_regs_commit();
+            cb_reserve_back(cb_out, MT);
+            tile_regs_wait();
+            for (uint32_t mt = 0; mt < MT; ++mt) {
+                pack_tile(mt, cb_out);
+            }
+            tile_regs_release();
+            cb_push_back(cb_out, MT);
         }
-        tile_regs_commit();
-        cb_reserve_back(cb_out, MT);
-        tile_regs_wait();
-        for (uint32_t mt = 0; mt < MT; ++mt) {
-            pack_tile(mt, cb_out);
-        }
-        tile_regs_release();
-        cb_push_back(cb_out, MT);
+        cb_pop_front(cb_in0a, SEG);
+        cb_pop_front(cb_in0b, SEG);
     }
-    cb_pop_front(cb_in0a, SEG);
-    cb_pop_front(cb_in0b, SEG);
+
+    if constexpr (SUM_MODE == 1) {
+        if (nslots > 0) {
+            if (ord.n == 0) {
+                compute_kernel_hw_startup(cb_stage, cb_zero, cb_part);
+            }
+            cb_wait_front(cb_zero, 1);
+            cb_wait_front(cb_stage, SLOTS * E * MT);
+            for (uint32_t s = 0; s < nslots; ++s) {
+                for (uint32_t mt = 0; mt < MT; ++mt) {
+                    add_init(cb_stage, cb_zero, true);
+                    reconfig_data_format(cb_stage, cb_zero);
+                    tile_regs_acquire();
+                    if (mask == 0) {
+                        add_tiles(cb_zero, cb_zero, 0, 0, 0);  // the stock sum of zero tiles
+                    }
+                    for (uint32_t e = 0; e < E; ++e) {
+                        if ((mask >> e) & 1u) {
+                            add_tiles(cb_stage, cb_zero, (s * E + e) * MT + mt, 0, 0);
+                        }
+                        // an inactive expert's stock y tile is +0: adding (0 + 0) to the fp32 DEST is the identity (the
+                        // DEST is never -0: it starts at +0 and an exact cancellation rounds to +0), so it is skipped
+                    }
+                    tile_regs_commit();
+                    cb_reserve_back(cb_part, 1);
+                    pack_reconfig_data_format(cb_part);
+                    tile_regs_wait();
+                    pack_tile(0, cb_part);
+                    tile_regs_release();
+                    cb_push_back(cb_part, 1);
+                }
+            }
+            cb_pop_front(cb_stage, SLOTS * E * MT);
+            cb_pop_front(cb_zero, 1);
+        }
+    }
 }

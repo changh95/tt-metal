@@ -2625,11 +2625,11 @@ def test_d3_decode_expert_mm_knob(monkeypatch):
     from models.demos.motif3.tt.model_config import DECODE_EXPERT_MM_MODES
     from models.demos.motif3.tt.moe import resolve_decode_expert_mm
 
-    assert DECODE_EXPERT_MM_MODES == ("stock", "dualnoc")
+    assert DECODE_EXPERT_MM_MODES == ("stock", "dualnoc", "fused")
     monkeypatch.delenv("MOTIF3_DECODE_EXPERT_MM", raising=False)
     default = _cfg().decode_expert_mm
     assert default == "dualnoc" and f"decode_expert_mm={default} " in _cfg().describe()
-    for v, want in ((" DualNoC ", "dualnoc"), ("stock", "stock"), ("", default)):
+    for v, want in ((" DualNoC ", "dualnoc"), ("stock", "stock"), (" FUSED", "fused"), ("", default)):
         monkeypatch.setenv("MOTIF3_DECODE_EXPERT_MM", v)
         assert _cfg().decode_expert_mm == want, v
     monkeypatch.setenv("MOTIF3_DECODE_EXPERT_MM", "dual")
@@ -2654,6 +2654,74 @@ def test_d3_decode_expert_mm_knob(monkeypatch):
         resolve_decode_expert_mm("dualnoc", C(), decode_experts="sparse", experts_dtype=ttnn.bfloat4_b)
     with pytest.raises(ValueError, match="decode_expert_mm must be one of"):
         resolve_decode_expert_mm("fast", C(), decode_experts="sparse")
+    # Phase E D3 stage 2: "fused" has the same requirements as "dualnoc"
+    C.decode_expert_mm = "fused"
+    assert resolve_decode_expert_mm(None, C(), decode_experts="sparse") == "fused"
+    assert resolve_decode_expert_mm(None, C(), decode_experts="dense") == "stock"
+    with pytest.raises(ValueError, match="decode_expert_mm='fused' needs bfp8"):
+        resolve_decode_expert_mm("fused", C(), decode_experts="sparse", experts_dtype=ttnn.bfloat4_b)
+
+
+def test_e_d3s2_plan_owner_and_h_mcast():
+    """Phase E D3 stage 2 (logs/opt/phaseE/D3S2): the stage-2 :func:`moe_sparse_mm.plan` modes (CB budget, staging CB =
+    ceil(NT / cores) slots of E x MT bf16 tiles, refused for the wrong kind / dtype), the expert-sum owners (every column
+    owned once; an owner expects k increments per owned column, exactly the units of that column) and
+    :func:`moe_sparse_mm.h_mcast_plan` (the host mirror of the down kernel's h multicast): for every k = 0..12 every
+    worker gets the h of each of its experts exactly once, into the segment its unit order uses (0 = first expert),
+    from a sender whose segment 0 holds that expert; multicast ranges never include the sender."""
+    from models.demos.motif3.tt.kernels import moe_sparse_mm as SMM
+
+    E = 12
+    for M in (32, 64):
+        p = SMM.plan("down", E, 1280, 4096, M, 2048, sum_mode=1, part_bytes=2048)
+        assert p["sum_mode"] == 1 and p["slots"] == 2 and p["cb_tiles"][SMM.CB_STAGE] == (2 * E * M // 32, 2048)
+        assert p["l1_bytes"] < 700 * 1024, p["l1_bytes"]
+        g = SMM.plan("gate_up", E, 4096, 2560, M, 4096, sp_mode=1)
+        assert g["sp_mode"] == 1 and g["l1_bytes"] < 700 * 1024
+        nc, NT = p["nc"], p["NT"]
+        owned = sorted(SMM.owner_of(col, nc) for col in range(NT))
+        assert len(set(owned)) == NT and max(s for _, s in owned) < p["slots"]
+        for k in range(E + 1):
+            units = {w: SMM.unit_order(1, w, nc, k, NT) for w in range(nc)}
+            incs = {}
+            for us in units.values():
+                for u in us:
+                    o = SMM.owner_of(u % NT, nc)[0]
+                    incs[o] = incs.get(o, 0) + 1
+            for o in range(nc):
+                ns = len([c for c in range(NT) if c % nc == o])
+                assert incs.get(o, 0) == k * ns, (k, o)
+            hp = SMM.h_mcast_plan(k, NT, nc)
+            assert sorted(hp) == list(range(k))
+            for w, us in units.items():
+                js = []
+                for u in us:
+                    if not js or js[-1] != u // NT:
+                        js.append(u // NT)
+                for seg, j in enumerate(js):
+                    d = hp[j]
+                    assert d["workers"][0] <= w <= d["workers"][1]
+                    src = []
+                    if d["self_read"] == w or d["sender"] == w:
+                        src.append(("self", seg))
+                    if d["mcast"] is not None and d["mcast"][0] <= w <= d["mcast"][1]:
+                        src.append(("mcast", 0))
+                    if d["uni"] == w:
+                        src.append(("uni", 1))
+                    assert len(src) == 1 and src[0][1] == seg, (k, w, j, seg, d, src)
+                    if d["sender"] is not None:
+                        sj = []
+                        for u in units[d["sender"]]:
+                            if not sj or sj[-1] != u // NT:
+                                sj.append(u // NT)
+                        assert sj[0] == j and not (d["mcast"] and d["mcast"][0] <= d["sender"] <= d["mcast"][1])
+    for bad in (dict(kind="gate_up", sum_mode=1), dict(kind="down", sp_mode=1), dict(kind="down", sum_mode=1, out_bytes=4096)):
+        a = dict(kind="down", E=E, K=1280, N=4096, M=32, out_bytes=2048)
+        a.update(bad)
+        if a["kind"] == "gate_up":
+            a.update(K=4096, N=2560)
+        with pytest.raises(ValueError):
+            SMM.plan(**a)
 
 
 def test_d3_moe_sparse_mm_plan_and_unit_order():

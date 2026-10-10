@@ -255,13 +255,13 @@ def resolve_decode_experts(decode_experts: Optional[str], cfg, combine_mode: str
 def resolve_decode_expert_mm(decode_expert_mm: Optional[str], cfg, *, decode_experts: str, experts_dtype=None) -> str:
     """Phase D (DESIGN-3 stage 1): the decode routed-expert matmuls of the sparse path. ``decode_expert_mm`` (explicit)
     or ``cfg.decode_expert_mm`` (``MOTIF3_DECODE_EXPERT_MM``, default "dualnoc"; a config without the field = "stock")
-    must be in :data:`DECODE_EXPERT_MM_MODES`. "dualnoc" needs ``decode_experts="sparse"`` and bfp8 expert weights (the
-    kernel's tile reads): an explicit request raises otherwise, the config value falls back to "stock"."""
+    must be in :data:`DECODE_EXPERT_MM_MODES`. "dualnoc" / "fused" need ``decode_experts="sparse"`` and bfp8 expert
+    weights (the kernel's tile reads): an explicit request raises otherwise, the config value falls back to "stock"."""
     explicit = decode_expert_mm is not None
     mode = str(decode_expert_mm if explicit else (getattr(cfg, "decode_expert_mm", None) or "stock"))
     if mode not in DECODE_EXPERT_MM_MODES:
         raise ValueError(f"decode_expert_mm must be one of {DECODE_EXPERT_MM_MODES}, got {mode!r}")
-    if mode == "dualnoc":
+    if mode in ("dualnoc", "fused"):
         why = None
         if decode_experts != "sparse":
             why = f"decode_experts='sparse' (got {decode_experts!r})"
@@ -269,7 +269,7 @@ def resolve_decode_expert_mm(decode_expert_mm: Optional[str], cfg, *, decode_exp
             why = f"bfp8 expert weights (got {experts_dtype})"
         if why is not None:
             if explicit:
-                raise ValueError(f"decode_expert_mm='dualnoc' needs {why}")
+                raise ValueError(f"decode_expert_mm={mode!r} needs {why}")
             return "stock"
     return mode
 
@@ -1120,8 +1120,10 @@ class MotifMoE:
         decode_expert_mm: the sparse path's two expert matmuls (Phase D; ``None`` = ``cfg.decode_expert_mm``,
             ``MOTIF3_DECODE_EXPERT_MM``): "stock" (``ttnn.sparse_matmul``) | "dualnoc" (the config default; one ``generic_op`` each,
             :class:`~models.demos.motif3.tt.kernels.moe_sparse_mm.DualNocSparseMM`: all 120 cores stream weights on both
-            NoCs; bitwise equal to "stock" in the kernel unit test; :func:`resolve_decode_expert_mm`). Decode row counts
-            32 / 64 only; program descriptors only, no device memory.
+            NoCs; bitwise equal to "stock" in the kernel unit test; :func:`resolve_decode_expert_mm`) | "fused" (Phase E,
+            D3 stage 2: "dualnoc" with the sparsity built in the gate_up kernel and the expert sum in the down kernel,
+            :meth:`local_partial`; bitwise equal to "dualnoc"). Decode row counts 32 / 64 only; program descriptors
+            only, no device memory.
     """
 
     def __init__(
@@ -1293,7 +1295,7 @@ class MotifMoE:
         self.decode_expert_mm = resolve_decode_expert_mm(decode_expert_mm, cfg, decode_experts=self.decode_experts,
                                                          experts_dtype=self.experts_dtype)
         self._smm = {}  # (kind, out dtype) -> DualNocSparseMM, built lazily (host objects only)
-        if self.decode_expert_mm == "dualnoc":
+        if self.decode_expert_mm in ("dualnoc", "fused"):
             try:
                 self._dualnoc_mm("down", self.down_dtype)
             except ValueError:
@@ -1522,6 +1524,11 @@ class MotifMoE:
         if taps is not None:
             taps["w_loc"] = w_loc
         if sparse:
+            part = self._fused_experts(f, w_loc, polynorm=polynorm, memory_config=mc, part_memory_config=pmc, taps=taps)
+            if part is not None:
+                if taps is None:
+                    _free(w_loc)
+                return part
             s = self.decode_sparsity(w_loc, memory_config=mc)
             if taps is not None:
                 taps["sparsity"] = s
@@ -2078,6 +2085,37 @@ class MotifMoE:
             op = self._smm[key] = DualNocSparseMM(self.mesh_device, w, kind=kind, out_dtype=out_dtype)
         return op
 
+    def _fused_experts(self, f, w_loc, *, polynorm: str, memory_config, part_memory_config, taps=None):
+        """D3 stage 2 (``decode_expert_mm="fused"``): ``f [1, 1, M, 4096]``, the lane-masked ``w_loc [1, 12, M, 1]`` fp32
+        -> the routed partial ``[1, 1, M, 4096]`` in ``combine_dtype`` (``part_memory_config``), or ``None`` when this
+        module / call does not run it (the caller takes the stage-1 path on the same inputs; bitwise the same result).
+        gate_up builds the sparsity from ``w_loc`` in the kernel (no :meth:`decode_sparsity`), down sums the experts in
+        the kernel (no ``y``, no :meth:`reduce_experts`); the PolyNorm between them is unchanged. ``taps`` (tests) get
+        ``sparsity`` = the kernel's stick ``[1, 1, 1, 16]`` bf16 (1.0 = active)."""
+        if getattr(self, "decode_expert_mm", "stock") != "fused":
+            return None
+        gu_dtype = self.gate_up_dtype
+        if gu_dtype is None:
+            gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
+        op_gu = self._dualnoc_mm("gate_up", gu_dtype)
+        op_dn = self._dualnoc_mm("down", self.down_dtype)
+        if not op_gu.supports_routed(f, w_loc) or op_dn.out_dtype != ttnn.bfloat16 \
+                or self.combine_dtype not in (ttnn.bfloat16, ttnn.float32):
+            return None
+        mc = memory_config
+        gu, s = op_gu.gate_up_routed(f, w_loc, memory_config=mc)  # [1, 12, M, 2560], inactive slices 0
+        if taps is not None:
+            taps["sparsity"] = s
+        h = self._decode_fused(gu, w_loc, mc)
+        if h is None:
+            h = self.polynorm(gu, mode=polynorm, row_scale=w_loc, memory_config=mc, impl=self.polynorm_impl)
+        _free(gu)
+        part = op_dn.down_sum(h, s, part_dtype=self.combine_dtype, memory_config=part_memory_config)
+        _free(h)
+        if taps is None:
+            _free(s)
+        return part
+
     def sparse_experts(self, f, sparsity, *, polynorm: str, row_scale, memory_config=None):
         """:meth:`experts` at a decode row count with the local experts whose ``sparsity`` entry is 0 skipped:
         ``f [1, 1, M, 4096]`` -> ``y [1, 12, M, 4096]`` (skipped experts' slices exactly 0). The same program configs,
@@ -2090,7 +2128,7 @@ class MotifMoE:
         if gu_dtype is None:
             gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
         pc_gu, pc_dn = (self.pc_gate_up, self.pc_down) if M == TILE else self.pc_wide[M]
-        dualnoc = getattr(self, "decode_expert_mm", "stock") == "dualnoc"  # host tests build modules without __init__
+        dualnoc = getattr(self, "decode_expert_mm", "stock") in ("dualnoc", "fused")  # host tests skip __init__
         op_gu = self._dualnoc_mm("gate_up", gu_dtype) if dualnoc else None
         if op_gu is not None and op_gu.supports(f, sparsity):
             gu = op_gu(f, sparsity, memory_config=mc)  # [1, 12, M, 2560], inactive slices 0
