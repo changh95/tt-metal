@@ -67,6 +67,12 @@ Device tests (lock wrapper; ~2 min; run with the trace-allocation tracker on)::
     and replays, the distribution of 48,000 draws per row = ``softmax(x / T)`` over the whole vocabulary (chi-square,
     TV vs the noise floor, the mass drawn outside the top-512 window), greedy / top-p / top-k lanes unchanged.
 
+(i) ``test_sampler_local_fused_bitwise`` -- Phase F F4 (``MOTIF3_SAMPLER_LOCAL``, ``tt/kernels/sampler_local.py``): the
+    fused per-chip stage against the op chain on the same inputs: its outputs (``part``, ``q``) and the debug
+    intermediates (``Z``, ``Z1``, the Gumbel winner, ``u``) and the sampler outputs (``tokens``, ``info``) bitwise on
+    every chip, for real / crafted / random rows under mixed lane parameters (greedy, top-p, top-k, full-support Gumbel
+    lanes, T down to 2e-5) and several counter sets; 10 repeated fused calls identical; traced fused == eager ops.
+
 Opt-in ``test_probe_sampler_variants`` (``MOTIF3_SAMPLER_PROBE=1``): per-stage traced latency and every option /
 implementation variant (K, W, logprobs, rng, L1 intermediates, fused activations, the cut repair, the cost of the
 exactness check).
@@ -1961,3 +1967,103 @@ def test_probe_sampler_variants(mesh_device):
         pass
     ttnn.deallocate(dev)
     base.deallocate()
+
+
+@pytest.mark.parametrize("mesh_device, device_params", _mesh_params(), indirect=True)
+def test_sampler_local_fused_bitwise(mesh_device):
+    """(i) Phase F F4: the fused per-chip stage (``impl={"local": "fused"}``) is bitwise the op chain (``"ops"``)."""
+    import ttnn
+
+    from models.demos.motif3.tt.sampling import MotifDeviceSampler
+
+    cfg, ccl, so = _setup(mesh_device, "sampling_local_fused", impl={"local": "ops"})
+    sf = MotifDeviceSampler(mesh_device, cfg, ccl=ccl, impl={"local": "fused"})
+    assert so._local is None and sf._local is not None
+
+    def bits(t):
+        out = []
+        for c in ttnn.get_device_tensors(t):
+            h = ttnn.to_torch(c)
+            out.append((h.contiguous().view(torch.int32) if h.dtype == torch.float32 else h).clone())
+        return out
+
+    def same(a, b):
+        return len(a) == len(b) and all(x.shape == y.shape and torch.equal(x, y) for x, y in zip(a, b))
+
+    rec = {"ops": {}, "fused": {}}
+    for nm, smp in (("ops", so), ("fused", sf)):
+        ng, gg, r = smp._norm_gather, smp._gumbel_gather, rec[nm]
+
+        def ng2(part, sel, tmp, ng=ng, r=r):
+            r["part"] = bits(part)
+            return ng(part, sel, tmp)
+
+        def gg2(q, tmp, gg=gg, r=r):
+            r["q"] = bits(q)
+            return gg(q, tmp)
+
+        smp._norm_gather, smp._gumbel_gather = ng2, gg2
+    rows = _real_rows()
+    g = torch.Generator().manual_seed(11)
+    rnd = (torch.randn(LANES, VOCAB, generator=g) * 3.0).to(torch.bfloat16)
+    syn = _synthetic_rows(0)
+    opts = [(0.0, 1.0, 0, None), (1.0, 1.0, 0, 11), (0.6, 0.95, 0, 5), (1.0, 0.95, 50, None), (1.3, 1.0, 0, 3),
+            (0.01, 1.0, 0, 9), (5.0, 1.0, 0, None), (0.7, 0.9, 20, 1), (2e-5, 1.0, 0, 2)]
+    mix = tuple(list(v) for v in zip(*[opts[l % len(opts)] for l in range(LANES)]))
+    cases = [
+        ("real", rows["logits"], (rows["temperature"], rows["top_p"], rows["top_k"], rows["seed"])),
+        ("real_mix", rows["logits"], mix),
+        ("synthetic", torch.cat([syn, syn, syn[:8]], 0), mix),
+        ("random_gumbel", rnd, ([1.0] * 16 + [0.3] * 8 + [3.0] * 8, [1.0] * LANES, [0] * LANES, list(range(LANES)))),
+    ]
+    dev = _upload_logits(mesh_device, cfg, rows["logits"])
+    bad = []
+    for name, x, params in cases:
+        _write_logits(mesh_device, cfg, dev, x)
+        so.set_params(*params)
+        sf.set_params(*params)
+        for ci in range(3):
+            ctr = np.random.default_rng(100 + ci).integers(0, 2**32, size=(LANES, 2), dtype=np.uint64).astype(np.uint32)
+            so.set_counters(ctr)
+            sf.set_counters(ctr)
+            oo, of = so.sample(dev, debug=True), sf.sample(dev, debug=True)
+            chk = {k: same(rec["ops"][k], rec["fused"][k]) for k in ("part", "q")}
+            for k in ("Z", "Z1", "g_tok", "g_score", "g_dx", "u"):
+                chk[k] = same(bits(oo.debug[k]), bits(of.debug[k]))
+            chk["tokens"] = same(bits(oo.tokens), bits(of.tokens))
+            chk["info"] = same(bits(oo.info), bits(of.info))
+            if not all(chk.values()):
+                bad.append((name, ci, [k for k, v in chk.items() if not v]))
+            _free_out(oo)
+            _free_out(of)
+    assert not bad, f"fused stage != op chain: {bad}"
+    # 10 repeated fused calls identical
+    ref = None
+    for _ in range(10):
+        o = sf.sample(dev)
+        b = (bits(o.tokens), bits(o.info), rec["fused"]["part"], rec["fused"]["q"])
+        assert ref is None or all(same(x, y) for x, y in zip(ref, b)), "fused stage not deterministic"
+        ref = ref or b
+        _free_out(o)
+    # traced fused == eager ops (new counters per replay)
+    for smp in (so, sf):
+        smp._norm_gather = type(smp)._norm_gather.__get__(smp)
+        smp._gumbel_gather = type(smp)._gumbel_gather.__get__(smp)
+    o = sf.sample(dev)
+    _free_out(o)
+    with _Capture(mesh_device) as cap:
+        tout = sf.sample(dev)
+    try:
+        for ci in range(3):
+            ctr = np.random.default_rng(300 + ci).integers(0, 2**32, size=(LANES, 2), dtype=np.uint64).astype(np.uint32)
+            sf.set_counters(ctr)
+            so.set_counters(ctr)
+            ttnn.execute_trace(mesh_device, cap.tid, cq_id=0, blocking=True)
+            e = so.sample(dev)
+            assert same(bits(tout.tokens), bits(e.tokens)) and same(bits(tout.info), bits(e.info)), "traced fused"
+            _free_out(e)
+    finally:
+        ttnn.release_trace(mesh_device, cap.tid)
+        _free_out(tout)
+    sf.deallocate()
+    so.deallocate()

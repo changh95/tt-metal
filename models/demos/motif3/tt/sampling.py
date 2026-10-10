@@ -743,7 +743,12 @@ class MotifDeviceSampler:
             ``prefix`` "2mm" (two matmuls, hi and mid) or "1mm" (one matmul of [mid | hi] with [U; U]);
             ``fuse`` (fold five small ops into their neighbours as unary pre/post activations); ``verify`` (the exact
             re-check of the cut and the draw; False only to MEASURE its cost -- the sampler is then not exact);
-            ``repair`` (move the proposed top-p cut by one token when the exact sums say so, instead of flagging).
+            ``repair`` (move the proposed top-p cut by one token when the exact sums say so, instead of flagging);
+            ``local`` (Phase F F4): "ops" or "fused" -- the per-chip stage between the candidate gather and the
+            normaliser / Gumbel gathers (the normaliser partials, the Gumbel race's local winner, the uniform) as ONE
+            ``generic_op`` (``tt/kernels/sampler_local.py``; bitwise the ops chain); default ``cfg.sampler_local``
+            (``MOTIF3_SAMPLER_LOCAL``). "fused" needs ``logprobs``, ``rowsum="stack"``, ``gumbel`` and ``rng="device"``
+            (otherwise the ops chain runs).
 
     Lifecycle (all device tensors are allocated here, before any trace capture):
         ``set_params(temperature, top_p, top_k, seeds)`` (on change; host compare, no device write when equal),
@@ -788,9 +793,12 @@ class MotifDeviceSampler:
         if tuple(mesh_device.shape) != tuple(cfg.axes.mesh_shape):
             raise ValueError(f"cfg is for mesh {cfg.axes.mesh_shape}, device mesh is {tuple(mesh_device.shape)}")
         self.impl = dict(self.DEFAULT_IMPL)
+        self.impl["local"] = str(getattr(cfg, "sampler_local", "ops"))
         self.impl.update(impl or {})
         if self.impl["rowsum"] not in ("stack", "row") or self.impl["prefix"] not in ("1mm", "2mm"):
             raise ValueError(f"bad impl {self.impl}")
+        if self.impl["local"] not in ("ops", "fused"):
+            raise ValueError(f"bad impl local {self.impl['local']!r} (ops | fused)")
         self.mesh_device = mesh_device
         self.cfg = cfg
         self.ccl = ccl if ccl is not None else MotifCCL(mesh_device, cfg)
@@ -808,6 +816,15 @@ class MotifDeviceSampler:
         self.imc = ttnn.L1_MEMORY_CONFIG if l1_intermediates else ttnn.DRAM_MEMORY_CONFIG
         self.ckc = cfg.compute_config("eltwise")  # HiFi4, fp32 dest acc (accurate SFPU reductions), approx off
         self._rng = np.random.default_rng(secrets.randbits(64) if rng_seed is None else int(rng_seed) & ((1 << 64) - 1))
+        # Phase F F4: the fused per-chip stage (tt/kernels/sampler_local.py) runs for the default configuration
+        self._local_ok = bool(
+            self.impl["local"] == "fused"
+            and self.logprobs
+            and self.impl["rowsum"] == "stack"
+            and self.gumbel
+            and self.rng == "device"
+            and self.vc == 6880
+        )
         self._readers: Dict[tuple, HostShardReader] = {}
         # steps / flagged_*: every read() (flags of ALL lanes: inactive and full-support lanes included);
         # resolved_steps / resolved_lanes: what resolve() actually re-sampled (the steps that paid the logits read)
@@ -881,10 +898,13 @@ class MotifDeviceSampler:
         z = torch.zeros(1, 1, L, 1)
         self._p = {k: up(z, ttnn.float32) for k in ("greedy", "inv_t", "top_p", "k_active", "k_in_win", "gumbel")}
         self._p["k_ofs"] = up(torch.full((1, 1, L, W), -BIG), ttnn.float32)  # top-k threshold mask (k_offset_rows)
+        if self._local_ok:  # the fused stage's row broadcast of 1 / T (written with inv_t)
+            self._p["inv_t_fill"] = up(torch.zeros(1, 1, L, TILE), ttnn.float32)
         # RNG inputs: the two counters (c1, c2) in columns 0 / 1 of one [32, 32] int32 tile (one host write per step);
         # rng="host" writes the uniform instead (and the counters too when the Gumbel path needs them)
-        self._ctr = up(torch.zeros(1, 1, L, TILE, dtype=torch.int32), ttnn.int32) if (rng == "device" or self.gumbel) \
-            else None  # fmt: skip
+        # (with the fused stage: rows 32..63 / 64..95 hold the row broadcasts of c1 / c2, written in the same copy)
+        self._ctr = up(torch.zeros(1, 1, (3 if self._local_ok else 1) * L, TILE, dtype=torch.int32), ttnn.int32) \
+            if (rng == "device" or self.gumbel) else None  # fmt: skip
         self._u = up(z, ttnn.float32) if rng == "host" else None
         self._counter = up(z, ttnn.float32) if coverage_counter else None
         # host-side state
@@ -895,6 +915,11 @@ class MotifDeviceSampler:
         self._last_ctr = np.zeros((L, 2), dtype=np.uint32)
         self.set_params([0.0] * L, [1.0] * L, [0] * L, [None] * L)
         self.set_positions([0] * L)
+        self._local = None
+        if self._local_ok:
+            from .kernels.sampler_local import FusedSamplerLocal
+
+            self._local = FusedSamplerLocal(mesh_device)
 
     # ---- host -> device parameters ------------------------------------------------------------------------
     def _host_tensor(self, t: torch.Tensor, dtype):
@@ -929,6 +954,9 @@ class MotifDeviceSampler:
             if k == "k_idx":
                 continue
             ttnn.copy_host_to_device_tensor(self._host_tensor(v.reshape(1, 1, self.lanes, 1), ttnn.float32), self._p[k])
+        if "inv_t_fill" in self._p:
+            f = cols["inv_t"].reshape(1, 1, self.lanes, 1).expand(1, 1, self.lanes, TILE).contiguous()
+            ttnn.copy_host_to_device_tensor(self._host_tensor(f, ttnn.float32), self._p["inv_t_fill"])
         kofs = k_offset_rows(cols, self.W).reshape(1, 1, self.lanes, self.W)
         ttnn.copy_host_to_device_tensor(self._host_tensor(kofs, ttnn.float32), self._p["k_ofs"])
         self._host_cols = cols
@@ -973,8 +1001,13 @@ class MotifDeviceSampler:
         if c.shape[0] != self.lanes:
             raise ValueError(f"expected {self.lanes} counters, got {c.shape[0]}")
         if self._ctr is not None:
-            t = torch.zeros(1, 1, self.lanes, TILE, dtype=torch.int32)
-            t[0, 0, :, :2] = torch.from_numpy(c.view(np.int32).copy())
+            L = self.lanes
+            ci = torch.from_numpy(c.view(np.int32).copy())
+            t = torch.zeros(1, 1, (3 if self._local_ok else 1) * L, TILE, dtype=torch.int32)
+            t[0, 0, :L, :2] = ci
+            if self._local_ok:  # the row broadcasts of c1 / c2 for the fused stage
+                t[0, 0, L : 2 * L, :] = ci[:, 0:1]
+                t[0, 0, 2 * L :, :] = ci[:, 1:2]
             ttnn.copy_host_to_device_tensor(self._host_tensor(t, ttnn.int32), self._ctr)
         if self._u is not None:
             u = torch.from_numpy(uniform_from_counter(c[:, 0])).reshape(1, 1, self.lanes, 1)
@@ -1076,6 +1109,15 @@ class MotifDeviceSampler:
                 part = ttnn.add(part, q, memory_config=mc)
                 T(part)
             sel = self._sel_z
+        out = self._norm_gather(part, sel, tmp)
+        out.update(dx=d, a=a)
+        return out
+
+    def _norm_gather(self, part, sel, tmp) -> Dict[str, Any]:
+        """The normaliser partials of every chip: all-gathered (TP then DP) and summed exactly -> ``Z`` (and ``Z1``)."""
+        mc = self.imc
+        L = self.lanes
+        T = tmp.append
         g = self.ccl.all_gather(part, 3, "tp", memory_config=mc)
         T(g)
         S = self.ccl.all_gather(g, 3, "dp", memory_config=mc)
@@ -1084,7 +1126,7 @@ class MotifDeviceSampler:
         T(zm)
         Zs = self._red(ttnn.sum, zm)
         T(Zs)
-        out = {"S": S, "dx": d, "a": a}
+        out = {"S": S}
         if self.logprobs and self.impl["rowsum"] == "stack":
             Z = ttnn.slice(Zs, [0, 0, 0, 0], [1, 1, L, 1], memory_config=mc)
             Z1 = ttnn.slice(Zs, [0, 0, L, 0], [1, 1, 2 * L, 1], memory_config=mc)
@@ -1232,6 +1274,17 @@ class MotifDeviceSampler:
                 [T(ttnn.multiply(self._e0, v, memory_config=mc)) for v in (m, gid, dw)], dim=2, memory_config=mc
             )
         )  # [1, 1, 96, 32]: score / id / raw blocks, column 0
+        return self._gumbel_gather(q, tmp)
+
+    def _gumbel_gather(self, q, tmp) -> Dict[str, Any]:
+        """The per-chip (score, global id, raw) triples ``q`` all-gathered (TP then DP) and reduced to the global winner
+        (the end of :meth:`_stage_gumbel`)."""
+        mc, red = self.imc, self._red
+
+        def T(t):
+            tmp.append(t)
+            return t
+
         G = T(self.ccl.all_gather(T(self.ccl.all_gather(q, 3, "tp", memory_config=mc)), 3, "dp", memory_config=mc))
         L = self.lanes
         Gs, Gi, Gd = (T(ttnn.slice(G, [0, 0, k * L, 0], [1, 1, (k + 1) * L, int(G.shape[3])], memory_config=mc))
@@ -1278,7 +1331,7 @@ class MotifDeviceSampler:
             keep = T(ttnn.lt(self._iota_w, n_kept, memory_config=mc))
             mass_kept = T(red(ttnn.sum, T(ttnn.multiply(PR, keep, memory_config=mc))))
         # draw: j = #{C_j <= u * mass_kept} = #{EX_j <= u * mass_kept} - 1, clamped to the kept prefix
-        u = self._stage_uniform(d.get("c1"), tmp)
+        u = d["u_local"] if "u_local" in d else self._stage_uniform(d.get("c1"), tmp)
         target = T(ttnn.multiply(u, mass_kept, memory_config=mc))
         cnt = T(red(ttnn.sum, T(ttnn.le(EX, target, memory_config=mc))))
         if fuse:
@@ -1468,10 +1521,21 @@ class MotifDeviceSampler:
         x = self.prepare_logits(logits, tmp)
         d: Dict[str, Any] = {"x": x}
         d.update(self._stage_local(x, tmp))
-        d.update(self._stage_norm(x, d["M"], tmp))
-        d.update(self._stage_counters(tmp))
-        if self.gumbel:
-            d.update(self._stage_gumbel(d, tmp))
+        if self._local is not None and self._local.supports(
+            x, d["M"], self._p["inv_t_fill"], self._ctr, self._gkey, self._iota_vc, self._chip_off
+        ):
+            # Phase F F4: the per-chip normaliser partials, Gumbel winner and uniform in one program (bitwise)
+            part, q, u = self._local(x, d["M"], self._p["inv_t_fill"], self._ctr, self._gkey, self._iota_vc,
+                                     self._chip_off, memory_config=self.imc)
+            tmp.extend([part, q, u])
+            d.update(self._norm_gather(part, self._sel_z64, tmp))
+            d.update(self._gumbel_gather(q, tmp))
+            d["u_local"] = u
+        else:
+            d.update(self._stage_norm(x, d["M"], tmp))
+            d.update(self._stage_counters(tmp))
+            if self.gumbel:
+                d.update(self._stage_gumbel(d, tmp))
         d.update(self._stage_window(d["Vb"], d["M"], d["Z"], tmp))
         d.update(self._stage_prefix(d["PR"], tmp))
         d.update(self._stage_select(d, tmp))
