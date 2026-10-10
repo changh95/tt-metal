@@ -141,6 +141,11 @@ SHARED_POLYNORM_MODES = ("composite", "fused")
 # output bitwise; the default since the D1 gates passed, logs/opt/phaseC/D1). Decode only (one 32-row tile, the
 # 1024-wide active mask); prefill and the sp1 absorbed path keep the ops.
 ATTN_EPILOGUE_MODES = ("ops", "fused")
+# Decode attention input chain (Phase F F1, docs/OPTIMIZATION_PLAN.md "Phase F"; MotifAttention): "ops" (q_a norm, q_b,
+# gate + sigmoid, kv split + norm, q heads split, W_UK bmm, 2 RoPEs, concats, transposes: 15 programs after the two
+# latent projections) | "fused" (tt/kernels/attn_in.py: ONE generic_op over the 12 x 10 grid that runs the same LLK
+# sequences with the ops' configurations and writes q_mla, g, lam and the kv update input directly). Decode only.
+ATTN_IN_MODES = ("ops", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
 # in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.
@@ -1456,6 +1461,8 @@ class MotifTTConfig:
     # Decode attention epilogue (Phase C D1): "fused" (default: one program, bitwise equal) | "ops" (the release op chain;
     # ATTN_EPILOGUE_MODES).
     attn_epilogue: str = "fused"  # MOTIF3_ATTN_EPILOGUE
+    # Decode attention input chain (Phase F F1): "ops" (default, the op chain) | "fused" (one program; ATTN_IN_MODES).
+    attn_in: str = "ops"  # MOTIF3_ATTN_IN
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
@@ -1555,7 +1562,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_DECODE_EXPERT_MM``, ``MOTIF3_MOE_REPLICAS``, ``MOTIF3_MOE_REPLICA_PLAN``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_IN``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_DECODE_EXPERT_MM``, ``MOTIF3_MOE_REPLICAS``, ``MOTIF3_MOE_REPLICA_PLAN``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_SP``, ``MOTIF3_PREFILL_SP_MIN_ROWS``, ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1666,6 +1673,7 @@ class MotifTTConfig:
             moe_polynorm=(os.environ.get("MOTIF3_MOE_POLYNORM") or "fused").strip().lower(),
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "fused").strip().lower(),
+            attn_in=(os.environ.get("MOTIF3_ATTN_IN") or "ops").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
@@ -1875,6 +1883,8 @@ class MotifTTConfig:
                 f"ag_rows_layout (MOTIF3_AG_ROWS_LAYOUT) must be one of {AG_ROWS_LAYOUT_MODES}, got "
                 f"{self.ag_rows_layout!r}"
             )
+        if self.attn_in not in ATTN_IN_MODES:
+            raise ValueError(f"attn_in (MOTIF3_ATTN_IN) must be one of {ATTN_IN_MODES}, got {self.attn_in!r}")
         if self.attn_epilogue not in ATTN_EPILOGUE_MODES:
             raise ValueError(
                 f"attn_epilogue (MOTIF3_ATTN_EPILOGUE) must be one of {ATTN_EPILOGUE_MODES}, got {self.attn_epilogue!r}"
@@ -2651,7 +2661,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} decode_expert_mm={self.decode_expert_mm} moe_replicas={self.moe_replicas} ag_rows_layout={self.ag_rows_layout} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_in={self.attn_in} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} decode_expert_mm={self.decode_expert_mm} moe_replicas={self.moe_replicas} ag_rows_layout={self.ag_rows_layout} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} prefill_sp={self.prefill_sp}/{self.prefill_sp_min_rows} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "

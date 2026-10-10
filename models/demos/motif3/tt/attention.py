@@ -1501,6 +1501,10 @@ class MotifAttention:
         # | "ops" (the release op chain)
         self.epilogue = getattr(cfg, "attn_epilogue", "ops")
         self._fused_combine = None
+        # decode input chain (Phase F F1, MOTIF3_ATTN_IN): "ops" (default, the op chain) | "fused"
+        # (tt/kernels/attn_in.py, one program after the latent projections, built lazily)
+        self.attn_in = getattr(cfg, "attn_in", "ops")
+        self._fused_input = None
 
         # ---- weights (ATTN-1) -----------------------------------------------------------------------------------
         src = _AttnSource(source, self.layer_idx, self.weight_prefix)
@@ -1793,6 +1797,67 @@ class MotifAttention:
         # host checks before any device op: the row count and, on global layers, the FlashMLA groups (option A'')
         groups = self._flash_groups(kv_write, self._decode_rows(x, kv_write, active), cur_pos, page_table)
         cos, sin = self._rot_tables(rot)
+        fused = self._fused_input_chain(x, cos, sin, kv_write) if taps is None else None
+        if fused is not None:  # Phase F F1: q_mla, g, lam and the kv update input from one program
+            q_mla, g, lam, kv = fused
+            if kv_write is None:
+                ttnn.experimental.paged_update_cache(kv_cache, kv, update_idxs_tensor=cur_pos, page_table=page_table)
+            else:
+                kv_write.write(kv, kv_cache, cur_pos=cur_pos, page_table=page_table)
+            ttnn.deallocate(kv)
+        else:
+            q_mla, g, lam = self._input_chain_ops(x, cos, sin, kv_write, kv_cache, cur_pos, page_table, taps)
+
+        # ---- FlashMLA decode (G1 config, scale folded into q, ATTN-2); option A'' on global layers at 16 rows ------
+        if len(groups) == 1:  # draft 1, T32, every SWA layer (B = L)
+            _, cur, pt = groups[0]
+            o_lat = self._flash_mla(q_mla, kv_cache, cur, pt)  # [1, L, 10, 512]
+        else:  # one B = 8 call per group (anchors at n, drafts at n + 1), concatenated: [1, L, 10, 512]
+            o_lat = self._flash_mla_groups(q_mla, kv_cache, groups)
+        if taps is not None:
+            taps["q_mla"] = q_mla
+            taps["o_lat"] = o_lat
+        else:
+            ttnn.deallocate(q_mla)
+
+        # ---- un-absorb per head, differential, gate, mask, wo, AR(tp) ------------------------------------------
+        o_heads = ttnn.transpose(o_lat, 1, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 10, L, 512]
+        if taps is None:
+            ttnn.deallocate(o_lat)
+        return self._absorbed_epilogue(o_heads, g, lam, active=active, taps=taps, decode=True)
+
+    def fused_input(self):
+        """The layer's :class:`~models.demos.motif3.tt.kernels.attn_in.FusedAttnIn` (built on first use)."""
+        if self._fused_input is None:
+            from .kernels.attn_in import FusedAttnIn
+
+            self._fused_input = FusedAttnIn(self.mesh_device, eps=self.cfg.rms_norm_eps)
+        return self._fused_input
+
+    def _fused_input_chain(self, x, cos, sin, kv_write):
+        """``attn_in="fused"`` (Phase F F1): the two latent projections (the release's ops), then ONE program for the
+        rest of the input chain -> ``(q_mla [1, L, 10, 576], g, lam, kv)`` with ``kv`` the draft-1 update input
+        (``kv_write=None``: :attr:`update_mc`) or ``kv_row [1, 1, L, 576]`` for the writer. ``None`` (nothing run) when
+        the mode is off or the operands are outside the kernel's contract (the op chain then runs)."""
+        if self.attn_in != "fused" or self.rope_mode != "hf":
+            return None
+        L = int(x.shape[-2])
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        if (int(grid.x), int(grid.y)) != (12, 10) or not 1 <= L <= TILE or (kv_write is None and L != 8):
+            return None
+        if int(cos.padded_shape[-2]) != TILE or int(cos.shape[-1]) != self.rope_dim:
+            return None
+        cq = self._linear(x, self.w_q_lat, ckc=self.ckc_latent, pc=self._pc("q_lat", True), dtype=ttnn.float32)
+        kvl = self._kv_latent(x, True)
+        out = self.fused_input()(cq, kvl, cos, sin, self.w_q_b, self.w_gate, self.w_uk,
+                                 update_mc=self.update_mc if kv_write is None else None)
+        ttnn.deallocate(cq)
+        ttnn.deallocate(kvl)
+        return out
+
+    def _input_chain_ops(self, x, cos, sin, kv_write, kv_cache, cur_pos, page_table, taps):
+        """The release's decode input chain (``attn_in="ops"``): projections, norms, heads, RoPE, KV write ->
+        ``(q_mla [1, L, 10, 576], g, lam)``."""
         q, g, n, kpe, lam = self._project(x, decode=True)
 
         # ---- Q [1, L, 10, 576] = [q_nope @ W_UK' | rope(q_pe)] (lanes on dim 1, heads on rows) -------------------
@@ -1834,24 +1899,7 @@ class MotifAttention:
                 taps["kv_row"] = kv_row
             else:
                 ttnn.deallocate(kv_row)
-
-        # ---- FlashMLA decode (G1 config, scale folded into q, ATTN-2); option A'' on global layers at 16 rows ------
-        if len(groups) == 1:  # draft 1, T32, every SWA layer (B = L)
-            _, cur, pt = groups[0]
-            o_lat = self._flash_mla(q_mla, kv_cache, cur, pt)  # [1, L, 10, 512]
-        else:  # one B = 8 call per group (anchors at n, drafts at n + 1), concatenated: [1, L, 10, 512]
-            o_lat = self._flash_mla_groups(q_mla, kv_cache, groups)
-        if taps is not None:
-            taps["q_mla"] = q_mla
-            taps["o_lat"] = o_lat
-        else:
-            ttnn.deallocate(q_mla)
-
-        # ---- un-absorb per head, differential, gate, mask, wo, AR(tp) ------------------------------------------
-        o_heads = ttnn.transpose(o_lat, 1, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 10, L, 512]
-        if taps is None:
-            ttnn.deallocate(o_lat)
-        return self._absorbed_epilogue(o_heads, g, lam, active=active, taps=taps, decode=True)
+        return q_mla, g, lam
 
     def _decode_rows(self, x, kv_write, active) -> int:
         """Rows ``L`` per DP row of the decode input ``x [1, 1, L, 4096]`` (host checks, no device op). ``L`` is at
