@@ -33,8 +33,12 @@ Assignment (host mirror :func:`assign`, device ``kernels/router_topk.py`` replic
 A chip computes native slot j (expert 12 c + j) iff it is active and assigned to c (always, without a replica), and
 replica slot j (expert ``slots[c][j]``) iff active and assigned to c.
 
-Per-chip table (``[1, 1, 1, TABLE_WORDS]`` uint32 ROW_MAJOR): words ``[0, 384)`` the replica code of every expert
-(``chip << 8 | slot``, ``NONE`` without a replica), ``[384, 400)`` the chip's 16 slot experts (12 natives, R replicas).
+Per-chip table (``[1, 1, 1, TABLE_WORDS]`` uint32 ROW_MAJOR, :func:`chip_table`): words ``[0, 16)`` the chip's slot
+experts (12 natives, R replicas, NONE padding), ``[16]`` the number NF of replicated experts, ``[17]`` the chip index,
+``[32, 32 + NF)`` the replicated experts in ascending id order as ``e << 16 | (e % 12) << 12 | home << 6 | replica chip``
+(no division on the device), ``[160, 192)`` per chip the 12-bit mask of its experts that have a replica.
+The device writes the assignment for tests (``[1, 1, 1, ASSIGN_WORDS]``): ``where`` of the 128 flex entries (NONE when
+inactive), then ``load[32]``.
 """
 
 from __future__ import annotations
@@ -51,10 +55,11 @@ N_CHIPS = 32
 PER_CHIP = 12
 DEFAULT_R = 4
 NONE = 0xFFFF  # (fits the uint32 tables as a small positive value; codes are < 32 << 8)
-TABLE_WORDS = 400  # 384 replica codes + 16 slot experts
 SLOT_WORDS = 16
-ASSIGN_WORDS = 416  # device debug output: where[384] (chip or NONE), load[32]
-PASSES = 2
+FLEX_WORDS = 128  # replicated experts (32 chips x R <= 4)
+TABLE_WORDS = 192  # slot experts, NF, chip, pad, flex list (at 32), replica masks (at 160): 768 B
+ASSIGN_WORDS = FLEX_WORDS + 32  # device debug output: flex where[128] (chip or NONE), load[32]
+PASSES = 1  # a second sweep changes the busiest chip by < 0.001 experts on real routes
 REPLICA_MODES = ("off", "r4")
 BFP8_TILE_BYTES = 1088
 DEFAULT_WORK_DIR = "/dev/shm/motif3_replicas"
@@ -158,11 +163,33 @@ def keep_slots(where: Dict[int, int], slots: Sequence[Sequence[int]], c: int, *,
     return [where.get(e) == c for e in chip_slots(slots, c, per=per)]
 
 
-def chip_table(slots: Sequence[Sequence[int]], c: int, *, per: int = PER_CHIP) -> List[int]:
-    """The per-chip uint32 table (module docstring): replica codes, then the 16 slot experts (padded with NONE)."""
-    code = rep_codes(slots, n_experts=len(slots) * per)
+def flex_list(slots: Sequence[Sequence[int]], *, per: int = PER_CHIP) -> List[int]:
+    """The replicated experts in ascending id order as ``e << 8 | replica chip``."""
+    return sorted((int(e) << 8) | c for c, row in enumerate(slots) for e in row)
+
+
+def chip_table(slots: Sequence[Sequence[int]], c: int, *, per: int = PER_CHIP, flex: bool = True) -> List[int]:
+    """The per-chip uint32 table (module docstring). ``flex=False``: no replicated expert (empty flex list and masks:
+    the device then assigns every expert to its home, bitwise the plain EP32 path; tests)."""
     sl = chip_slots(slots, c, per=per)
-    return code + sl + [NONE] * (SLOT_WORDS - len(sl))
+    fl = flex_list(slots, per=per) if flex else []
+    if len(sl) > SLOT_WORDS or len(fl) > FLEX_WORDS:
+        raise ValueError("replica table overflow")
+    masks = [0] * N_CHIPS
+    enc = []
+    for v in fl:
+        e, r = v >> 8, v & 0xFF
+        masks[e // per] |= 1 << (e % per)
+        enc.append((e << 16) | ((e % per) << 12) | ((e // per) << 6) | r)
+    return (sl + [NONE] * (SLOT_WORDS - len(sl)) + [len(fl), int(c)] + [0] * 14 + enc + [0] * (FLEX_WORDS - len(enc))
+            + masks)
+
+
+def assign_words(where: Dict[int, int], load: Sequence[int], slots: Sequence[Sequence[int]]) -> List[int]:
+    """The device's assignment output for :func:`assign`'s result (flex where, then load)."""
+    fl = flex_list(slots)
+    w = [where.get(v >> 8, NONE) for v in fl]
+    return w + [NONE] * (FLEX_WORDS - len(w)) + list(load)
 
 
 def max_load(idx_rows, live, slots, *, per: int = PER_CHIP) -> Tuple[int, int]:
@@ -358,6 +385,6 @@ def ensure_replica_file(src, dst, chip_experts, header: bytes, K: int, N: int, *
 __all__ = [
     "ASSIGN_WORDS", "DEFAULT_R", "NONE", "N_CHIPS", "N_EXPERTS", "PASSES", "PER_CHIP", "REPLICA_MODES", "SLOT_WORDS",
     "TABLE_WORDS", "active_from_rows", "assign", "build_replica_tensorbin", "chip_slots", "chip_table",
-    "check_shard_table", "choose_replicas", "default_plan_path", "shard_table", "ensure_replica_file", "expert_bytes", "keep_slots", "load_plan",
+    "check_shard_table", "choose_replicas", "default_plan_path", "flex_list", "assign_words", "FLEX_WORDS", "shard_table", "ensure_replica_file", "expert_bytes", "keep_slots", "load_plan",
     "max_load", "plan_hash", "rep_codes", "replica_file", "spread_targets", "template_header", "tensorbin_layout",
 ]

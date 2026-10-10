@@ -87,10 +87,7 @@ def _per_chip(x: torch.Tensor, mesh_device, dtype, layout=ttnn.TILE_LAYOUT, mc=D
 def _table(slots, mesh_device, codes_off=False):
     t = torch.zeros(4, 8, 1, RP.TABLE_WORDS, dtype=torch.int32)
     for k in range(32):
-        row = RP.chip_table(slots, k)
-        if codes_off:
-            row = [RP.NONE] * RP.N_EXPERTS + row[RP.N_EXPERTS:]
-        t[k // 8, k % 8, 0] = torch.tensor(row, dtype=torch.int32)
+        t[k // 8, k % 8, 0] = torch.tensor(RP.chip_table(slots, k, flex=not codes_off), dtype=torch.int32)
     return _per_chip(t, mesh_device, ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
 
 
@@ -219,11 +216,11 @@ def test_replicas_device_router(mesh_device, device_params):
                         D[:, 12 * k:12 * k + 12] = sh.float().reshape(12, M).t()
                     act = RP.active_from_rows(I0.tolist(), live)
                     where, load = RP.assign(act, code)
-                    exp_where = [where.get(e, RP.NONE) for e in range(E)]
+                    exp_assign = RP.assign_words(where, load, slots)
                     ok_assign, ok_w, cover = True, True, torch.zeros(M, E, dtype=torch.long)
                     for k, (ash, wsh) in enumerate(zip(_shards(a1), _shards(w1))):
                         a = ash.reshape(-1).long().tolist()
-                        ok_assign &= a[:E] == exp_where and a[E:E + 32] == load
+                        ok_assign &= a == exp_assign
                         got = wsh.float().reshape(16, M).t()
                         exp = torch.zeros(M, 16)
                         for sl, e in enumerate(RP.chip_slots(slots, k)):

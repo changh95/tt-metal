@@ -87,9 +87,18 @@ def test_assign_tie_goes_home_and_moves():
 def test_chip_table_layout():
     slots = RP.choose_replicas(_freq(2), 4)
     t = RP.chip_table(slots, 5)
-    assert len(t) == RP.TABLE_WORDS
-    assert t[:384] == RP.rep_codes(slots)
-    assert t[384:396] == list(range(60, 72)) and t[396:400] == slots[5]
+    assert len(t) == RP.TABLE_WORDS == 192
+    assert t[:12] == list(range(60, 72)) and t[12:16] == slots[5] and t[16] == 128 and t[17] == 5
+    fl = t[32:160]
+    code = RP.rep_codes(slots)
+    assert fl == sorted(fl) and {v >> 16 for v in fl} == {e for r in slots for e in r}
+    for v in fl:
+        e = v >> 16
+        assert (v >> 12) & 15 == e % 12 and (v >> 6) & 63 == e // 12 and v & 63 == code[e] >> 8
+    for c in range(32):
+        assert t[160 + c] == sum(1 << (e % 12) for r in slots for e in r if e // 12 == c)
+    t0 = RP.chip_table(slots, 5, flex=False)
+    assert t0[16] == 0 and t0[32:] == [0] * 160
 
 
 def test_plan_roundtrip(tmp_path):

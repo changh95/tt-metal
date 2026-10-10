@@ -20,9 +20,9 @@
 //    NREP replica slots holding the experts of the chip table (the reader stages it in CB_ID). Every worker sends its
 //    K ids and its live flag (lane mask column 0 != 0; LANE = 0: live) to worker 0's CB_G (64 B record per row) and
 //    bumps worker 0's semaphore G. Worker 0 waits for the M records, runs the deterministic greedy assignment (every
-//    chip computes the same one from the same records), writes where[384] / load[32] to the assign tensor
-//    [1, 1, 1, 416] uint32 RM, and multicasts this chip's 32-bit keep mask (slot s computes iff its expert is active
-//    and assigned here) to every worker's CB_K with semaphore K. A worker writes the weight of slot s only when bit s
+//    chip computes the same one from the same records), writes it to the assign tensor [1, 1, 1, 160] uint32 RM,
+//    and multicasts this chip's 32-bit keep mask (slot s computes iff its expert is active
+//    and assigned here) to every worker's CB_K with semaphore K (the assign tensor: flex where[128], load[32]). A worker writes the weight of slot s only when bit s
 //    is kept and its row is live (else +0), so w_loc is already lane-masked. Inactive rows still send their record.
 //    Every spin is bounded (a lost increment gives wrong data, never a hang).
 //
@@ -56,7 +56,6 @@ inline uint32_t as_bits(float f) {
 
 constexpr uint32_t SPIN_LIMIT = 200000000u;
 constexpr uint32_t NONE = 0xFFFFu;  // tt/replicas.py NONE
-constexpr uint32_t PEND = 0xFFFEu;  // active, not yet assigned
 constexpr uint32_t NE_REP = 384;    // tt/replicas.py N_EXPERTS
 constexpr uint32_t N_CHIPS = 32;
 
@@ -76,11 +75,16 @@ inline bool wait_min(volatile tt_l1_ptr uint32_t* sem, uint32_t v) {
 }
 
 // DESIGN-2 replica mode, step 4 of the header: returns this chip's keep mask (bit s = slot s computes).
+// CB_ID holds the chip table (tt/replicas.py chip_table) at byte 256 = word 64: [0, 16) slot experts, [16] the flex
+// count NF, [17] this chip's index, [32, 32 + NF) the flex list (e << 16 | e % 12 << 12 | home << 6 | replica chip,
+// ascending e), [160, 192) per-chip masks of the experts that have a replica.
 template <uint32_t K, uint32_t M, uint32_t E_LOC, uint32_t NREP, uint32_t cb_g, uint32_t cb_k, uint32_t cb_sc,
           uint32_t sem_g_id, uint32_t sem_k_id, uint32_t CX, uint32_t CY, uint32_t AX0, uint32_t AY0, uint32_t AX1,
           uint32_t AY1, uint32_t AN, uint32_t BX0, uint32_t BY0, uint32_t BX1, uint32_t BY1, uint32_t BN, typename AArgs>
 uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t base,
                       const volatile tt_l1_ptr uint32_t* idw, uint32_t rec_l1, const AArgs& a_args, uint32_t a_addr) {
+    constexpr uint32_t NF_MAX = 128;  // tt/replicas.py FLEX_WORDS
+    static_assert(E_LOC == 12, "the flex encoding and the chip masks assume 12 native experts per chip");
     // 1. this row's record -> worker 0's CB_G (64 B at q * 64): K ids, padding, word 15 = live
     volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rec_l1);
     for (uint32_t j = 0; j < 15; ++j) {
@@ -103,76 +107,92 @@ uint32_t replica_keep(uint32_t q, const uint32_t* ids, uint32_t live, uint32_t b
         wait_min(semg, M);
         *semg = 0;
         invalidate_l1_cache();
-        const volatile tt_l1_ptr uint32_t* g = reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(gbuf);
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(gbuf);
+        const uint32_t* tab = const_cast<const uint32_t*>(idw) + 64;  // table word 0
+        const uint32_t nf = tab[16] < NF_MAX ? tab[16] : NF_MAX;
+        const uint32_t me = tab[17];
+        const uint32_t* flex = tab + 32;
+        const uint32_t* rmask = tab + 160;
         const uint32_t sc = get_write_ptr(cb_sc);
-        uint32_t* where = reinterpret_cast<uint32_t*>(sc);
-        uint32_t* load = where + NE_REP;
-        const volatile tt_l1_ptr uint32_t* code = idw + 64;  // byte 256
-        for (uint32_t e = 0; e < NE_REP; ++e) {
-            where[e] = NONE;
-        }
-        for (uint32_t c = 0; c < N_CHIPS; ++c) {
-            load[c] = 0;
+        uint32_t* where = reinterpret_cast<uint32_t*>(sc);  // [NF_MAX], then load[32] (the assign output)
+        uint32_t* lout = where + NF_MAX;
+        uint32_t act[NE_REP / 32 + 1];  // active bitmap (+1: the chip-mask extraction reads one word past)
+        for (uint32_t w = 0; w <= NE_REP / 32; ++w) {
+            act[w] = 0;
         }
         for (uint32_t t = 0; t < M; ++t) {
-            if (g[t * 16 + 15] != 0) {
+            const uint32_t* r = g + t * 16;
+            if (r[15] != 0) {
                 for (uint32_t j = 0; j < K; ++j) {
-                    const uint32_t e = g[t * 16 + j];
+                    const uint32_t e = r[j];
                     if (e < NE_REP) {
-                        where[e] = PEND;
+                        act[e >> 5] |= 1u << (e & 31);
                     }
                 }
             }
         }
-        for (uint32_t e = 0; e < NE_REP; ++e) {  // experts without a replica: their home
-            if (where[e] == PEND && code[e] == NONE) {
-                const uint32_t h = e / E_LOC;
-                where[e] = h;
-                load[h] += 1;
+        uint32_t cm[N_CHIPS];
+        uint32_t load[N_CHIPS];
+        for (uint32_t c = 0; c < N_CHIPS; ++c) {  // chip c's experts = bits [12 c, 12 c + 12)
+            const uint32_t off = (c << 3) + (c << 2);
+            const uint32_t w = off >> 5, sh = off & 31;
+            uint32_t v = act[w] >> sh;
+            if (sh > 20) {
+                v |= act[w + 1] << (32 - sh);
             }
+            cm[c] = v & 0xFFFu;
+            load[c] = __builtin_popcount(cm[c] & ~rmask[c]);  // experts without a replica: their home
         }
-        for (uint32_t e = 0; e < NE_REP; ++e) {  // replicated: the less loaded holder, ties home
-            if (where[e] == PEND) {
-                const uint32_t h = e / E_LOC, r = code[e] >> 8;
-                const uint32_t c = load[h] <= load[r] ? h : r;
+        for (uint32_t i = 0; i < nf; ++i) {  // replicated, ascending id: the less loaded holder, ties home
+            const uint32_t v = flex[i];
+            const uint32_t h = (v >> 6) & 63u, r = v & 63u, lb = (v >> 12) & 15u;
+            uint32_t c = NONE;
+            if ((cm[h] >> lb) & 1u) {
+                c = load[h] <= load[r] ? h : r;
                 load[c] += 1;
-                where[e] = c;
+            }
+            where[i] = c;
+        }
+        for (uint32_t i = 0; i < nf; ++i) {  // replicas.PASSES = 1: move to the other holder when that helps
+            const uint32_t c = where[i];
+            if (c == NONE) {
+                continue;
+            }
+            const uint32_t v = flex[i];
+            const uint32_t h = (v >> 6) & 63u, r = v & 63u;
+            const uint32_t o = c == h ? r : h;
+            if (load[o] + 1 < load[c]) {
+                load[c] -= 1;
+                load[o] += 1;
+                where[i] = o;
             }
         }
-        for (uint32_t pass = 0; pass < 2; ++pass) {  // replicas.PASSES
-            bool moved = false;
-            for (uint32_t e = 0; e < NE_REP; ++e) {
-                if (where[e] == NONE || code[e] == NONE) {
-                    continue;
+        keep = cm[me] & ~rmask[me];  // active natives without a replica
+        for (uint32_t i = 0; i < nf; ++i) {
+            if (where[i] != me) {
+                continue;
+            }
+            const uint32_t v = flex[i];
+            if (((v >> 6) & 63u) == me) {
+                keep |= 1u << ((v >> 12) & 15u);
+            } else {
+                const uint32_t e = v >> 16;
+                for (uint32_t rj = 0; rj < NREP; ++rj) {
+                    if (tab[E_LOC + rj] == e) {
+                        keep |= 1u << (E_LOC + rj);
+                    }
                 }
-                const uint32_t h = e / E_LOC, r = code[e] >> 8, c = where[e];
-                const uint32_t o = c == h ? r : h;
-                if (load[o] + 1 < load[c]) {
-                    load[c] -= 1;
-                    load[o] += 1;
-                    where[e] = o;
-                    moved = true;
-                }
-            }
-            if (!moved) {
-                break;
             }
         }
-        const uint32_t me = base / E_LOC;
-        for (uint32_t s = 0; s < E_LOC; ++s) {
-            if (where[base + s] == me) {
-                keep |= 1u << s;
-            }
+        for (uint32_t i = nf; i < NF_MAX; ++i) {
+            where[i] = NONE;
         }
-        for (uint32_t rj = 0; rj < NREP; ++rj) {
-            const uint32_t e = idw[448 + E_LOC + rj];
-            if (e < NE_REP && where[e] == me) {
-                keep |= 1u << (E_LOC + rj);
-            }
+        for (uint32_t c = 0; c < N_CHIPS; ++c) {
+            lout[c] = load[c];
         }
         asm volatile("" ::: "memory");
-        const auto as = TensorAccessor(a_args, a_addr, (NE_REP + N_CHIPS) * 4);
-        noc_async_write(sc, as.get_noc_addr(0, 0), (NE_REP + N_CHIPS) * 4);
+        const auto as = TensorAccessor(a_args, a_addr, (NF_MAX + N_CHIPS) * 4);
+        noc_async_write(sc, as.get_noc_addr(0, 0), (NF_MAX + N_CHIPS) * 4);
         // 3. keep -> every other worker (data, then the linked flag), per rectangle of the worker grid
         kbuf[0] = keep;
         *semk = 1;
@@ -311,7 +331,7 @@ void kernel_main() {
         if constexpr (REPL != 0) {
             if (slot == 0xFFFFFFFFu) {
                 for (uint32_t rj = 0; rj < NREP; ++rj) {
-                    if (idw[448 + E_LOC + rj] == ids[j]) {  // byte 1792: the slot experts
+                    if (idw[64 + E_LOC + rj] == ids[j]) {  // byte 256: the table's slot experts
                         slot = E_LOC + rj;
                         break;
                     }

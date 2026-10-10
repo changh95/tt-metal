@@ -68,8 +68,8 @@ CB_S, CB_B, CB_O, CB_ID, CB_ST = 0, 1, 2, 3, 4
 CB_G, CB_K, CB_SC = 5, 6, 7  # DESIGN-2 replica mode: records (worker 0), keep mask, assignment scratch (worker 0)
 SEM_G, SEM_K = 0, 1
 FP32_TILE_BYTES = 4096
-TABLE_WORDS = 400  # tt/replicas.py TABLE_WORDS
-ASSIGN_WORDS = 416  # tt/replicas.py ASSIGN_WORDS
+TABLE_WORDS = 192  # tt/replicas.py TABLE_WORDS
+ASSIGN_WORDS = 160  # tt/replicas.py ASSIGN_WORDS
 
 
 def _sources_tag() -> str:

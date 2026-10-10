@@ -16,8 +16,8 @@
 //
 // DESIGN-2 replica mode (REPL = 1, tt/replicas.py): the same CB_ID page also receives, at byte 64, the 64 B half-row of
 // the lane mask lane [1, 1, M, 1] fp32 TILE holding this row's column 0 (LANE = 1), and the chip's table
-// table [1, 1, 1, 400] uint32 ROW_MAJOR: worker 0 (the assignment coordinator) reads all of it to byte 256 (replica
-// codes at 256, slot experts at 1792), the other workers only its slot experts (table bytes 1536..1599) to byte 1792.
+// table [1, 1, 1, 192] uint32 ROW_MAJOR (tt/replicas.py chip_table) to byte 256: worker 0 (the assignment coordinator)
+// all of it, the other workers its first 64 B (the slot experts).
 //
 // CT: 0 cb_s, 1 cb_b, 2 cb_id, 3 NT, 4 GX, 5.. TensorAccessorArgs(scores), (bias), (ids), then REPL, LANE,
 //     TensorAccessorArgs(lane), (table) (copies of ids' when absent)
@@ -67,13 +67,9 @@ void kernel_main() {
     }
     noc_async_read(is.get_noc_addr(0, 0), get_write_ptr(cb_id), 64);
     if constexpr (REPL != 0) {
-        constexpr uint32_t TABLE_BYTES = 1600;  // 400 uint32: 384 replica codes + 16 slot experts
+        constexpr uint32_t TABLE_BYTES = 768;  // 192 uint32 (tt/replicas.py chip_table)
         const auto ts = TensorAccessor(t_args, get_common_arg_val<uint32_t>(4), TABLE_BYTES);
-        if (q == 0) {
-            noc_async_read(ts.get_noc_addr(0, 0), get_write_ptr(cb_id) + 256, TABLE_BYTES);
-        } else {
-            noc_async_read(ts.get_noc_addr(0, 1536), get_write_ptr(cb_id) + 1792, 64);
-        }
+        noc_async_read(ts.get_noc_addr(0, 0), get_write_ptr(cb_id) + 256, q == 0 ? TABLE_BYTES : 64);
         if constexpr (LANE != 0) {
             const auto ls = TensorAccessor(l_args, get_common_arg_val<uint32_t>(3), tb);
             noc_async_read(ls.get_noc_addr(tr, row_off), get_write_ptr(cb_id) + 64, 64);
