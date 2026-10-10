@@ -745,11 +745,36 @@ RACE_PAYLOADS = [
     # the chips skew), then immediately the decode AR(tp) of [1, 1, 8, 4096]: the CCL's fabric writes land while the
     # slower chips still stream on NoC0 / NoC1. Always asserted.
     ("d3_smm_ar_tp_decode", "d3_smm", [1, 1, 8, 4096], ttnn.bfloat16, None, False, "- (new)"),
+    # Phase E D3 stage 2 (MOTIF3_DECODE_EXPERT_MM=fused): gate_up_routed (sparsity multicast from w_loc) -> down_sum
+    # (h multicast, cross-core expert sum into column owners) with k = (chip index) % 13 active experts per chip, then
+    # immediately the decode AR(tp). Always asserted.
+    ("d3s2_fused_ar_tp_decode", "d3s2", [1, 1, 8, 4096], ttnn.bfloat16, None, False, "- (new)"),
 ]
 
 
 _D4_FOLD: dict = {}  # id(mesh) -> the D4 RowFold (tt/kernels/row_fold.py) of the race test's d4_chain payload
 _D3_SMM: dict = {}  # id(mesh) -> (gate_up op, down op, x, h, per-chip sparsity, weights) of the d3_smm payload
+_D3S2: dict = {}  # id(mesh) -> (per-chip w_loc,) of the d3s2 payload (ops / x / h shared with d3_smm)
+
+
+def _d3s2_setup(mesh_device):
+    """The d3s2 race payload's per-chip routing weights ``w_loc [1, 12, 32, 1]`` fp32: k = (chip index) % 13 active
+    experts, each routed by a few rows (the chips finish at different times)."""
+    st = _D3S2.get(id(mesh_device))
+    if st is None:
+        R, C = (int(s) for s in tuple(mesh_device.shape))
+        g = torch.Generator().manual_seed(34)
+        w = torch.zeros(R, C * 12, 32, 1)
+        for r in range(R):
+            for q in range(C):
+                for e in range((r * C + q) % 13):
+                    rows = torch.randperm(32, generator=g)[:5]
+                    w[r, q * 12 + e, rows, 0] = torch.rand(5, generator=g) * 0.3 + 0.01
+        wl = ttnn.from_torch(w, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=mesh_device,
+                             memory_config=ttnn.L1_MEMORY_CONFIG,
+                             mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C)))
+        st = _D3S2[id(mesh_device)] = (wl,)
+    return st
 
 
 def _d3_smm_setup(mesh_device):
@@ -795,8 +820,8 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
     counted and reported, not asserted. ``MOTIF3_DET_NATIVE_CONTROL=1`` also counts the native gather of every
     payload (reported: the race is timing dependent). ``MOTIF3_DET_RACE_ONLY=name,...`` runs only those payloads.
     Phase C D4's payloads (``d4_*``: the direct RS(dp) on dim 1 and the fold / RS / unfold / AR(tp) chain) and Phase D's
-    ``d3_smm_ar_tp_decode`` (the dual-NoC expert matmuls, skewed per chip, then the decode AR(tp)) are always
-    asserted."""
+    ``d3_smm_ar_tp_decode`` (the dual-NoC expert matmuls, skewed per chip, then the decode AR(tp)) and Phase E's
+    ``d3s2_fused_ar_tp_decode`` (the stage-2 pair) are always asserted."""
     from collections import Counter
 
     from models.demos.motif3.tt.ccl import MotifCCL, device_tensors_to_torch, log_fabric, native_ag_cb_pages_per_link
@@ -832,7 +857,7 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                   for k in range(2)]  # fmt: skip
             gshape = [1, m, max(rows, 32), width if op == "ag" else width // C]  # the gathered per-chip payload
             dt_name = getattr(xs[0].dtype, "name", str(xs[0].dtype).split(".")[-1])
-            d4 = op in ("rs_dp_d4", "d4_chain", "d3_smm")
+            d4 = op in ("rs_dp_d4", "d4_chain", "d3_smm", "d3s2")
             assert d4 or native_ag_cb_pages_per_link(gshape, dt_name, True) == pages, name
             for mode, ccl in ccls.items():
                 rerouted = d4 or mode == "safe" or (mode == "lean" and (pages > 1 or race_free))
@@ -862,6 +887,14 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                         gu_op, dn_op, xg, hh, spd, _ = _d3_smm_setup(mesh_device)
                         ttnn.deallocate(gu_op(xg, spd, memory_config=ttnn.L1_MEMORY_CONFIG))
                         ttnn.deallocate(dn_op(hh, spd, memory_config=ttnn.L1_MEMORY_CONFIG))
+                        o = ccl.ar_tp(x)
+                    elif op == "d3s2":
+                        gu_op, dn_op, xg, hh, _, _ = _d3_smm_setup(mesh_device)
+                        (wl,) = _d3s2_setup(mesh_device)
+                        gu_, sp_ = gu_op.gate_up_routed(xg, wl, memory_config=ttnn.L1_MEMORY_CONFIG)
+                        ttnn.deallocate(gu_)
+                        ttnn.deallocate(dn_op.down_sum(hh, sp_, memory_config=ttnn.L1_MEMORY_CONFIG))
+                        ttnn.deallocate(sp_)
                         o = ccl.ar_tp(x)
                     else:
                         o = ccl.ar_tp(x, race_free=race_free)

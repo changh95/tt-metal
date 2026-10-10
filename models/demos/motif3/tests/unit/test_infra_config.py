@@ -2617,7 +2617,7 @@ def test_p1diag_debug_sync_knob(monkeypatch):
 
 
 def test_d3_decode_expert_mm_knob(monkeypatch):
-    """Phase D DESIGN-3 (logs/opt/phaseD/D3BUILD): ``MOTIF3_DECODE_EXPERT_MM`` ("dualnoc" default | "stock"; case and
+    """Phase D DESIGN-3 (logs/opt/phaseD/D3BUILD): ``MOTIF3_DECODE_EXPERT_MM`` ("fused" default since Phase E D3S2 | "dualnoc" | "stock"; case and
     blanks ignored, anything else refused; in ``describe``) and :func:`resolve_decode_expert_mm` (explicit requests
     that cannot run raise, the config value falls back to "stock")."""
     import ttnn
@@ -2628,7 +2628,7 @@ def test_d3_decode_expert_mm_knob(monkeypatch):
     assert DECODE_EXPERT_MM_MODES == ("stock", "dualnoc", "fused")
     monkeypatch.delenv("MOTIF3_DECODE_EXPERT_MM", raising=False)
     default = _cfg().decode_expert_mm
-    assert default == "dualnoc" and f"decode_expert_mm={default} " in _cfg().describe()
+    assert default == "fused" and f"decode_expert_mm={default} " in _cfg().describe()
     for v, want in ((" DualNoC ", "dualnoc"), ("stock", "stock"), (" FUSED", "fused"), ("", default)):
         monkeypatch.setenv("MOTIF3_DECODE_EXPERT_MM", v)
         assert _cfg().decode_expert_mm == want, v
