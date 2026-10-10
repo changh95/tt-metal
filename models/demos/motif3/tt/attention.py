@@ -1505,6 +1505,10 @@ class MotifAttention:
         # (tt/kernels/attn_in.py, one program after the latent projections, built lazily)
         self.attn_in = getattr(cfg, "attn_in", "ops")
         self._fused_input = None
+        # decode output chain (Phase F F2, MOTIF3_ATTN_OUT): "ops" (default) | "uv" (tt/kernels/attn_out.py: transpose,
+        # W_UV, sigmoid(lam @ E) and the combine as one program) | "fused" (plus wo in that program); built lazily
+        self.attn_out = getattr(cfg, "attn_out", "ops")
+        self._fused_output = None
 
         # ---- weights (ATTN-1) -----------------------------------------------------------------------------------
         src = _AttnSource(source, self.layer_idx, self.weight_prefix)
@@ -1821,10 +1825,49 @@ class MotifAttention:
             ttnn.deallocate(q_mla)
 
         # ---- un-absorb per head, differential, gate, mask, wo, AR(tp) ------------------------------------------
+        if taps is None:  # Phase F F2: the output chain from o_lat in one program
+            part = self._fused_output_chain(o_lat, g, lam, active)
+            if part is not None:
+                ttnn.deallocate(o_lat)
+                out = self.ccl.ar_tp(part)
+                ttnn.deallocate(part)
+                return out
         o_heads = ttnn.transpose(o_lat, 1, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, 10, L, 512]
         if taps is None:
             ttnn.deallocate(o_lat)
         return self._absorbed_epilogue(o_heads, g, lam, active=active, taps=taps, decode=True)
+
+    def fused_output(self):
+        """The layer's :class:`~models.demos.motif3.tt.kernels.attn_out.FusedAttnOut` (built on first use)."""
+        if getattr(self, "_fused_output", None) is None:
+            from .kernels.attn_out import FusedAttnOut
+
+            self._fused_output = FusedAttnOut(self.mesh_device)
+        return self._fused_output
+
+    def _fused_output_chain(self, o_lat, g, lam, active):
+        """``attn_out="uv"`` (Phase F F2): ONE program for transpose(o_lat) / W_UV / sigmoid(lam @ E) / the combine
+        (the wo input), then the release's wo linear; ``attn_out="fused"``: wo in that program too -> the AR(tp) input
+        ``part [1, 1, L, 4096]``, consuming ``g`` and ``lam`` (not ``o_lat``). ``None`` (nothing run or consumed) when the
+        mode is ``ops`` or the operands are outside the kernel's contract (the op chain then runs)."""
+        mode = getattr(self, "attn_out", "ops")  # (host tests build the module without __init__)
+        if mode not in ("uv", "fused") or active is None:
+            return None
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        if (int(grid.x), int(grid.y)) != (12, 10):
+            return None
+        fo = self.fused_output()
+        w_o = self.w_o if mode == "fused" else None
+        if not fo.supports(o_lat, g, lam, active, self.w_uv, self.lam_expand, w_o):
+            return None
+        out = fo(mode, o_lat, g, lam, active, self.w_uv, self.lam_expand, w_o)
+        ttnn.deallocate(g)
+        ttnn.deallocate(lam)
+        if mode == "fused":
+            return out
+        part = self._linear(out, self.w_o, ckc=self.ckc_heads, pc=self._pc("wo", True))
+        ttnn.deallocate(out)
+        return part
 
     def fused_input(self):
         """The layer's :class:`~models.demos.motif3.tt.kernels.attn_in.FusedAttnIn` (built on first use)."""

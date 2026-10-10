@@ -2196,6 +2196,34 @@ def test_f1_attn_in_knob(monkeypatch):
             assert all(x0 <= c // gx <= x1 for c in range(AI.NLQ + AI.NLK)), mode
 
 
+def test_f2_attn_out_knob(monkeypatch):
+    """Phase F F2 (logs/opt/phaseF/F2): ``MOTIF3_ATTN_OUT`` ("ops" default | "uv" | "fused"; case and blanks ignored,
+    anything else refused; in ``describe``) and the fused output chain's core layout (``tt/kernels/attn_out``): the UV
+    units (one W_UV tile each, a head's 4 cores in one row), the 32 CMB cores and the 8 x 8 WO block fit the 12 x 10
+    grid, the CMB cores sit outside the WO multicast rectangle, and the wo split covers the 128 output tiles."""
+    from models.demos.motif3.tt.kernels import attn_out as AO
+    from models.demos.motif3.tt.model_config import ATTN_OUT_MODES
+
+    assert ATTN_OUT_MODES == ("ops", "uv", "fused")
+    monkeypatch.delenv("MOTIF3_ATTN_OUT", raising=False)
+    assert _cfg().attn_out == "ops" and "attn_out=ops " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("uv", "uv"), ("OPS", "ops"), ("", "ops")):
+        monkeypatch.setenv("MOTIF3_ATTN_OUT", v)
+        assert _cfg().attn_out == want, v
+    monkeypatch.setenv("MOTIF3_ATTN_OUT", "kernel")
+    with pytest.raises(ValueError, match="MOTIF3_ATTN_OUT"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_ATTN_OUT", raising=False)
+    gx, gy = AO.GRID
+    assert AO.STAGES == ("uv", "fused")
+    assert AO.H * AO.TPH == AO.UV_ROWS * AO.LEFT_X  # 40 UV units on the left block's first rows
+    for h in range(AO.H):  # a head's 4 UV cores share one row
+        assert len({(h * AO.TPH + i) // AO.LEFT_X for i in range(AO.TPH)}) == 1
+    assert AO.NCMB == (gx - AO.CMB_X0) * AO.WO_ROWS and AO.CMB_X0 >= AO.LEFT_X
+    assert AO.LEFT_X * AO.WO_ROWS * AO.NWO_PER == AO.NWO_T and AO.WO_ROWS <= gy
+    assert AO.KUV % 4 == 0 and AO.SG % (AO.H - AO.SG) == 0
+
+
 def test_d1_attn_epilogue_knob(monkeypatch):
     """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("fused" default | "ops"; case and blanks ignored, anything
     else refused; in ``describe``) and the fused combine's worker plan (``tt/kernels/attn_combine.plan``)."""
