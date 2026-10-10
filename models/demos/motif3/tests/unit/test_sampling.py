@@ -67,8 +67,9 @@ Device tests (lock wrapper; ~2 min; run with the trace-allocation tracker on)::
     and replays, the distribution of 48,000 draws per row = ``softmax(x / T)`` over the whole vocabulary (chi-square,
     TV vs the noise floor, the mass drawn outside the top-512 window), greedy / top-p / top-k lanes unchanged.
 
-(i) ``test_sampler_local_fused_bitwise`` -- Phase F F4 (``MOTIF3_SAMPLER_LOCAL``, ``tt/kernels/sampler_local.py``): the
-    fused per-chip stage against the op chain on the same inputs: its outputs (``part``, ``q``) and the debug
+(i) ``test_sampler_local_fused_bitwise`` -- Phase F F4 (``MOTIF3_SAMPLER_LOCAL``, ``tt/kernels/sampler_local.py`` and
+    the two tails ``tt/kernels/sampler_tail.py``): the fused per-chip stage, the Gumbel winner selection and the output
+    packing against the op chain on the same inputs: the stage outputs (``part``, ``q``) and the debug
     intermediates (``Z``, ``Z1``, the Gumbel winner, ``u``) and the sampler outputs (``tokens``, ``info``) bitwise on
     every chip, for real / crafted / random rows under mixed lane parameters (greedy, top-p, top-k, full-support Gumbel
     lanes, T down to 2e-5) and several counter sets; 10 repeated fused calls identical; traced fused == eager ops.

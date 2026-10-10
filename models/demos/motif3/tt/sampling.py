@@ -915,11 +915,13 @@ class MotifDeviceSampler:
         self._last_ctr = np.zeros((L, 2), dtype=np.uint32)
         self.set_params([0.0] * L, [1.0] * L, [0] * L, [None] * L)
         self.set_positions([0] * L)
-        self._local = None
+        self._local = self._tail = None
         if self._local_ok:
             from .kernels.sampler_local import FusedSamplerLocal
+            from .kernels.sampler_tail import FusedSamplerTail
 
             self._local = FusedSamplerLocal(mesh_device)
+            self._tail = FusedSamplerTail(mesh_device)  # with the fused stage: the Gumbel winner and output tails
 
     # ---- host -> device parameters ------------------------------------------------------------------------
     def _host_tensor(self, t: torch.Tensor, dtype):
@@ -1286,6 +1288,10 @@ class MotifDeviceSampler:
             return t
 
         G = T(self.ccl.all_gather(T(self.ccl.all_gather(q, 3, "tp", memory_config=mc)), 3, "dp", memory_config=mc))
+        if self._local is not None and self._tail is not None and self._tail.supports_gumbel(G):
+            # Phase F F4: the global winner's selection as one data movement program (bitwise the ops below)
+            gmax, g_tok, g_dx = (T(t) for t in self._tail.gumbel_winner(G, memory_config=mc))
+            return {"g_tok": g_tok, "g_dx": g_dx, "g_score": gmax}
         L = self.lanes
         Gs, Gi, Gd = (T(ttnn.slice(G, [0, 0, k * L, 0], [1, 1, (k + 1) * L, int(G.shape[3])], memory_config=mc))
                       for k in range(3))  # fmt: skip
@@ -1484,6 +1490,8 @@ class MotifDeviceSampler:
         if self._counter is not None:
             ttnn.add(self._counter, o["flag"], output_tensor=self._counter)
         rows = [o["tok"], o["flag"], o["lp"], o["n_kept"], o["u"], o["mass_kept"], o["total"], o["kth"]]
+        if self._local is not None and self._tail is not None and self._tail.supports_pack(rows):
+            return self._tail.pack(rows, memory_config=omc)  # Phase F F4: one data movement program (bitwise)
         packed = ttnn.concat(rows, dim=3, memory_config=mc)  # [1, 1, 32, 8]
         T(packed)
         pt = ttnn.transpose(packed, 2, 3, memory_config=mc)  # [1, 1, 8, 32]

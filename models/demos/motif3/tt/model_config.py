@@ -164,10 +164,11 @@ ATTN_OUT_MODES = ("ops", "uv", "fused")
 # passed bitwise: E1 53 layers row + KV-R, spec_t32 / t64, KV-R + MTP, logs/opt/phaseF/F3). Bitwise the same rows.
 # Decode only.
 MOE_LOCAL_MODES = ("ops", "shared", "fused")
-# Decode device-sampler per-chip stage (Phase F F4; tt/kernels/sampler_local.py): "ops" (default: the Phase E sampler
-# op chain) | "fused" (one generic_op per step for every per-chip op between the candidate gather and the normaliser /
-# Gumbel gathers: the exact full-vocab normaliser partials, the Gumbel hash, scores and local winner, and the device
-# uniform, with the ops path's LLK calls; MotifDeviceSampler only, every decode trace that holds the sampler).
+# Decode device-sampler per-chip stage (Phase F F4; tt/kernels/sampler_local.py, sampler_tail.py): "ops" (default: the
+# Phase E sampler op chain) | "fused" (one generic_op per step for every per-chip op between the candidate gather and
+# the normaliser / Gumbel gathers: the exact full-vocab normaliser partials, the Gumbel hash, scores and local winner,
+# and the device uniform, with the ops path's LLK calls; the Gumbel race's global winner and the output packing as two
+# data movement programs; MotifDeviceSampler only, every decode trace that holds the sampler). Bitwise the same tokens.
 SAMPLER_LOCAL_MODES = ("ops", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
