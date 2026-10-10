@@ -65,7 +65,11 @@ TILE = 32
 MAX_K = 16
 EPS = 1e-20
 CB_S, CB_B, CB_O, CB_ID, CB_ST = 0, 1, 2, 3, 4
+CB_G, CB_K, CB_SC = 5, 6, 7  # DESIGN-2 replica mode: records (worker 0), keep mask, assignment scratch (worker 0)
+SEM_G, SEM_K = 0, 1
 FP32_TILE_BYTES = 4096
+TABLE_WORDS = 400  # tt/replicas.py TABLE_WORDS
+ASSIGN_WORDS = 416  # tt/replicas.py ASSIGN_WORDS
 
 
 def _sources_tag() -> str:
@@ -183,9 +187,13 @@ class FusedRouterTopK:
         local_ids: ``[1, E_LOC, 1, 1]`` fp32 TILE interleaved; element 0 of tile 0 = the chip's first global id (the
             chip's experts are ``[base, base + E_LOC)``, ``weights.ep_layout``).
         top_k: experts per token (8).
+        replica_table: DESIGN-2 replica mode (tt/replicas.py): the per-chip table ``[1, 1, 1, 400]`` uint32 ROW_MAJOR
+            interleaved (``replicas.chip_table``); ``w_loc`` then has ``E_LOC + n_rep`` slots, holds only the slots this
+            chip computes after the on-device greedy assignment and is lane-masked by the call's ``lane_mask``.
+        n_rep: replica slots per chip (with ``replica_table``).
     """
 
-    def __init__(self, mesh_device, bias, local_ids, *, top_k: int):
+    def __init__(self, mesh_device, bias, local_ids, *, top_k: int, replica_table=None, n_rep: int = 0):
         self.mesh_device = mesh_device
         self.bias, self.ids = bias, local_ids
         bshape = tuple(int(v) for v in bias.shape)
@@ -198,9 +206,23 @@ class FusedRouterTopK:
             if t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or not _is_interleaved(t.memory_config()):
                 raise ValueError(f"fused router: {name} must be fp32 TILE interleaved, got {t.dtype} {t.layout}")
         self.n_experts, self.e_loc, self.top_k = bshape[3], ishape[1], int(top_k)
+        self.table = replica_table
+        self.n_rep = int(n_rep) if replica_table is not None else 0
+        if replica_table is not None:
+            tshape = tuple(int(v) for v in replica_table.shape)
+            if tshape != (1, 1, 1, TABLE_WORDS) or replica_table.dtype != ttnn.uint32 \
+                    or replica_table.layout != ttnn.ROW_MAJOR_LAYOUT or not _is_interleaved(replica_table.memory_config()):
+                raise ValueError(f"fused router: the replica table must be [1, 1, 1, {TABLE_WORDS}] uint32 RM, got "
+                                 f"{tshape} {replica_table.dtype} {replica_table.layout}")
+            if self.n_rep < 1 or self.e_loc + self.n_rep > 16 or self.top_k > 15:
+                raise ValueError(f"fused router: replica mode needs E_LOC + n_rep <= 16 and top_k <= 15, got "
+                                 f"{self.e_loc} + {self.n_rep}, {self.top_k}")
+            if self.n_experts != 384:
+                raise ValueError("fused router: replica mode assumes 384 experts (tt/replicas.py)")
+        self.e_tot = self.e_loc + self.n_rep
         g = mesh_device.compute_with_storage_grid_size()
         self.grid = (int(g.x), int(g.y))
-        plan(TILE, self.n_experts, self.top_k, self.e_loc, self.grid)  # validate the shape up front (no device op)
+        plan(TILE, self.n_experts, self.top_k, self.e_tot, self.grid)  # validate the shape up front (no device op)
         self._desc: Dict[tuple, object] = {}
         self._hash: Dict[tuple, int] = {}
         self._tag = _sources_tag()
@@ -221,48 +243,81 @@ class FusedRouterTopK:
             raise ValueError(f"fused router: scores must be fp32 TILE, got {scores.dtype} {scores.layout}")
         if not _is_interleaved(scores.memory_config()):
             raise ValueError("fused router: scores must be interleaved")
-        plan(shp[2], self.n_experts, self.top_k, self.e_loc, self.grid)
+        plan(shp[2], self.n_experts, self.top_k, self.e_tot, self.grid)
+        if self.table is not None and shp[2] > 64:
+            raise ValueError(f"fused router: replica mode serves M <= 64 rows, got {shp[2]}")
         return shp[2]
 
+    def _rects(self, n_workers: int):
+        """Replica mode: worker 0's NOC coordinates and the (up to 2) worker rectangles of the keep multicast as
+        ``(x0, y0, x1, y1, n_dests)`` in NOC coordinates (rect A: the full grid rows, minus worker 0 itself; rect B: the
+        partial last row; n_dests 0 = absent)."""
+        gx = self.grid[0]
+        full, rem = divmod(int(n_workers), gx)
+
+        def xy(x, y):
+            c = self.mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+            return int(c.x), int(c.y)
+
+        cx, cy = xy(0, 0)
+        a = b = (0, 0, 0, 0, 0)
+        if full:
+            a = xy(0, 0) + xy(gx - 1, full - 1) + (gx * full - 1,)
+        if rem:
+            b = xy(0, full) + xy(rem - 1, full) + (rem,)
+        if not full:  # (M < GX: worker 0 is in the partial row)
+            b = b[:4] + (rem - 1,)
+        return (cx, cy), a, b
+
     def _build(self, p, scale_bits: int, ios):
-        scores, w_loc, idx = ios
+        scores, w_loc, idx, lane, assign = ios
+        repl = self.table is not None
         cores = _core_range_set(p["n_workers"], self.grid[0])
         cbs = [_cb(CB_S, cores), _cb(CB_B, cores), _cb(CB_O, cores), _cb(CB_ID, cores), _cb(CB_ST, cores)]
+        sems = []
+        if repl:
+            cbs += [_cb(CB_G, cores), _cb(CB_K, cores, page=64), _cb(CB_SC, cores)]
+            sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=cores, initial_value=0) for i in (SEM_G, SEM_K)]
         from ..model_config import compute_config_descriptor  # lazy: keeps this module's import light
 
         cc = compute_config_descriptor("router", fp32_unpack_cbs=[CB_S, CB_B])
         defines = [("MOTIF_RT_SRC", self._tag)]
         gx = self.grid[0]
         reader_ct = [CB_S, CB_B, CB_ID, p["NT"], gx] + _accessor(scores) + _accessor(self.bias) + _accessor(self.ids)
-        writer_ct = ([CB_S, CB_O, CB_ID, CB_ST, p["NE"], p["K"], p["E_loc"], p["R"], gx, int(scale_bits),
-                      1] + _accessor(w_loc) + _accessor(idx))
+        reader_ct += [int(repl), int(lane is not None)] + _accessor(lane if lane is not None else self.ids) \
+            + _accessor(self.table if repl else self.ids)
+        (cx, cy), ra, rb = self._rects(p["n_workers"]) if repl else ((0, 0), (0,) * 5, (0,) * 5)
+        writer_ct = ([CB_S, CB_O, CB_ID, CB_ST, p["NE"], p["K"], self.e_loc, p["R"], gx, int(scale_bits),
+                      1] + _accessor(w_loc) + _accessor(idx)
+                     + [int(repl), int(lane is not None), self.n_rep, p["M"], CB_G, CB_K, CB_SC, SEM_G, SEM_K, cx, cy]
+                     + list(ra) + list(rb) + _accessor(assign if assign is not None else idx))
         compute_ct = [CB_S, CB_B, CB_O]
         kernels = [
             ttnn.KernelDescriptor(
                 kernel_source=str(READER_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores, compile_time_args=reader_ct, defines=defines, runtime_args=[],
-                common_runtime_args=[0, 0, 0], config=ttnn.ReaderConfigDescriptor()),
+                common_runtime_args=[0] * 5, config=ttnn.ReaderConfigDescriptor()),
             ttnn.KernelDescriptor(
                 kernel_source=str(WRITER_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores, compile_time_args=writer_ct, defines=defines, runtime_args=[],
-                common_runtime_args=[0, 0], config=ttnn.WriterConfigDescriptor()),
+                common_runtime_args=[0] * 3, config=ttnn.WriterConfigDescriptor()),
             ttnn.KernelDescriptor(
                 kernel_source=str(COMPUTE_SRC), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores, compile_time_args=compute_ct, defines=defines, runtime_args=[],
                 common_runtime_args=[], config=cc),
         ]
-        desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
         return desc, (tuple(reader_ct), tuple(writer_ct), tuple(compute_ct), p["n_workers"])
 
-    def _program(self, M, scale_bits, scores, w_loc, idx):
+    def _program(self, M, scale_bits, scores, w_loc, idx, lane=None, assign=None):
         """The cached descriptor for these tensors' buffer types, M and scale, patched with this call's
         addresses (common runtime args only: a cache hit rebuilds nothing)."""
-        ts = (scores, w_loc, self.bias, self.ids, idx)
-        key = (M, scale_bits) + tuple(tuple(_accessor(t)) for t in ts)
+        ts = (scores, w_loc, self.bias, self.ids, idx) + tuple(t for t in (lane, self.table, assign) if t is not None)
+        key = (M, scale_bits, lane is not None, self.table is not None) + tuple(tuple(_accessor(t)) for t in ts)
         desc = self._desc.get(key)
         if desc is None:
-            p = plan(M, self.n_experts, self.top_k, self.e_loc, self.grid)
-            desc, prog_key = self._build(p, scale_bits, (scores, w_loc, idx))
+            p = plan(M, self.n_experts, self.top_k, self.e_tot, self.grid)
+            desc, prog_key = self._build(p, scale_bits, (scores, w_loc, idx, lane, assign))
             if hasattr(ttnn, "compute_program_descriptor_hash"):
                 hv = self._hash.get(prog_key)
                 if hv is None:
@@ -270,37 +325,66 @@ class FusedRouterTopK:
                 desc.custom_program_hash = hv
             self._desc[key] = desc
         desc.kernels[0].common_runtime_args = [scores.buffer_address(), self.bias.buffer_address(),
-                                               self.ids.buffer_address()]
-        desc.kernels[1].common_runtime_args = [w_loc.buffer_address(), idx.buffer_address()]
+                                               self.ids.buffer_address(),
+                                               lane.buffer_address() if lane is not None else 0,
+                                               self.table.buffer_address() if self.table is not None else 0]
+        desc.kernels[1].common_runtime_args = [w_loc.buffer_address(), idx.buffer_address(),
+                                               assign.buffer_address() if assign is not None else 0]
         return desc
 
-    def __call__(self, scores, *, scale: float = 1.0, memory_config=None, want_idx: bool = False):
-        """``scores [1, 1, M, NE]`` fp32 -> ``w_loc [1, E_LOC, M, 1]`` fp32 TILE in ``memory_config`` (interleaved;
-        default L1), or ``(w_loc, idx)`` with ``want_idx`` (``idx [1, 1, M, K]`` uint32 ROW_MAJOR in L1). Consumes
-        nothing. The kernel writes ``idx`` either way (one program per shape: a tapped eager call compiles exactly the
-        program a later trace capture replays); without ``want_idx`` it is freed right after the op."""
+    def __call__(self, scores, *, scale: float = 1.0, memory_config=None, want_idx: bool = False, lane_mask=None,
+                 want_assign: bool = False):
+        """``scores [1, 1, M, NE]`` fp32 -> ``w_loc [1, E_LOC (+ n_rep), M, 1]`` fp32 TILE in ``memory_config``
+        (interleaved; default L1), or ``(w_loc, idx)`` with ``want_idx`` (``idx [1, 1, M, K]`` uint32 ROW_MAJOR in L1).
+        Consumes nothing. The kernel writes ``idx`` either way (one program per shape: a tapped eager call compiles
+        exactly the program a later trace capture replays); without ``want_idx`` it is freed right after the op.
+
+        Replica mode (``replica_table``): ``lane_mask`` ``[1, 1, M, 1]`` fp32 TILE (the step's live rows; ``None``: all
+        live) masks ``w_loc`` and the active set; the kernel always writes the assignment ``[1, 1, 1, 416]`` uint32 RM
+        (``where[384]``, ``load[32]``), returned last with ``want_assign`` (else freed). Ignored without a table."""
         M = self._check(scores)
         mc = memory_config or ttnn.L1_MEMORY_CONFIG
         if not _is_interleaved(mc):
             raise ValueError("fused router: the output memory_config must be interleaved")
+        repl = self.table is not None
+        lane = lane_mask if repl else None
+        if lane is not None:
+            if tuple(int(v) for v in lane.shape) != (1, 1, M, 1) or lane.dtype != ttnn.float32 \
+                    or lane.layout != ttnn.TILE_LAYOUT or not _is_interleaved(lane.memory_config()):
+                raise ValueError(f"fused router: lane_mask must be [1, 1, {M}, 1] fp32 TILE interleaved")
         w_loc = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([1, self.e_loc, M, 1]), ttnn.float32, ttnn.TILE_LAYOUT, self.mesh_device, mc
+            ttnn.Shape([1, self.e_tot, M, 1]), ttnn.float32, ttnn.TILE_LAYOUT, self.mesh_device, mc
         )
         idx = ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, 1, M, self.top_k]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
             ttnn.L1_MEMORY_CONFIG,
         )
-        desc = self._program(M, _f32_bits(scale), scores, w_loc, idx)
-        ttnn.generic_op([scores, self.bias, self.ids, idx, w_loc], desc)
+        assign = None
+        if repl:
+            assign = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, 1, ASSIGN_WORDS]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.mesh_device,
+                ttnn.L1_MEMORY_CONFIG,
+            )
+        desc = self._program(M, _f32_bits(scale), scores, w_loc, idx, lane, assign)
+        io = [scores, self.bias, self.ids] + [t for t in (lane, self.table) if t is not None] + [idx] \
+            + ([assign] if assign is not None else []) + [w_loc]
+        ttnn.generic_op(io, desc)
+        out = [w_loc]
         if want_idx:
-            return w_loc, idx
-        ttnn.deallocate(idx)
-        return w_loc
+            out.append(idx)
+        else:
+            ttnn.deallocate(idx)
+        if assign is not None:
+            if want_assign:
+                out.append(assign)
+            else:
+                ttnn.deallocate(assign)
+        return out[0] if len(out) == 1 else tuple(out)
 
     def deallocate(self) -> None:
         """Drops the cached descriptors and the constant references (the constants belong to the MoE module)."""
         self._desc.clear()
-        self.bias = self.ids = None
+        self.bias = self.ids = self.table = None
 
 
 __all__ = ["FusedRouterTopK", "emulate_fp32", "order_keys", "plan", "worker_cores"]

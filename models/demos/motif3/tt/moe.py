@@ -696,6 +696,66 @@ def grouped_polynorm(gu, consts: Dict[str, object], *, inter: int, mode: str = "
     return h
 
 
+_REPLICA_PLANS: Dict[str, Dict] = {}
+_REPLICA_HEADERS: Dict[Tuple[int, int, int], bytes] = {}
+
+
+def _replica_plan(src) -> Dict:
+    """The replica plan (a dict, or a JSON path; ``None`` / "" = the package's ``replica_plan_r4.json``), cached."""
+    from . import replicas as RP
+
+    if isinstance(src, dict):
+        return src
+    path = str(src) if src else str(RP.default_plan_path())
+    if path not in _REPLICA_PLANS:
+        _REPLICA_PLANS[path] = RP.load_plan(path)
+    return _REPLICA_PLANS[path]
+
+
+def _replica_header(K: int, N: int, R: int, work_dir: str) -> bytes:
+    from . import replicas as RP
+
+    key = (int(K), int(N), int(R))
+    if key not in _REPLICA_HEADERS:
+        _REPLICA_HEADERS[key] = RP.template_header(K, N, R, work_dir=work_dir)
+    return _REPLICA_HEADERS[key]
+
+
+def resolve_moe_replicas(moe_replicas: Optional[str], cfg, *, module=None) -> str:
+    """DESIGN-2 replica slots: ``moe_replicas`` or ``cfg.moe_replicas`` (``MOTIF3_MOE_REPLICAS``, default "off"; a
+    config without the field = "off"). "r4" needs the production decode path (router_mask "fused", decode_experts
+    "sparse", decode_expert_mm "fused", moe_polynorm "fused") and a launch without MTP (the assignment depends on the
+    whole step, so the T64 verify rows cannot equal the T32 rows: MTP would not be lossless). From the config, a launch
+    that does not meet this gets "off" (logged); an explicit request raises."""
+    from .model_config import MOE_REPLICAS_MODES
+
+    explicit = moe_replicas is not None
+    mode = str(moe_replicas if explicit else getattr(cfg, "moe_replicas", "off") or "off").strip().lower()
+    if mode not in MOE_REPLICAS_MODES:
+        raise ValueError(f"moe_replicas must be one of {MOE_REPLICAS_MODES}, got {mode!r}")
+    if mode == "off" or module is None:
+        return mode
+    why = []
+    if getattr(module, "router_mask", None) != "fused":
+        why.append(f"router_mask {getattr(module, 'router_mask', None)!r} != 'fused'")
+    if getattr(module, "decode_experts", None) != "sparse":
+        why.append(f"decode_experts {getattr(module, 'decode_experts', None)!r} != 'sparse'")
+    if getattr(module, "decode_expert_mm", None) != "fused":
+        why.append(f"decode_expert_mm {getattr(module, 'decode_expert_mm', None)!r} != 'fused'")
+    if getattr(module, "moe_polynorm", None) != "fused":
+        why.append(f"moe_polynorm {getattr(module, 'moe_polynorm', None)!r} != 'fused'")
+    if int(getattr(cfg, "spec_tokens", 0) or 0) > 0 and not explicit:
+        why.append("MTP (spec_tokens > 0): T64 rows would not equal T32 rows")
+    if why:
+        if explicit and not (len(why) == 1 and why[0].startswith("MTP")):
+            raise ValueError(f"moe_replicas={mode!r} needs: {'; '.join(why)}")
+        if not explicit:
+            if getattr(module, "layer_idx", None) == 2:
+                print(f"[motif3.moe] MOTIF3_MOE_REPLICAS={mode} ignored: {'; '.join(why)}", flush=True)
+            return "off"
+    return mode
+
+
 class MotifRouter:
     """fp32 composite router of one MoE layer (MOE-2, G5), replicated on every chip.
 
@@ -1157,6 +1217,8 @@ class MotifMoE:
         prefill_moe_combine: Optional[str] = None,
         decode_ccl: Optional[str] = None,
         decode_expert_mm: Optional[str] = None,
+        moe_replicas: Optional[str] = None,
+        replica_plan=None,
     ):
         self.mesh_device = mesh_device
         self.cfg = cfg
@@ -1346,6 +1408,16 @@ class MotifMoE:
         if getattr(ccl, "rows_layout", "ops") == "kernel" and hasattr(ccl, "_rows_kernel"):
             ccl._rows_kernel()
 
+        # ---- DESIGN-2 replica slots (decode only; tt/replicas.py): "off" | "r4" (MOTIF3_MOE_REPLICAS) ---------------
+        self.moe_replicas = resolve_moe_replicas(moe_replicas, cfg, module=self)
+        self.router_fused_rep = self.pn_fused_rep = self.w_rep_gate_up = self.w_rep_down = None
+        self.rep_table = self.rep_slots = None
+        self._smm_rep = {}
+        self._rep_consts = None
+        if self.moe_replicas != "off":
+            self._init_replicas(replica_plan if replica_plan is not None else getattr(cfg, "moe_replica_plan", None),
+                                cache=cache)
+
     # ==========================================================================================================
     # router (MOE-2) and local routing weights (MOE-3)
     # ==========================================================================================================
@@ -1496,6 +1568,9 @@ class MotifMoE:
         mc = memory_config or self.dram
         pmc = part_memory_config or self.dram
         M = int(f.shape[-2])
+        if decode and getattr(self, "decode_experts", "dense") == "sparse" and self.replica_applies(M):
+            return self._replica_partial(f, polynorm=polynorm, memory_config=mc, part_memory_config=pmc,
+                                         lane_mask=lane_mask, taps=taps)
         consts = getattr(self, "scatter_consts", {}).get(M) if decode else None
         fused = getattr(self, "router_fused", None) if decode and M in getattr(self, "decode_rows", ()) else None
         if fused is not None:  # B4 fused router tail at a decode row count (taps get idx, scores, w_loc; no "w")
@@ -2060,6 +2135,143 @@ class MotifMoE:
     # ==========================================================================================================
     # B1: sparse decode experts
     # ==========================================================================================================
+    # ==========================================================================================================
+    # DESIGN-2 replica slots (decode)
+    # ==========================================================================================================
+    def _init_replicas(self, plan_src, *, cache: bool) -> None:
+        """Replica weights (byte copies of the TT cache, :func:`replicas.build_replica_tensorbin`), the 16-slot fused
+        PolyNorm constants, the per-chip assignment table and the replica-mode router / matmul programs."""
+        import os
+        import types
+
+        import torch
+
+        from . import replicas as RP
+        from .kernels.moe_polynorm import FusedGroupedPolyNorm
+        from .kernels.router_topk import FusedRouterTopK
+
+        if not cache:
+            raise ValueError("moe_replicas: the replica weights are built from the TT cache (cache=True)")
+        plan = _replica_plan(plan_src)
+        slots = plan["layers"].get(str(self.layer_idx))
+        if slots is None:
+            raise ValueError(f"moe_replicas: the replica plan has no layer {self.layer_idx}")
+        R = int(plan["R"])
+        P, E = int(self.cfg.dp) * int(self.cfg.tp), self.e_loc
+        if len(slots) != P or P != RP.N_CHIPS or E != RP.PER_CHIP or self.n_experts != RP.N_EXPERTS:
+            raise ValueError(f"moe_replicas: the plan is for {RP.N_CHIPS} chips x {RP.PER_CHIP} experts")
+        self.rep_slots, self.rep_plan_hash = slots, plan.get("hash") or RP.plan_hash(plan)
+        work = os.environ.get("MOTIF3_MOE_REPLICA_DIR") or RP.DEFAULT_WORK_DIR
+        keep = (os.environ.get("MOTIF3_MOE_REPLICA_KEEP") or "0").strip() == "1"
+        tag = "_".join(self.cfg.cache_dir.parts[-2:])
+        down_scale = self.cfg.polynorm_output_scale * (self.route_scale if self.fold_route_scale else 1.0)
+        down_name = "moe.experts.down" if down_scale == self.cfg.polynorm_output_scale else f"moe.experts.down_x{down_scale:g}"
+
+        def load(kind, name, K, N):
+            src = W.tensorbin_path(W.cache_prefix(self.cfg, name, self.layer_idx, 0, 1), self.experts_dtype,
+                                   ttnn.TILE_LAYOUT)
+            if not src.is_file():
+                raise FileNotFoundError(f"moe_replicas: no cached {name} for layer {self.layer_idx}: {src}")
+            st = src.stat()
+            meta = {"src": str(src), "size": st.st_size, "mtime": int(st.st_mtime), "plan": self.rep_plan_hash,
+                    "layer": self.layer_idx, "kind": kind}
+            dst, _ = RP.ensure_replica_file(src, RP.replica_file(work, tag, self.layer_idx, kind), slots,
+                                            _replica_header(K, N, R, work), K, N, meta=meta)
+            t = ttnn.load_tensor(dst, device=self.mesh_device)
+            if not keep:
+                for f in (dst, RP.sidecar(dst)):
+                    try:
+                        os.unlink(f)
+                    except OSError:
+                        pass
+            return t
+
+        self.w_rep_gate_up = load("gate_up", "moe.experts.gate_up", self.hidden, 2 * self.inter)
+        self.w_rep_down = load("down", down_name, self.inter, self.hidden)
+
+        # 16-slot PolyNorm constants (fp32 b, D, E) from this layer's cached EP32 ones: chip c = natives + replicas
+        def shards(name):
+            dt = _pn._coeff_dtype(self.cfg)
+            path = W.tensorbin_path(W.cache_prefix(self.cfg, f"moe.experts.polynorm.{name}", self.layer_idx, 0, 1), dt,
+                                    ttnn.TILE_LAYOUT)
+            if not path.is_file():
+                raise FileNotFoundError(f"moe_replicas: no cached PolyNorm constant {name}: {path}")
+            host = ttnn.load_tensor(path)
+            return [ttnn.to_torch(t).float() for t in ttnn.get_device_tensors(host)]  # chip k: [n, 12, 1, 1]
+
+        dp, tp = int(self.cfg.dp), int(self.cfg.tp)
+        consts = {}
+        for name in ("b", "D", "E"):
+            sh = shards(name)
+            n = int(sh[0].shape[0])
+            g = torch.zeros(dp * n, tp * (E + R), 1, 1)
+            for k in range(P):
+                d_, t_ = divmod(k, tp)
+                cols = [sh[k][:, j] for j in range(E)] + [sh[e // E][:, e % E] for e in slots[k]]
+                g[d_ * n:(d_ + 1) * n, t_ * (E + R):(t_ + 1) * (E + R)] = torch.stack(cols, dim=1)
+            consts[name] = W.as_tensor(g, mesh_device=self.mesh_device, cfg=self.cfg, dtype=ttnn.float32,
+                                       cache_name=None, layer=self.layer_idx, dp_dim=0, tp_dim=1)
+        self._rep_consts = consts
+        cns = types.SimpleNamespace(D=consts["D"], E=consts["E"], c={"fp32": {"b": consts["b"]}})
+        self.pn_fused_rep = FusedGroupedPolyNorm(self.mesh_device, cns, e_loc=E + R, inter=self.inter)
+
+        table = torch.zeros(dp, tp, 1, RP.TABLE_WORDS, dtype=torch.int32)
+        for k in range(P):
+            table[k // tp, k % tp, 0] = torch.tensor(RP.chip_table(slots, k), dtype=torch.int32)
+        self.rep_table = ttnn.from_torch(table, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                                         device=self.mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                                         mesh_mapper=W.mesh_mapper(self.mesh_device, self.cfg.axes, dp_dim=0, tp_dim=1))
+        self.router_fused_rep = FusedRouterTopK(self.mesh_device, self.router.bias, self.local_ids, top_k=self.top_k,
+                                                replica_table=self.rep_table, n_rep=R)
+
+    def _rep_mm(self, kind: str, out_dtype):
+        from .kernels.moe_sparse_mm import DualNocSparseMM  # lazy: generic_op kernel, decode shapes only
+
+        key = (kind, out_dtype)
+        op = self._smm_rep.get(key)
+        if op is None:
+            w, wr = (self.w_gate_up, self.w_rep_gate_up) if kind == "gate_up" else (self.w_down, self.w_rep_down)
+            op = self._smm_rep[key] = DualNocSparseMM(self.mesh_device, w, kind=kind, out_dtype=out_dtype, w_rep=wr)
+        return op
+
+    def replica_applies(self, rows: int) -> bool:
+        """DESIGN-2: this decode call (``rows`` gathered rows) runs the replica path."""
+        return getattr(self, "moe_replicas", "off") != "off" and getattr(self, "router_fused_rep", None) is not None \
+            and int(rows) in getattr(self, "decode_rows", ())
+
+    def _replica_partial(self, f, *, polynorm: str, memory_config, part_memory_config, lane_mask=None, taps=None):
+        """DESIGN-2 decode partial: router matmul -> replica-mode router tail (top-8, on-device greedy assignment,
+        lane-masked ``w_loc [1, 12 + R, M, 1]`` of the slots this chip computes) -> gate_up / fused PolyNorm / down_sum
+        over the 12 + R slots (replica slots read ``w_rep``). ``taps`` get ``idx``, ``scores``, ``assign``
+        (``[1, 1, 1, 416]``: where[384], load[32]), ``w_loc``, ``sparsity``."""
+        mc = memory_config
+        M = int(f.shape[-2])
+        scores = self.router._scores(f, mc)
+        gu_dtype = self.gate_up_dtype
+        if gu_dtype is None:
+            gu_dtype = ttnn.float32 if polynorm == "fp32" else ttnn.bfloat16
+        if taps is not None:
+            w_loc, idx, assign = self.router_fused_rep(scores, scale=self.internal_route_scale, memory_config=mc,
+                                                       want_idx=True, lane_mask=lane_mask, want_assign=True)
+            taps.update(idx=idx, scores=scores, assign=assign, w_loc=w_loc)
+        else:
+            w_loc = self.router_fused_rep(scores, scale=self.internal_route_scale, memory_config=mc,
+                                          lane_mask=lane_mask)
+            _free(scores)
+        op_gu = self._rep_mm("gate_up", gu_dtype)
+        op_dn = self._rep_mm("down", self.down_dtype)
+        gu, sp = op_gu.gate_up_routed(f, w_loc, memory_config=mc)
+        if taps is not None:
+            taps["sparsity"] = sp
+        h = self.pn_fused_rep(gu, w_loc, memory_config=mc)
+        _free(gu)
+        part = op_dn.down_sum(h, sp, part_dtype=self.combine_dtype, memory_config=part_memory_config or self.dram)
+        _free(h)
+        if taps is None:
+            _free(sp, w_loc)
+        del M
+        return part
+
     def decode_sparsity(self, w_loc, *, memory_config=None):
         """``w_loc [1, 12, M, 1]`` fp32 TILE (lane-masked) -> the ``sparse_matmul`` sparsity ``[1, 1, 1, 12]`` bf16
         ROW_MAJOR (one stick): ``max`` over the rows (weights are >= 0, exactly 0 where no row routes), bf16, untilize,
@@ -2401,6 +2613,16 @@ class MotifMoE:
         for op in getattr(self, "_smm", {}).values():
             op.deallocate()
         self._smm = {}
+        for op in getattr(self, "_smm_rep", {}).values():
+            op.deallocate()
+        self._smm_rep = {}
+        for o in (getattr(self, "router_fused_rep", None), getattr(self, "pn_fused_rep", None)):
+            if o is not None:
+                o.deallocate()
+        self.router_fused_rep = self.pn_fused_rep = None
+        _free(getattr(self, "w_rep_gate_up", None), getattr(self, "w_rep_down", None), getattr(self, "rep_table", None),
+              *(getattr(self, "_rep_consts", None) or {}).values())
+        self.w_rep_gate_up = self.w_rep_down = self.rep_table = self._rep_consts = None
         _free(getattr(self, "_disp_meta", None))
         self._disp_meta = None
         st = getattr(self, "compact_state", None)
@@ -2413,5 +2635,6 @@ __all__ = ["COMBINE_MODES", "CompactPrefillState", "DECODE_EXPERTS_MODES", "DECO
            "compact_bucket", "compact_ladder", "compact_need_blocks", "compact_prefill_meta", "compact_upload_fast",
            "PREFILL_MOE_DISPATCH_MAX_ROWS", "PREFILL_MOE_DEVICE_ROWS", "b2b_rows_ok", "resolve_prefill_moe_kernels",
            "grouped_polynorm",
-           "prefill_experts_pc", "resolve_decode_expert_mm", "resolve_decode_experts", "resolve_moe_polynorm", "resolve_prefill_moe",
+           "prefill_experts_pc", "resolve_decode_expert_mm", "resolve_decode_experts", "resolve_moe_polynorm",
+           "resolve_moe_replicas", "resolve_prefill_moe",
            "wide_decode_rows"]

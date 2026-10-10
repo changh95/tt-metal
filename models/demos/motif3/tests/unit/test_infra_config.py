@@ -2754,3 +2754,40 @@ def test_d3_moe_sparse_mm_plan_and_unit_order():
         a.update(bad)
         with pytest.raises(ValueError):
             SMM.plan(**a)
+
+
+def test_d2_moe_replicas_knob(monkeypatch):
+    """Phase E DESIGN-2 (logs/opt/phaseE/DESIGN2): ``MOTIF3_MOE_REPLICAS`` ("off" default | "r4"; case and blanks
+    ignored, anything else refused; in ``describe``) and :func:`resolve_moe_replicas` (the fused decode path is required;
+    an MTP config resolves to "off"; explicit requests that cannot run raise)."""
+    import types
+
+    from models.demos.motif3.tt.model_config import MOE_REPLICAS_MODES
+    from models.demos.motif3.tt.moe import resolve_moe_replicas
+
+    assert MOE_REPLICAS_MODES == ("off", "r4")
+    monkeypatch.delenv("MOTIF3_MOE_REPLICAS", raising=False)
+    assert _cfg().moe_replicas == "off" and "moe_replicas=off " in _cfg().describe()
+    for v, want in ((" R4 ", "r4"), ("off", "off"), ("", "off")):
+        monkeypatch.setenv("MOTIF3_MOE_REPLICAS", v)
+        assert _cfg().moe_replicas == want, v
+    monkeypatch.setenv("MOTIF3_MOE_REPLICAS", "r6")
+    with pytest.raises(ValueError, match="MOTIF3_MOE_REPLICAS"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_MOE_REPLICAS", raising=False)
+    ok = types.SimpleNamespace(router_mask="fused", decode_experts="sparse", decode_expert_mm="fused",
+                               moe_polynorm="fused", layer_idx=5)
+    bad = types.SimpleNamespace(router_mask="gather", decode_experts="sparse", decode_expert_mm="fused",
+                                moe_polynorm="fused", layer_idx=5)
+    plain = types.SimpleNamespace(moe_replicas="r4", spec_tokens=0)
+    mtp = types.SimpleNamespace(moe_replicas="r4", spec_tokens=1)
+    old = types.SimpleNamespace()  # a config without the fields
+    assert resolve_moe_replicas(None, plain, module=ok) == "r4"
+    assert resolve_moe_replicas(None, mtp, module=ok) == "off"
+    assert resolve_moe_replicas(None, plain, module=bad) == "off"
+    assert resolve_moe_replicas(None, old, module=ok) == "off"
+    assert resolve_moe_replicas("r4", mtp, module=ok) == "r4"  # explicit (tests): allowed, T64 rows then differ
+    with pytest.raises(ValueError, match="router_mask"):
+        resolve_moe_replicas("r4", plain, module=bad)
+    with pytest.raises(ValueError):
+        resolve_moe_replicas("r8", plain, module=ok)

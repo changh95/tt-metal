@@ -45,9 +45,10 @@
 //     23 sp_bytes, 24 SP_MODE, 25 SUM_MODE, 26 cb_stage, 27 cb_part, 28 sem_aux_id, 29 cb_scratch, 30 SLOTS,
 //     31 H_MCAST (SUM_MODE 1: h multicast, H_MC), 32 sem_h_base (4 semaphores: RISC r segment s = base + 2 r + s),
 //     33.. TensorAccessorArgs(w), (in0), (sp: the stick, or w_loc when SP_MODE 1), (out: y, or part when SUM_MODE 1),
-//     (sp_out when SP_MODE 1, else a copy of sp's: the kernel always parses 5 accessors)
+//     (sp_out when SP_MODE 1, else a copy of sp's), (w_rep, or a copy of w's: the kernel always parses 6 accessors),
+//     then E_NAT (DESIGN-2: experts [E_NAT, E) are replica slots read from w_rep; E_NAT = E without replicas)
 // common RT: 0 w_addr, 1 in0_addr, 2 sp_addr, 3 out_addr, 4 sp_out_addr (0 unless SP_MODE 1),
-//     5.. (SUM_MODE 1) the NOC coordinates (x << 16 | y) of core index 0 .. NCORES - 1
+//     5.. (SUM_MODE 1) the NOC coordinates (x << 16 | y) of core index 0 .. NCORES - 1, then w_rep_addr (0 if none)
 
 #include <stdint.h>
 
@@ -146,6 +147,11 @@ void kernel_main() {
     constexpr auto in0_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     constexpr auto sp_args = TensorAccessorArgs<in0_args.next_compile_time_args_offset()>();
     constexpr auto out_args = TensorAccessorArgs<sp_args.next_compile_time_args_offset()>();
+    constexpr auto spo_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
+    // DESIGN-2 replica slots: experts e >= E_NAT live in a second weight tensor w_rep [1, E - E_NAT, K, N] (the 6th
+    // accessor, a copy of w's when E_NAT == E); its address is the last common runtime arg.
+    constexpr auto wr_args = TensorAccessorArgs<spo_args.next_compile_time_args_offset()>();
+    constexpr uint32_t E_NAT = get_compile_time_arg_val(wr_args.next_compile_time_args_offset());
 
     constexpr uint32_t KH = KT / 2;
     constexpr uint32_t K0 = RISC * KH;
@@ -155,6 +161,7 @@ void kernel_main() {
     static_assert(SP_MODE == 0 || IN0_MODE == 0, "the in-kernel sparsity is built by the gate_up call");
     static_assert(SUM_MODE == 0 || IN0_MODE == 1, "the in-kernel expert sum belongs to the down call");
     static_assert(E <= 16 && sp_bytes >= 2 * E, "one sparsity stick");
+    static_assert(E_NAT >= 1 && E_NAT <= E, "native experts first, then the replica slots");
 
     const uint32_t w_addr = get_common_arg_val<uint32_t>(0);
     const uint32_t in0_addr = get_common_arg_val<uint32_t>(1);
@@ -167,6 +174,7 @@ void kernel_main() {
     constexpr uint32_t pt = SUM_MODE ? get_tile_size(cb_part) : ot;  // the out tensor's page
     constexpr uint32_t spt = SP_MODE ? 4096u : sp_bytes;               // the sp tensor's page (fp32 tile / stick)
     const auto ws = TensorAccessor(w_args, w_addr, wt);
+    const auto wrs = TensorAccessor(wr_args, get_common_arg_val<uint32_t>(5 + (SUM_MODE ? NCORES : 0)), wt);
     const auto xs = TensorAccessor(in0_args, in0_addr, it);
     const auto ss = TensorAccessor(sp_args, sp_addr, spt);
     const auto os = TensorAccessor(out_args, out_addr, pt);
@@ -185,7 +193,6 @@ void kernel_main() {
             noc_async_read_barrier();
         } else {
             if (c == 0) {
-                constexpr auto spo_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
                 const auto so = TensorAccessor(spo_args, get_common_arg_val<uint32_t>(4), sp_bytes);
                 const uint32_t scr = get_write_ptr(cb_scratch);  // RISC 1's in0 CB: untouched until cb_sp is pushed
                 for (uint32_t t = 0; t < E * MT; ++t) {          // column 0 lives in faces 0 (rows 0-15), 2 (16-31)
@@ -439,7 +446,8 @@ void kernel_main() {
                     }
                 }
             }
-            uint32_t page = e * KT * NT + K0 * NT + col;
+            const bool rep = (E_NAT < E) && e >= E_NAT;  // a replica slot: its weights are in w_rep
+            uint32_t page = (rep ? e - E_NAT : e) * KT * NT + K0 * NT + col;
             for (uint32_t b = 0; b < KH / BATCH; ++b) {
                 if constexpr (IN0_MODE == 0) {
                     // compute waits for all of x before it consumes weights: keep handing it chunks while cb_w is full
@@ -457,7 +465,7 @@ void kernel_main() {
                 cb_reserve_back(cb_w, BATCH);
                 uint32_t dst = get_write_ptr(cb_w);
                 for (uint32_t i = 0; i < BATCH; ++i) {
-                    noc_async_read(ws.get_noc_addr(page), dst, wt);
+                    noc_async_read(rep ? wrs.get_noc_addr(page) : ws.get_noc_addr(page), dst, wt);
                     dst += wt;
                     page += NT;
                 }

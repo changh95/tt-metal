@@ -14,8 +14,14 @@
 // j) in one fp32 page of CB_S, the bias row the same way in CB_B: the compute kernel adds the two pages elementwise
 // (position-independent SFPU op), so the page's layout does not matter as long as both match.
 //
-// CT: 0 cb_s, 1 cb_b, 2 cb_id, 3 NT, 4 GX, 5.. TensorAccessorArgs(scores), (bias), (ids)
-// common RT: 0 scores_addr, 1 bias_addr, 2 ids_addr
+// DESIGN-2 replica mode (REPL = 1, tt/replicas.py): the same CB_ID page also receives, at byte 64, the 64 B half-row of
+// the lane mask lane [1, 1, M, 1] fp32 TILE holding this row's column 0 (LANE = 1), and the chip's table
+// table [1, 1, 1, 400] uint32 ROW_MAJOR: worker 0 (the assignment coordinator) reads all of it to byte 256 (replica
+// codes at 256, slot experts at 1792), the other workers only its slot experts (table bytes 1536..1599) to byte 1792.
+//
+// CT: 0 cb_s, 1 cb_b, 2 cb_id, 3 NT, 4 GX, 5.. TensorAccessorArgs(scores), (bias), (ids), then REPL, LANE,
+//     TensorAccessorArgs(lane), (table) (copies of ids' when absent)
+// common RT: 0 scores_addr, 1 bias_addr, 2 ids_addr, 3 lane_addr, 4 table_addr
 
 #include <stdint.h>
 
@@ -30,6 +36,10 @@ void kernel_main() {
     constexpr auto s_args = TensorAccessorArgs<5>();
     constexpr auto b_args = TensorAccessorArgs<s_args.next_compile_time_args_offset()>();
     constexpr auto i_args = TensorAccessorArgs<b_args.next_compile_time_args_offset()>();
+    constexpr uint32_t REPL = get_compile_time_arg_val(i_args.next_compile_time_args_offset());
+    constexpr uint32_t LANE = get_compile_time_arg_val(i_args.next_compile_time_args_offset() + 1);
+    constexpr auto l_args = TensorAccessorArgs<i_args.next_compile_time_args_offset() + 2>();
+    constexpr auto t_args = TensorAccessorArgs<l_args.next_compile_time_args_offset()>();
 
     const uint32_t s_addr = get_common_arg_val<uint32_t>(0);
     const uint32_t b_addr = get_common_arg_val<uint32_t>(1);
@@ -56,6 +66,19 @@ void kernel_main() {
         noc_async_read(bs.get_noc_addr(t, 1024), bdst + t * 128 + 64, 64);
     }
     noc_async_read(is.get_noc_addr(0, 0), get_write_ptr(cb_id), 64);
+    if constexpr (REPL != 0) {
+        constexpr uint32_t TABLE_BYTES = 1600;  // 400 uint32: 384 replica codes + 16 slot experts
+        const auto ts = TensorAccessor(t_args, get_common_arg_val<uint32_t>(4), TABLE_BYTES);
+        if (q == 0) {
+            noc_async_read(ts.get_noc_addr(0, 0), get_write_ptr(cb_id) + 256, TABLE_BYTES);
+        } else {
+            noc_async_read(ts.get_noc_addr(0, 1536), get_write_ptr(cb_id) + 1792, 64);
+        }
+        if constexpr (LANE != 0) {
+            const auto ls = TensorAccessor(l_args, get_common_arg_val<uint32_t>(3), tb);
+            noc_async_read(ls.get_noc_addr(tr, row_off), get_write_ptr(cb_id) + 64, 64);
+        }
+    }
     noc_async_read_barrier();
     cb_push_back(cb_s, 1);
     cb_push_back(cb_b, 1);

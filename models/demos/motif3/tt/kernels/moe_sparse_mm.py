@@ -236,9 +236,13 @@ class DualNocSparseMM:
         kind: ``"gate_up"`` (in0 ``[1, 1, M, K]`` shared) or ``"down"`` (in0 ``[1, E, M, K]`` per expert).
         out_dtype: ``ttnn.float32`` or ``ttnn.bfloat16``.
         compute_role: the compute role (default ``experts``: HiFi4 + fp32 dest acc, as the stock op).
+        w_rep: DESIGN-2 replica slots (``MOTIF3_MOE_REPLICAS``, tt/replicas.py): ``[1, R, K, N]`` bfp8 TILE interleaved
+            weights of R more local experts; the op then serves ``E = E_nat + R`` experts, ``[0, E_nat)`` from ``w`` and
+            ``[E_nat, E)`` from ``w_rep`` (only the weight reads differ: per output tile the same full-K fp32 DEST
+            accumulation, so a native expert's tiles are bitwise the same with or without ``w_rep``).
     """
 
-    def __init__(self, mesh_device, w, *, kind: str, out_dtype, compute_role: str = "experts"):
+    def __init__(self, mesh_device, w, *, kind: str, out_dtype, compute_role: str = "experts", w_rep=None):
         if kind not in KINDS:
             raise ValueError(f"moe_sparse_mm: kind {kind!r} not in {KINDS}")
         if out_dtype not in _DT:
@@ -252,6 +256,16 @@ class DualNocSparseMM:
         self.w = w
         self.kind = kind
         self.E, self.K, self.N = shp[1], shp[2], shp[3]
+        self.E_nat = self.E
+        self.w_rep = w_rep
+        if w_rep is not None:
+            rshp = tuple(int(v) for v in w_rep.shape)
+            if len(rshp) != 4 or rshp[0] != 1 or rshp[2:] != shp[2:]:
+                raise ValueError(f"moe_sparse_mm: replica weights must be [1, R, {shp[2]}, {shp[3]}], got {rshp}")
+            if w_rep.dtype != ttnn.bfloat8_b or w_rep.layout != ttnn.TILE_LAYOUT \
+                    or not _is_interleaved(w_rep.memory_config()):
+                raise ValueError("moe_sparse_mm: replica weights must be bfp8 TILE interleaved")
+            self.E = self.E_nat + rshp[1]
         self.out_dtype = out_dtype
         self.compute_role = compute_role
         g = mesh_device.compute_with_storage_grid_size()
@@ -368,7 +382,9 @@ class DualNocSparseMM:
                           if stage2 else (SEM_A, SEM_B))]
         x0, y0, x1, y1 = self._mcast_rect()
         acc = _accessor(self.w) + _accessor(in0) + _accessor(sp) + _accessor(out)
-        acc += _accessor(sp_out if p["sp_mode"] else sp)  # the kernel always parses 5 accessors (dummy: sp)
+        acc += _accessor(sp_out if p["sp_mode"] else sp)  # the kernel always parses 6 accessors (dummy: sp)
+        acc += _accessor(self.w_rep if self.w_rep is not None else self.w)  # (dummy: w)
+        acc += [self.E_nat]
         defines = [("MOTIF_SMM_SRC", self._tag)]
 
         def dm(risc):
@@ -394,15 +410,17 @@ class DualNocSparseMM:
             core_ranges=cores, compile_time_args=compute_ct, defines=defines, runtime_args=[],
             common_runtime_args=[], config=cc)
         desc = ttnn.ProgramDescriptor(kernels=[k0, k1, kc], semaphores=sems, cbs=cbs)
-        return desc, (tuple(ct0), tuple(ct1), tuple(compute_ct), str(self.out_dtype), str(out.dtype), self.compute_role)
+        return desc, (tuple(ct0), tuple(ct1), tuple(compute_ct), str(self.out_dtype), str(out.dtype), self.compute_role,
+                      self.E_nat)
 
     @staticmethod
     def _n_common(p) -> int:
-        return 5 + (p["ncores"] if p["sum_mode"] else 0)
+        return 6 + (p["ncores"] if p["sum_mode"] else 0)
 
     def _program(self, M, in0, sp, out, *, sp_out=None, sp_mode=0, sum_mode=0):
-        ts = (self.w, in0, sp, out) + ((sp_out,) if sp_mode else ())
-        key = (M, sp_mode, sum_mode, str(out.dtype), bool(self.h_mcast)) + tuple(tuple(_accessor(t)) for t in ts)
+        ts = (self.w, in0, sp, out) + ((sp_out,) if sp_mode else ()) + ((self.w_rep,) if self.w_rep is not None else ())
+        key = (M, sp_mode, sum_mode, str(out.dtype), bool(self.h_mcast), self.E_nat) + tuple(
+            tuple(_accessor(t)) for t in ts)
         desc = self._desc.get(key)
         if desc is None:
             p = plan(self.kind, self.E, self.K, self.N, M, _DT[self.out_dtype], self.grid, sp_mode=sp_mode,
@@ -418,6 +436,7 @@ class DualNocSparseMM:
                 sp_out.buffer_address() if sp_mode else 0]
         if sum_mode:
             args += self._core_xy()
+        args += [self.w_rep.buffer_address() if self.w_rep is not None else 0]
         desc.kernels[0].common_runtime_args = args
         desc.kernels[1].common_runtime_args = args
         return desc
@@ -434,7 +453,7 @@ class DualNocSparseMM:
             ttnn.Shape([1, self.E, M, self.N]), self.out_dtype, ttnn.TILE_LAYOUT, self.mesh_device, mc
         )
         desc = self._program(M, in0, sparsity, out)
-        ttnn.generic_op([in0, self.w, sparsity, out], desc)
+        ttnn.generic_op([in0, self.w, sparsity] + self._rep_io() + [out], desc)
         return out
 
     def gate_up_routed(self, x, w_loc, *, memory_config=None):
@@ -454,7 +473,7 @@ class DualNocSparseMM:
             ttnn.Shape([1, self.E, M, self.N]), self.out_dtype, ttnn.TILE_LAYOUT, self.mesh_device, mc
         )
         desc = self._program(M, x, w_loc, out, sp_out=sp, sp_mode=1)
-        ttnn.generic_op([x, self.w, w_loc, sp, out], desc)
+        ttnn.generic_op([x, self.w, w_loc, sp] + self._rep_io() + [out], desc)
         return out, sp
 
     def down_sum(self, h, sp, *, part_dtype=None, memory_config=None):
@@ -473,12 +492,16 @@ class DualNocSparseMM:
             raise ValueError("moe_sparse_mm: the output memory_config must be interleaved")
         out = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, M, self.N]), pd, ttnn.TILE_LAYOUT, self.mesh_device, mc)
         desc = self._program(M, h, sp, out, sum_mode=1)
-        ttnn.generic_op([h, self.w, sp, out], desc)
+        ttnn.generic_op([h, self.w, sp] + self._rep_io() + [out], desc)
         return out
+
+    def _rep_io(self) -> list:
+        return [self.w_rep] if self.w_rep is not None else []
 
     def deallocate(self) -> None:
         self._desc.clear()
         self.w = None
+        self.w_rep = None
 
 
 __all__ = ["DualNocSparseMM", "KINDS", "SP_STICK", "golden", "h_mcast_plan", "owner_of", "plan", "sparsity_of",
