@@ -1505,7 +1505,7 @@ class MotifAttention:
         # (tt/kernels/attn_in.py, one program after the latent projections, built lazily)
         self.attn_in = getattr(cfg, "attn_in", "ops")
         self._fused_input = None
-        # decode output chain (Phase F F2, MOTIF3_ATTN_OUT): "ops" (default) | "uv" (tt/kernels/attn_out.py: transpose,
+        # decode output chain (Phase F F2, MOTIF3_ATTN_OUT): "fused" (default) | "ops" (the Phase E chain) | "uv" (tt/kernels/attn_out.py: transpose,
         # W_UV, sigmoid(lam @ E) and the combine as one program) | "fused" (plus wo in that program); built lazily
         self.attn_out = getattr(cfg, "attn_out", "ops")
         self._fused_output = None

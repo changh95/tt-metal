@@ -150,9 +150,10 @@ ATTN_EPILOGUE_MODES = ("ops", "fused")
 ATTN_IN_MODES = ("ops", "post", "fused")
 # Decode attention output chain (Phase F F2, docs/OPTIMIZATION_PLAN.md "Phase F"; MotifAttention): "ops" (default: the
 # o_lat transpose, the per-head W_UV bmm, sigmoid(lam @ E) (2 programs), the attention epilogue (ATTN_EPILOGUE_MODES)
-# and the wo linear) | "uv" (tt/kernels/attn_out.py: transpose + W_UV + lam expansion + sigmoid + combine as ONE
+# and the wo linear; the Phase E chain) | "uv" (tt/kernels/attn_out.py: transpose + W_UV + lam expansion + sigmoid + combine as ONE
 # generic_op that writes the wo input; wo stays the stock linear) | "fused" ("uv" plus the wo linear in the same
-# program, its weights streamed from launch). The same LLK sequences with the ops' configurations. Decode only; the
+# program; the default since the F2 gates passed bitwise: E1 53 layers row + KV-R, spec_t32 / t64, logs/opt/phaseF/F2).
+# The same LLK sequences with the ops' configurations. Decode only; the
 # AR(tp) and the mHC post-mix after it are unchanged.
 ATTN_OUT_MODES = ("ops", "uv", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
@@ -1473,8 +1474,9 @@ class MotifTTConfig:
     # Decode attention input chain (Phase F F1): "fused" (default, one program incl. the latent projections) | "post" |
     # "ops" (the release op chain) (ATTN_IN_MODES).
     attn_in: str = "fused"  # MOTIF3_ATTN_IN
-    # Decode attention output chain (Phase F F2): "ops" (default) | "uv" | "fused" (ATTN_OUT_MODES).
-    attn_out: str = "ops"  # MOTIF3_ATTN_OUT
+    # Decode attention output chain (Phase F F2): "fused" (default, one program incl. wo) | "uv" | "ops" (the Phase E
+    # chain) (ATTN_OUT_MODES).
+    attn_out: str = "fused"  # MOTIF3_ATTN_OUT
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
@@ -1686,7 +1688,7 @@ class MotifTTConfig:
             shared_polynorm=(os.environ.get("MOTIF3_SHARED_POLYNORM") or "fused").strip().lower(),
             attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "fused").strip().lower(),
             attn_in=(os.environ.get("MOTIF3_ATTN_IN") or "fused").strip().lower(),
-            attn_out=(os.environ.get("MOTIF3_ATTN_OUT") or "ops").strip().lower(),
+            attn_out=(os.environ.get("MOTIF3_ATTN_OUT") or "fused").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),

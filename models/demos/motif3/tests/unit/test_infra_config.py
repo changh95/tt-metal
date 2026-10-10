@@ -2197,7 +2197,7 @@ def test_f1_attn_in_knob(monkeypatch):
 
 
 def test_f2_attn_out_knob(monkeypatch):
-    """Phase F F2 (logs/opt/phaseF/F2): ``MOTIF3_ATTN_OUT`` ("ops" default | "uv" | "fused"; case and blanks ignored,
+    """Phase F F2 (logs/opt/phaseF/F2): ``MOTIF3_ATTN_OUT`` ("fused" default | "uv" | "ops"; case and blanks ignored,
     anything else refused; in ``describe``) and the fused output chain's core layout (``tt/kernels/attn_out``): the UV
     units (one W_UV tile each, a head's 4 cores in one row), the 32 CMB cores and the 8 x 8 WO block fit the 12 x 10
     grid, the CMB cores sit outside the WO multicast rectangle, and the wo split covers the 128 output tiles."""
@@ -2206,8 +2206,8 @@ def test_f2_attn_out_knob(monkeypatch):
 
     assert ATTN_OUT_MODES == ("ops", "uv", "fused")
     monkeypatch.delenv("MOTIF3_ATTN_OUT", raising=False)
-    assert _cfg().attn_out == "ops" and "attn_out=ops " in _cfg().describe()
-    for v, want in ((" Fused ", "fused"), ("uv", "uv"), ("OPS", "ops"), ("", "ops")):
+    assert _cfg().attn_out == "fused" and "attn_out=fused " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("uv", "uv"), ("OPS", "ops"), ("", "fused")):
         monkeypatch.setenv("MOTIF3_ATTN_OUT", v)
         assert _cfg().attn_out == want, v
     monkeypatch.setenv("MOTIF3_ATTN_OUT", "kernel")
