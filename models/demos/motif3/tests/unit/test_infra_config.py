@@ -2757,7 +2757,7 @@ def test_d3_moe_sparse_mm_plan_and_unit_order():
 
 
 def test_d2_moe_replicas_knob(monkeypatch):
-    """Phase E DESIGN-2 (logs/opt/phaseE/DESIGN2): ``MOTIF3_MOE_REPLICAS`` ("off" default | "r4"; case and blanks
+    """Phase E DESIGN-2 (logs/opt/phaseE/DESIGN2): ``MOTIF3_MOE_REPLICAS`` ("r4" default since D2EVAL | "off"; case and blanks
     ignored, anything else refused; in ``describe``) and :func:`resolve_moe_replicas` (the fused decode path is required;
     an MTP config resolves to "off"; explicit requests that cannot run raise)."""
     import types
@@ -2767,8 +2767,8 @@ def test_d2_moe_replicas_knob(monkeypatch):
 
     assert MOE_REPLICAS_MODES == ("off", "r4")
     monkeypatch.delenv("MOTIF3_MOE_REPLICAS", raising=False)
-    assert _cfg().moe_replicas == "off" and "moe_replicas=off " in _cfg().describe()
-    for v, want in ((" R4 ", "r4"), ("off", "off"), ("", "off")):
+    assert _cfg().moe_replicas == "r4" and "moe_replicas=r4 " in _cfg().describe()
+    for v, want in ((" R4 ", "r4"), ("off", "off"), (" OFF ", "off"), ("", "r4")):
         monkeypatch.setenv("MOTIF3_MOE_REPLICAS", v)
         assert _cfg().moe_replicas == want, v
     monkeypatch.setenv("MOTIF3_MOE_REPLICAS", "r6")

@@ -722,7 +722,7 @@ def _replica_header(K: int, N: int, R: int, work_dir: str) -> bytes:
 
 
 def resolve_moe_replicas(moe_replicas: Optional[str], cfg, *, module=None) -> str:
-    """DESIGN-2 replica slots: ``moe_replicas`` or ``cfg.moe_replicas`` (``MOTIF3_MOE_REPLICAS``, default "off"; a
+    """DESIGN-2 replica slots: ``moe_replicas`` or ``cfg.moe_replicas`` (``MOTIF3_MOE_REPLICAS``, default "r4" since the D2EVAL eval; a
     config without the field = "off"). "r4" needs the production decode path (router_mask "fused", decode_experts
     "sparse", decode_expert_mm "fused", moe_polynorm "fused") and a launch without MTP (the assignment depends on the
     whole step, so the T64 verify rows cannot equal the T32 rows: MTP would not be lossless). From the config, a launch
@@ -1410,6 +1410,16 @@ class MotifMoE:
 
         # ---- DESIGN-2 replica slots (decode only; tt/replicas.py): "off" | "r4" (MOTIF3_MOE_REPLICAS) ---------------
         self.moe_replicas = resolve_moe_replicas(moe_replicas, cfg, module=self)
+        if self.moe_replicas != "off" and moe_replicas is None:
+            # the config default ("r4" since D2EVAL) needs the TT cache (byte copies of the cached experts) and the
+            # 32-chip x 12-expert EP32 layout of the plan: otherwise fall back to "off" (an explicit request raises)
+            why = [] if cache else ["no TT cache (cache=False)"]
+            if int(cfg.dp) * int(cfg.tp) != 32 or self.e_loc != 12 or self.n_experts != 384:
+                why.append(f"mesh dp*tp={int(cfg.dp) * int(cfg.tp)} e_loc={self.e_loc} is not the plan's 32 x 12")
+            if why:
+                if self.layer_idx == 2:
+                    print(f"[motif3.moe] MOTIF3_MOE_REPLICAS={self.moe_replicas} ignored: {'; '.join(why)}", flush=True)
+                self.moe_replicas = "off"
         self.router_fused_rep = self.pn_fused_rep = self.w_rep_gate_up = self.w_rep_down = None
         self.rep_table = self.rep_slots = None
         self._smm_rep = {}

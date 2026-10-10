@@ -174,9 +174,12 @@ MOE_DECODE_CCL_MODES = ("ar", "rs")
 # expert instead of one per core); logs/opt/phaseE/D3S2. "fused" is the default since the D3S2 gates (bitwise
 # equal to "dualnoc": kernel unit test, 53-layer E1 row and KV-R, spec T32 / T64; decode replay -1.8 to -1.9 ms).
 DECODE_EXPERT_MM_MODES = ("stock", "dualnoc", "fused")
-# DESIGN-2 replica slots (Phase E; MotifMoE(moe_replicas=...), tt/replicas.py, logs/opt/phaseE/DESIGN2): "off" (default)
+# DESIGN-2 replica slots (Phase E; MotifMoE(moe_replicas=...), tt/replicas.py, logs/opt/phaseE/DESIGN2): "off"
 # | "r4" (EP32 + 4 replica slots per chip, per-step greedy assignment on device; decode only; NOT bitwise equal to "off":
 # another chip / summation order for a reassigned expert; needs the fused decode path and a launch without MTP).
+# "r4" is the default since the eval passed (logs/opt/phaseE/D2EVAL: production launch, MATH-500 99.0, AIME24 86.7,
+# GPQA-D pooled 85.83 over 3 runs, all inside the production 95 % intervals); from the config, MTP launches, launches
+# without the fused sparse decode path and modules built without the TT cache resolve to "off".
 # MOTIF3_MOE_REPLICA_PLAN: the plan JSON (default tt/replica_plan_r4.json); MOTIF3_MOE_REPLICA_DIR / _KEEP: where the
 # replica tensorbins are built (default /dev/shm/motif3_replicas) and whether they stay there (default 0: deleted).
 MOE_REPLICAS_MODES = ("off", "r4")
@@ -1463,8 +1466,10 @@ class MotifTTConfig:
     # Decode routed-expert matmuls of the sparse path (Phase D DESIGN-3 / Phase E D3S2): "fused" (default since the
     # D3S2 gates: bitwise equal) | "dualnoc" (stage 1) | "stock" (ttnn.sparse_matmul; DECODE_EXPERT_MM_MODES).
     decode_expert_mm: str = "fused"  # MOTIF3_DECODE_EXPERT_MM
-    # DESIGN-2 replica slots: "off" (default) | "r4" (MOE_REPLICAS_MODES) and the plan JSON ("" = the package's).
-    moe_replicas: str = "off"  # MOTIF3_MOE_REPLICAS
+    # DESIGN-2 replica slots: "r4" (default since the Phase E D2EVAL eval passed; an MTP launch, a launch without the
+    # fused sparse decode path or without the TT cache resolves to "off") | "off" (MOE_REPLICAS_MODES) and the plan JSON
+    # ("" = the package's).
+    moe_replicas: str = "r4"  # MOTIF3_MOE_REPLICAS
     moe_replica_plan: str = ""  # MOTIF3_MOE_REPLICA_PLAN
     # Layout changes of MotifCCL.ag_dp_rows (Phase C D4): "kernel" (default since the D4 E1: 53-layer logits bitwise,
     # row and KV-R write) | "ops" (AG_ROWS_LAYOUT_MODES).
@@ -1665,7 +1670,7 @@ class MotifTTConfig:
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
             decode_expert_mm=(os.environ.get("MOTIF3_DECODE_EXPERT_MM") or "fused").strip().lower(),
-            moe_replicas=(os.environ.get("MOTIF3_MOE_REPLICAS") or "off").strip().lower(),
+            moe_replicas=(os.environ.get("MOTIF3_MOE_REPLICAS") or "r4").strip().lower(),
             moe_replica_plan=(os.environ.get("MOTIF3_MOE_REPLICA_PLAN") or "").strip(),
             ag_rows_layout=(os.environ.get("MOTIF3_AG_ROWS_LAYOUT") or "kernel").strip().lower(),
             prefill_moe=(os.environ.get("MOTIF3_PREFILL_MOE") or "compact").strip().lower(),
