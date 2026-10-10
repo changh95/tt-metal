@@ -158,10 +158,11 @@ ATTN_IN_MODES = ("ops", "post", "fused")
 ATTN_OUT_MODES = ("ops", "uv", "fused")
 # Decode MoE local chain (Phase F F3, docs/OPTIMIZATION_PLAN.md "Phase F"; PolyNormMLP / MotifMoE): "ops" (the Phase E
 # chain) | "shared" (tt/kernels/shared_tail.py: the shared expert's B5 apply, down linear and row slice as ONE
-# generic_op, and no row pad before its gate_up linear; the default since the F3 gates passed bitwise: E1 53 layers row
-# + KV-R, spec_t32 / t64, logs/opt/phaseF/F3) | "fused" ("shared" plus the router tail kernels, B4 router_fused and the
-# DESIGN-2 replica tail, with batched L1 loads in the top-K / assignment code: the same selections and weights).
-# Bitwise the same rows. Decode only.
+# generic_op, and no row pad before its gate_up linear) | "fused" ("shared" plus the router tail kernels, B4
+# router_fused and the DESIGN-2 replica tail, with batched L1 loads in the top-K / assignment code: the same selections
+# and weights; and the fused routed PolyNorm skipping the slots no row routes to; the default since the F3 gates
+# passed bitwise: E1 53 layers row + KV-R, spec_t32 / t64, KV-R + MTP, logs/opt/phaseF/F3). Bitwise the same rows.
+# Decode only.
 MOE_LOCAL_MODES = ("ops", "shared", "fused")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
@@ -1484,9 +1485,9 @@ class MotifTTConfig:
     # Decode attention output chain (Phase F F2): "fused" (default, one program incl. wo) | "uv" | "ops" (the Phase E
     # chain) (ATTN_OUT_MODES).
     attn_out: str = "fused"  # MOTIF3_ATTN_OUT
-    # Decode MoE local chain (Phase F F3): "shared" (default, the fused shared-expert tail) | "ops" (the Phase E chain)
-    # (MOE_LOCAL_MODES).
-    moe_local: str = "shared"  # MOTIF3_MOE_LOCAL
+    # Decode MoE local chain (Phase F F3): "fused" (default: the fused shared-expert tail + router tails / PolyNorm
+    # skip) | "shared" (the shared-expert tail only) | "ops" (the Phase E chain) (MOE_LOCAL_MODES).
+    moe_local: str = "fused"  # MOTIF3_MOE_LOCAL
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
@@ -1699,7 +1700,7 @@ class MotifTTConfig:
             attn_epilogue=(os.environ.get("MOTIF3_ATTN_EPILOGUE") or "fused").strip().lower(),
             attn_in=(os.environ.get("MOTIF3_ATTN_IN") or "fused").strip().lower(),
             attn_out=(os.environ.get("MOTIF3_ATTN_OUT") or "fused").strip().lower(),
-            moe_local=(os.environ.get("MOTIF3_MOE_LOCAL") or "shared").strip().lower(),
+            moe_local=(os.environ.get("MOTIF3_MOE_LOCAL") or "fused").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
