@@ -164,9 +164,9 @@ ATTN_OUT_MODES = ("ops", "uv", "fused")
 # passed bitwise: E1 53 layers row + KV-R, spec_t32 / t64, KV-R + MTP, logs/opt/phaseF/F3). Bitwise the same rows.
 # Decode only.
 MOE_LOCAL_MODES = ("ops", "shared", "fused")
-# Decode device-sampler per-chip stage (Phase F F4; tt/kernels/sampler_local.py, sampler_tail.py): "ops" (default: the
-# Phase E sampler op chain) | "fused" (one generic_op per step for every per-chip op between the candidate gather and
-# the normaliser / Gumbel gathers: the exact full-vocab normaliser partials, the Gumbel hash, scores and local winner,
+# Decode device-sampler per-chip stage (Phase F F4; tt/kernels/sampler_local.py, sampler_tail.py): "fused" (the
+# default since every F4 gate passed bitwise, logs/opt/phaseF/F4) | "ops" (the Phase E sampler op chain). "fused": one
+# generic_op per step for every per-chip op between the candidate gather and the normaliser / Gumbel gathers: the exact full-vocab normaliser partials, the Gumbel hash, scores and local winner,
 # and the device uniform, with the ops path's LLK calls; the Gumbel race's global winner and the output packing as two
 # data movement programs; MotifDeviceSampler only, every decode trace that holds the sampler). Bitwise the same tokens.
 SAMPLER_LOCAL_MODES = ("ops", "fused")
@@ -1494,8 +1494,8 @@ class MotifTTConfig:
     # Decode MoE local chain (Phase F F3): "fused" (default: the fused shared-expert tail + router tails / PolyNorm
     # skip) | "shared" (the shared-expert tail only) | "ops" (the Phase E chain) (MOE_LOCAL_MODES).
     moe_local: str = "fused"  # MOTIF3_MOE_LOCAL
-    # Device sampler per-chip stage (Phase F F4): "ops" (default) | "fused" (SAMPLER_LOCAL_MODES).
-    sampler_local: str = "ops"  # MOTIF3_SAMPLER_LOCAL
+    # Device sampler per-chip stage (Phase F F4): "fused" (default, bitwise) | "ops" (SAMPLER_LOCAL_MODES).
+    sampler_local: str = "fused"  # MOTIF3_SAMPLER_LOCAL
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
@@ -1709,7 +1709,7 @@ class MotifTTConfig:
             attn_in=(os.environ.get("MOTIF3_ATTN_IN") or "fused").strip().lower(),
             attn_out=(os.environ.get("MOTIF3_ATTN_OUT") or "fused").strip().lower(),
             moe_local=(os.environ.get("MOTIF3_MOE_LOCAL") or "fused").strip().lower(),
-            sampler_local=(os.environ.get("MOTIF3_SAMPLER_LOCAL") or "ops").strip().lower(),
+            sampler_local=(os.environ.get("MOTIF3_SAMPLER_LOCAL") or "fused").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),

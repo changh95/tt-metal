@@ -2252,7 +2252,7 @@ def test_f3_moe_local_knob(monkeypatch):
 
 
 def test_f4_sampler_local_knob(monkeypatch):
-    """Phase F F4 (logs/opt/phaseF/F4): ``MOTIF3_SAMPLER_LOCAL`` ("ops" default | "fused"; case and blanks ignored,
+    """Phase F F4 (logs/opt/phaseF/F4): ``MOTIF3_SAMPLER_LOCAL`` ("fused" default | "ops"; case and blanks ignored,
     anything else refused; in ``describe``) and the fused sampler stage's core plan (``tt/kernels/sampler_local``):
     108 producers on rows 0..8 of the 12 x 10 grid own 2 of the 215 vocab tiles each (the last one 1), the 8 ACC cores
     and the AGG fit row 9, the producers' rows fit 4 partial tiles; grids without room are refused."""
@@ -2261,8 +2261,8 @@ def test_f4_sampler_local_knob(monkeypatch):
 
     assert SAMPLER_LOCAL_MODES == ("ops", "fused")
     monkeypatch.delenv("MOTIF3_SAMPLER_LOCAL", raising=False)
-    assert _cfg().sampler_local == "ops" and "sampler_local=ops " in _cfg().describe()
-    for v, want in ((" Fused ", "fused"), ("OPS", "ops"), ("", "ops")):
+    assert _cfg().sampler_local == "fused" and "sampler_local=fused " in _cfg().describe()
+    for v, want in ((" Fused ", "fused"), ("OPS", "ops"), ("", "fused")):
         monkeypatch.setenv("MOTIF3_SAMPLER_LOCAL", v)
         assert _cfg().sampler_local == want, v
     monkeypatch.setenv("MOTIF3_SAMPLER_LOCAL", "select")
