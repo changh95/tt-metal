@@ -3002,13 +3002,27 @@ class MotifGenerator(api.MotifGenerator):
                         rows64.append(head.logits_rows_to_host(lg_s))
                     return rows64[0]
 
+                # A draft row's draw is the bonus only where the anchor accepted the draft, and is discarded
+                # otherwise: a flagged draft row is resolved on the host only then (exact; saves the host fallback
+                # of rejected rows). The anchors resolve first.
                 if wide_s:
                     res_s = self._finish_sampled(key[0], phys_pos, res_s, None, logits_fn=lambda: logits64()[:32])
                     if res_b is not None:
+                        acc = batch.has_draft & (res_s.tokens.to(torch.int64) == batch.draft_tokens.to(torch.int64))
                         res_b = self._finish_sampled(
-                            key[0] + "_draft", draft_pos, res_b, None, smp=smp_b, logits_fn=lambda: logits64()[32:],
-                            count=False,
+                            key[0] + "_draft", torch.where(acc, draft_pos, torch.full_like(draft_pos, -1)), res_b,
+                            None, smp=smp_b, logits_fn=lambda: logits64()[32:], count=False,
                         )  # fmt: skip
+                elif sampled_verify:
+                    owners = torch.full_like(phys_pos, -1)
+                    owners[batch.active] = phys_pos[batch.active]
+                    res_s = self._finish_sampled(key[0], owners, res_s, rm_s)
+                    partners = torch.full_like(phys_pos, -1)
+                    tk = res_s.tokens.tolist()
+                    for o, d in plan.partner_of.items():
+                        if tk[o] == int(batch.draft_tokens[o]):
+                            partners[d] = phys_pos[d]
+                    res_s = self._finish_sampled(key[0] + "_draft", partners, res_s, rm_s, count=False)
                 else:
                     res_s = self._finish_sampled(key[0], phys_pos, res_s, rm_s)
                 sampled_ids = mtp_input = None
