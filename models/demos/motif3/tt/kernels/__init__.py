@@ -18,6 +18,9 @@
 * ``row_fold`` -- the decode MoE combine's row fold / unfold / fold-add (D4, ``MOTIF3_MOE_DECODE_CCL=rs``; ``row_fold/``).
 * ``rm_tile`` -- bf16 untilize / tilize of ``MotifCCL.ag_dp_rows`` as data movement (D4, ``MOTIF3_AG_ROWS_LAYOUT``;
   ``rm_tile/``; bitwise ``ttnn.to_layout``).
+* ``ccl_ar`` -- the decode all-reduce as ONE program (Phase F F5, ``MOTIF3_CCL_FUSE=ar``): ttnn's direct reduce-scatter
+  (its reader / compute kernels byte copies: the same reduction order) + an in-kernel multicast all-gather whose data
+  and completion counter share one route; ``ccl_ar/``. Bitwise the reduce-scatter + all_broadcast + concat chain.
 * ``moe_compact`` -- the compacted prefill MoE's on-device row dispatch (B2b, ``MOTIF3_PREFILL_MOE_DISPATCH=device``;
   ``moe_dispatch/``) and gather combine (``MOTIF3_PREFILL_MOE_COMBINE=gather``; ``moe_combine/``), both exact.
 

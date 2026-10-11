@@ -170,6 +170,11 @@ MOE_LOCAL_MODES = ("ops", "shared", "fused")
 # and the device uniform, with the ops path's LLK calls; the Gumbel race's global winner and the output packing as two
 # data movement programs; MotifDeviceSampler only, every decode trace that holds the sampler). Bitwise the same tokens.
 SAMPLER_LOCAL_MODES = ("ops", "fused")
+# Decode CCL fusion (Phase F F5; tt/kernels/ccl_ar.py): "off" (default: the Phase E collectives) | "ar" (every
+# MotifCCL.all_reduce on the reduce-scatter + gather path whose payload is bf16 TILE interleaved on a ring axis runs as
+# ONE program: the direct reduce-scatter, its reduction order unchanged, plus an in-kernel unicast all-gather whose data
+# and completion counter share one route; replaces reduce_scatter_minimal_direct + all_broadcast + concat).
+CCL_FUSE_MODES = ("off", "ar")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
 # in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.
@@ -1496,6 +1501,8 @@ class MotifTTConfig:
     moe_local: str = "fused"  # MOTIF3_MOE_LOCAL
     # Device sampler per-chip stage (Phase F F4): "fused" (default, bitwise) | "ops" (SAMPLER_LOCAL_MODES).
     sampler_local: str = "fused"  # MOTIF3_SAMPLER_LOCAL
+    # Decode CCL fusion (Phase F F5): "off" (default) | "ar" (the fused all-reduce program) (CCL_FUSE_MODES).
+    ccl_fuse: str = "off"  # MOTIF3_CCL_FUSE
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
     # Decode mHC site (Phase C D3): "fused" (default: 5 programs, bitwise equal) | "ops" (the release, 7 programs;
@@ -1595,7 +1602,7 @@ class MotifTTConfig:
         * Environment overrides: ``MOTIF3_NUM_LAYERS``, ``MOTIF3_KV_POOL_TOKENS``, ``MOTIF3_MAX_MODEL_LEN``,
           ``MOTIF3_TRACE_REGION_SIZE``, ``MOTIF3_FABRIC`` (no mesh), ``MOTIF3_TT_CACHE_PATH`` / ``TT_CACHE_PATH``,
           ``MOTIF3_L1_SMALL_SIZE``, ``MOTIF3_ROUTER_LOGITS``, ``MOTIF3_RING_GATHER``, ``MOTIF3_FLASH_MLA_SWA_MCPH``, ``MOTIF3_ROUTER_MASK``,
-          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_IN``, ``MOTIF3_ATTN_OUT``, ``MOTIF3_MOE_LOCAL``, ``MOTIF3_SAMPLER_LOCAL``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_DECODE_EXPERT_MM``, ``MOTIF3_MOE_REPLICAS``, ``MOTIF3_MOE_REPLICA_PLAN``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
+          ``MOTIF3_DECODE_EXPERTS``, ``MOTIF3_MOE_POLYNORM``, ``MOTIF3_SHARED_POLYNORM``, ``MOTIF3_ATTN_EPILOGUE``, ``MOTIF3_ATTN_IN``, ``MOTIF3_ATTN_OUT``, ``MOTIF3_MOE_LOCAL``, ``MOTIF3_SAMPLER_LOCAL``, ``MOTIF3_CCL_FUSE``, ``MOTIF3_ATTN_MM_PCS``, ``MOTIF3_MHC_DECODE``, ``MOTIF3_MOE_DECODE_CCL``, ``MOTIF3_DECODE_EXPERT_MM``, ``MOTIF3_MOE_REPLICAS``, ``MOTIF3_MOE_REPLICA_PLAN``, ``MOTIF3_AG_ROWS_LAYOUT``, ``MOTIF3_HOST_STAGING``, ``MOTIF3_HOST_WAIT``,
           ``MOTIF3_PREFILL_TRACE``, ``MOTIF3_CAPTURE_THREAD``, ``MOTIF3_PREFILL_MOE``, ``MOTIF3_PREFILL_MOE_BLOCK``,
           ``MOTIF3_PREFILL_MOE_MIN_ROWS``, ``MOTIF3_PREFILL_MOE_DISPATCH``, ``MOTIF3_PREFILL_MOE_COMBINE``,
           ``MOTIF3_PREFILL_SP``, ``MOTIF3_PREFILL_SP_MIN_ROWS``, ``MOTIF3_PREFILL_MAX_BUCKET``,
@@ -1710,6 +1717,7 @@ class MotifTTConfig:
             attn_out=(os.environ.get("MOTIF3_ATTN_OUT") or "fused").strip().lower(),
             moe_local=(os.environ.get("MOTIF3_MOE_LOCAL") or "fused").strip().lower(),
             sampler_local=(os.environ.get("MOTIF3_SAMPLER_LOCAL") or "fused").strip().lower(),
+            ccl_fuse=(os.environ.get("MOTIF3_CCL_FUSE") or "off").strip().lower(),
             attn_mm_pcs=(os.environ.get("MOTIF3_ATTN_MM_PCS") or "tuned").strip().lower(),
             mhc_decode=(os.environ.get("MOTIF3_MHC_DECODE") or "fused").strip().lower(),
             moe_decode_ccl=(os.environ.get("MOTIF3_MOE_DECODE_CCL") or "ar").strip().lower(),
@@ -1925,6 +1933,8 @@ class MotifTTConfig:
             raise ValueError(f"attn_out (MOTIF3_ATTN_OUT) must be one of {ATTN_OUT_MODES}, got {self.attn_out!r}")
         if self.moe_local not in MOE_LOCAL_MODES:
             raise ValueError(f"moe_local (MOTIF3_MOE_LOCAL) must be one of {MOE_LOCAL_MODES}, got {self.moe_local!r}")
+        if self.ccl_fuse not in CCL_FUSE_MODES:
+            raise ValueError(f"ccl_fuse (MOTIF3_CCL_FUSE) must be one of {CCL_FUSE_MODES}, got {self.ccl_fuse!r}")
         if self.sampler_local not in SAMPLER_LOCAL_MODES:
             raise ValueError(
                 f"sampler_local (MOTIF3_SAMPLER_LOCAL) must be one of {SAMPLER_LOCAL_MODES}, got {self.sampler_local!r}"
@@ -2705,7 +2715,7 @@ class MotifTTConfig:
             f"W={self.kv_blocks_per_seq}; buckets={self.prefill_buckets[0]}..{self.prefill_buckets[-1]}; "
             f"trace={self.trace_region_size}; l1_small={self.l1_small_size} (mesh {self.mesh_l1_small_size}); "
             f"sinkhorn={self.mhc_sinkhorn} router={self.router_logits} router_mask={self.router_mask} "
-            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_in={self.attn_in} attn_out={self.attn_out} moe_local={self.moe_local} sampler_local={self.sampler_local} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} decode_expert_mm={self.decode_expert_mm} moe_replicas={self.moe_replicas} ag_rows_layout={self.ag_rows_layout} "
+            f"decode_experts={self.decode_experts} moe_polynorm={self.moe_polynorm} shared_polynorm={self.shared_polynorm} attn_epilogue={self.attn_epilogue} attn_in={self.attn_in} attn_out={self.attn_out} moe_local={self.moe_local} sampler_local={self.sampler_local} ccl_fuse={self.ccl_fuse} attn_mm_pcs={self.attn_mm_pcs} mhc_decode={self.mhc_decode} moe_decode_ccl={self.moe_decode_ccl} decode_expert_mm={self.decode_expert_mm} moe_replicas={self.moe_replicas} ag_rows_layout={self.ag_rows_layout} "
             f"prefill_moe={self.prefill_moe}/{self.prefill_moe_block}/{self.prefill_moe_min_rows}/{self.prefill_moe_dispatch}/{self.prefill_moe_combine}/{self.prefill_moe_upload} prefill_sp={self.prefill_sp}/{self.prefill_sp_min_rows} shm_tracking={'off' if os.environ.get('TT_METAL_SHM_TRACKING_DISABLED', '0') not in ('', '0') else 'on'} host_staging={self.host_staging} host_wait={self.host_wait} "
             f"prefill_trace={self.prefill_trace} capture_thread={self.capture_thread} "
             f"ring_gather={self.ring_gather} "

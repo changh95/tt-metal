@@ -2278,6 +2278,36 @@ def test_f4_sampler_local_knob(monkeypatch):
     assert SL.f32_bits(-SL.BIG) == 0xFF61B1E6 and SL.f32_bits(SL.ID_SENTINEL) == 0x4B800000
 
 
+def test_f5_ccl_fuse_knob(monkeypatch):
+    """Phase F F5 (logs/opt/phaseF/F5): ``MOTIF3_CCL_FUSE`` ("off" default | "ar"; case and blanks ignored, anything
+    else refused; in ``describe``), ``MotifCCL(fuse=...)`` follows cfg.ccl_fuse, the fused all-reduce's kernels keep
+    ttnn's reduce-scatter reader / compute byte for byte (the reduction order), its contract (bf16 TILE interleaved,
+    whole-page slices, <= 512 KiB) and its geometry equal reduce_scatter_minimal_direct's for the decode payloads."""
+    import hashlib
+
+    from models.demos.motif3.tt.kernels import ccl_ar as CA
+    from models.demos.motif3.tt.model_config import CCL_FUSE_MODES
+
+    assert CCL_FUSE_MODES == ("off", "ar")
+    monkeypatch.delenv("MOTIF3_CCL_FUSE", raising=False)
+    assert _cfg().ccl_fuse == "off" and "ccl_fuse=off " in _cfg().describe()
+    for v, want in ((" AR ", "ar"), ("Off", "off"), ("", "off")):
+        monkeypatch.setenv("MOTIF3_CCL_FUSE", v)
+        assert _cfg().ccl_fuse == want, v
+    monkeypatch.setenv("MOTIF3_CCL_FUSE", "rs")
+    with pytest.raises(ValueError, match="MOTIF3_CCL_FUSE"):
+        _cfg()
+    monkeypatch.delenv("MOTIF3_CCL_FUSE", raising=False)
+    for name, md5 in CA.UPSTREAM_MD5.items():
+        assert hashlib.md5((CA.KERNEL_DIR / name).read_bytes()).hexdigest() == md5, name
+    # geometry (tile_bytes 2048, 4352 B fabric payload -> 2 tiles per packet, 8-tile chunks)
+    monkeypatch.setattr(CA.ttnn, "get_tt_fabric_max_payload_size_bytes", lambda: 4352)
+    g = CA.FusedAllReduce.geometry([1, 1, 32, 4096], 3, 8)
+    assert (g["tg"], g["ipp"], g["pps"], g["cps"], g["run"], g["stride"]) == (8, 2, 16, 2, 16, 128)
+    g = CA.FusedAllReduce.geometry([1, 1, 64, 4096], 3, 4)
+    assert (g["pps"], g["cps"], g["run"], g["stride"]) == (64, 8, 32, 128)
+
+
 def test_d1_attn_epilogue_knob(monkeypatch):
     """Phase C D1 (logs/opt/phaseC/D1): ``MOTIF3_ATTN_EPILOGUE`` ("fused" default | "ops"; case and blanks ignored, anything
     else refused; in ``describe``) and the fused combine's worker plan (``tt/kernels/attn_combine.plan``)."""

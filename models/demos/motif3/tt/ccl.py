@@ -395,6 +395,7 @@ class MotifCCL:
         l1_small_semaphores: Optional[bool] = None,
         ring_gather: Optional[str] = None,
         rows_layout: Optional[str] = None,
+        fuse: Optional[str] = None,
     ):
         global _WARNED_NO_L1_SMALL
         self.mesh_device = mesh_device
@@ -439,6 +440,11 @@ class MotifCCL:
             raise ValueError(f"rows_layout must be one of {AG_ROWS_LAYOUT_MODES}, got {rows_layout!r}")
         self.rows_layout = rows_layout
         self._row_layout = None  # tt/kernels/rm_tile.RowLayout, built on first use
+        # F5: "off" | "ar" (cfg.ccl_fuse, MOTIF3_CCL_FUSE): all_reduce's RS + AG path as one fused program
+        # (tt/kernels/ccl_ar.py, bitwise the same). No cfg, or a cfg without the field: "off". A plain attribute: tests
+        # and the E1 gate may switch it between calls (every mode's programs must then be compiled before a capture).
+        self.fuse = fuse if fuse is not None else (getattr(cfg, "ccl_fuse", None) or "off")
+        self._fused_ar = None  # tt/kernels/ccl_ar.FusedAllReduce, built on first use
         self._race_free_depth = 0  # > 0 inside race_free_scope()
         self._ring_axis: Dict[int, bool] = {}  # cluster_axis -> usable topology is a ring / torus
         self._plans: Dict[tuple, Any] = {}  # (op, cluster_axis, tensor spec) -> dispatch decision (host-side cache)
@@ -708,6 +714,8 @@ class MotifCCL:
         dim, composite = self._ar_plan(x, n)
         if composite:
             out = self._ar_gather_sum(work, ca, n, mc)
+        elif self._fuse_ar(work, dim, ca, n, mc):  # F5: RS + AG in one program (bitwise the same)
+            out = self._fused_ar(work, ca, dim, memory_config=mc)
         else:  # RS + AG, both into the output memory config (as all_reduce_async does)
             rs = self._reduce_scatter(work, dim, ca, n, mc)
             if self._ag_race_prone(rs, dim, ca, race_free=race_free):  # module docstring: the completion race
@@ -722,6 +730,26 @@ class MotifCCL:
             ttnn.deallocate(out)
             out = t
         return out
+
+    def _fuse_ar(self, x, dim: int, ca: int, n: int, mc) -> bool:
+        """F5 (``fuse="ar"``): whether this all-reduce's RS + AG runs as the fused program of
+        ``tt/kernels/ccl_ar.py``: the RS would take the direct op (:meth:`_rs_direct`, whose reduction order the fused
+        program keeps) and the payload is in its contract (bf16 TILE interleaved, interleaved output). Builds the
+        :class:`~.kernels.ccl_ar.FusedAllReduce` on first use. Cached per spec."""
+        if getattr(self, "fuse", "off") != "ar" or not self.l1_small_semaphores:
+            return False
+        key = ("fuse_ar", ca, dim, self._spec_key(x), str(mc))
+        plan = self._plans.get(key)
+        if plan is None:
+            from .kernels.ccl_ar import FusedAllReduce  # lazy: generic_op kernels
+
+            plan = bool(self._rs_direct(x, dim, ca, n)) and FusedAllReduce.supported(x, n, dim, mc)
+            self._plans[key] = plan
+        if plan and self._fused_ar is None:
+            from .kernels.ccl_ar import FusedAllReduce
+
+            self._fused_ar = FusedAllReduce(self.mesh_device, num_links=self.num_links)
+        return plan
 
     def _ar_gather_sum(self, work, ca: int, n: int, out_mc):
         """``all_reduce_async``'s AG + local-sum branch: ``[1, *shape]`` -> composite all-gather on dim 0 (Linear
