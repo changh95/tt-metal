@@ -749,6 +749,9 @@ RACE_PAYLOADS = [
     # (h multicast, cross-core expert sum into column owners) with k = (chip index) % 13 active experts per chip, then
     # immediately the decode AR(tp). Always asserted.
     ("d3s2_fused_ar_tp_decode", "d3s2", [1, 1, 8, 4096], ttnn.bfloat16, None, False, "- (new)"),
+    # Phase F F5 (MOTIF3_CCL_FUSE=ar): the decode MoE combine's AR(dp) of [1, 1, 32, 4096] (with the knob: the fused
+    # all-reduce program, tt/kernels/ccl_ar.py; the AR(tp) payloads above take it too). Always asserted.
+    ("f5_ar_dp_decode", "ar_dp", [1, 1, 32, 4096], ttnn.bfloat16, None, False, "- (new)"),
 ]
 
 
@@ -857,7 +860,7 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                   for k in range(2)]  # fmt: skip
             gshape = [1, m, max(rows, 32), width if op == "ag" else width // C]  # the gathered per-chip payload
             dt_name = getattr(xs[0].dtype, "name", str(xs[0].dtype).split(".")[-1])
-            d4 = op in ("rs_dp_d4", "d4_chain", "d3_smm", "d3s2")
+            d4 = op in ("rs_dp_d4", "d4_chain", "d3_smm", "d3s2", "ar_dp")
             assert d4 or native_ag_cb_pages_per_link(gshape, dt_name, True) == pages, name
             for mode, ccl in ccls.items():
                 rerouted = d4 or mode == "safe" or (mode == "lean" and (pages > 1 or race_free))
@@ -896,6 +899,8 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                         ttnn.deallocate(dn_op.down_sum(hh, sp_, memory_config=ttnn.L1_MEMORY_CONFIG))
                         ttnn.deallocate(sp_)
                         o = ccl.ar_tp(x)
+                    elif op == "ar_dp":
+                        o = ccl.ar_dp(x)
                     else:
                         o = ccl.ar_tp(x, race_free=race_free)
                     return o, ttnn.clone(o)  # the consumer, enqueued right behind the gather
