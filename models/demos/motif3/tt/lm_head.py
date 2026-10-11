@@ -752,6 +752,29 @@ class MotifLMHead:
                 ttnn.deallocate(t)
         return self._assemble_decode(views, dtype, np_views=reader.np_views)
 
+    def logits_rows_to_host(self, logits, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """The T64 step's TILE logits ``[1, 1, 64, 6880]`` ("mesh"; or the 32-row ones) -> **fresh** host ``[rows,
+        220160]`` in split order (rows 0..31 the anchors in lane order, 32..63 the drafts): one eager device untilize
+        (compiled at the warmup; the temporary is freed here, before the next replay), one concurrent read of every
+        chip, numpy block copies. Phase G: the host fallback of flagged T64 rows (rare; ~28 MB)."""
+        if self.vocab_split != "mesh":
+            raise ValueError(f"logits_rows_to_host needs the 'mesh' vocab split, got {self.vocab_split!r}")
+        rows = int(logits.shape[2])
+        if rows % TILE or int(logits.shape[3]) != self.vc:
+            raise ValueError(f"expected decode logits [1, 1, 32 k, {self.vc}], got {list(logits.shape)}")
+        t = self.logits_rm(logits, check_lanes=False) if logits.layout == ttnn.TILE_LAYOUT else logits
+        try:
+            reader = self._reader(t)
+            views = reader.read(t)
+            out = _concat_views(views, rows, self.vc, self.vocab_split, self.cfg.axes, self.cfg.axes.mesh_shape[1],
+                                np_views=reader.np_views)  # fmt: skip
+        finally:
+            if t is not logits:
+                ttnn.deallocate(t)
+        if dtype is not None and out.dtype != dtype:
+            out = out.to(dtype)
+        return out
+
     def _assemble_decode(self, views, dtype, np_views=None) -> torch.Tensor:
         """Per-chip zero-copy views (mesh row-major order) -> fresh ``[32, V]``: numpy block copies (each byte copied
         once) split over ``host_copy_threads`` Python threads (numpy releases the GIL in the copies).

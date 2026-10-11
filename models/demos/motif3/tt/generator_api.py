@@ -328,6 +328,13 @@ KV_WRITE_MODES = ("row", "row_split", "all", "all_split")
 # "wide" / "auto" need MotifTTConfig.ring_gather == "safe" (F3N rule R1; the config refuses anything else).
 SPEC_VERIFY_MODES = ("packed", "wide", "auto")
 WIDE_SPEC_VERIFY_MODES = ("wide", "auto")  # the modes that stage and capture the T64 trace
+# Speculative sampling (Phase G, C10a; MOTIF3_SPEC_SAMPLED, logs/opt/phaseG/DESIGN.md): "on" lets sampled requests
+# (temperature, top-k, top-p, seed: what the device sampler serves) speculate on a launch that samples decode steps on
+# device. The verify samples the anchor row and the draft row with the exact device sampler (noise independent of the
+# draft) and returns those ids (plugin accept mode "sampled_ids"); the id-equality walk is then lossless rejection
+# sampling for the greedy MTP draft. The MTP layer is fed the sampled token instead of the argmax (identical on greedy
+# lanes). "off" (default) keeps the Phase F paths byte for byte.
+SPEC_SAMPLED_MODES = ("off", "on")
 # T64 rows: per DP row [8 anchors | 8 drafts] (a draft on its owner's DP row at n + 1, with the owner's page-table row),
 # still one 32-row tile row; the gathered step has 64 rows (split order: 0..31 = the anchors in lane order, 32..63 =
 # the drafts).
@@ -665,6 +672,15 @@ def spec_verify_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
     return v
 
 
+def spec_sampled_from_env(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """``MOTIF3_SPEC_SAMPLED``: ``off`` (default) or ``on`` (:data:`SPEC_SAMPLED_MODES`); True for ``on``."""
+    env = os.environ if environ is None else environ
+    v = (env.get("MOTIF3_SPEC_SAMPLED") or "").strip().lower() or "off"
+    if v not in SPEC_SAMPLED_MODES:
+        raise ValueError(f"MOTIF3_SPEC_SAMPLED must be one of {SPEC_SAMPLED_MODES}, got {v!r}")
+    return v == "on"
+
+
 def check_wide_min_lanes(lanes: int) -> int:
     """``lanes`` if it is in ``[1, WIDE_MIN_LANES_NEVER]`` (33 = never draft every lane), else ``ValueError``."""
     n = int(lanes)
@@ -1000,6 +1016,9 @@ class GeneratorSettings:
             ``"packed"`` (drafts on idle lanes of the 32-lane trace), ``"wide"`` (the 64-row trace alone) or ``"auto"``
             (both traces, the 64-row one for verify steps whose drafts do not fit idle lanes). A generator without the
             64-row trace must refuse ``"wide"`` and ``"auto"`` in ``create``. Without speculation it has no effect.
+        spec_sampled: speculative sampling (``MOTIF3_SPEC_SAMPLED=on``, :data:`SPEC_SAMPLED_MODES`): sampled
+            requests speculate (verify in the plugin's ``sampled_ids`` mode). Effective only with ``spec_tokens > 0``
+            and device sampling; otherwise ignored (logged).
 
     Packed-prefill knobs (P5, §3.3-§3.5, §3.9; they matter only with ``packed_prefill``):
         packed_prefill_max_seg: the largest packed segment S (``MOTIF3_PACKED_PREFILL_MAX_SEG``, one of
@@ -1042,6 +1061,7 @@ class GeneratorSettings:
     prefill_span_cap: Optional[int] = None
     packed_prefill: bool = False
     spec_verify: str = "packed"
+    spec_sampled: bool = False
     # ---- packed prefill (P5) and T64 verify knobs (docs/p5_t64/P5_T64_DESIGN.md §3.9, §4.5-§4.7) -----------------
     packed_prefill_max_seg: int = DEFAULT_PACKED_PREFILL_MAX_SEG
     packed_prefill_max_tokens: int = DEFAULT_PACKED_PREFILL_MAX_TOKENS
@@ -1066,7 +1086,7 @@ class GeneratorSettings:
             raise ValueError(f"optimizations must be None, 'performance' or 'accuracy', got {self.optimizations!r}")
         if self.block_size is not None:
             check_block_size(self.block_size)
-        for name in ("chunked_prefill", "prefix_caching", "packed_prefill", "packed_prefill_pk1"):
+        for name in ("chunked_prefill", "prefix_caching", "packed_prefill", "packed_prefill_pk1", "spec_sampled"):
             if getattr(self, name) not in (True, False):
                 raise TypeError(f"{name} must be a bool, got {getattr(self, name)!r}")
         if self.kv_replicated_decode not in (None, True, False):
@@ -1166,7 +1186,8 @@ class GeneratorSettings:
         (vLLM ``num_speculative_tokens`` after the platform published ``effective_k``). None = draft 1. Environment:
         ``MOTIF3_TT_CACHE_POLICY``, ``MOTIF3_KV_REPLICATED_DECODE``, ``MOTIF3_PREFILL_MAX_BUCKET``,
         ``MOTIF3_PACKED_PREFILL``, ``MOTIF3_PACKED_PREFILL_MAX_SEG``, ``MOTIF3_PACKED_PREFILL_MAX_TOKENS``,
-        ``MOTIF3_PACKED_PREFILL_PK1``, ``MOTIF3_PACKED_WARMUP``, ``MOTIF3_SPEC_VERIFY``, ``MOTIF3_WIDE_MIN_LANES``,
+        ``MOTIF3_PACKED_PREFILL_PK1``, ``MOTIF3_PACKED_WARMUP``, ``MOTIF3_SPEC_VERIFY``, ``MOTIF3_SPEC_SAMPLED``,
+        ``MOTIF3_WIDE_MIN_LANES``,
         ``MOTIF3_WIDE_STEP_RATIO`` (``spec_alpha_prior`` keeps its default)."""
         env = os.environ if environ is None else environ
         hf_layers = int(getattr(hf_config, "num_hidden_layers", NUM_HIDDEN_LAYERS))
@@ -1207,6 +1228,7 @@ class GeneratorSettings:
             prefill_span_cap=prefill_span_cap_from_env(env),
             packed_prefill=packed_prefill_from_env(env),
             spec_verify=spec_verify_from_env(env),
+            spec_sampled=spec_sampled_from_env(env),
             packed_prefill_max_seg=packed_prefill_max_seg_from_env(env),
             packed_prefill_max_tokens=packed_prefill_max_tokens_from_env(env),
             packed_prefill_pk1=packed_prefill_pk1_from_env(env),
@@ -1878,6 +1900,7 @@ __all__ = [
     "SERVING_KEYS",
     "SERVING_TT_CONFIG",
     "SPEC_ALPHA_PRIOR_WEIGHT",
+    "SPEC_SAMPLED_MODES",
     "SPEC_VERIFY_MODES",
     "SUPPORTED_BLOCK_SIZES",
     "SUPPORTED_SPEC_TOKENS",
@@ -1927,6 +1950,7 @@ __all__ = [
     "resolve_weights_location",
     "serving_additional_config",
     "smoothed_acceptance",
+    "spec_sampled_from_env",
     "spec_verify_from_env",
     "HOST_STAGING_MODES",
     "DEFAULT_HOST_STAGING",

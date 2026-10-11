@@ -1461,6 +1461,10 @@ class MotifTTConfig:
     # requires ring_gather "safe" (F3N R1) and refuses "auto" with the exact-fp32 router at a T64 row count missing
     # from ROUTER_EXACT_FP32_DECODE_ROWS (R-E7).
     spec_verify: str = "packed"  # "packed" | "wide" | "auto" (generator_api.SPEC_VERIFY_MODES)
+    # Speculative sampling (Phase G, C10a): GeneratorSettings.spec_sampled (MOTIF3_SPEC_SAMPLED) via from_settings.
+    # With spec_tokens > 0 and the device sampler, the T32-spec trace samples before the MTP layer and feeds it the
+    # sampled token, and the T64 trace samples its anchor and draft rows (two samplers). Off: the Phase F traces.
+    spec_sampled: bool = False
     # r = T64 step / T32-spec step: the input of c* (G16 updates it; MOTIF3_WIDE_STEP_RATIO via from_settings overrides)
     wide_step_ratio: float = DEFAULT_WIDE_STEP_RATIO
 
@@ -1831,6 +1835,7 @@ class MotifTTConfig:
         if getattr(settings, "packed_prefill_max_tokens", None) is not None:
             kw["pack_max_tokens"] = int(settings.packed_prefill_max_tokens)
         kw["spec_verify"] = str(getattr(settings, "spec_verify", None) or "packed")
+        kw["spec_sampled"] = bool(getattr(settings, "spec_sampled", False))
         if getattr(settings, "wide_step_ratio", None) is not None:
             kw["wide_step_ratio"] = float(settings.wide_step_ratio)
         kw.update(overrides)
@@ -2727,7 +2732,8 @@ class MotifTTConfig:
             f"ring_gather={self.ring_gather} "
             f"mla_mcph swa={self.flash_mla_swa_mcph}/global={FLASH_MLA_DECODE_MAX_CORES_PER_HEAD_BATCH}; "
             f"span cap={self.max_prefill_span} A={self.prefill_resume_alignment} kv_write={self.kv_write_mode} "
-            f"spec={self.spec_tokens} spec_verify={self.spec_verify}{wide}; "
+            f"spec={self.spec_tokens} spec_verify={self.spec_verify}{wide} "
+            f"spec_sampled={'on' if self.spec_sampled else 'off'}; "
             f"pack S={segs(self.pack_seg_buckets)} pk1 S={segs(self.pack_sp1_seg_buckets)} T<={self.pack_tokens_cap}; "
             f"cache={self.cache_dir})"
         )

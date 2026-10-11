@@ -212,6 +212,7 @@ def choose_verify_kind(
     *,
     kv_mode: str,
     lanes_per_row: int = LANES_PER_GROUP,
+    sampled_verify: bool = False,
 ) -> str:
     """The decode trace that runs ``batch`` (design §2.2, §4.5): :data:`SPEC_STEP` (the T32 spec trace) or
     :data:`WIDE_STEP` (the T64 trace).
@@ -225,7 +226,9 @@ def choose_verify_kind(
             steps never do (R-E6), only test-made ones, which then run like ``packed`` (T32, with the overflow pass
             when the drafts do not fit).
         sampling: the step's device-sampling parameters (None or False = none). The device sampler lives in the T32
-            trace only in ``auto``.
+            trace only in ``auto``, unless ``sampled_verify``.
+        sampled_verify: Phase G (spec_sampled): both traces hold samplers, so a sampled VERIFY step is routed like a
+            greedy one (T64 when its drafts do not fit idle lanes); an ordinary sampled step still runs on T32.
         kv_mode: the T32 spec path's KV-write mode (its partner rule decides what fits).
         lanes_per_row: owner lanes per DP row (8).
     """
@@ -238,7 +241,8 @@ def choose_verify_kind(
         return SPEC_STEP
     if mode == "wide":
         return WIDE_STEP
-    if not batch.is_verify or want_logits or (sampling is not None and sampling is not False):
+    sampled = sampling is not None and sampling is not False
+    if not batch.is_verify or want_logits or (sampled and not sampled_verify):
         return SPEC_STEP
     return SPEC_STEP if drafts_fit_idle_lanes(batch, kv_mode=kv_mode, lanes_per_row=lanes_per_row) else WIDE_STEP
 

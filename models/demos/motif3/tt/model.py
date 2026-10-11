@@ -96,7 +96,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -699,7 +699,7 @@ class MotifModel:
         return logits
 
     def decode_spec(self, tokens, *, rot_idxs, kv_write, kv_caches, stop_after: Optional[int] = None,
-                    keep_hidden: bool = False):
+                    keep_hidden: bool = False, sampler: Any = None):
         """One **T32-spec** decode step for all 32 lanes (trace-safe; features design §3.8.1, D10; README §17): the
         main layers, the LM head, the main argmax and the MTP layer on EVERY lane, in one step::
 
@@ -723,8 +723,15 @@ class MotifModel:
         decoder layers only (plumbing runs; the MTP layer then reads a truncated hidden). ``keep_hidden`` (eager
         diagnostics only): also return ``hn`` (the caller frees it).
 
-        Returns ``(rm, a, m)`` (``+ (hn,)`` with ``keep_hidden``): read with ``head.logits_to_host(rm)`` /
-        ``head.tokens_to_host(a)`` / ``head.tokens_to_host(m)``."""
+        ``sampler`` (Phase G, ``MOTIF3_SPEC_SAMPLED=on``): a :class:`~models.demos.motif3.tt.sampling.MotifDeviceSampler`
+        that samples the TILE logits ``lg`` BEFORE the MTP layer (``so = sampler.sample(lg)``, the parameters and
+        counters written last), and the MTP layer consumes the sampled tokens ``so.tokens`` instead of ``a``. On a
+        greedy lane the sampled token IS ``a`` (the same lowest-id-among-maxima rule on the same logits), so its MTP
+        input is unchanged; on a sampled lane the MTP drafts after the token the step actually commits. Without it the
+        step is the Phase F one, op for op.
+
+        Returns ``(rm, a, m)`` (``+ (hn,)`` with ``keep_hidden``; ``+ (so,)`` with ``sampler``, last): read with
+        ``head.logits_to_host(rm)`` / ``head.tokens_to_host(a)`` / ``head.tokens_to_host(m)``."""
         if self.mtp is None:
             raise ValueError("decode_spec needs the MTP layer (MotifModel(..., mtp=True))")
         if kv_write is None:
@@ -752,16 +759,24 @@ class MotifModel:
             lg = self.head.decode_logits(hn)  # TILE; hn kept for the MTP layer
             rm = self.head.logits_rm(lg)
             a = self.head.argmax_decode(lg)
+            so = None
+            if sampler is not None:  # Phase G: sample first, the MTP layer drafts after the sampled token
+                so = sampler.sample(lg)
             _free(lg)
-            m = self.mtp.forward_decode(hn, a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=mtp_cache,
-                                        active=act, kv_write=kv_write)
+            mtp_in = a if so is None else so.tokens
+            m = self.mtp.forward_decode(hn, mtp_in, rot=rot, cur_pos=cur_pos, page_table=page_table,
+                                        kv_cache=mtp_cache, active=act, kv_write=kv_write)  # fmt: skip
             kv_write.end_step()
         finally:
             _free(act, lm, *[t for cs in rot.values() for t in cs])
+        out = (rm, a, m)
         if keep_hidden:
-            return rm, a, m, hn
-        _free(hn)
-        return rm, a, m
+            out += (hn,)
+        else:
+            _free(hn)
+        if so is not None:
+            out += (so,)
+        return out
 
     def decode_wide(
         self,
@@ -773,6 +788,7 @@ class MotifModel:
         want_rm: bool = False,
         stop_after: Optional[int] = None,
         keep_hidden: bool = False,
+        samplers: Optional[Tuple[Any, Any]] = None,
     ):
         """One **T64** step: the full-batch speculative verify step (trace-safe; docs/p5_t64/P5_T64_DESIGN.md §4.1-§4.4,
         decisions T1-T5). Each DP row decodes 16 rows, still one 32-row tile row: rows 0..7 = the anchors of its 8
@@ -808,9 +824,16 @@ class MotifModel:
         ``auto`` mode's T64 trace is argmax-only). ``stop_after``: the first k decoder layers only (plumbing runs).
         ``keep_hidden`` (eager diagnostics only): also return ``hn`` (the caller frees it).
 
-        Returns ``(rm or None, a, m)`` (``+ (hn,)`` with ``keep_hidden``): read ``a`` / ``m`` with
-        ``head.tokens_to_host`` (int64 ``[64]``, split order), ``rm`` with ``head.logits_to_host`` (the 32 anchors).
-        Host checks run before any device op."""
+        ``samplers`` (Phase G, ``MOTIF3_SPEC_SAMPLED=on``): ``(A, B)``, two
+        :class:`~models.demos.motif3.tt.sampling.MotifDeviceSampler` (32 lanes each). ``A`` samples the anchor rows
+        ``lg[0:32]`` (lane order: exactly the T32 layout), ``B`` the draft rows ``lg[32:64]`` (two tile-aligned slices),
+        each with the parameters and counters written last (the caller writes B's counters at ``n + 1``). The MTP layer
+        consumes ``s = concat(so_a.tokens, so_b.tokens)`` (``[1, 1, 1, 64]``, the split order of ``a``) instead of
+        ``a``; on greedy rows ``s == a`` bitwise. ``lg`` is kept (returned) for the host fallback of flagged rows.
+
+        Returns ``(rm or None, a, m)`` (``+ (hn,)`` with ``keep_hidden``; ``+ (so_a, so_b, lg)`` with ``samplers``,
+        last): read ``a`` / ``m`` with ``head.tokens_to_host`` (int64 ``[64]``, split order), ``rm`` with
+        ``head.logits_to_host`` (the 32 anchors). Host checks run before any device op."""
         if self.mtp is None:
             raise ValueError("decode_wide needs the MTP layer (MotifModel(..., mtp=True))")
         if kv_write is None:
@@ -861,16 +884,50 @@ class MotifModel:
             if want_rm:
                 rm = self.head.logits_rm(lg, rows=int(cfg.max_batch))  # the anchors: [1, 1, 32, 6880] ROW_MAJOR
             a = self.head.argmax_decode(lg)  # [1, 1, 1, 64]
-            _free(lg)
-            m = self.mtp.forward_decode(hn, a, rot=rot, cur_pos=cur_pos, page_table=page_table, kv_cache=mtp_cache,
-                                        active=act, kv_write=kv_write)  # fmt: skip
+            sampled = None
+            mtp_in = a
+            if samplers is not None:  # Phase G: anchors with A, drafts with B; the MTP layer drafts after the samples
+                sampled = self._sample_wide(lg, samplers)
+                mtp_in = sampled[2]
+            else:
+                _free(lg)
+            m = self.mtp.forward_decode(hn, mtp_in, rot=rot, cur_pos=cur_pos, page_table=page_table,
+                                        kv_cache=mtp_cache, active=act, kv_write=kv_write)  # fmt: skip
+            if sampled is not None:
+                _free(sampled[2])
             kv_write.end_step()
         finally:
             _free(act, lm, *[t for cs in rot.values() for t in cs])
+        out = (rm, a, m)
         if keep_hidden:
-            return rm, a, m, hn
-        _free(hn)
-        return rm, a, m
+            out += (hn,)
+        else:
+            _free(hn)
+        if sampled is not None:
+            out += (sampled[0], sampled[1], lg)
+        return out
+
+    def _sample_wide(self, lg, samplers):
+        """The T64 step's two sampler calls (trace-safe): ``A`` on the anchor rows ``lg[0:32]``, ``B`` on the draft rows
+        ``lg[32:64]`` (tile-aligned slices of the TILE logits, freed here), and the MTP input ``s = concat(tokens_a,
+        tokens_b)`` ``[1, 1, 1, 64]`` uint32 ROW_MAJOR (the split order of ``argmax_decode``). Returns ``(so_a, so_b,
+        s)``; the caller frees ``s`` after the MTP layer."""
+        A, B = samplers
+        n, V = int(self.cfg.max_batch), int(lg.shape[3])
+        mc = self.head.memory_config
+        so_a = so_b = None
+        la = ttnn.slice(lg, [0, 0, 0, 0], [1, 1, n, V], memory_config=mc)
+        try:
+            so_a = A.sample(la)
+        finally:
+            _free(la)
+        lb = ttnn.slice(lg, [0, 0, n, 0], [1, 1, 2 * n, V], memory_config=mc)
+        try:
+            so_b = B.sample(lb)
+        finally:
+            _free(lb)
+        s = ttnn.concat([so_a.tokens, so_b.tokens], dim=3, memory_config=mc)
+        return so_a, so_b, s
 
     def chunk_inputs(self, host: Union[ChunkHostTables, PackedHostTables]) -> PrefillChunkInputs:
         """Upload one prefill chunk's host tables (``attention.ChunkHostTables``: ``chunk_host_tables`` /

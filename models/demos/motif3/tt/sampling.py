@@ -1605,6 +1605,26 @@ class MotifDeviceSampler:
             self.stats["flagged_steps"] += int(nf > 0)
         return res
 
+    def stage_read(self, out: SamplerOutput) -> None:
+        """Enqueue a NON-blocking read of every chip's ``out.info`` into persistent staging (Phase G: the T64 step reads
+        two samplers' outputs with one blocking read; this one lands with the next blocking read of the step).
+        :meth:`staged_result` builds the result once that read returned."""
+        r = self._reader(out.info)
+        ttnn.copy_device_to_host_tensor(out.info, r.host, blocking=False)
+
+    def staged_result(self, out: SamplerOutput, *, count: bool = True) -> SampleResult:
+        """:class:`SampleResult` of a :meth:`stage_read` (call it after a later blocking read of the same step; the
+        staging is overwritten by the next read). Counters / stats as :meth:`read`."""
+        r = self._reader(out.info)
+        res = SampleResult.from_info(r.views[0])
+        res.counters = self._last_ctr.copy()
+        if count:
+            self.stats["steps"] += 1
+            nf = int(res.flags.sum())
+            self.stats["flagged_lanes"] += nf
+            self.stats["flagged_steps"] += int(nf > 0)
+        return res
+
     def resolve(
         self,
         res: SampleResult,

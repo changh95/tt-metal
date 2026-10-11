@@ -219,6 +219,7 @@ from .generator_api import (  # noqa: F401  (pool constants re-exported: gv.NULL
     resolve_weights_location,
     serving_additional_config,
     smoothed_acceptance,
+    spec_sampled_from_env,
 )
 
 ARCHITECTURE = "MotifForCausalLM"
@@ -244,6 +245,9 @@ MODEL_OWNED_DRAFTER = "vllm_tt_plugin.model_owned_drafter"
 SPEC_REQUIREMENTS = ("device_propose", "hidden_feed")  # the MTP layer reads the target's last hidden, on device
 SPEC_HIDDEN_HANDOFF = ("on_device",)  # keeps supports_narrow_decode (SPEC_DECODE_CONTRACT.md §1a)
 SPEC_ACCEPT_MODE = "argmax_ids"
+# Phase G (MOTIF3_SPEC_SAMPLED=on): the plan also offers the plugin's "sampled_ids" mode (speculative sampling); the
+# plugin asks for it on a launch that samples decode steps on device, and sampled requests then speculate.
+SPEC_SAMPLED_ACCEPT_MODE = "sampled_ids"
 # A drafted request takes two rows: its own lane + an idle partner lane (packed verify, features design §3.8.2), or its
 # anchor row + its draft row on the owner's DP row (the 64-row verify, T64; docs/p5_t64/P5_T64_DESIGN.md §4.1).
 SPEC_LANES_PER_REQUEST = 2
@@ -404,6 +408,16 @@ def spec_plan_supports_speculable_rows() -> bool:
     return any(f.name == "verify_requires_speculable_rows" for f in dataclasses.fields(SpecPlan))
 
 
+def spec_plan_supports_sampled_ids() -> bool:
+    """The installed vllm-tt-plugin knows the ``sampled_ids`` accept mode (speculative sampling). False when the
+    plugin predates it or is not importable."""
+    try:
+        from vllm_tt_plugin.spec_decode import ACCEPT_MODES
+    except Exception:  # pragma: no cover - no plugin
+        return False
+    return SPEC_SAMPLED_ACCEPT_MODE in ACCEPT_MODES
+
+
 def mtp_weights_status(vllm_config: Any = None, environ: Optional[Mapping[str, str]] = None) -> Tuple[bool, str]:
     """``(available, why)`` for the MTP layer's weights (``model.mtp_layers.0.*``, shard 104 of the checkpoint), cheap
     and device-free (``spec_plan`` runs at config time in the API server and in EngineCore). Never raises.
@@ -491,6 +505,16 @@ def _spec_plan(vllm_config: Any, max_num_seqs: int, requested_k: int):
         drafter_state="internal",  # the MTP cache is model-owned, indexed by the target's block ids
         supports_narrow_decode=True,  # an ordinary step is the [B, 1] decode (the same spec trace, host logits)
     )
+    if spec_sampled_from_env():
+        if spec_plan_supports_sampled_ids():
+            # Phase G: sampled requests speculate when the launch samples decode steps on device (the plugin latches
+            # sampled_ids then; without device sampling it keeps asking for argmax_ids and PS-1 holds them back)
+            kwargs["accept_modes"] = (SPEC_ACCEPT_MODE, SPEC_SAMPLED_ACCEPT_MODE)
+        else:
+            logger.warning(
+                "Motif-3 spec_plan: MOTIF3_SPEC_SAMPLED=on, but the installed vllm-tt-plugin has no 'sampled_ids' "
+                "accept mode, so sampled requests keep the PS-1 path (no speculation)"
+            )
     if spec_plan_supports_speculable_rows():
         kwargs["verify_requires_speculable_rows"] = True  # PS-1: a verify step never holds a sampled request
     else:
@@ -878,11 +902,17 @@ class SpecRetained(NamedTuple):
     ``pos0`` is the step's anchor position ``n``; ``argmax`` is ``(a0,)`` or, when the lane carried a draft, ``(a0,
     a1)``: the target's choice at ``n`` (the token at ``n + 1``) and at ``n + 1``; ``mtp`` is ``(m0,)`` / ``(m0, m1)``:
     the MTP layer's drafts for ``n + 2`` and ``n + 3``. The plugin commits ``argmax[:count]`` for a greedy row, so the
-    next draft is ``mtp[count - 1]``."""
+    next draft is ``mtp[count - 1]``.
+
+    Phase G (``MOTIF3_SPEC_SAMPLED=on``): ``argmax`` holds the tokens the MTP layer consumed (the device draws of the
+    step, before any host resolve; the argmax on a greedy row, bitwise), so a draft is offered exactly when the
+    committed tokens are the ones the MTP layer drafted after. ``sampled``: the row was sampled (temperature > 0), for
+    the drafting policy's per-class acceptance."""
 
     pos0: int
     argmax: Tuple[int, ...]
     mtp: Tuple[int, ...]
+    sampled: bool = False
 
     @property
     def drafted(self) -> bool:
@@ -907,6 +937,12 @@ class SpecStats:
     # (MotifGenerator.drafts_all_lanes), and the drafts they offered past the idle-lane budget (the 64-row step's own)
     all_lane_proposals: int = 0
     drafts_beyond_budget: int = 0
+    # Phase G (spec_sampled): the verdicts of sampled rows (included in accepted / rejected), sampled_ids verify steps,
+    # and those that came without sampling_params (served greedy)
+    accepted_sampled: int = 0
+    rejected_sampled: int = 0
+    sampled_verify_steps: int = 0
+    sampled_verify_without_params: int = 0
 
     @property
     def verdicts(self) -> int:
@@ -917,6 +953,15 @@ class SpecStats:
         """The drafting policy's acceptance estimate (review edit R-E3, ``generator_api.smoothed_acceptance``):
         ``(accepted + weight * prior) / (verdicts + weight)``; ``prior`` before any verdict."""
         return smoothed_acceptance(self.accepted, self.verdicts, prior=prior, weight=weight)
+
+    def class_acceptance(
+        self, sampled: bool, prior: float = DEFAULT_SPEC_ALPHA_PRIOR, weight: int = SPEC_ALPHA_PRIOR_WEIGHT
+    ) -> float:
+        """Phase G: :meth:`acceptance` of the greedy rows' or the sampled rows' verdicts alone."""
+        acc_s, ver_s = self.accepted_sampled, self.accepted_sampled + self.rejected_sampled
+        if sampled:
+            return smoothed_acceptance(acc_s, ver_s, prior=prior, weight=weight)
+        return smoothed_acceptance(self.accepted - acc_s, self.verdicts - ver_s, prior=prior, weight=weight)
 
     def as_dict(self) -> Dict[str, int]:
         return dataclasses.asdict(self)
@@ -972,6 +1017,14 @@ def lane_sampling_lists(
         t[lane], p[lane], k[lane] = float(T[row]), float(P[row]), int(K[row])
         sd[lane] = None if S[row] is None else int(S[row])
     return t, p, k, sd
+
+
+def _hot_lanes(sampling: Optional[Tuple[Sequence[float], ...]]) -> Optional[List[bool]]:
+    """Lane-ordered "sampled row" flags (temperature >= 1e-5, the sampler's greedy rule) of a step's
+    :func:`lane_sampling_lists`, or None for a step without device sampling."""
+    if sampling is None:
+        return None
+    return [float(t) >= 1e-5 for t in sampling[0]]
 
 
 def wants_logprobs(sampling_params: Any) -> bool:
@@ -1081,6 +1134,8 @@ class MotifForCausalLM:
         # Speculation (settings.spec_tokens = 1): every decode step goes through generator.decode_forward_spec and the
         # bridge keeps, per OWNER lane, what the last step computed (lanes are stable for a request's life).
         self._spec = bool(self.settings.spec_decode)
+        # Phase G (MOTIF3_SPEC_SAMPLED=on): verify steps may come in the plugin's "sampled_ids" mode
+        self._spec_sampled = self._spec and bool(getattr(self.settings, "spec_sampled", False))
         self._retained: Dict[int, SpecRetained] = {}
         self._propose_calls = 0
         self.spec_stats = SpecStats()
@@ -1256,6 +1311,12 @@ class MotifForCausalLM:
             self.drafting_threshold_text(),
             packed if s.packed_prefill else False,
         )
+        if getattr(s, "spec_sampled", False):  # Phase G; its own line keeps the features line the server checks grep
+            logger.info(
+                "Motif-3 spec_sampled: {} (MOTIF3_SPEC_SAMPLED=on; sampled requests speculate when the launch samples "
+                "decode steps on device)",
+                "on" if self._spec_sampled else "ignored (no speculation)",
+            )
         never = _inherits_default(type(self.generator), "drafts_all_lanes")
         if self._spec and s.spec_verify in WIDE_SPEC_VERIFY_MODES and never:
             logger.warning(
@@ -1891,7 +1952,9 @@ class MotifForCausalLM:
             check_spec_result(
                 "MotifGenerator.decode_forward_spec", result, want_logits=sampling is None, vocab_size=self.vocab_size
             )
-            retained = self._spec_retained(result, lanes, pos.tolist(), active.tolist(), [False] * rows)
+            retained = self._spec_retained(
+                result, lanes, pos.tolist(), active.tolist(), [False] * rows, _hot_lanes(sampling)
+            )
             if sampling is None:
                 logits = result.logits
             else:
@@ -2106,9 +2169,16 @@ class MotifForCausalLM:
             check_spec_side_tensors,
         )
 
-        if spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+        sampled_mode = spec_mode == SPEC_SAMPLED_ACCEPT_MODE
+        if sampled_mode and not self._spec_sampled:
             raise NotImplementedError(
-                f"Motif-3 verifies in spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} only, got {spec_mode!r}"
+                f"Motif-3 was asked to verify in spec_mode {spec_mode!r}, which this launch did not offer "
+                f"(MOTIF3_SPEC_SAMPLED=on with device sampling)"
+            )
+        if spec_mode != ACCEPT_MODE_ARGMAX_IDS and not sampled_mode:
+            raise NotImplementedError(
+                f"Motif-3 verifies in spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} or {SPEC_SAMPLED_ACCEPT_MODE!r} only, got "
+                f"{spec_mode!r}"
             )
         K = int(self.settings.spec_tokens)
         tok = torch.as_tensor(tokens)
@@ -2142,7 +2212,7 @@ class MotifForCausalLM:
             drafted.append(d)
             anchor.append(p0)
             need.append(((p1 if d else p0) // bs + 1) if p0 >= 0 else 0)
-        if sampling_params is not None:
+        if sampling_params is not None and not sampled_mode:
             temps = _param_list(sampling_params, "temperature")
             hot = sum(1 for i in range(min(rows, len(temps))) if active[i] and float(temps[i]) >= 1e-5)
             self.sampling_stats.verify_steps_with_params += 1
@@ -2172,24 +2242,44 @@ class MotifForCausalLM:
             draft_tokens=torch.tensor(lane_draft, dtype=torch.int32),
             page_table=lane_pt,
         )
+        sampling = None
+        if sampled_mode:
+            if sampling_params is not None:
+                sampling = lane_sampling_lists(sampling_params, lanes)
+                self.sampling_stats.verify_steps_with_params += 1
+            else:  # a host-sampled step cannot verify on this launch (held back); served greedy if it ever does
+                self.spec_stats.sampled_verify_without_params += 1
+            self.spec_stats.sampled_verify_steps += 1
+        spec_kw = {} if sampling is None else {"sampling": sampling}
         result = self.generator.decode_forward_spec(
-            batch, kv_cache=kv.device_cache, enable_trace=enable_trace, want_logits=False
+            batch, kv_cache=kv.device_cache, enable_trace=enable_trace, want_logits=False, **spec_kw
         )
         check_spec_result("MotifGenerator.decode_forward_spec", result, want_logits=False, vocab_size=self.vocab_size)
-        retained = self._spec_retained(result, lanes, anchor, active, drafted)
+        hot = _hot_lanes(sampling)
+        retained = self._spec_retained(result, lanes, anchor, active, drafted, hot)
+        if sampling is not None:
+            ids_t = getattr(result, "sampled_ids", None)
+            if ids_t is None:
+                raise RuntimeError(
+                    "MotifGenerator.decode_forward_spec returned no sampled_ids for a sampled verify step "
+                    "(spec_sampled needs the generator's samples_spec)"
+                )
+        else:
+            ids_t = result.argmax
         # Accepted: commit the slot move exactly once, then the retained ids.
         self._lanes.commit(slot_remap)
         self._retained.update(retained)
         self.spec_stats.verify_steps += 1
         self.spec_stats.drafts_verified += sum(drafted)
-        argmax = result.argmax.tolist()
+        lane_ids = ids_t.tolist()
         ids = [
-            [argmax[lane][0] if on else 0, argmax[lane][1] if d else PLACEHOLDER_TOKEN_ID]
+            [lane_ids[lane][0] if on else 0, lane_ids[lane][1] if d else PLACEHOLDER_TOKEN_ID]
             for lane, on, d in zip(lanes, active, drafted)
         ]
-        return VerifyOutput(
-            spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=torch.tensor(ids, dtype=torch.int32), hidden=None
-        )
+        out = torch.tensor(ids, dtype=torch.int32)
+        if sampled_mode:
+            return VerifyOutput(spec_mode=SPEC_SAMPLED_ACCEPT_MODE, sampled_ids=out, hidden=None)
+        return VerifyOutput(spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=out, hidden=None)
 
     def _spec_retained(
         self,
@@ -2198,12 +2288,17 @@ class MotifForCausalLM:
         anchor_pos: Sequence[int],
         active: Sequence[bool],
         drafted: Sequence[bool],
+        hot: Optional[Sequence[bool]] = None,
     ) -> Dict[int, SpecRetained]:
         """The per-lane entries a step leaves for ``propose_draft_tokens``, validated (ids in the vocabulary on every
-        active owner lane; column 1 on drafted lanes) before anything is committed."""
+        active owner lane; column 1 on drafted lanes) before anything is committed. Phase G: the retained tokens are
+        the MTP layer's inputs (``result.mtp_input``) when the generator reports them, else the argmax; ``hot``: the
+        lane-ordered "sampled row" flags (None = all greedy)."""
         out: Dict[int, SpecRetained] = {}
         V = self.vocab_size
-        argmax, mtp = result.argmax.tolist(), result.mtp_argmax.tolist()  # host lists: no per-element tensor indexing
+        mtp_in = getattr(result, "mtp_input", None)
+        argmax = (result.argmax if mtp_in is None else mtp_in).tolist()
+        mtp = result.mtp_argmax.tolist()  # host lists: no per-element tensor indexing
         for lane, on, d, p in zip(lanes, active, drafted, anchor_pos):
             if not on:
                 continue
@@ -2214,7 +2309,7 @@ class MotifForCausalLM:
                     f"MotifGenerator.decode_forward_spec: lane {lane} returned argmax {a} / MTP argmax {m} outside "
                     f"[0, {V})"
                 )
-            out[int(lane)] = SpecRetained(int(p), a, m)
+            out[int(lane)] = SpecRetained(int(p), a, m, bool(hot[lane]) if hot is not None else False)
         return out
 
     # ---- drafting policy (T64: docs/p5_t64/P5_T64_DESIGN.md §4.5, §4.7; review edits R-E3, R-E9) --------------
@@ -2282,7 +2377,21 @@ class MotifForCausalLM:
 
         return take
 
-    def _draft_budget(self, live_lanes: Sequence[int]) -> Callable[[int], bool]:
+    def _policy_acceptance(self, live_lanes: Sequence[int]) -> float:
+        """The acceptance the drafting policy asks the generator with (Phase G, design R9): :meth:`spec_acceptance`
+        while no live lane is a sampled row (bitwise the Phase F policy for greedy traffic); otherwise the live lanes'
+        mean of the per-class estimates (:meth:`SpecStats.class_acceptance`), so sampled traffic with a lower
+        acceptance does not lower the greedy rows' estimate, nor the reverse."""
+        sampled = sum(1 for lane in live_lanes if (st := self._retained.get(lane)) is not None and st.sampled)
+        if not sampled:
+            return self.spec_acceptance()
+        prior = self.settings.spec_alpha_prior
+        g = len(live_lanes) - sampled
+        a_s = self.spec_stats.class_acceptance(True, prior)
+        a_g = self.spec_stats.class_acceptance(False, prior)
+        return (g * a_g + sampled * a_s) / max(1, len(live_lanes))
+
+    def _draft_budget(self, live_lanes: Sequence[int], acceptance: Optional[float] = None) -> Callable[[int], bool]:
         """``take(owner_lane) -> bool``: whether the next step can verify one more draft.
 
         The generator answers first: ``generator.drafts_all_lanes(live_lanes, acceptance=alpha_hat)``, alpha_hat =
@@ -2293,7 +2402,8 @@ class MotifForCausalLM:
         not express). Counted in ``spec_stats.all_lane_proposals`` / ``drafts_beyond_budget``."""
         live = tuple(dict.fromkeys(int(lane) for lane in live_lanes))
         budget = self._idle_lane_budget(live)
-        if not live or not bool(self.generator.drafts_all_lanes(live, acceptance=self.spec_acceptance())):
+        a = self.spec_acceptance() if acceptance is None else float(acceptance)
+        if not live or not bool(self.generator.drafts_all_lanes(live, acceptance=a)):
             return budget
         stats = self.spec_stats
         stats.all_lane_proposals += 1
@@ -2372,14 +2482,17 @@ class MotifForCausalLM:
             if st.drafted:
                 if c == 2:
                     stats.accepted += 1
+                    stats.accepted_sampled += int(st.sampled)
                 else:
                     stats.rejected += 1
+                    stats.rejected_sampled += int(st.sampled)
             if tuple(committed_l[i][:c]) != st.argmax[:c]:
                 stats.declined_mismatch += 1
                 continue
             candidates.append((i, st.mtp[c - 1]))
         if candidates:  # after this step's verdicts: the acceptance the budget asks with includes them
-            take = self._draft_budget([lane for lane, on in zip(lanes, live) if on])
+            live_lanes = [lane for lane, on in zip(lanes, live) if on]
+            take = self._draft_budget(live_lanes, acceptance=self._policy_acceptance(live_lanes))
             for i, draft in candidates:
                 if not take(lanes[i]):
                     stats.declined_budget += 1

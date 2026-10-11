@@ -189,7 +189,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -225,7 +225,7 @@ from .model_config import ROUTER_EXACT_FP32_DECODE_ROWS, MotifTTConfig, require_
 from .moe import EXACT_ROUTER_DECODE_ROWS
 from .mtp import mtp_next_tokens
 from .rope import dp_row_mapper, positions_to_rot_idxs, shard_lanes
-from .sampling import MotifDeviceSampler, SampleResult, SamplerOutput
+from .sampling import SAMPLING_EPS, MotifDeviceSampler, SampleResult, SamplerOutput
 
 # A prefill program-set key: solo (path "sp0" | "sp1", bucket); packed ("pk0", T, S) | ("pk1", T, S, "shared" |
 # "distinct") (prefill_plan.PrefillPass.shape; MotifTTConfig.packed_prefill_shapes()).
@@ -262,6 +262,19 @@ def _free(*ts) -> None:
             pass
 
 
+def _extra_tensors(extra: Optional[Dict[str, Any]]) -> List[Any]:
+    """The device tensors of a Phase G T64 step's extra outputs (``so_b``'s tensors and ``lg``), for freeing."""
+    if not extra:
+        return []
+    out: List[Any] = []
+    for v in extra.values():
+        if isinstance(v, SamplerOutput):
+            out += v.tensors()
+        elif v is not None:
+            out.append(v)
+    return out
+
+
 def _exact_router_refusal(wide_m: int) -> Optional[str]:
     """Why ``spec_verify="auto"`` cannot run with ``router_logits="exact_fp32"`` at the T64 step's ``wide_m`` gathered
     decode rows (review edit R-E7), or None when it can. Both lists must name ``wide_m``:
@@ -292,9 +305,49 @@ class SampledSpecDecodeResult(api.SpecDecodeResult):
     already resolved on the host)."""
 
     sample: Optional[SampleResult] = None
+    # Phase G (spec_sampled): ``int32 [32, 2]`` owner order. ``sampled_ids``: the step's draws (column 0 the anchor's,
+    # column 1 the draft row's on drafted lanes; flagged lanes resolved on the host; a greedy lane carries its argmax;
+    # -1 where the contract leaves the entry unspecified). ``mtp_input``: the tokens the MTP layer consumed (the device
+    # draws before any host resolve; the argmax where no sampler ran). None on a launch without spec_sampled.
+    sampled_ids: Optional[torch.Tensor] = None
+    mtp_input: Optional[torch.Tensor] = None
+
+
+# Domain constant of the T64 draft-row sampler's host RNG (unseeded lanes; Phase G design §3.4): its stream is
+# splitmix64(rng_seed ^ this), independent of the anchor sampler's (rng_seed).
+SAMPLER_B_RNG_DOMAIN = 0x5350454353414D50  # "SPECSAMP"
+
+
+def _splitmix64(x: int) -> int:
+    x = (int(x) + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = x
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return z ^ (z >> 31)
+
+
+def sampler_b_rng_seed(rng_seed: Optional[int]) -> Optional[int]:
+    """The T64 draft-row sampler's host-RNG seed for the anchor sampler's ``rng_seed`` (None stays None: OS entropy)."""
+    return None if rng_seed is None else _splitmix64((int(rng_seed) & 0xFFFFFFFFFFFFFFFF) ^ SAMPLER_B_RNG_DOMAIN)
 
 
 LaneSampling = Tuple[Sequence[float], Sequence[float], Sequence[int], Sequence[Optional[int]]]
+
+
+def _greedy_lane_sampling(n: int = api.NUM_LANES) -> LaneSampling:
+    """All-greedy lane lists (the plugin's padding defaults: temperature 0, top_p 1, top_k 1, no seed)."""
+    return [0.0] * n, [1.0] * n, [1] * n, [None] * n
+
+
+def _partner_lane_sampling(sampling: LaneSampling, partner_of: Mapping[int, int]) -> LaneSampling:
+    """Phase G, a sampled T32 packed verify: the PHYSICAL lanes' ``(temperature, top_p, top_k, seeds)``. An owner lane
+    keeps its own; the idle partner lane that carries an owner's draft takes the owner's (its seed included, so a
+    seeded draft row draws from the owner's ``(seed, n + 1)`` counters); other idle lanes stay as sent (padding:
+    greedy)."""
+    t, p, k, sd = (list(v.reshape(-1).tolist()) if isinstance(v, torch.Tensor) else list(v) for v in sampling)
+    for o, d in partner_of.items():
+        t[d], p[d], k[d], sd[d] = t[o], p[o], k[o], sd[o]
+    return t, p, k, sd
 
 
 # ======================================================================================================================
@@ -620,6 +673,9 @@ class DecodePath:
     pool: Any = None
     warmed: bool = False
     so: Optional[SamplerOutput] = None
+    # Phase G (spec_sampled) T64 trace: the draft-row sampler's outputs ("so_b") and the kept TILE logits ("lg", the
+    # host fallback's source); None otherwise
+    extra: Optional[Dict[str, Any]] = None
     # B6a ``host_staging="fast"``: the host values last copied into each of ``inputs`` (an input whose new values are
     # equal is not copied again; DecodeKVWrite.write_step does the same for its inputs)
     host_last: Dict[str, torch.Tensor] = field(default_factory=dict)
@@ -899,6 +955,14 @@ class MotifGenerator(api.MotifGenerator):
         # and captures hand them over through _take_so)
         self.sampler: Optional[MotifDeviceSampler] = None
         self._pending_so: Optional[SamplerOutput] = None
+        # Phase G (MOTIF3_SPEC_SAMPLED, cfg.spec_sampled): speculative sampling on a speculating launch. Effective once
+        # the device sampler exists (samples_spec); the T64 path then also holds a second sampler for its draft rows.
+        self.spec_sampled = bool(getattr(cfg, "spec_sampled", False)) and spec
+        if bool(getattr(cfg, "spec_sampled", False)) and not spec:
+            self.log("spec_sampled ignored: the launch does not speculate (spec_tokens = 0 or no MTP layer)")
+        self.sampler_b: Optional[MotifDeviceSampler] = None
+        self._pending_extra: Optional[Dict[str, Any]] = None
+        self._warned_once: Set[str] = set()
         self.stats: Dict[str, int] = {
             "prefill_calls": 0,
             "prefill_rows": 0,
@@ -934,6 +998,12 @@ class MotifGenerator(api.MotifGenerator):
             "gumbel_lanes": 0,  # ... of which full-vocab (top_p = 1) Gumbel lanes
             "fallback_steps": 0,  # device-sampled steps that read the logits for the host fallback
             "fallback_lanes": 0,  # ... active lanes re-sampled on the host
+            # Phase G (spec_sampled)
+            "sampled_verify_steps": 0,  # verify steps whose rows were sampled on device (sampled_ids)
+            "sampled_verify_rows": 0,  # ... their non-greedy active owner rows
+            "sampled_drafts": 0,  # ... drafts of non-greedy rows they verified
+            "greedy_s_ne_a": 0,  # greedy active rows whose device sample differs from the argmax (must stay 0)
+            "draft_fallback_lanes": 0,  # T64 draft rows re-sampled on the host
         }
         self.timings: Dict[str, float] = {}
         self.spec_profile: Dict[str, float] = {k: 0.0 for k in SPEC_PROFILE_KEYS}
@@ -1249,6 +1319,7 @@ class MotifGenerator(api.MotifGenerator):
             sampling,
             kv_mode=self.spec_kv_mode,
             lanes_per_row=int(self.cfg.lanes_per_row),
+            sampled_verify=self.samples_spec,
         )
 
     # ==============================================================================================================
@@ -1280,14 +1351,37 @@ class MotifGenerator(api.MotifGenerator):
             raise ValueError(f"the device sampler needs the LM head's 'mesh' vocab split, got {head.vocab_split!r}")
         t0 = time.time()
         self.sampler = MotifDeviceSampler(self.mesh_device, self.cfg, ccl=self.model.ccl, **sampler_kwargs)
+        if self.spec_sampled and self.wide_path is not None:  # Phase G: the T64 draft rows' sampler
+            kw_b = dict(sampler_kwargs)
+            kw_b["rng_seed"] = sampler_b_rng_seed(sampler_kwargs.get("rng_seed"))
+            if sampler_kwargs.get("rng_seed") is None:
+                kw_b.pop("rng_seed")
+            self.sampler_b = MotifDeviceSampler(self.mesh_device, self.cfg, ccl=self.model.ccl, **kw_b)
         for p in self._paths.values():
             p.warmed = False
         s = self.sampler
         self.log(
             f"device sampling on: K {s.K}, W {s.W}, logprobs {s.logprobs}, rng {s.rng}, gumbel {s.gumbel} "
             f"({time.time() - t0:.1f} s); every decode step of the trace runs the sampler"
+            + (
+                f"; spec_sampled: the T32-spec trace samples before the MTP layer"
+                f"{' and the T64 trace samples its anchor and draft rows (2 samplers)' if self.sampler_b else ''}"
+                if self.spec_sampled
+                else ""
+            )
         )
         return s
+
+    @property
+    def samples_spec(self) -> bool:
+        """Phase G: the speculating traces sample before the MTP layer and serve sampled verify steps
+        (``cfg.spec_sampled`` on a speculating launch with the device sampler; the T64 path also needs its draft-row
+        sampler)."""
+        return bool(self.spec_sampled and self.sampler is not None and (self.wide_path is None or self.sampler_b))
+
+    def _take_extra(self) -> Optional[Dict[str, Any]]:
+        extra, self._pending_extra = self._pending_extra, None
+        return extra
 
     def _require_sampler(self) -> MotifDeviceSampler:
         if self.sampler is None:
@@ -1318,29 +1412,38 @@ class MotifGenerator(api.MotifGenerator):
             _free(lg)
         return rm
 
-    def _finish_sampled(self, kind: str, positions: torch.Tensor, res: SampleResult, rm) -> SampleResult:
+    def _finish_sampled(
+        self, kind: str, positions: torch.Tensor, res: SampleResult, rm, *, smp: Optional[MotifDeviceSampler] = None,
+        logits_fn: Optional[Callable[[], torch.Tensor]] = None, count: bool = True,
+    ) -> SampleResult:  # fmt: skip
         """Counters, the host fallback of the flagged ACTIVE lanes (exact, the step's 53-bit uniform; the logits are
-        read only then) and the test observer."""
-        smp = self.sampler
+        read only then) and the test observer. ``smp`` (default :attr:`sampler`) and ``logits_fn`` (default: the host
+        read of ``rm``) serve Phase G's T64 rows (the draft rows' sampler; the kept 64-row logits); ``count=False``:
+        the step's sampled counters are not advanced (the T64 draft rows of a step already counted)."""
+        smp = self.sampler if smp is None else smp
         active = positions >= 0
         cache: List[torch.Tensor] = []
 
         def logits() -> torch.Tensor:
             if not cache:
-                cache.append(self.model.head.logits_to_host(rm))
+                cache.append(self.model.head.logits_to_host(rm) if logits_fn is None else logits_fn())
             return cache[0]
 
         st = self.stats
-        st["sampled_steps"] += 1
         act = active.tolist()
-        st["sampled_lanes"] += sum(act)
+        if count:
+            st["sampled_steps"] += 1
+            st["sampled_lanes"] += sum(act)
         if smp.gumbel:
             st["gumbel_lanes"] += sum(1 for on, lp in zip(act, smp.lane_params) if on and lp.full_support)
         flagged = res.flags & active
         if bool(flagged.any()):
             res = smp.resolve(res, logits, active=active)
-            st["fallback_steps"] += 1
-            st["fallback_lanes"] += int(flagged.sum())
+            if count:
+                st["fallback_steps"] += 1
+                st["fallback_lanes"] += int(flagged.sum())
+            else:
+                st["draft_fallback_lanes"] += int(flagged.sum())
         if self.sampling_observer is not None:
             self.sampling_observer(kind, positions, res, logits)
         return res
@@ -1354,6 +1457,11 @@ class MotifGenerator(api.MotifGenerator):
         out: Dict[str, Any] = {k: st[k] for k in ("sampled_steps", "sampled_lanes", "gumbel_lanes", "fallback_steps",
                                                   "fallback_lanes")}  # fmt: skip
         out.update({f"sampler_{k}": v for k, v in self.sampler.stats.items()})
+        if self.spec_sampled:
+            out.update({k: st[k] for k in ("sampled_verify_steps", "sampled_verify_rows", "sampled_drafts",
+                                           "greedy_s_ne_a", "draft_fallback_lanes")})  # fmt: skip
+            if self.sampler_b is not None:
+                out.update({f"sampler_b_{k}": v for k, v in self.sampler_b.stats.items()})
         n = max(1, st["sampled_steps"])
         out["fallback_step_rate"] = round(st["fallback_steps"] / n, 6)
         out["fallback_lane_rate"] = round(st["fallback_lanes"] / max(1, st["sampled_lanes"]), 6)
@@ -2200,6 +2308,12 @@ class MotifGenerator(api.MotifGenerator):
         """One T32-spec step on the device (eager or inside a capture): ``(rm, a, m)`` (``MotifModel.decode_spec``).
         With device sampling the step also samples ``rm`` (ROW_MAJOR: one tilize inside the sampler); its outputs
         wait in :meth:`_take_so`."""
+        if self.samples_spec:  # Phase G: the sampler runs inside decode_spec, before the MTP layer
+            rm, a, m, so = self.model.decode_spec(
+                p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool, sampler=self.sampler
+            )
+            self._pending_so = so
+            return rm, a, m
         out = self.model.decode_spec(p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool)
         if self.sampler is not None:
             try:
@@ -2215,6 +2329,14 @@ class MotifGenerator(api.MotifGenerator):
         device sampling the step also samples ``rm`` (the 32 anchors, exactly the ``[1, 1, 32, 6880]`` the T32 trace
         samples); its outputs wait in :meth:`_take_so`. In ``auto`` the T64 trace holds no sampler."""
         want_rm = self.wide_has_logits
+        if self.samples_spec:  # Phase G: anchors with the sampler, drafts with sampler_b, before the MTP layer
+            rm, a, m, so_a, so_b, lg = self.model.decode_wide(
+                p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool, want_rm=want_rm,
+                samplers=(self.sampler, self.sampler_b),
+            )  # fmt: skip
+            self._pending_so = so_a
+            self._pending_extra = {"so_b": so_b, "lg": lg}
+            return rm, a, m
         out = self.model.decode_wide(
             p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool, want_rm=want_rm
         )
@@ -2635,11 +2757,21 @@ class MotifGenerator(api.MotifGenerator):
           pass). Logits (``spec_verify="wide"`` only; in ``auto`` the T64 trace is argmax-only and a step that wants
           logits or sampling runs on T32): the anchor rows.
 
-        ``sampling`` (device sampling; an ORDINARY step only -- a verify step returns argmax ids and PS-1 keeps sampled
-        rows out of it): the lane-ordered ``(temperature, top_p, top_k, seeds)`` of :meth:`decode_forward_sampled`;
-        the step samples every lane on device (the anchors' positions key the RNG) and returns a
-        :class:`SampledSpecDecodeResult` whose ``sample`` holds the tokens (flagged active lanes resolved on the
-        host); ``a`` / ``m`` are still returned for the bridge's speculation bookkeeping.
+        ``sampling`` (device sampling): the lane-ordered ``(temperature, top_p, top_k, seeds)`` of
+        :meth:`decode_forward_sampled`. On an ORDINARY step the step samples every lane on device (the anchors'
+        positions key the RNG) and returns a :class:`SampledSpecDecodeResult` whose ``sample`` holds the tokens
+        (flagged active lanes resolved on the host); ``a`` / ``m`` are still returned for the bridge's speculation
+        bookkeeping. A VERIFY step with sampling needs :attr:`samples_spec` (Phase G, ``MOTIF3_SPEC_SAMPLED=on``):
+
+        * T32: the partner lane that carries a draft is sampled with its owner's parameters and seed at its physical
+          position ``n + 1`` (an overflow pass is refused: the bridge's idle-lane budget never needs it, and ``auto``
+          sends such a step to T64);
+        * T64: the anchor rows with :attr:`sampler` at ``n``, the draft rows with :attr:`sampler_b` at ``n + 1``;
+
+        ``sampled_ids`` then holds each row's draw at the anchor (column 0) and after the draft (column 1), with noise
+        independent of the draft (counters of ``(seed, position)``, or fresh host bits); greedy rows carry the argmax.
+        With :attr:`samples_spec` every step also reports ``mtp_input`` (the tokens the MTP layer consumed), and a step
+        without ``sampling`` runs the in-trace sampler with greedy parameters, so its MTP input is the argmax.
 
         Every step ends in one blocking read of the outputs it replayed (F3N rule R4: a replay of the other trace while
         outputs are unread is refused, :meth:`_replay`)."""
@@ -2664,31 +2796,65 @@ class MotifGenerator(api.MotifGenerator):
         else:
             plan = self.plan_spec_step(batch, path=key)
             passes = plan.passes
-        smp = None
+        sspec = self.samples_spec  # Phase G: the traces sample before the MTP layer
+        smp = smp_b = None
+        sampled_verify = False
         if sampling is not None:
             smp = self._require_sampler()
             if plan.is_verify:
-                raise ValueError(
-                    "device sampling on a verify step: a verify returns the target argmax ids (PS-1 keeps sampled "
-                    "rows out of verify steps); sample on ordinary steps only"
-                )
-            if wide and not self.wide_has_logits:
+                if not sspec:
+                    raise ValueError(
+                        "device sampling on a verify step: a verify returns the target argmax ids (PS-1 keeps sampled "
+                        "rows out of verify steps); sample on ordinary steps only (or MOTIF3_SPEC_SAMPLED=on)"
+                    )
+                sampled_verify = True
+                if not wide and len(passes) > 1:
+                    raise ValueError(
+                        f"a sampled verify step whose drafts do not all fit idle lanes ({len(plan.overflow)} overflow): "
+                        f"the overflow pass holds no draft-row sampler (the bridge's idle-lane budget prevents it; "
+                        f"spec_verify='auto' runs such a step on T64)"
+                    )
+            if wide and not (self.wide_has_logits or sspec):
                 raise ValueError(
                     f"device sampling on the T64 trace of a spec_verify={self.spec_verify!r} launch: it holds no "
                     f"sampler (sampled steps run on the T32-spec trace)"
                 )
+            if wide and sspec:
+                smp_b = self.sampler_b
         use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
-        if smp is not None and use_trace and self._paths[key].so is None:
+        if (smp is not None or sspec) and use_trace and self._paths[key].so is None:
             raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
+        if sspec and wide and use_trace and self._paths[key].extra is None:
+            raise RuntimeError("the T64 trace was captured without spec_sampled's samplers (release_traces() first)")
         p = self._stage_path(key, batch.page_table_width)
         head, outs, logits = self.model.head, [], None
         n_ids = api.WIDE_ROWS if wide else api.NUM_LANES  # a / m: 32 lane-ordered ids (T32), 64 split-order (T64)
         prof = self.spec_profile
         t_prev = time.perf_counter()
         prof["plan"] += (t_prev - t0) * 1e3
+        phys_pos = batch.positions  # the sampled lanes' input positions (T32 verify: the physical ones)
+        draft_pos = None  # T64: the draft rows' positions (n + 1 on drafted lanes, else -1)
         if smp is not None:
-            smp.set_params(*sampling)  # host compare; a device write only when the lanes' parameters changed
-            smp.set_positions(batch.positions)  # the step's RNG counters (anchor positions n)
+            if wide:
+                smp.set_params(*sampling)  # host compare; a device write only when the lanes' parameters changed
+                smp.set_positions(batch.positions)  # the step's RNG counters (anchor positions n)
+                if smp_b is not None:
+                    draft_pos = torch.where(batch.has_draft, batch.positions + 1, torch.full_like(batch.positions, -1))
+                    smp_b.set_params(*sampling)
+                    smp_b.set_positions(draft_pos)  # the draft rows' counters: position n + 1
+            elif sampled_verify:
+                phys = _partner_lane_sampling(sampling, plan.partner_of)
+                phys_pos = plan.passes[0].step.positions
+                smp.set_params(*phys)
+                smp.set_positions(phys_pos)
+            else:
+                smp.set_params(*sampling)
+                smp.set_positions(batch.positions)
+        elif sspec:  # a host-sampled (or test) step: greedy parameters, so the MTP layer reads the argmax
+            g = _greedy_lane_sampling()
+            self.sampler.set_params(*g)
+            if wide and self.sampler_b is not None:
+                self.sampler_b.set_params(*g)
         # Fast path (traced, "mesh" vocab split, no observer): every pass is enqueued back to back -- its inputs, the
         # replay, then non-blocking reads of a / m into pass-indexed host staging -- and only the step's LAST read
         # blocks (the logits on an ordinary step, else the last m; on a device-sampled step the sampler's info read
@@ -2698,16 +2864,16 @@ class MotifGenerator(api.MotifGenerator):
         fast = use_trace and head.vocab_split == "mesh" and self.spec_observer is None
         staged = []
         n_pass = len(passes)
-        res_s = None
+        res_s = res_b = None
         keep_dev = None  # an eager device-sampled step keeps its outputs until the host fallback ran
-        rm_s = None
+        rm_s = lg_s = None
         try:
             for i, ps in enumerate(passes):
                 if wide:
                     self._write_wide(p, ps)
                 else:
                     self._write_spec(p, ps)
-                dev = so = None
+                dev = so = extra = None
                 t1 = time.perf_counter()
                 t_enq = None
                 if use_trace:
@@ -2715,9 +2881,11 @@ class MotifGenerator(api.MotifGenerator):
                     t_enq = time.perf_counter()
                     rm, a_t, m_t = p.out
                     so_read = p.so
+                    extra_read = p.extra
                 else:
                     rm, a_t, m_t = dev = self._device_step(p, pool)
                     so = so_read = self._take_so()
+                    extra = extra_read = self._take_extra()
                 read_logits = rm is not None and (
                     (bool(want_logits) and i == 0) or (self.spec_observer is not None and self.observe_logits)
                 )
@@ -2732,7 +2900,12 @@ class MotifGenerator(api.MotifGenerator):
                     t_read = self._spin(wkey, t_enq) if (block or sample_here or read_logits) else None
                     ttnn.copy_device_to_host_tensor(m_t, rmm.host, blocking=block)
                     if sample_here:  # the step's one blocking read: every chip's info (lands a / m too)
-                        res_s = smp.read(so_read, mesh_sync=True)
+                        if smp_b is not None:  # T64 + spec_sampled: A's info staged, B's read blocks
+                            smp.stage_read(so_read)
+                            res_b = smp_b.read(extra_read["so_b"], mesh_sync=True)
+                            res_s = smp.staged_result(so_read)
+                        else:
+                            res_s = smp.read(so_read, mesh_sync=True)
                     if block or sample_here:
                         self._waited(wkey, t_enq, t_read)
                     t3 = time.perf_counter()
@@ -2743,6 +2916,7 @@ class MotifGenerator(api.MotifGenerator):
                     staged.append((ra, rmm))
                     if sample_here:
                         rm_s = rm
+                        lg_s = None if extra_read is None else extra_read.get("lg")
                 else:
                     try:
                         t_read = self._spin(wkey, t_enq) if t_enq is not None else None
@@ -2754,13 +2928,16 @@ class MotifGenerator(api.MotifGenerator):
                         lg = head.logits_to_host(rm) if read_logits else None
                         if sample_here:
                             res_s = smp.read(so_read)
+                            if smp_b is not None:
+                                res_b = smp_b.read(extra_read["so_b"])
                             rm_s = rm
+                            lg_s = None if extra_read is None else extra_read.get("lg")
                     finally:
                         if dev is not None:
                             if sample_here:
-                                keep_dev = (dev, so)  # freed after the host fallback (it may read rm)
+                                keep_dev = (dev, so, extra)  # freed after the host fallback (it may read rm / lg)
                             else:
-                                _free(*dev, so)
+                                _free(*dev, so, *_extra_tensors(extra))
                     outs.append((a, m))
                 t4 = time.perf_counter()
                 prof["write"] += (t1 - t_prev) * 1e3
@@ -2782,17 +2959,45 @@ class MotifGenerator(api.MotifGenerator):
             else:
                 res = plan.result(outs, logits=logits)
             if smp is not None:
-                res_s = self._finish_sampled(key[0], batch.positions, res_s, rm_s)
+                dev_a = res_s.tokens.clone()  # the device draws (the MTP layer's input), before any host resolve
+                dev_b = None if res_b is None else res_b.tokens.clone()
+                rows64: List[torch.Tensor] = []
+
+                def logits64() -> torch.Tensor:  # the T64 step's 64 host logits rows, read once, only on a flag
+                    if not rows64:
+                        rows64.append(head.logits_rows_to_host(lg_s))
+                    return rows64[0]
+
+                if wide and sspec:
+                    res_s = self._finish_sampled(key[0], phys_pos, res_s, None, logits_fn=lambda: logits64()[:32])
+                    if res_b is not None:
+                        res_b = self._finish_sampled(
+                            key[0] + "_draft", draft_pos, res_b, None, smp=smp_b, logits_fn=lambda: logits64()[32:],
+                            count=False,
+                        )  # fmt: skip
+                else:
+                    res_s = self._finish_sampled(key[0], phys_pos, res_s, rm_s)
+                sampled_ids = mtp_input = None
+                if sspec:
+                    sampled_ids, mtp_input = self._spec_sampled_ids(
+                        plan, wide, res, sampling, res_s, res_b, dev_a, dev_b, sampled_verify
+                    )
                 res = SampledSpecDecodeResult(
-                    logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=res_s
-                )
+                    logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=res_s,
+                    sampled_ids=sampled_ids, mtp_input=mtp_input,
+                )  # fmt: skip
+            elif sspec:  # greedy parameters ran in the trace: the MTP input is the argmax
+                res = SampledSpecDecodeResult(
+                    logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=None,
+                    sampled_ids=None, mtp_input=res.argmax.clone(),
+                )  # fmt: skip
             self._read_done()
         except BaseException:
             self._abort_step()
             raise
         finally:
             if keep_dev is not None:
-                _free(*keep_dev[0], keep_dev[1])
+                _free(*keep_dev[0], keep_dev[1], *_extra_tensors(keep_dev[2]))
         st = self.stats
         st["spec_steps"] += 1
         st["verify_steps"] += int(plan.is_verify)
@@ -2816,6 +3021,60 @@ class MotifGenerator(api.MotifGenerator):
         prof["total"] += (t5 - t0) * 1e3
         self.timings["last_spec_step_ms"] = (t5 - t0) * 1e3
         return res
+
+    def _spec_sampled_ids(
+        self, plan, wide: bool, res: api.SpecDecodeResult, sampling: LaneSampling, res_s: SampleResult,
+        res_b: Optional[SampleResult], dev_a: torch.Tensor, dev_b: Optional[torch.Tensor], verify: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+        """Phase G: the owner-order ``(sampled_ids, mtp_input)`` ``int32 [32, 2]`` of a sampled spec step (host only).
+
+        T32: column 0 from the owner lane, column 1 from its partner lane (``plan.partner_of``); T64: column 0 from
+        the anchor sampler, column 1 from the draft-row sampler. A greedy row's ``sampled_ids`` are its ``argmax``
+        (bitwise the device draw by the sampler's greedy rule; ``stats["greedy_s_ne_a"]`` counts any active greedy
+        row whose device draw differs). Unspecified entries (inactive lanes, column 1 of undrafted lanes) are -1."""
+        n = api.NUM_LANES
+        temps = [float(t) for t in sampling[0]]
+        greedy = [not (t >= SAMPLING_EPS) for t in temps]  # LaneParams.greedy
+        batch_active = plan.batch.active.tolist()
+        drafted = plan.batch.has_draft.tolist()
+        am = res.argmax.tolist()
+        tok_a, dv_a = res_s.tokens.tolist(), dev_a.tolist()
+        tok_b = None if res_b is None else res_b.tokens.tolist()
+        dv_b = None if dev_b is None else dev_b.tolist()
+        partner = {} if wide else dict(plan.partner_of)
+        sid = [[-1, -1] for _ in range(n)]
+        mtp = [[-1, -1] for _ in range(n)]
+        mism = rows = drafts = 0
+        for lane in range(n):
+            if not batch_active[lane]:
+                continue
+            g = greedy[lane]
+            mtp[lane][0] = dv_a[lane]
+            sid[lane][0] = am[lane][0] if g else tok_a[lane]
+            mism += int(g and dv_a[lane] != am[lane][0])
+            rows += int(not g)
+            if drafted[lane]:
+                if wide:
+                    d_tok, d_dev = tok_b[lane], dv_b[lane]
+                else:
+                    q = partner.get(lane)
+                    if q is None:  # unreachable: an overflow pass is refused with sampling
+                        raise RuntimeError(f"lane {lane}: a draft without a partner lane on a sampled T32 step")
+                    d_tok, d_dev = tok_a[q], dv_a[q]
+                mtp[lane][1] = d_dev
+                sid[lane][1] = am[lane][1] if g else d_tok
+                mism += int(g and d_dev != am[lane][1])
+                drafts += int(not g)
+        st = self.stats
+        st["greedy_s_ne_a"] += mism
+        if verify:
+            st["sampled_verify_steps"] += 1
+            st["sampled_verify_rows"] += rows
+            st["sampled_drafts"] += drafts
+        if mism and "greedy_s_ne_a" not in self._warned_once:
+            self._warned_once.add("greedy_s_ne_a")
+            self.log(f"warning: {mism} greedy row(s) whose device sample differs from the argmax (spec_sampled)")
+        return torch.tensor(sid, dtype=torch.int32), torch.tensor(mtp, dtype=torch.int32)
 
     def _out_reader(self, role: str, t) -> HostShardReader:
         """Persistent host staging (``lm_head.HostShardReader``: every chip's copy, read concurrently) of one spec
@@ -2964,6 +3223,7 @@ class MotifGenerator(api.MotifGenerator):
                 self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
                 rm, a, m = outs = self._spec_step(p, pool)
             so = self._take_so()
+            extra = self._take_extra()
             try:
                 head.tokens_to_host(a)
                 head.tokens_to_host(m)
@@ -2972,8 +3232,14 @@ class MotifGenerator(api.MotifGenerator):
                 if so is not None:  # the sampler's reads (chip 0 and the staged every-chip read) before the capture
                     self.sampler.read(so, count=False)
                     self.sampler.read(so, mesh_sync=True, count=False)
+                    if extra is not None:  # Phase G T64: the staged read of A, B's reads, the 64-row logits read
+                        self.sampler.stage_read(so)
+                        self.sampler.staged_result(so, count=False)
+                        self.sampler_b.read(extra["so_b"], count=False)
+                        self.sampler_b.read(extra["so_b"], mesh_sync=True, count=False)
+                        head.logits_rows_to_host(extra["lg"])
             finally:
-                _free(*outs, so)
+                _free(*outs, so, *_extra_tensors(extra))
         else:
             self._write_plain(p, api.DecodeBatch(tokens=tokens, positions=pos, page_table=pt))
             out = self._plain_step(p, pool)
@@ -3116,6 +3382,7 @@ class MotifGenerator(api.MotifGenerator):
         outs = list(p.out if isinstance(p.out, tuple) else (p.out,))
         if p.so is not None:
             outs += list(p.so.tensors())
+        outs += _extra_tensors(p.extra)
         for t in outs:
             if t is not None:
                 tat.acknowledge_corruptible(t)
@@ -3127,7 +3394,7 @@ class MotifGenerator(api.MotifGenerator):
         try:
             out = self._device_step(p, pool)
         except BaseException:
-            _free(self._take_so())
+            _free(self._take_so(), *_extra_tensors(self._take_extra()))
             try:
                 ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
             except Exception:
@@ -3138,6 +3405,7 @@ class MotifGenerator(api.MotifGenerator):
                 pass
             raise
         so = self._take_so()  # the device sampler's outputs: extra trace outputs of the path
+        extra = self._take_extra()  # Phase G T64: the draft-row sampler's outputs and the kept logits
         try:
             ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
         except BaseException:
@@ -3145,9 +3413,10 @@ class MotifGenerator(api.MotifGenerator):
                 ttnn.release_trace(self.mesh_device, tid)
             except Exception:
                 pass
-            _free(*(out if isinstance(out, tuple) else (out,)), so)
+            _free(*(out if isinstance(out, tuple) else (out,)), so, *_extra_tensors(extra))
             raise
         p.so = so
+        p.extra = extra
         return tid, out
 
     # ==============================================================================================================
@@ -3252,8 +3521,10 @@ class MotifGenerator(api.MotifGenerator):
                 p.trace_id = None
                 _free(*(p.out if isinstance(p.out, tuple) else (p.out,)))
                 _free(p.so)  # the sampler's trace outputs (tokens, info)
+                _free(*_extra_tensors(p.extra))
                 p.out = None
                 p.so = None
+                p.extra = None
                 p.pool = None
         if err is not None:
             raise err
@@ -3269,6 +3540,9 @@ class MotifGenerator(api.MotifGenerator):
         if self.sampler is not None:
             self.sampler.deallocate()
             self.sampler = None
+        if self.sampler_b is not None:
+            self.sampler_b.deallocate()
+            self.sampler_b = None
         if self._pool is not None:
             self._pool.deallocate()
             self._pool = None
