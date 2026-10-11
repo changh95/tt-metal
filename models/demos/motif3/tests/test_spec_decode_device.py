@@ -1774,7 +1774,7 @@ def test_cpu_wide_paths_and_routing(monkeypatch):
     k = len(tr.kinds)
     lg = gen.decode_forward(drv.batch(reqs[:1]).anchors(), kv_cache=pool, enable_trace=True)
     assert tr.kinds[k:] == ["spec"] and tuple(lg.shape) == (32, gen.vocab_size)
-    assert G.WIDE == "wide" and G.SPEC_KINDS == ("spec", "wide")
+    assert G.WIDE == "wide" and G.SPEC_KINDS == ("spec", "wide", "wide_s")  # "wide_s": Phase G (spec_sampled)
 
 
 @pytest.mark.parametrize("verify", ["auto", "wide"])

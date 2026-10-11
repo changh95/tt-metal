@@ -334,6 +334,14 @@ def sampler_b_rng_seed(rng_seed: Optional[int]) -> Optional[int]:
 LaneSampling = Tuple[Sequence[float], Sequence[float], Sequence[int], Sequence[Optional[int]]]
 
 
+def _has_sampled_row(sampling: Optional[LaneSampling], active: torch.Tensor) -> bool:
+    """Phase G: some ACTIVE lane of the step is sampled (temperature >= 1e-5, ``LaneParams.greedy``'s rule)."""
+    if sampling is None:
+        return False
+    temps = sampling[0].reshape(-1).tolist() if isinstance(sampling[0], torch.Tensor) else list(sampling[0])
+    return any(on and float(t) >= SAMPLING_EPS for t, on in zip(temps, active.tolist()))
+
+
 def _greedy_lane_sampling(n: int = api.NUM_LANES) -> LaneSampling:
     """All-greedy lane lists (the plugin's padding defaults: temperature 0, top_p 1, top_k 1, no seed)."""
     return [0.0] * n, [1.0] * n, [1] * n, [None] * n
@@ -354,8 +362,13 @@ def _partner_lane_sampling(sampling: LaneSampling, partner_of: Mapping[int, int]
 # decode paths and the speculative step plan (features design §3.8, D10; host only)
 # ======================================================================================================================
 PLAIN, SPEC, WIDE = "plain", "spec", VP.WIDE_STEP  # "wide": the T64 step (verify_plan's kinds: "spec" | "wide")
-DECODE_KINDS = (PLAIN, SPEC, WIDE)
-SPEC_KINDS = (SPEC, WIDE)  # the decode paths of a speculating launch (decode_forward_spec)
+# Phase G (spec_sampled, design §3.5 option B): "wide_s" is the T64 step with the two samplers before the MTP layer,
+# captured next to the argmax-only "wide" trace (which stays the Phase F trace): a T64 step with a sampled active row
+# runs on "wide_s", every other T64 step on "wide" (greedy traffic keeps the Phase F step time).
+WIDE_S = "wide_s"
+WIDE_KINDS = (WIDE, WIDE_S)
+DECODE_KINDS = (PLAIN, SPEC, WIDE, WIDE_S)
+SPEC_KINDS = (SPEC, WIDE, WIDE_S)  # the decode paths of a speculating launch (decode_forward_spec)
 DecodeKey = Tuple[str, str]  # (kind "plain" | "spec" | "wide", KV-write mode)
 # decode_forward_spec's host profile (reset_spec_profile): "steps" calls, "passes" device runs, "wide" T64 steps
 class ReplayWaiter:
@@ -1157,7 +1170,18 @@ class MotifGenerator(api.MotifGenerator):
         out = [self.serving_path]
         if self.wide_path is not None and self.wide_path not in out:
             out.append(self.wide_path)
+        ws = self.wide_s_path
+        if ws is not None and ws not in out:
+            out.append(ws)
         return out
+
+    @property
+    def wide_s_path(self) -> Optional[DecodeKey]:
+        """Phase G: the sampled T64 path (``("wide_s", mode)``), staged and captured after the T64 path once the
+        draft-row sampler exists (``spec_sampled`` with the T64 path and device sampling), else None."""
+        if self.wide_path is None or not self.spec_sampled or self.sampler_b is None:
+            return None
+        return (WIDE_S, self.wide_path[1])
 
     @property
     def wide_has_logits(self) -> bool:
@@ -2152,7 +2176,7 @@ class MotifGenerator(api.MotifGenerator):
         pos = positions.to(torch.int32)
         active = pos >= 0
         tok = torch.where(active, tokens.to(torch.int32), torch.zeros_like(pos))
-        if kind == WIDE:
+        if kind in WIDE_KINDS:
             rpd = self.wide_rows_per_dp
             return {
                 "tokens": self.model.embed.decode_tokens_host(tok, rows_per_dp=rpd),
@@ -2177,7 +2201,7 @@ class MotifGenerator(api.MotifGenerator):
         pos = positions.to(torch.int32)
         active = pos >= 0
         tok = torch.where(active, tokens.to(torch.int32), torch.zeros_like(pos))
-        rpd = self.wide_rows_per_dp if kind == WIDE else None
+        rpd = self.wide_rows_per_dp if kind in WIDE_KINDS else None
         out = {
             "tokens": (decode_token_rows(tok, cfg, n_streams=self.model.embed.n_streams, rows_per_dp=rpd), ttnn.uint32),
             "rot": (positions_to_rot_idxs(pos, cfg, rows_per_dp=rpd), ttnn.uint32),
@@ -2237,18 +2261,18 @@ class MotifGenerator(api.MotifGenerator):
             )
         if kind in SPEC_KINDS and self.model.mtp is None:
             raise ValueError(f"the {kind} decode path needs the MTP layer")
-        if kind == WIDE:  # before anything is freed or allocated: a T64 config, a split mode, R1 (ring_gather safe)
+        if kind in WIDE_KINDS:  # before anything is freed or allocated: a T64 config, a split mode, R1 (ring_gather safe)
             self._check_wide_launch(mode)
         if p is not None:
             self._free_path(p)
-        n = api.WIDE_ROWS if kind == WIDE else api.NUM_LANES
+        n = api.WIDE_ROWS if kind in WIDE_KINDS else api.NUM_LANES
         h = self._path_host_inputs(
             kind, mode, torch.zeros(n, dtype=torch.int32), torch.full((n,), -1, dtype=torch.int32),
             torch.zeros(n, int(width), dtype=torch.int32),
         )  # fmt: skip
         p = DecodePath(kind=kind, mode=mode, width=int(width))
         p.inputs = {k: ttnn.to_device(v, self.mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG) for k, v in h.items()}
-        if kind == WIDE:  # 16 rows per DP row; the split-order KV-R gather (all_split); the A'' group inputs
+        if kind in WIDE_KINDS:  # 16 rows per DP row; the split-order KV-R gather (all_split); the A'' group inputs
             p.kv_write = DecodeKVWrite(
                 self.mesh_device, self.cfg, ccl=self.model.ccl, page_table_width=int(width), mode=mode,
                 rows=api.WIDE_ROWS, gather="split",
@@ -2329,7 +2353,7 @@ class MotifGenerator(api.MotifGenerator):
         device sampling the step also samples ``rm`` (the 32 anchors, exactly the ``[1, 1, 32, 6880]`` the T32 trace
         samples); its outputs wait in :meth:`_take_so`. In ``auto`` the T64 trace holds no sampler."""
         want_rm = self.wide_has_logits
-        if self.samples_spec:  # Phase G: anchors with the sampler, drafts with sampler_b, before the MTP layer
+        if p.kind == WIDE_S:  # Phase G: anchors with the sampler, drafts with sampler_b, before the MTP layer
             rm, a, m, so_a, so_b, lg = self.model.decode_wide(
                 p.inputs["tokens"], rot_idxs=p.inputs["rot"], kv_write=p.kv_write, kv_caches=pool, want_rm=want_rm,
                 samplers=(self.sampler, self.sampler_b),
@@ -2351,7 +2375,7 @@ class MotifGenerator(api.MotifGenerator):
     def _device_step(self, p: DecodePath, pool: MotifKVPool):
         if p.kind == SPEC:
             return self._spec_step(p, pool)
-        if p.kind == WIDE:
+        if p.kind in WIDE_KINDS:
             return self._wide_step(p, pool)
         return self._plain_step(p, pool)
 
@@ -2718,7 +2742,7 @@ class MotifGenerator(api.MotifGenerator):
         """``verify_plan.plan_wide_step`` with this generator's config and pool, and the T64 path's geometry (once
         staged: its ``DecodeKVWrite(rows=64)``'s users per call and gather order; once traced: its width): every host
         check and the 64-row layout of one T64 step, before any device op. Raises ``ValueError`` on a bad batch."""
-        key = self._resolve_key(WIDE, path)
+        key = self._resolve_key(WIDE_KINDS, path)
         p = self._paths.get(key)
         w = None if p is None else p.kv_write
         return VP.plan_wide_step(
@@ -2784,7 +2808,13 @@ class MotifGenerator(api.MotifGenerator):
             key = self._resolve_key(SPEC_KINDS, path)
         else:
             key = (self.verify_kind(batch, want_logits=want_logits, sampling=sampling), self.spec_kv_mode)
-        wide = key[0] == WIDE
+        sspec = self.samples_spec  # Phase G: the traces sample before the MTP layer
+        if key[0] == WIDE and sspec and _has_sampled_row(sampling, batch.active):
+            key = (WIDE_S, key[1])  # a sampled active row: the sampled T64 trace
+        wide = key[0] in WIDE_KINDS
+        wide_s = key[0] == WIDE_S
+        if wide_s and not sspec:
+            raise ValueError("the sampled T64 path needs spec_sampled with device sampling (samples_spec)")
         if wide:
             plan = self.plan_wide_step(batch, path=key)
             passes: Sequence[Any] = (plan,)
@@ -2796,9 +2826,9 @@ class MotifGenerator(api.MotifGenerator):
         else:
             plan = self.plan_spec_step(batch, path=key)
             passes = plan.passes
-        sspec = self.samples_spec  # Phase G: the traces sample before the MTP layer
         smp = smp_b = None
         sampled_verify = False
+        argmax_wide_verify = False  # Phase G: an all-greedy sampled verify on the argmax-only T64 trace
         if sampling is not None:
             smp = self._require_sampler()
             if plan.is_verify:
@@ -2814,17 +2844,21 @@ class MotifGenerator(api.MotifGenerator):
                         f"the overflow pass holds no draft-row sampler (the bridge's idle-lane budget prevents it; "
                         f"spec_verify='auto' runs such a step on T64)"
                     )
-            if wide and not (self.wide_has_logits or sspec):
+            if wide and not wide_s and sampled_verify:
+                # every active row is greedy (a sampled one takes "wide_s"): the argmax IS each row's draw
+                smp, argmax_wide_verify = None, True
+            elif wide and not (self.wide_has_logits or wide_s):
                 raise ValueError(
                     f"device sampling on the T64 trace of a spec_verify={self.spec_verify!r} launch: it holds no "
                     f"sampler (sampled steps run on the T32-spec trace)"
                 )
-            if wide and sspec:
+            if wide_s:
                 smp_b = self.sampler_b
         use_trace = self._check_trace_use(self._paths.get(key), pool, batch.page_table_width, enable_trace)
-        if (smp is not None or sspec) and use_trace and self._paths[key].so is None:
+        needs_so = smp is not None or (sspec and key[0] in (SPEC, WIDE_S))
+        if needs_so and use_trace and self._paths[key].so is None:
             raise RuntimeError("the decode trace was captured without the device sampler (release_traces() first)")
-        if sspec and wide and use_trace and self._paths[key].extra is None:
+        if wide_s and use_trace and self._paths[key].extra is None:
             raise RuntimeError("the T64 trace was captured without spec_sampled's samplers (release_traces() first)")
         p = self._stage_path(key, batch.page_table_width)
         head, outs, logits = self.model.head, [], None
@@ -2850,10 +2884,10 @@ class MotifGenerator(api.MotifGenerator):
             else:
                 smp.set_params(*sampling)
                 smp.set_positions(batch.positions)
-        elif sspec:  # a host-sampled (or test) step: greedy parameters, so the MTP layer reads the argmax
-            g = _greedy_lane_sampling()
+        elif sspec and key[0] in (SPEC, WIDE_S):  # a host-sampled (or greedy) step: greedy parameters, so the MTP
+            g = _greedy_lane_sampling()  # layer reads the argmax
             self.sampler.set_params(*g)
-            if wide and self.sampler_b is not None:
+            if wide_s:
                 self.sampler_b.set_params(*g)
         # Fast path (traced, "mesh" vocab split, no observer): every pass is enqueued back to back -- its inputs, the
         # replay, then non-blocking reads of a / m into pass-indexed host staging -- and only the step's LAST read
@@ -2968,7 +3002,7 @@ class MotifGenerator(api.MotifGenerator):
                         rows64.append(head.logits_rows_to_host(lg_s))
                     return rows64[0]
 
-                if wide and sspec:
+                if wide_s:
                     res_s = self._finish_sampled(key[0], phys_pos, res_s, None, logits_fn=lambda: logits64()[:32])
                     if res_b is not None:
                         res_b = self._finish_sampled(
@@ -2986,10 +3020,12 @@ class MotifGenerator(api.MotifGenerator):
                     logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=res_s,
                     sampled_ids=sampled_ids, mtp_input=mtp_input,
                 )  # fmt: skip
-            elif sspec:  # greedy parameters ran in the trace: the MTP input is the argmax
+            elif sspec:  # greedy parameters, or the argmax-only T64 trace: the MTP input is the argmax
+                if argmax_wide_verify:
+                    self.stats["sampled_verify_steps"] += 1
                 res = SampledSpecDecodeResult(
                     logits=res.logits, argmax=res.argmax, mtp_argmax=res.mtp_argmax, sample=None,
-                    sampled_ids=None, mtp_input=res.argmax.clone(),
+                    sampled_ids=res.argmax.clone() if argmax_wide_verify else None, mtp_input=res.argmax.clone(),
                 )  # fmt: skip
             self._read_done()
         except BaseException:
@@ -3216,7 +3252,7 @@ class MotifGenerator(api.MotifGenerator):
         pt = torch.zeros(n, p.width, dtype=torch.int32)
         head = self.model.head
         if p.kind in SPEC_KINDS:
-            if p.kind == WIDE:
+            if p.kind in WIDE_KINDS:
                 self._write_wide(p, self._inactive_wide_plan(p))
                 rm, a, m = outs = self._wide_step(p, pool)
             else:
@@ -3267,7 +3303,7 @@ class MotifGenerator(api.MotifGenerator):
         n = api.NUM_LANES
         tokens, pos = torch.zeros(n, dtype=torch.int32), torch.full((n,), -1, dtype=torch.int32)
         pt = torch.zeros(n, p.width, dtype=torch.int32)
-        if p.kind == WIDE:
+        if p.kind in WIDE_KINDS:
             self._write_wide(p, self._inactive_wide_plan(p))
         elif p.kind == SPEC:
             self._write_spec(p, SpecPass(tokens, KVWriteStep.ordinary(pos, pt)))
@@ -3292,7 +3328,7 @@ class MotifGenerator(api.MotifGenerator):
             raise ValueError(f"page_table_width must be >= 1, got {W}")
         keys = self.decode_paths()
         for key in keys:
-            if key[0] == WIDE:  # F3N R1 / R-E5 / R-E7 before any T64 staging or capture
+            if key[0] in WIDE_KINDS:  # F3N R1 / R-E5 / R-E7 before any T64 staging or capture
                 self._check_wide_launch(key[1])
         if not enable_trace:
             t0 = time.time()
@@ -3338,7 +3374,8 @@ class MotifGenerator(api.MotifGenerator):
             ttnn.execute_trace(self.mesh_device, p.trace_id, cq_id=0, blocking=True)  # one replay: all lanes inactive
             dt = time.time() - t0
             self.timings[f"capture_decode_{key[0]}_{key[1]}_s"] = dt
-            what = {PLAIN: "plain", SPEC: "T32-spec", WIDE: "T64 (16 rows per DP row)"}[key[0]]
+            what = {PLAIN: "plain", SPEC: "T32-spec", WIDE: "T64 (16 rows per DP row)",
+                    WIDE_S: "T64 sampled (16 rows per DP row, 2 samplers)"}[key[0]]  # fmt: skip
             self.log(
                 f"decode trace captured: {what} path (W={W}, {self.num_layers} layers"
                 f"{' + the MTP layer' if key[0] in SPEC_KINDS else ''}, KV write {key[1]!r}"
@@ -3617,4 +3654,6 @@ __all__ = [
     "plan_spec_step",
     "prefill_page_table_host",
     "WIDE",
+    "WIDE_KINDS",
+    "WIDE_S",
 ]
