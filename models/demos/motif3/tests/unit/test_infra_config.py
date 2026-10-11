@@ -2279,7 +2279,7 @@ def test_f4_sampler_local_knob(monkeypatch):
 
 
 def test_f5_ccl_fuse_knob(monkeypatch):
-    """Phase F F5 (logs/opt/phaseF/F5): ``MOTIF3_CCL_FUSE`` ("ar" default | "off"; case and blanks ignored, anything
+    """Phase F F5 (logs/opt/phaseF/F5): ``MOTIF3_CCL_FUSE`` ("ar" default | "off" | "all"; case and blanks ignored, anything
     else refused; in ``describe``), ``MotifCCL(fuse=...)`` follows cfg.ccl_fuse, the fused all-reduce's kernels keep
     ttnn's reduce-scatter reader / compute byte for byte (the reduction order), its contract (bf16 TILE interleaved,
     whole-page slices, <= 512 KiB) and its geometry equal reduce_scatter_minimal_direct's for the decode payloads."""
@@ -2288,10 +2288,10 @@ def test_f5_ccl_fuse_knob(monkeypatch):
     from models.demos.motif3.tt.kernels import ccl_ar as CA
     from models.demos.motif3.tt.model_config import CCL_FUSE_MODES
 
-    assert CCL_FUSE_MODES == ("off", "ar")
+    assert CCL_FUSE_MODES == ("off", "ar", "all")
     monkeypatch.delenv("MOTIF3_CCL_FUSE", raising=False)
     assert _cfg().ccl_fuse == "ar" and "ccl_fuse=ar " in _cfg().describe()
-    for v, want in ((" AR ", "ar"), ("Off", "off"), ("", "ar")):
+    for v, want in ((" AR ", "ar"), ("Off", "off"), ("", "ar"), ("ALL", "all")):
         monkeypatch.setenv("MOTIF3_CCL_FUSE", v)
         assert _cfg().ccl_fuse == want, v
     monkeypatch.setenv("MOTIF3_CCL_FUSE", "rs")

@@ -11,6 +11,9 @@ Device (lock wrapper)::
 
 ``F5_CASES`` (comma list of case names, default all) runs a subset; ``F5_REPEAT`` the repeated-call count.
 
+* ``test_ccl_fuse_ag_bitwise`` (``fuse="all"``): every decode gather on the safe path (PolyNorm moments, sampler
+  gathers) through ``FusedAllGather`` == all_broadcast + concat on all 32 chips; traced cost.
+* ``test_ccl_fuse_ar_timing`` / ``test_ccl_fuse_ar_eager_host``: traced and eager cost per all-reduce.
 * ``test_ccl_fuse_ar_bitwise``: every decode all-reduce payload (AR(tp) of [1, 1, L, 4096] at L = 8 / 16 / 32 into DRAM
   and L1, AR(dp) of [1, 1, 32 / 64, 4096]) with distinct random data per chip: fused == ops on all 32 chips (padding
   tiles included: the full padded tiles are compared through a TILE->host copy of the padded shape), the fused path
@@ -202,3 +205,64 @@ def test_ccl_fuse_ar_eager_host(mesh_device, device_params):
             print(f"[f5-eager] {name} {mode}: host {1e6 * (t1 - t0) / 50:.0f} us per call, wall {1e6 * (t2 - t0) / 50:.0f}"
                   f" us per call (50 calls)", flush=True)
         ttnn.deallocate(x)
+
+
+# name -> (axis, local shape, dtype, input mc, output mc): the decode gathers on the safe path (all_broadcast + concat)
+AG_CASES = {
+    "moments_tp": ("tp", (1, 3, 32, 32), ttnn.float32, L1, L1),
+    "s512_tp": ("tp", (1, 1, 32, 512), ttnn.bfloat16, DRAM, DRAM),
+    "s64_tp": ("tp", (1, 1, 32, 64), ttnn.bfloat16, DRAM, DRAM),
+    "f96x32_tp": ("tp", (1, 1, 96, 32), ttnn.float32, DRAM, DRAM),
+    "f96x256_dp": ("dp", (1, 1, 96, 256), ttnn.float32, DRAM, DRAM),
+    "s512_dp": ("dp", (1, 1, 32, 512), ttnn.bfloat16, DRAM, DRAM),
+}
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_ccl_fuse_ag_bitwise(mesh_device, device_params):
+    """``fuse="all"``: every decode gather payload on the safe path, fused == all_broadcast + concat on all 32 chips,
+    the fused program ran, F5_REPEAT repeats identical; traced cost per gather (ops vs fused)."""
+    log_fabric(mesh_device, "ccl_fuse_ag")
+    cfg = MotifTTConfig.from_hf_config(mesh_device=mesh_device)
+    ops = MotifCCL(mesh_device, cfg, fuse="off")
+    fus = MotifCCL(mesh_device, cfg, fuse="all")
+    R, C = (int(s) for s in tuple(mesh_device.shape))
+    mapper = ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C))
+    names = [c for c in (os.environ.get("F5_AG_CASES") or ",".join(AG_CASES)).split(",") if c]
+    reps = int(os.environ.get("F5_REPEAT", "20"))
+    g = torch.Generator().manual_seed(58)
+    failures = []
+    for name in names:
+        axis, shape, dt, imc, omc = AG_CASES[name]
+        xh = torch.randn(R, C * shape[1], *shape[2:], generator=g) * 3.0
+        x = ttnn.from_torch(xh, dtype=dt, layout=ttnn.TILE_LAYOUT, device=mesh_device, mesh_mapper=mapper,
+                            memory_config=imc)
+        b = ops.all_gather(x, 3, axis, memory_config=omc)
+        c0 = fus._fused_ag.calls if fus._fused_ag is not None else 0
+        a = fus.all_gather(x, 3, axis, memory_config=omc)
+        ttnn.synchronize_device(mesh_device)
+        used = (fus._fused_ag.calls if fus._fused_ag is not None else 0) - c0
+        wa, wb = device_tensors_to_torch(a, mesh_device), device_tensors_to_torch(b, mesh_device)
+        iv = torch.int32 if dt == ttnn.float32 else torch.int16
+        same = bool(torch.equal(wa.contiguous().view(iv), wb.contiguous().view(iv)))
+        rep_ok = True
+        for i in range(reps):
+            a2 = fus.all_gather(x, 3, axis, memory_config=omc)
+            w2 = device_tensors_to_torch(a2, mesh_device)
+            ttnn.deallocate(a2)
+            if not torch.equal(w2.contiguous().view(iv), wa.contiguous().view(iv)):
+                rep_ok = False
+                break
+        t = {}
+        for mode, ccl in (("off", ops), ("all", fus), ("off", ops), ("all", fus)):
+            us = _traced_us(mesh_device, lambda: ccl.all_gather(x, 3, axis, memory_config=omc))
+            t.setdefault(mode, []).append(us)
+        print(f"[f5-ag] {name}: fused used {used}, bitwise {same}, {reps} repeats identical {rep_ok}, out "
+              f"{list(a.shape)} {a.memory_config().buffer_type}; traced ops {min(t['off']):.1f} us, fused "
+              f"{min(t['all']):.1f} us per gather", flush=True)
+        if not (same and used == 1 and rep_ok):
+            failures.append(f"{name}: used {used} same {same} repeats {rep_ok}")
+        for tt_ in (a, b, x):
+            ttnn.deallocate(tt_)
+    assert not failures, failures
+

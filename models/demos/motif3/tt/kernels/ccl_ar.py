@@ -25,6 +25,10 @@ connections differ per chip), cached per (axis, input spec, output memory config
 the start barrier, all monotonic (never reset, as ttnn's). Buffer addresses (input, staging, output) are runtime
 arguments patched per call; the staging buffer (both parity halves, as ttnn's) is allocated per call like the
 reduce-scatter's, but only on the worker cores.
+
+:class:`FusedAllGather` (``MOTIF3_CCL_FUSE=all``): the race-prone tile-aligned ring gathers (all_broadcast + concat
+today, e.g. the shared expert's PolyNorm moments, the sampler gathers) as one program (``ccl_ar/gather.cpp``): the same
+start barrier and multicast routes, straight into the concatenated output. Pure data movement (bitwise).
 """
 
 from __future__ import annotations
@@ -49,6 +53,42 @@ DIRECT_RS_MAX_INPUT_BYTES = 512 * 1024
 
 def _ca_size(mesh_device, ca: int) -> int:
     return int(tuple(mesh_device.shape)[ca])
+
+
+def _ring_routes(mesh, r: int, c: int, ca: int, n: int):
+    """The ring of chip (r, c) on cluster axis ``ca`` (n chips): its fabric node, the forward / backward neighbours'
+    nodes and every other ring member as a destination (slice = ring index, conn 0 / 1 = the forward / backward
+    connection the fabric routes it through, hops = ring distance the shorter way, ties forward; chip / mesh ids for
+    2D routing), farthest first (stable; reduce_scatter_minimal_direct_factory.cpp's order and direction fix-up)."""
+    me = r if ca == 0 else c
+
+    def at(k):
+        return ttnn.MeshCoordinate(*((k, c) if ca == 0 else (r, k)))
+
+    coord = ttnn.MeshCoordinate(r, c)
+    self_node = mesh.get_fabric_node_id(coord)
+    fwd_node, bwd_node = mesh.get_fabric_node_id(at((me + 1) % n)), mesh.get_fabric_node_id(at((me - 1) % n))
+    fwd_dir = ttnn.get_eth_forwarding_direction(self_node, fwd_node)
+    bwd_dir = ttnn.get_eth_forwarding_direction(self_node, bwd_node)
+    if fwd_dir is None or bwd_dir is None:
+        raise RuntimeError(f"ccl_ar: no fabric route to the ring neighbours of {coord}")
+    dests = []
+    for j in range(n):
+        if j == me:
+            continue
+        fh, bh = (j - me) % n, (me - j) % n
+        hops = fh if fh <= bh else bh
+        node = mesh.get_fabric_node_id(at(j))
+        d = ttnn.get_eth_forwarding_direction(self_node, node)
+        if d == fwd_dir:
+            conn = 0
+        elif d == bwd_dir:
+            conn = 1
+        else:
+            raise RuntimeError(f"ccl_ar: route {coord} -> ring member {j} leaves the ring ({d})")
+        dests.append(dict(slice=j, conn=conn, hops=hops, chip=int(node.chip_id), mesh=int(node.mesh_id)))
+    dests.sort(key=lambda d: -d["hops"])
+    return self_node, fwd_node, bwd_node, dests
 
 
 class _Prog:
@@ -208,32 +248,7 @@ class FusedAllReduce:
                     cbs=[cbd(CB_SEND, 2 * tg), cbd(CB_OUT, max(2, cc_max) * tg), self._cb_reduce(prog, staging_t)],
                 )
 
-                def at(k):
-                    return ttnn.MeshCoordinate(*((k, c) if ca == 0 else (r, k)))
-
-                fwd, bwd = at((me + 1) % n), at((me - 1) % n)
-                self_node = mesh.get_fabric_node_id(coord)
-                fwd_node, bwd_node = mesh.get_fabric_node_id(fwd), mesh.get_fabric_node_id(bwd)
-                fwd_dir = ttnn.get_eth_forwarding_direction(self_node, fwd_node)
-                bwd_dir = ttnn.get_eth_forwarding_direction(self_node, bwd_node)
-                if fwd_dir is None or bwd_dir is None:
-                    raise RuntimeError(f"ccl_ar: no fabric route to the ring neighbours of {coord}")
-                dests = []
-                for j in range(n):
-                    if j == me:
-                        continue
-                    fh, bh = (j - me) % n, (me - j) % n
-                    hops = fh if fh <= bh else bh
-                    node = mesh.get_fabric_node_id(at(j))
-                    d = ttnn.get_eth_forwarding_direction(self_node, node)
-                    if d == fwd_dir:
-                        conn = 0
-                    elif d == bwd_dir:
-                        conn = 1
-                    else:
-                        raise RuntimeError(f"ccl_ar: route {coord} -> ring member {j} leaves the ring ({d})")
-                    dests.append(dict(slice=j, conn=conn, hops=hops, chip=int(node.chip_id), mesh=int(node.mesh_id)))
-                dests.sort(key=lambda d: -d["hops"])  # stable: farthest first, as the reduce-scatter
+                self_node, fwd_node, bwd_node, dests = _ring_routes(mesh, r, c, ca, n)
                 uses_bwd = any(d["conn"] == 1 for d in dests)
                 mrange = [sum(1 for d in dests if d["conn"] == k) for k in (0, 1)]
                 for link, core in enumerate(cores):
@@ -321,3 +336,145 @@ class FusedAllReduce:
         ttnn.deallocate(staging)
         self.calls += 1
         return out
+
+
+_TILE_BYTES = {"BFLOAT16": 2048, "FLOAT32": 4096}
+GATHER_MAX_TILES_PER_CORE = 64  # the input tiles a gather worker stages in L1
+
+
+class FusedAllGather:
+    """Phase F F5 (``MOTIF3_CCL_FUSE=all``): the race-free ring all-gather of a tile-aligned TILE tensor (bf16 / fp32,
+    interleaved) as ONE program (``ccl_ar/gather.cpp``), replacing ``all_broadcast`` + ``concat`` (tt/ccl.py
+    ``_all_gather_safe``); pure data movement, bitwise the concat. One program per mesh coordinate (the routes and
+    fabric connections differ), cached per (axis, dim, input spec, output memory config) with its own L1_SMALL global
+    semaphores (per-source gather counters, the invocation counter and the start barrier; monotonic)."""
+
+    def __init__(self, mesh_device, *, num_links: Optional[int] = None):
+        self.mesh_device = mesh_device
+        g = mesh_device.compute_with_storage_grid_size()
+        self.grid = (int(g.x), int(g.y))
+        self.num_links = int(num_links) if num_links else 2
+        self._progs: Dict[tuple, _Prog] = {}
+        self.calls = 0
+
+    @staticmethod
+    def _dt(x) -> str:
+        dt = x.dtype
+        return getattr(dt, "name", str(dt).split(".")[-1])
+
+    @classmethod
+    def supported(cls, x, n: int, dim: int, out_mc) -> bool:
+        """TILE bf16 / fp32 interleaved rank-4 input whose gather dim is not tile-padded, a 4 / 8-chip axis, an
+        interleaved output, at most 2 x GATHER_MAX_TILES_PER_CORE input tiles per chip."""
+        try:
+            if x.layout != ttnn.TILE_LAYOUT or cls._dt(x) not in _TILE_BYTES or int(n) not in (2, 4, 8):
+                return False
+            if x.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
+                return False
+            if out_mc.memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
+                return False
+            s = [int(d) for d in x.shape]
+            p = [int(d) for d in x.padded_shape]
+            d = int(dim) % 4
+            if len(p) != 4 or p[d] != s[d]:
+                return False
+            return math.prod(p) // (TILE * TILE) <= 2 * GATHER_MAX_TILES_PER_CORE
+        except Exception:
+            return False
+
+    def _build(self, x, ca: int, n: int, dim: int, out_mc) -> _Prog:
+        mesh = self.mesh_device
+        R, C = (int(v) for v in tuple(mesh.shape))
+        p = [int(d) for d in x.padded_shape]
+        d = dim % 4
+        tb = _TILE_BYTES[self._dt(x)]
+        dim_pages = p[d] // TILE if d >= 2 else p[d]
+        inner = 1
+        for k in range(d + 1, 4):
+            inner *= p[k] // TILE if k >= 2 else p[k]
+        run = dim_pages * inner
+        stride = n * run
+        tiles = math.prod(p) // (TILE * TILE)
+        num_links = max(1, min(self.num_links, tiles))
+        base, extra = divmod(tiles, num_links)
+        per_max = base + (1 if extra else 0)
+        if per_max > GATHER_MAX_TILES_PER_CORE:
+            raise ValueError(f"ccl_ar gather: {tiles} tiles per chip exceed the per-core staging")
+        pairs = int(2 * tb <= int(ttnn.get_tt_fabric_max_payload_size_bytes()))
+        cores = [ttnn.CoreCoord(i % self.grid[0], i // self.grid[0]) for i in range(num_links)]
+        core_set = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cores])
+        prog = _Prog()
+        prog.cores = cores
+        oshape = [int(v) for v in x.shape]
+        oshape[d] *= n
+        prog.staging = oshape  # (the output shape)
+        out_t = ttnn.allocate_tensor_on_device(ttnn.Shape(oshape), x.dtype, x.layout, mesh, out_mc)
+        sems = [ttnn.create_global_semaphore(mesh, core_set, 0, ttnn.BufferType.L1_SMALL) for _ in range(n + 2)]
+        ttnn.synchronize_device(mesh)
+        prog.sems = sems
+        addr = [int(ttnn.get_global_semaphore_address(s)) for s in sems]
+        ag, gen, init_sem = addr[0:n], addr[n], addr[n + 1]
+        ct = [tb, n, run, stride, pairs, 0]
+        ct += list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+        ct += list(ttnn.TensorAccessorArgs(out_t).get_compile_time_args())
+        exp = int(os.environ.get("MOTIF3_CCLAR_EXP", "0") or 0)  # timing experiments only (gather.cpp)
+        defines = [("MOTIF_CCLAR_EXP", str(exp))] if exp else []
+        cb = ttnn.CBDescriptor(total_size=per_max * tb, core_ranges=core_set, format_descriptors=[
+            ttnn.CBFormatDescriptor(buffer_index=0, data_format=x.dtype, page_size=tb)])
+        for r in range(R):
+            for c in range(C):
+                coord = ttnn.MeshCoordinate(r, c)
+                me = r if ca == 0 else c
+                desc = ttnn.ProgramDescriptor(
+                    kernels=[ttnn.KernelDescriptor(kernel_source=str(KERNEL_DIR / "gather.cpp"),
+                                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                                                   core_ranges=core_set, compile_time_args=ct, defines=defines,
+                                                   config=ttnn.WriterConfigDescriptor())],
+                    semaphores=[], cbs=[cb])
+                self_node, fwd_node, bwd_node, dests = _ring_routes(mesh, r, c, ca, n)
+                uses_bwd = any(dd["conn"] == 1 for dd in dests)
+                mrange = [sum(1 for dd in dests if dd["conn"] == k) for k in (0, 1)]
+                for link, core in enumerate(cores):
+                    t0 = link * base + min(link, extra)
+                    cnt = base + (1 if link < extra else 0)
+                    peer = mesh.worker_core_from_logical_core(core)
+                    rt = [0, 0, me, t0, cnt, gen, init_sem, ag[me], int(peer.x), int(peer.y), 2 if uses_bwd else 1,
+                          mrange[0], mrange[1]]
+                    rt += [ag[s] for s in range(n) if s != me]
+                    dst_nodes = [fwd_node] + ([bwd_node] if uses_bwd else [])
+                    fab = ttnn.setup_routing_plane_connection(self_node, dst_nodes, [link] * len(dst_nodes), desc, 0,
+                                                              core)
+                    desc.kernels[0].runtime_args[core.x][core.y] = rt + list(fab)
+                if hasattr(ttnn, "compute_program_descriptor_hash"):
+                    desc.custom_program_hash = ttnn.compute_program_descriptor_hash(desc)
+                prog.descs.append(desc)
+                prog.ranges.append(ttnn.MeshCoordinateRange(coord, coord))
+        ttnn.deallocate(out_t)
+        return prog
+
+    def __call__(self, x, cluster_axis: int, dim: int, *, memory_config=None):
+        """Concatenate the shards of ``cluster_axis`` along ``dim`` (ring index order), into ``memory_config`` (DRAM
+        interleaved by default). Consumes nothing."""
+        mc = memory_config or ttnn.DRAM_MEMORY_CONFIG
+        ca = int(cluster_axis)
+        n = _ca_size(self.mesh_device, ca)
+        d = int(dim) % len(x.shape)
+        key = (ca, d, tuple(int(v) for v in x.shape), tuple(int(v) for v in x.padded_shape), self._dt(x),
+               str(x.memory_config()), str(mc))
+        prog = self._progs.get(key)
+        if prog is None:
+            if not self.supported(x, n, d, mc):
+                raise ValueError(f"ccl_ar gather: unsupported {x.dtype} {x.layout} {list(x.shape)} dim {dim} over {n}")
+            prog = self._progs[key] = self._build(x, ca, n, d, mc)
+        out = ttnn.allocate_tensor_on_device(ttnn.Shape(prog.staging), x.dtype, x.layout, self.mesh_device, mc)
+        xa, oa = int(x.buffer_address()), int(out.buffer_address())
+        md = ttnn.MeshProgramDescriptor()
+        for rng, desc in zip(prog.ranges, prog.descs):
+            for core in prog.cores:
+                ra = desc.kernels[0].runtime_args[core.x][core.y]
+                ra[0], ra[1] = xa, oa
+            md[rng] = desc
+        ttnn.generic_op([x, out], md)
+        self.calls += 1
+        return out
+

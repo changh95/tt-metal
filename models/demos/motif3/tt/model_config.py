@@ -175,8 +175,11 @@ SAMPLER_LOCAL_MODES = ("ops", "fused")
 # "ar": every
 # MotifCCL.all_reduce on the reduce-scatter + gather path whose payload is bf16 TILE interleaved on a ring axis runs as
 # ONE program: the direct reduce-scatter, its reduction order unchanged, plus an in-kernel multicast all-gather whose data
-# and completion counter share one route; replaces reduce_scatter_minimal_direct + all_broadcast + concat).
-CCL_FUSE_MODES = ("off", "ar")
+# and completion counter share one route; replaces reduce_scatter_minimal_direct + all_broadcast + concat) | "all" ("ar"
+# plus every race-prone ring all-gather of a tile-aligned bf16 / fp32 TILE tensor, e.g. the PolyNorm moments and the
+# sampler gathers, as ONE program: the multicast gather straight into the concatenated output, replacing
+# all_broadcast + concat; tt/kernels/ccl_ar/gather.cpp).
+CCL_FUSE_MODES = ("off", "ar", "all")
 # Decode attention matmul program configs (Phase C D1; attention.decode_matmul_program_configs): "tuned" (default:
 # Wkv_lat 1D multicast on 10 x 2 cores, wq_b in0_block_w 8; bitwise equal, -4.6 us per layer) | "release" (5 x 4 /
 # in0_block_w 4). Matmul configs only move work between cores here: every output element keeps its K order.
@@ -1503,7 +1506,8 @@ class MotifTTConfig:
     moe_local: str = "fused"  # MOTIF3_MOE_LOCAL
     # Device sampler per-chip stage (Phase F F4): "fused" (default, bitwise) | "ops" (SAMPLER_LOCAL_MODES).
     sampler_local: str = "fused"  # MOTIF3_SAMPLER_LOCAL
-    # Decode CCL fusion (Phase F F5): "ar" (default, the fused all-reduce program, bitwise) | "off" (CCL_FUSE_MODES).
+    # Decode CCL fusion (Phase F F5): "ar" (default, the fused all-reduce program, bitwise) | "all" (+ the fused
+    # gathers) | "off" (CCL_FUSE_MODES).
     ccl_fuse: str = "ar"  # MOTIF3_CCL_FUSE
     # Decode attention matmul configs (Phase C D1): "tuned" (default, bitwise) | "release" (ATTN_MM_PCS_MODES).
     attn_mm_pcs: str = "tuned"  # MOTIF3_ATTN_MM_PCS
