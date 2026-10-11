@@ -174,3 +174,31 @@ def test_ccl_fuse_ar_timing(mesh_device, device_params):
         print(f"[f5-time] {name}: ops {min(res['off']):.1f} us, fused {min(res['ar']):.1f} us per all-reduce "
               f"(traced, 32 back-to-back, median of 10 replays; runs {res})", flush=True)
         ttnn.deallocate(x)
+
+
+@pytest.mark.parametrize("mesh_device, device_params", MESH, indirect=True)
+def test_ccl_fuse_ar_eager_host(mesh_device, device_params):
+    """Eager (untraced) cost per all-reduce, ops chain vs fused: host dispatch time of 50 back-to-back calls (no sync)
+    and the wall time including the final sync (prefill runs eager)."""
+    log_fabric(mesh_device, "ccl_fuse_ar_eager_host")
+    cfg = MotifTTConfig.from_hf_config(mesh_device=mesh_device)
+    ccls = {"off": MotifCCL(mesh_device, cfg, fuse="off"), "ar": MotifCCL(mesh_device, cfg, fuse="ar")}
+    R, C = (int(s) for s in tuple(mesh_device.shape))
+    mapper = ttnn.ShardTensor2dMesh(mesh_device, dims=(0, 1), mesh_shape=(R, C))
+    g = torch.Generator().manual_seed(57)
+    for name in [c for c in (os.environ.get("F5_CASES") or "tp8_l1,dp32_dram").split(",") if c]:
+        axis, shape, imc, omc = CASES[name]
+        x = ttnn.from_torch(torch.randn(R, C, *shape[2:], generator=g), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                            device=mesh_device, mesh_mapper=mapper, memory_config=imc)
+        for mode in ("off", "ar", "off", "ar"):
+            ttnn.deallocate(ccls[mode].all_reduce(x, axis, memory_config=omc))
+            ttnn.synchronize_device(mesh_device)
+            t0 = time.perf_counter()
+            for _ in range(50):
+                ttnn.deallocate(ccls[mode].all_reduce(x, axis, memory_config=omc))
+            t1 = time.perf_counter()
+            ttnn.synchronize_device(mesh_device)
+            t2 = time.perf_counter()
+            print(f"[f5-eager] {name} {mode}: host {1e6 * (t1 - t0) / 50:.0f} us per call, wall {1e6 * (t2 - t0) / 50:.0f}"
+                  f" us per call (50 calls)", flush=True)
+        ttnn.deallocate(x)
