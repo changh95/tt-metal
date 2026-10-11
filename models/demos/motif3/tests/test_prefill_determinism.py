@@ -920,10 +920,12 @@ def test_ring_gather_race_isolated(mesh_device, device_params):
                         chips.update(f"{r},{q}" for r in range(R) for q in range(C) if float(cnt[r, q]) > 0)
                     for t in (o, c, ne, cnt_t):
                         ttnn.deallocate(t)
+                fused = getattr(getattr(ccl, "_fused_ar", None), "calls", 0)  # F5: fused all-reduce programs so far
                 print(
                     f"[ring_gather] isolated race {name} ({pages} CB page(s) per link), ring_gather={mode} "
                     f"({'safe path' if rerouted else 'native op'}): {bad} of {iters} consumers read a stale tile; "
-                    f"receiving chips {dict(chips)} (native measured: {measured})"
+                    f"receiving chips {dict(chips)} (native measured: {measured}); ccl fuse={getattr(ccl, 'fuse', '-')}"
+                    f", fused all-reduce calls so far {fused}"
                 )
                 if rerouted and bad:
                     failures.append(f"{name} ({mode}): {bad} of {iters} stale reads on {dict(chips)}")
