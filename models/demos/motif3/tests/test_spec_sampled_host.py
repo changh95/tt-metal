@@ -426,3 +426,28 @@ def test_bridge_sampled_ids_verify(knob):
     assert not bridge._retained[bridge._lanes.slot_to_lane[0]].sampled
     assert bridge.spec_stats.sampled_verify_steps == 1
     assert gen.verify_sampling[3][lane_h] == 5
+
+
+def test_bridge_refuses_a_sampled_verify_without_sampling_params():
+    """A 'sampled_ids' verify routed to host sampling carries no sampling_params; the plugin holds such a step back
+    (TTModelRunner._sampled_verify_needs_host_sampling). If one arrives anyway the bridge raises rather than commit
+    argmax tokens on sampled rows."""
+    from models.demos.motif3.tests import test_generator_vllm_host as T
+
+    bridge, gen = T._bridge(num_slots=4, gen_cls=_sampled_gen_cls(), spec_tokens=1, spec_sampled=True)
+    kv = bridge.allocate_kv_cache((640, 1, 32, 576), torch.bfloat16, 3)
+    d = T.PluginDriver(bridge, kv, num_slots=4, block_size=32, num_blocks=640, width=kv.page_table_width, vocab=4096)
+    d.add("g", [101, 102, 103, 104, 105])
+    d.prefill(["g"])
+    kwargs = d._decode_common(["g"])
+    tokens = torch.zeros(4, 2, dtype=torch.int32)
+    positions = torch.full((4, 2), -1, dtype=torch.int32)
+    n = len(d.seqs["g"]) - 1
+    tokens[0] = torch.tensor([d.seqs["g"][-1], 77])
+    positions[0] = torch.tensor([n, n + 1])
+    call = dict(tokens=tokens, start_pos=positions, num_valid_drafts=torch.tensor([1, 0, 0, 0], dtype=torch.int32),
+                accepted_counts=torch.ones(4, dtype=torch.int32), spec_mode="sampled_ids", **kwargs)  # fmt: skip
+    call.pop("sampling_params", None)
+    with pytest.raises(RuntimeError, match="without sampling_params"):
+        bridge.decode_forward(**call)
+    assert bridge.spec_stats.sampled_verify_without_params == 1

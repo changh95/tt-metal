@@ -2247,8 +2247,17 @@ class MotifForCausalLM:
             if sampling_params is not None:
                 sampling = lane_sampling_lists(sampling_params, lanes)
                 self.sampling_stats.verify_steps_with_params += 1
-            else:  # a host-sampled step cannot verify on this launch (held back); served greedy if it ever does
+            else:
+                # The plugin holds back every step it would sample on the host while a sampled request is in the
+                # batch (TTModelRunner._sampled_verify_needs_host_sampling), so a sampled_ids verify always carries
+                # sampling_params. Answering one without them with the argmax would silently commit argmax tokens on
+                # sampled rows: refuse it.
                 self.spec_stats.sampled_verify_without_params += 1
+                raise RuntimeError(
+                    "Motif-3 decode_forward: a 'sampled_ids' verify step arrived without sampling_params (the step "
+                    "was routed to host sampling). The vllm-tt-plugin must hold such a step back instead of "
+                    "verifying it; update vllm-tt-plugin, or run with MOTIF3_SPEC_SAMPLED=off"
+                )
             self.spec_stats.sampled_verify_steps += 1
         spec_kw = {} if sampling is None else {"sampling": sampling}
         result = self.generator.decode_forward_spec(
