@@ -70,7 +70,7 @@ from .generator_api import DEFAULT_PREFILL_SPAN_CAP, SUPPORTED_SPEC_TOKENS, chec
 from .generator_api import prefill_span_cap_from_env
 from .generator_api import DEFAULT_PACKED_PREFILL_MAX_SEG, DEFAULT_PACKED_PREFILL_MAX_TOKENS, PACK_BATCHES
 from .generator_api import PACK_SEG_BUCKETS, PACK_SP1_SEG_BUCKETS, PACKED_PASS_KINDS, PK1_TAIL_VARIANTS
-from .generator_api import SPEC_VERIFY_MODES, WIDE_SPEC_VERIFY_MODES, check_packed_prefill_max_seg
+from .generator_api import SPEC_VERIFY_MODES, WIDE_SPEC_VERIFY_MODES, check_packed_prefill_max_seg, spec_sampled_from_env
 from .generator_api import check_packed_prefill_max_tokens
 from .generator_api import packed_prefill_max_seg_from_env, packed_prefill_max_tokens_from_env
 from .generator_api import packed_prefill_pk1_from_env
@@ -1835,7 +1835,9 @@ class MotifTTConfig:
         if getattr(settings, "packed_prefill_max_tokens", None) is not None:
             kw["pack_max_tokens"] = int(settings.packed_prefill_max_tokens)
         kw["spec_verify"] = str(getattr(settings, "spec_verify", None) or "packed")
-        kw["spec_sampled"] = bool(getattr(settings, "spec_sampled", False))
+        # the settings' flag (the bridge: GeneratorSettings.from_env) or the environment (tests and tools that build
+        # GeneratorSettings directly), like the other MOTIF3_* decode knobs
+        kw["spec_sampled"] = bool(getattr(settings, "spec_sampled", False)) or spec_sampled_from_env()
         if getattr(settings, "wide_step_ratio", None) is not None:
             kw["wide_step_ratio"] = float(settings.wide_step_ratio)
         kw.update(overrides)
