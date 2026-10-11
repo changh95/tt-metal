@@ -3854,7 +3854,7 @@ def test_t64_wide_launch(wide_session):
                 tok[r.lane], pos[r.lane], pt[r.lane] = r.out[-1], q, drv.page_row(r, q)
             b = api.DecodeBatch(tokens=tok, positions=pos, page_table=pt)
             res = gen.decode_forward_sampled(b, (temp, top_p, top_k, seeds), kv_cache=s.pool, enable_trace=True)
-            assert gen.last_verify_kind == "wide"
+            assert gen.last_verify_kind == ("wide_s" if gen.samples_spec else "wide")  # Phase G: the sampled T64 trace
             out.append([int(res.tokens[r.lane]) for r in reqs])
             for r in reqs:
                 r.out.append(int(res.tokens[r.lane]))
