@@ -28,7 +28,8 @@ import torch
 
 from models.demos.motif3.tt import generator_api as api
 
-CTX = 4096
+CTX = 512  # natural text: the golden prompt stream (2971 tokens) does not repeat inside a context (a longer one is
+# copied with near certainty, and every sampler would return the greedy token)
 STEPS = 40  # committed tokens per lane (positions CTX .. CTX + STEPS stay in the lane's private block)
 N_CTX = 8
 
@@ -187,11 +188,25 @@ CONFIGS = {
 }
 
 
+_GREEDY: Dict[int, List[int]] = {}
+
+
+def greedy_reference(s: Session) -> Dict[int, List[int]]:
+    if not _GREEDY:
+        _GREEDY.update(decode(s, list(range(0, 8)), lambda g: (0.0, 1.0, 1, None), speculate=False))
+    return _GREEDY
+
+
 @pytest.mark.parametrize("cfg", sorted(CONFIGS))
 def test_g_seeded_spec_equals_plain(session, cfg):
     s, params = session, CONFIGS[cfg]
     gen = s.gen
+    greedy = greedy_reference(s)
     plain = decode(s, list(range(0, 8)), params, speculate=False)
+    hot = [g for g in range(8) if params(g)[0] > 0]
+    off_greedy = sum(a != b for g in hot for a, b in zip(plain[g], greedy[g]))
+    log(f"{cfg}: {off_greedy} of {len(hot) * STEPS} sampled tokens differ from the greedy chain")
+    assert off_greedy >= len(hot) * STEPS // 20, f"{cfg}: sampling barely departs from greedy ({off_greedy})"
     t32 = decode(s, list(range(8, 16)), params, speculate=True)
     k32 = dict(s.last)
     wide = decode(s, list(range(8, 32)), params, speculate=True)
@@ -203,7 +218,7 @@ def test_g_seeded_spec_equals_plain(session, cfg):
             assert wide[c + g] == ref, f"{cfg} ctx {g} lane {c + g}: T64 spec diverged at {_first_diff(wide[c + g], ref)}"
     assert "spec" in k32["kinds"] and k32["acc"] + k32["rej"] > 0
     assert "wide_s" in kw["kinds"], kw["kinds"]  # every configuration has sampled rows
-    assert kw["acc"] > 0, "no draft was accepted: the drafts were not exercised"
+    assert kw["acc"] > 0 and kw["rej"] > 0, "the drafts were not exercised on both branches"
     assert gen.stats["greedy_s_ne_a"] == 0
     log(f"{cfg}: identical over {8 * STEPS} plain tokens x 4 speculative copies; sampling stats {gen.sampling_stats()}")
 
